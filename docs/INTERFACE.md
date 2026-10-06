@@ -104,7 +104,7 @@ class RunSpec(BaseModel):
     medium: MediumSpec; metrics: list[PluginSpec]; budget: Budget; options: RunOptions
 ```
 
-`spec_hash(run_spec)` is SHA-256 of canonical JSON (sorted keys, no whitespace). Run identity is `(git_commit, dirty, spec_hash)`; the runner records all three on `run_started` and archives the serialised spec to `artifacts/spec.yaml`. YAML files hold `name`, `arms: {arm: {world, participants: [{type, count, params}], medium, metrics}}`, `budget`, and `options`; `participants[].count` expands to repeated entries.
+`Plugin.type_name()` uses `entry_point` only when it is defined on the class itself (`cls.__dict__`), so a subclass of a registered plugin serialises as `module:Class`, never as its parent. `spec_hash(run_spec)` is SHA-256 of canonical JSON (sorted keys, no whitespace). Run identity is `(git_commit, dirty, spec_hash)`; the runner records all three on `run_started` and archives the serialised spec to `artifacts/spec.yaml`. YAML files hold `name`, `arms: {arm: {world, participants: [{type, count, params}], medium, metrics}}`, `budget`, and `options`; `participants[].count` expands to repeated entries.
 
 ## 4. Events
 
@@ -114,14 +114,14 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 |---|---|---|
 | `run_started` | `spec_hash, git_commit, dirty, run_spec, parent_run, fork_round` | once |
 | `round_started` | `order: list[AgentId]` | per round |
-| `turn_started` | | per agent turn |
+| `turn_started` | `private: dict` (the observation's evaluator-only data) | per agent turn |
 | `tool_called` | `call_id, tool, args` | each tool call inside a turn |
 | `tool_returned` | `call_id, result, pending: bool` | each tool return |
 | `inference_attempt` | `call_id, provider, model, request_hash, reserved_usd` | M1b; operational |
 | `inference_response` | `call_id, response_hash, usage, cost_usd, latency_s` | M1b; operational |
 | `turn_ended` | `yield_kind: "no_tool"|"end_turn"|"cap"|"error", calls, usage` | per agent turn |
 | `read` | `delivery_ids` | each board read, inside the turn |
-| `post` | `post_id, channel, text, fields` | at commit, per accepted post |
+| `post` | `post_id, provisional_id, channel, text, fields` | at commit, per accepted post |
 | `delivery` | `post_id, recipient, delivery_id, eligible_round, content_hash` | at commit, per fan-out |
 | `action_committed` | `action_id, action, accepted, feedback` | at commit, per buffered action |
 | `world_changed` | `payload` (opaque) | at commit, optional |
@@ -132,7 +132,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 
 **Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them and also drops `seq`, because operational events are appended as they happen and shift later sequence numbers. Acceptance tests compare logical views.
 
-**Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events may be appended as they happen.
+**Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events are appended to the log immediately by the runner (never buffered), so an `inference_attempt` exists on disk before the model is called and spend survives an aborted round.
 
 `EventLog(path)`: `append(event) -> seq`, `__iter__`, `last_committed() -> (round, seq) | None`, `truncate_after(seq)`. One JSONL file, fsync on `round_committed`.
 
@@ -142,13 +142,13 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 
 ## 6. Tools and the executor
 
-`ToolSchema`, `ToolCall`, `ToolResult`, `ToolExecutor`, `EndTurn`, `TurnCapReached` are in `tools.py` as shipped. The executor is the only mutation path. Namespaces: world tools from `World.tool_schemas()`; board tools `read_board(channel?, limit?)` and `post(channel, text, fields?)`; `my_status()` and `collective_status()` if the world enables them; `end_turn()` always. A call outside the agent's allowlist returns `ok=False, error="not_allowed"` and is logged.
+`ToolSchema`, `ToolCall`, `ToolResult`, `TurnCapReached` are in `tools.py` as shipped. The executor is the only mutation path. **A participant never receives the round executor itself.** It receives an agent-bound handle `AgentTools` with `agent`, `schemas() -> list[ToolSchema]`, `call(name, args) -> ToolResult`, and (M1b) `infer(request) -> response`; the handle carries the agent identity, so a participant cannot act or read as another agent and has no path to the world or board objects. `end_turn()` does not raise: it marks the turn ended and returns `ok=True`; any later call in the same turn returns `ok=False, error="turn_ended"`. `TurnCapReached` still raises after `max_calls_per_turn` calls. (`EndTurn` remains defined for backward compatibility but is no longer raised.) Namespaces: world tools from `World.tool_schemas()`; board tools `read_board(channel?, limit?)` and `post(channel, text, fields?)`; `my_status()` and `collective_status()` if the world enables them; `end_turn()` always. A call outside the agent's allowlist returns `ok=False, error="not_allowed"` and is logged.
 
 Under `commit == "round_end"`: `post` and world actions return `pending=True` with `{"id": ...}`; `read_board` returns eligible unread inbox items (`eligible_round <= round`), marks them read, logs `read`; status tools answer from round-start state. Under `commit == "immediate"`: every call applies at once and returns the real outcome with `pending=False`.
 
 ## 7. View
 
-`Part`, `Observation`, `View` as shipped in `view.py`, plus `text_observation(text: str, **private) -> Observation`.
+`Part`, `Observation`, `View` as shipped in `view.py`, plus `text_observation(text: str, **private) -> Observation`. **`Observation.private` never reaches a participant**: the runner copies the observation with `private={}` into the view and records the private dict on the `turn_started` event (`private` field) for the evaluator and viewer.
 
 ## 8. World
 
@@ -176,9 +176,11 @@ Constructor kwargs are stored on `self.params` and returned by `spec()`. Nothing
 
 ### FlagGame (text variant)
 
-Constructor kwargs with defaults: `height=8, width=12, palette=6, n_candidates=8, rival_similarity=0.85, crop_h=3, crop_w=4, candidate_names="letters"`, `status_tools=("my_status","collective_status")`, `guess_limit=None`.
+Constructor kwargs with defaults: `height=8, width=12, palette=6, n_candidates=8, rival_edits=1, crop_h=3, crop_w=4, candidate_names="letters"`, `status_tools=("my_status","collective_status")`, `guess_limit=None`.
 
-- `reset` draws the truth flag from `("world",)` as a structured colour grid (stripes or blocks), the rival by recolouring a `1 - rival_similarity` fraction of the truth's cells, distractors as fresh structured flags; candidates are shuffled and named, the mapping is hidden. Each agent's crop is a random `crop_h × crop_w` window from `("private", agent)`.
+**No shortcut from the observation alone.** Candidates are generated as `n_candidates / 2` near-twin pairs: each pair is a structured flag plus a variant with `rival_edits` bands or blocks recoloured (both members are clean structured flags). The truth is a random member of a random pair and its twin is the rival. Every candidate therefore has a twin, and no similarity or cleanliness heuristic singles out the truth. A test asserts that a crop-free heuristic (choose among the most similar pair, then the cleaner member) scores within sampling noise of chance over 400 seeds.
+
+- `reset` draws the pairs as above from `("world",)`; candidates are shuffled and named, the mapping is hidden. Each agent's crop is a random `crop_h × crop_w` window of the truth from a per-agent stream derived from the world rng.
 - `observe`: one text part with the named candidate grids and the agent's crop rendered the same way, position withheld; `private` holds the crop coordinates.
 - `@tool("guess", ...)`: records the latest guess; `Outcome.feedback == {"recorded": True}`. Guess limit enforced in `validate`.
 - `my_status` → `{"current_guess", "guesses_made"}`; `collective_status` → `{"guess_counts", "agents_with_guess"}`. Both return `None` when disabled via `status_tools`.
@@ -219,9 +221,11 @@ class TurnUsage(BaseModel): calls=0; prompt_tokens=0; completion_tokens=0; cost_
 class Participant(Persistable, Plugin):
     agent: AgentId; rng: random.Random
     def bind(self, agent, rng) -> None            # default stores both; override to add state
-    async def turn(self, view: View, tools: ToolExecutor) -> TurnUsage: ...   # required
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage: ...   # required
 ```
-A turn ends when `turn` returns, or the executor raises `TurnCapReached` or `EndTurn`; `yield_kind` is recorded accordingly (`end_turn`, `cap`, `error`, else `no_tool`).
+A turn ends when `turn` returns or `TurnCapReached` propagates. `yield_kind` is `end_turn` if `end_turn()` was called during the turn (the returned `TurnUsage` is kept), `cap` on `TurnCapReached`, `error` on any other exception (traceback in `turn_ended.error`), else `no_tool`.
+
+Participants never hold provider clients, locks, or other shared services: they are deep-copied per agent and pickled per round. Inference (M1b) goes through `tools.infer(request)`, which the runner owns: it applies the admission gate, logs `inference_attempt` before and `inference_response` after the call, charges the ledger, and serves the record/replay cache. `Persistable` skips `params` and every attribute whose name starts with `_`, so transient caches can be kept out of snapshots.
 
 Scripted participants in M1a: `Silent` (round 1 guesses the candidate containing its crop, never posts or reads, `end_turn`), `EvidenceAggregator` (round 1 posts `"crop: <rows>"`; every round reads the board, pools crops, guesses the most consistent candidate, `end_turn`), `Enumerator` (cycles candidates, reads both status tools, raises if any tool result or view field contains `"correct"`, `"truth"`, or the truth name supplied out of band by the test).
 
@@ -236,7 +240,7 @@ The commit policy is a run option read by the runner. In M1a the scheduler is al
 
 ## 12. Runner
 
-`Runner(run_dir, experiment, options)` executes `live()`, `replay()`, `resume()`, `fork(at_round, experiment=None)` exactly as specified below. `Experiment.run` and `Run` wrap it; nothing else calls it.
+`Runner(run_dir, experiment, options)` executes `live()`, `replay()`, `resume()`, `fork(at_round, experiment=None)` exactly as specified below. `Experiment.run` and `Run` wrap it; nothing else calls it. `run.json` is written before `run_started` so a directory is always resumable or removable. `Experiment.run` works inside an already-running event loop (notebooks) by running the runner in a worker thread.
 
 Phase-commit round `r`:
 ```
@@ -278,7 +282,7 @@ class Metric(Persistable, Plugin):
     def set_truth(self, truth: dict) -> None: ...
 registry: get(name) -> Metric via entry points; Metric.from_fn(name, fn) for one-liners
 ```
-M1a metrics: `belief.accuracy` (needs truth), `belief.consensus`, `belief.polarization(threshold=0.2)`, `belief.entropy`, `comm.read_rate`, `comm.posts_per_round`, `comm.hops`. Denominators: live agents with a committed guess for belief metrics, turns for comm metrics.
+M1a metrics: `belief.accuracy` (needs truth), `belief.consensus`, `belief.polarization(threshold=0.2)`, `belief.entropy`, `comm.read_rate`, `comm.posts_per_round`, `comm.hops`. Denominators: **all live agents** for belief metrics, with agents that have no committed guess counted as an explicit `none` category (so `belief.accuracy` equals the world's `score()["accuracy"]`, and agents that never guess lower consensus rather than raise it); turns for comm metrics.
 
 ## 15. Run directory
 

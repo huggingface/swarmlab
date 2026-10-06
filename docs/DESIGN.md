@@ -68,8 +68,8 @@ class Counter(World):
 
 class Adder(Participant):                    # the smallest participant: one action, then yield
     async def turn(self, view, tools):
-        await tools.call(self.agent, "add", {"n": 1})
-        await tools.call(self.agent, "end_turn", {})
+        await tools.call("add", {"n": 1})
+        await tools.call("end_turn", {})
         return TurnUsage(calls=2)
 
 Experiment(name="count", world=Counter(), participants=[Adder()] * 4).run(seed=0, max_rounds=5)
