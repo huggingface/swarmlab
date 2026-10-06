@@ -21,12 +21,23 @@ Decisions where the contract is silent:
   part of `completion_tokens` (true for OpenAI-style usage and for Anthropic `output_tokens`).
 - Providers are services, not snapshot state: the runner never deep-copies or pickles them.
   `calls` counts `complete()` invocations on the instance (tests use it).
+- Timeouts and retries: `timeout_s` (default 90 s) bounds each attempt (the transport timeout
+  plus an `asyncio.timeout` deadline around the whole attempt); `max_retries` (default 2, so at
+  most 3 attempts) bounds retries of timeouts, transport errors, 429 and 5xx. Backoff is
+  `backoff_s * 2**attempt` (1 s, 2 s, 4 s) times a uniform jitter in [0.8, 1.2], or the
+  server's `retry-after` when given, capped at 60 s. Retries happen inside `complete()`, so
+  the gate's reservation is held across them and released once. `ChatResponse.attempts` and
+  `.retried_after_timeout` record what happened; exhausted retries raise `ProviderError` with
+  `.attempts`. Both knobs are constructor kwargs of the real providers, so they are part of the
+  provider spec (YAML `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 60,
+  max_retries: 3}}}`).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import math
+import random
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
@@ -37,6 +48,9 @@ from ..tools import ToolCall, ToolSchema
 from ..view import Part
 
 PricingRow = tuple[float, float, float]
+DEFAULT_TIMEOUT_S = 90.0
+DEFAULT_MAX_RETRIES = 2
+MAX_BACKOFF_S = 60.0
 
 
 class UnknownModelPricing(ValueError):
@@ -46,9 +60,10 @@ class UnknownModelPricing(ValueError):
 class ProviderError(RuntimeError):
     """A provider returned a non-retryable error (or retries were exhausted)."""
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    def __init__(self, message: str, *, status: int | None = None, attempts: int = 1) -> None:
         super().__init__(message)
         self.status = status
+        self.attempts = attempts
 
 
 class Usage(BaseModel):
@@ -92,6 +107,8 @@ class ChatResponse(BaseModel):
     latency_s: float
     finish_reason: str
     cached: bool = False
+    attempts: int = 1  # provider attempts this response took (1 = no retry)
+    retried_after_timeout: bool = False  # at least one failed attempt was a timeout
 
 
 def split_model(model: str) -> tuple[str, str]:
@@ -136,12 +153,31 @@ class Provider(Plugin):
     name: str = ""
     pricing: dict[str, PricingRow]
     concurrency: int = 8
+    timeout_s: float = DEFAULT_TIMEOUT_S
+    max_retries: int = DEFAULT_MAX_RETRIES
     default_pricing: ClassVar[dict[str, PricingRow]] = {}
+    _backoff_s: float = 1.0
 
-    def _setup(self, pricing: dict | None, concurrency: int) -> None:
+    def _setup(self, pricing: dict | None, concurrency: int, timeout_s: float = DEFAULT_TIMEOUT_S,
+               max_retries: int = DEFAULT_MAX_RETRIES) -> None:
         self.pricing = {**self.default_pricing, **_normalise_pricing(pricing)}
         self.concurrency = int(concurrency)
+        self.timeout_s = float(timeout_s)
+        self.max_retries = int(max_retries)
+        if self.timeout_s <= 0 or self.max_retries < 0:
+            raise ValueError("timeout_s must be > 0 and max_retries >= 0")
         self.calls = 0
+        self._jitter = random.Random()  # operational only: never affects logical state
+
+    def _delay(self, attempt: int, retry_after: Any = None) -> float:
+        """Seconds to wait before retry number `attempt + 1` (attempt counts from 0)."""
+        try:
+            if retry_after is not None:
+                return min(max(float(retry_after), 0.0), MAX_BACKOFF_S)
+        except (TypeError, ValueError):
+            pass
+        jitter = getattr(self, "_jitter", None) or random.Random()
+        return min(self._backoff_s * (2 ** attempt) * jitter.uniform(0.8, 1.2), MAX_BACKOFF_S)
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         raise NotImplementedError

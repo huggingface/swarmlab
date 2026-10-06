@@ -30,10 +30,13 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   `usage.prompt_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`,
   `cached_prompt_tokens = cache_read_input_tokens`, `completion_tokens = output_tokens`.
   `served_by` is None.
-- Errors (typed chain, most specific first): `RateLimitError` -> retry with backoff (honouring
-  `retry-after`, capped at 60 s) up to 3 times; other `APIStatusError` -> raise;
-  `APIConnectionError` (including timeouts) -> retry up to 3 times. The SDK's own retries are
-  disabled (`max_retries=0`) so this chain is the only one.
+- Timeouts and retries (see `base.py`): the SDK client gets `timeout=timeout_s` and
+  `max_retries=0`, and each attempt also runs under `asyncio.timeout(timeout_s)`. Our own loop
+  retries `APITimeoutError` (and the attempt deadline), `APIConnectionError`, `RateLimitError`
+  (honouring `retry-after`) and 5xx `APIStatusError` up to `max_retries` times with the same
+  jittered backoff as the OpenAI-compatible adapter; exhausted retries raise
+  `ProviderError(status=..., attempts=...)` chained to the last SDK error. Other
+  `APIStatusError`s (4xx) propagate unchanged at once.
 - API key: `ANTHROPIC_API_KEY`, else `ANTHROPIC_KEY`; with neither set the SDK's own credential
   resolution applies. The client is created per event loop (the runner uses `asyncio.run` per
   live/resume call). Tests replace `_client` with a stub; a stub set that way is always used.
@@ -47,11 +50,14 @@ from typing import Any, ClassVar
 
 from ..tools import ToolCall, ToolSchema
 from .base import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT_S,
     ChatMessage,
     ChatRequest,
     ChatResponse,
     PricingRow,
     Provider,
+    ProviderError,
     Usage,
     model_id,
     parse_json_args,
@@ -59,7 +65,6 @@ from .base import (
 )
 
 THINKING_BUDGET_MODELS = frozenset({"claude-haiku-4-5"})
-MAX_RETRIES = 3
 
 
 def tool_definition(schema: ToolSchema) -> dict:
@@ -161,12 +166,10 @@ class AnthropicProvider(Provider):
     default_pricing: ClassVar[dict[str, PricingRow]] = {"claude-haiku-4-5": (1.00, 5.00, 0.10)}
 
     def __init__(self, pricing: dict | None = None, concurrency: int = 8,
-                 timeout_s: float = 120.0) -> None:
-        self._setup(pricing, concurrency)
-        self.timeout_s = timeout_s
+                 timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES) -> None:
+        self._setup(pricing, concurrency, timeout_s, max_retries)
         self._client: Any = None
         self._client_loop: Any = None
-        self._backoff_s = 1.0
 
     def _get_client(self) -> Any:
         loop = asyncio.get_running_loop()
@@ -179,14 +182,6 @@ class AnthropicProvider(Provider):
         self._client_loop = loop
         return self._client
 
-    def _delay(self, attempt: int, retry_after: Any = None) -> float:
-        try:
-            if retry_after is not None:
-                return min(float(retry_after), 60.0)
-        except (TypeError, ValueError):
-            pass
-        return min(self._backoff_s * (2 ** attempt), 60.0)
-
     async def complete(self, request: ChatRequest) -> ChatResponse:
         import anthropic
 
@@ -194,26 +189,37 @@ class AnthropicProvider(Provider):
         client = self._get_client()
         kwargs = build_kwargs(request)
         start = time.monotonic()
-        attempt = 0
+        timed_out = False
+        attempt = 0  # failed attempts so far
         while True:
+            retry_after: Any = None
+            status: int | None = None
             try:
-                message = await client.messages.create(**kwargs)
+                async with asyncio.timeout(self.timeout_s):
+                    message = await client.messages.create(**kwargs)
                 break
-            except anthropic.RateLimitError as e:
-                if attempt >= MAX_RETRIES:
+            except anthropic.APIStatusError as e:
+                status = e.status_code
+                if not (isinstance(e, anthropic.RateLimitError) or status >= 500):
                     raise
                 headers = getattr(getattr(e, "response", None), "headers", None) or {}
-                await asyncio.sleep(self._delay(attempt, headers.get("retry-after")))
-            except anthropic.APIStatusError:
-                raise
-            except anthropic.APIConnectionError:
-                if attempt >= MAX_RETRIES:
-                    raise
-                await asyncio.sleep(self._delay(attempt))
+                retry_after = headers.get("retry-after")
+                failure: str = f"HTTP {status}: {e}"
+                err: BaseException = e
+            except (anthropic.APITimeoutError, TimeoutError) as e:
+                timed_out = True
+                failure, err = f"timeout after {self.timeout_s:g} s ({type(e).__name__})", e
+            except anthropic.APIConnectionError as e:
+                failure, err = f"connection error: {e}", e
+            if attempt >= self.max_retries:
+                raise ProviderError(f"{self.name}: {failure} (gave up after {attempt + 1} "
+                                    f"attempt(s))", status=status, attempts=attempt + 1) from err
+            await asyncio.sleep(self._delay(attempt, retry_after))
             attempt += 1
         text, calls, usage, finish = parse_message(message)
         return ChatResponse(
             text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage),
             provider=self.name, model=model_id(request), served_by=None,
             latency_s=time.monotonic() - start, finish_reason=finish,
+            attempts=attempt + 1, retried_after_timeout=timed_out,
         )

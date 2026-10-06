@@ -23,6 +23,10 @@ Decisions where the contract is silent:
   produced (real usage and `cost_usd`) on hits and misses alike. The executor accumulates nominal
   usage into `turn_ended.usage`, so a resumed run whose turns hit the cache has the same logical
   `turn_ended` events as an uninterrupted one. The ledger records actual spend.
+- **Retries** happen inside `provider.complete` while this call holds the gate reservation and
+  the provider semaphore, so the reservation is taken once and released once whatever the number
+  of attempts. `inference_response.attempts` records the attempts (from `ChatResponse.attempts`,
+  or `ProviderError.attempts` on failure).
 - Concurrent identical requests may both miss and both call the provider (no in-flight dedupe);
   the later write wins the cache file, which is harmless for a deterministic provider.
 """
@@ -125,7 +129,8 @@ class Inference:
             except Exception as e:
                 self.log(InferenceResponseEvent(
                     run=self.run_id, round=round, agent=agent, call_id=call_id, response_hash="",
-                    latency_s=time.monotonic() - start, finish_reason=f"error:{type(e).__name__}"))
+                    latency_s=time.monotonic() - start, finish_reason=f"error:{type(e).__name__}",
+                    attempts=int(getattr(e, "attempts", 1) or 1)))
                 raise
             res.charge(resp.cost_usd)
         resp = resp.model_copy(update={"cached": False})
@@ -134,6 +139,7 @@ class Inference:
         self.log(InferenceResponseEvent(
             run=self.run_id, round=round, agent=agent, call_id=call_id, response_hash=sha,
             usage=resp.usage.model_dump(), cost_usd=resp.cost_usd, latency_s=resp.latency_s,
-            served_by=resp.served_by, finish_reason=resp.finish_reason, cached=False))
+            served_by=resp.served_by, finish_reason=resp.finish_reason, cached=False,
+            attempts=resp.attempts))
         self.cache.put(h, resp, round)
         return resp, resp

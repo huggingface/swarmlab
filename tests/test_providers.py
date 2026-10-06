@@ -210,19 +210,74 @@ async def test_anthropic_retries_rate_limit_and_connection_then_succeeds():
     assert len(p._client.messages.kwargs) == 3
 
 
-async def test_anthropic_gives_up_after_three_retries_and_raises_status_errors():
+async def test_anthropic_gives_up_after_max_retries_and_raises_4xx_at_once():
     anthropic, _request, status = _sdk_errors()
     p = stub_provider([status(429, anthropic.RateLimitError) for _ in range(4)])
-    with pytest.raises(anthropic.RateLimitError):
+    with pytest.raises(ProviderError) as e:
         await p.complete(req())
-    assert len(p._client.messages.kwargs) == 4
+    assert isinstance(e.value.__cause__, anthropic.RateLimitError)
+    assert e.value.attempts == 3 and e.value.status == 429  # default max_retries=2
+    assert len(p._client.messages.kwargs) == 3
     p = stub_provider([status(400, anthropic.BadRequestError), anthropic_message()])
     with pytest.raises(anthropic.BadRequestError):
         await p.complete(req())
     assert len(p._client.messages.kwargs) == 1
     p = stub_provider([status(500, anthropic.InternalServerError), anthropic_message()])
-    with pytest.raises(anthropic.APIStatusError):
+    resp = await p.complete(req())  # 5xx is retried now
+    assert resp.attempts == 2 and not resp.retried_after_timeout
+
+
+async def test_anthropic_retries_api_timeout_once():
+    anthropic, request, _status = _sdk_errors()
+    p = stub_provider([anthropic.APITimeoutError(request=request), anthropic_message()])
+    resp = await p.complete(req())
+    assert resp.text == "hello" and resp.attempts == 2 and resp.retried_after_timeout
+    assert p.calls == 1 and len(p._client.messages.kwargs) == 2
+    p = stub_provider([anthropic.APITimeoutError(request=request) for _ in range(3)])
+    p.max_retries = 1
+    with pytest.raises(ProviderError) as e:
         await p.complete(req())
+    assert e.value.attempts == 2 and "timeout" in str(e.value)
+
+
+async def test_anthropic_attempt_deadline_counts_as_timeout():
+    import asyncio
+
+    class Slow(StubMessages):
+        async def create(self, **kw):
+            if not self.kwargs:
+                self.kwargs.append(kw)
+                await asyncio.sleep(5)
+            return await super().create(**kw)
+
+    p = AnthropicProvider(timeout_s=0.05)
+    p._backoff_s = 0.0
+    p._client = SimpleNamespace(messages=Slow([anthropic_message()]))
+    resp = await p.complete(req())
+    assert resp.attempts == 2 and resp.retried_after_timeout
+
+
+def test_timeout_and_retry_knobs_are_spec_params():
+    from swarmlab.registry import build
+
+    for p in (AnthropicProvider(timeout_s=30, max_retries=5),
+              OpenAICompatProvider("hf", timeout_s=30, max_retries=5)):
+        assert p.params["timeout_s"] == 30 and p.params["max_retries"] == 5
+        q = build(json.loads(json.dumps(p.spec())), "swarmlab.providers")
+        assert (q.timeout_s, q.max_retries) == (30.0, 5)
+    d = OpenAICompatProvider("hf")
+    assert (d.timeout_s, d.max_retries) == (90.0, 2)
+    assert d.spec()["params"]["timeout_s"] == 90.0 and d.spec()["params"]["max_retries"] == 2
+    with pytest.raises(ValueError):
+        OpenAICompatProvider("hf", max_retries=-1)
+
+
+def test_backoff_is_exponential_and_jittered():
+    p = OpenAICompatProvider("hf")
+    for attempt, base in enumerate((1.0, 2.0, 4.0)):
+        delays = {p._delay(attempt) for _ in range(20)}
+        assert all(0.8 * base <= d <= 1.2 * base for d in delays) and len(delays) > 1
+    assert p._delay(0, "3") == 3.0 and p._delay(0, "9999") == 60.0
 
 
 def test_anthropic_key_fallback(monkeypatch):
@@ -330,7 +385,7 @@ async def test_openai_retries_429_and_5xx_then_raises():
 
     with pytest.raises(ProviderError) as e:
         await compat(always_500).complete(req(model="hf:m"))
-    assert n["calls"] == 4 and e.value.status == 500
+    assert n["calls"] == 3 and e.value.status == 500 and e.value.attempts == 3
 
     def bad_request(request):
         n["calls"] += 1
@@ -340,6 +395,76 @@ async def test_openai_retries_429_and_5xx_then_raises():
     with pytest.raises(ProviderError):
         await compat(bad_request).complete(req(model="hf:m"))
     assert n["calls"] == 1
+
+
+async def test_openai_retries_after_attempt_timeout():
+    import asyncio
+
+    n = {"calls": 0}
+
+    async def handler(request):
+        n["calls"] += 1
+        if n["calls"] == 1:
+            await asyncio.sleep(5)  # past the tiny timeout below
+        return httpx.Response(200, json=completion({"content": "late but fine"}))
+
+    p = compat(handler)
+    p.timeout_s = 0.05
+    resp = await p.complete(req(model="hf:m"))
+    assert resp.text == "late but fine" and resp.attempts == 2 and resp.retried_after_timeout
+    assert n["calls"] == 2 and p.calls == 1
+
+    def raises_timeout(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    p = compat(raises_timeout)
+    p.max_retries = 1
+    with pytest.raises(ProviderError) as e:
+        await p.complete(req(model="hf:m"))
+    assert e.value.attempts == 2 and e.value.status is None and "timeout" in str(e.value)
+
+    codes = iter([502, 200])
+
+    def flaky(request):
+        code = next(codes)
+        return httpx.Response(code, json=completion({"content": "ok"}) if code == 200 else {})
+
+    resp = await compat(flaky).complete(req(model="hf:m"))
+    assert resp.attempts == 2 and not resp.retried_after_timeout
+
+
+async def test_reservation_held_across_retries_and_released_once(tmp_path):
+    import asyncio
+
+    from swarmlab.blobs import BlobStore
+    from swarmlab.budget import Gate, Ledger
+    from swarmlab.inference import Inference, InferenceCache
+    from swarmlab.spec import Budget
+
+    seen = []
+
+    async def handler(request):
+        seen.append(ledger.reserved)
+        if len(seen) == 1:
+            await asyncio.sleep(5)
+        return httpx.Response(200, json=completion({"content": "ok"}))
+
+    p = compat(handler)
+    p.timeout_s = 0.05
+    ledger = Ledger()
+    gate = Gate({"hf": p}, ledger, Budget(hard_usd=1.0))
+    events = []
+    inf = Inference(run_id="r", gate=gate, blobs=BlobStore(tmp_path / "blobs"),
+                    cache=InferenceCache(tmp_path / "blobs"),
+                    log_operational=lambda e: events.append(e) or len(events))
+    r = req(model="hf:m")
+    resp, _ = await inf.infer(agent="a000", round=1, call_id="i1-a000-0", request=r)
+    worst = p.max_cost(r)
+    assert seen == [pytest.approx(worst), pytest.approx(worst)]  # held during both attempts
+    assert ledger.reserved == 0 and ledger.calls == 1 and gate.provider_calls == 1
+    assert ledger.spent["swarm"] == pytest.approx(resp.cost_usd)
+    response = [e for e in events if e.type == "inference_response"]
+    assert len(response) == 1 and response[0].attempts == 2
 
 
 # ---- fake ----------------------------------------------------------------------------------------

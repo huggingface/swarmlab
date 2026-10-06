@@ -106,6 +106,7 @@ class InferenceResponseEvent(Event):
     served_by: str | None = None
     finish_reason: str = ""
     cached: bool = False
+    attempts: int = 1  # provider attempts (retries + 1); 1 on cache hits
 
 
 class TurnEndedEvent(Event):

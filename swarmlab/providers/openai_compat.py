@@ -1,8 +1,8 @@
 """OpenAICompatProvider: chat-completions over `httpx.AsyncClient` (docs/INTERFACE-M1b.md §1).
 
 `OpenAICompatProvider(name, base_url=None, api_key_env=None, pricing=None, concurrency=8,
-timeout_s=120.0)`. Presets (`preset(name, **overrides)`): `hf` (`https://router.huggingface.co/v1`,
-`HF_TOKEN`), `openai` (`https://api.openai.com/v1`, `OPENAI_API_KEY`), `vllm` (`base_url`
+timeout_s=90.0, max_retries=2)`. Presets (`preset(name, **overrides)`): `hf`
+(`https://router.huggingface.co/v1`, `HF_TOKEN`), `openai` (`https://api.openai.com/v1`, `OPENAI_API_KEY`), `vllm` (`base_url`
 required, no key). A preset's `base_url`/`api_key_env` fill in when not given explicitly, so
 `OpenAICompatProvider("hf", pricing={...})` is the HF router with prices. Presets ship with an
 empty pricing table: open-model prices vary by served provider, so the experimenter supplies them
@@ -28,8 +28,11 @@ Mapping:
   JSON; a non-JSON string becomes `{"_raw": <string>}` and `finish_reason = "bad_tool_args"`.
   Usage from `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`,
   `completion_tokens_details.reasoning_tokens`. `served_by` = the `x-inference-provider` header.
-- Retries: HTTP 429 and 5xx, and transport errors, with exponential backoff (honouring
-  `retry-after`, capped at 60 s) up to 3 times; then, or for any other non-2xx, `ProviderError`.
+- Timeouts and retries (see `base.py`): each attempt is bounded by `timeout_s` (httpx timeout and
+  an `asyncio.timeout` around the attempt). `httpx.TimeoutException`, the attempt deadline,
+  other `httpx.TransportError`s, HTTP 429 and 5xx are retried up to `max_retries` times with
+  jittered exponential backoff (1 s, 2 s, 4 s; `retry-after` honoured, capped at 60 s); then
+  `ProviderError(status=..., attempts=...)`. Any other non-2xx raises `ProviderError` at once.
 - A fresh `httpx.AsyncClient` is opened per call (cheap at our call rates, and never bound to a
   dead event loop). Tests set `_transport` to an `httpx.MockTransport`.
 """
@@ -45,6 +48,8 @@ import httpx
 
 from ..tools import ToolCall
 from .base import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_TIMEOUT_S,
     ChatMessage,
     ChatRequest,
     ChatResponse,
@@ -61,7 +66,6 @@ PRESETS: dict[str, dict[str, str | None]] = {
     "openai": {"base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
     "vllm": {"base_url": None, "api_key_env": None},
 }
-MAX_RETRIES = 3
 
 
 def _message(m: ChatMessage) -> dict:
@@ -137,17 +141,16 @@ class OpenAICompatProvider(Provider):
     entry_point: ClassVar[str | None] = "openai_compat"
 
     def __init__(self, name: str, base_url: str | None = None, api_key_env: str | None = None,
-                 pricing: dict | None = None, concurrency: int = 8, timeout_s: float = 120.0) -> None:
+                 pricing: dict | None = None, concurrency: int = 8,
+                 timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES) -> None:
         preset = PRESETS.get(name, {})
         self.name = name
         self.base_url = (base_url or preset.get("base_url") or "").rstrip("/")
         if not self.base_url:
             raise ValueError(f"provider {name!r} needs a base_url")
         self.api_key_env = api_key_env if api_key_env is not None else preset.get("api_key_env")
-        self.timeout_s = timeout_s
-        self._setup(pricing, concurrency)
+        self._setup(pricing, concurrency, timeout_s, max_retries)
         self._transport: httpx.AsyncBaseTransport | None = None
-        self._backoff_s = 1.0
 
     def _headers(self) -> dict[str, str]:
         headers = {"content-type": "application/json"}
@@ -156,48 +159,51 @@ class OpenAICompatProvider(Provider):
             headers["authorization"] = f"Bearer {key}"
         return headers
 
-    def _delay(self, attempt: int, retry_after: str | None) -> float:
-        try:
-            if retry_after is not None:
-                return min(float(retry_after), 60.0)
-        except ValueError:
-            pass
-        return min(self._backoff_s * (2 ** attempt), 60.0)
-
     async def complete(self, request: ChatRequest) -> ChatResponse:
         self.calls += 1
         body = build_body(request)
         start = time.monotonic()
+        timed_out = False
+        attempt = 0  # failed attempts so far
         async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout_s) as client:
-            attempt = 0
             while True:
+                retry_after: str | None = None
                 try:
-                    resp = await client.post(f"{self.base_url}/chat/completions", json=body,
-                                             headers=self._headers())
+                    async with asyncio.timeout(self.timeout_s):
+                        resp = await client.post(f"{self.base_url}/chat/completions", json=body,
+                                                 headers=self._headers())
+                except (httpx.TimeoutException, TimeoutError) as e:
+                    timed_out = True
+                    failure = f"timeout after {self.timeout_s:g} s ({type(e).__name__})"
+                    status = None
+                    err: BaseException | None = e
                 except httpx.TransportError as e:
-                    if attempt >= MAX_RETRIES:
-                        raise ProviderError(f"{self.name}: transport error: {e}") from e
-                    await asyncio.sleep(self._delay(attempt, None))
-                    attempt += 1
-                    continue
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    if attempt >= MAX_RETRIES:
-                        raise ProviderError(f"{self.name}: HTTP {resp.status_code} after "
-                                            f"{MAX_RETRIES} retries: {resp.text[:500]}",
-                                            status=resp.status_code)
-                    await asyncio.sleep(self._delay(attempt, resp.headers.get("retry-after")))
-                    attempt += 1
-                    continue
-                if resp.status_code >= 400:
-                    raise ProviderError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:500]}",
-                                        status=resp.status_code)
-                break
+                    failure = f"transport error: {type(e).__name__}: {e}"
+                    status = None
+                    err = e
+                else:
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        failure = f"HTTP {resp.status_code}: {resp.text[:500]}"
+                        status = resp.status_code
+                        retry_after = resp.headers.get("retry-after")
+                        err = None
+                    elif resp.status_code >= 400:
+                        raise ProviderError(f"{self.name}: HTTP {resp.status_code}: {resp.text[:500]}",
+                                            status=resp.status_code, attempts=attempt + 1)
+                    else:
+                        break
+                if attempt >= self.max_retries:
+                    raise ProviderError(f"{self.name}: {failure} (gave up after {attempt + 1} "
+                                        f"attempt(s))", status=status, attempts=attempt + 1) from err
+                await asyncio.sleep(self._delay(attempt, retry_after))
+                attempt += 1
         text, calls, usage, finish = parse_completion(resp.json())
         return ChatResponse(
             text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage),
             provider=self.name, model=model_id(request),
             served_by=resp.headers.get("x-inference-provider"),
             latency_s=time.monotonic() - start, finish_reason=finish,
+            attempts=attempt + 1, retried_after_timeout=timed_out,
         )
 
 
