@@ -27,6 +27,13 @@ Round `r` (phase-commit, `commit == "round_end"`):
    `board.commit(r, live, derive(seed, "topology", r), blobs)`; log `post*`, `delivery*`.
 5. `world.commit(actions in order)`; log `action_committed*`; outcomes become next round's
    `View.outcomes` as `{"action_id", "tool", "accepted", "feedback"}` dicts.
+5b. (M1b, WP7) Probes: for every probe due this round (`r % every == 0`) each live agent is
+   probed after the commit and before the metrics, so `probe` events are part of the round,
+   fed to metrics (probe-sourced belief metrics see round r's answers in round r), covered by
+   the round's `budget` event, and dropped with the round on a crash (resume re-asks them; the
+   cache answers the ones already paid). See swarmlab/probes.py for the request, skip and budget
+   rules. A `HardCeilingReached` from a probe does not abort the round: the round commits and
+   the run then ends with `run_ended(hard_ceiling)` at round r.
 6. Metrics are folded over this round's logical events (every event from `round_started`
    through the last `action_committed`, parsed back from JSON so live and replay feed identical
    objects); log `metric*`.
