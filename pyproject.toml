@@ -47,6 +47,14 @@ enumerator = "swarmlab.participants.scripted:Enumerator"
 "comm.posts_per_round" = "swarmlab.metrics.comm:PostsPerRound"
 "comm.hops" = "swarmlab.metrics.comm:Hops"
 
+[project.entry-points."swarmlab.providers"]
+anthropic = "swarmlab.providers.anthropic:AnthropicProvider"
+openai_compat = "swarmlab.providers.openai_compat:OpenAICompatProvider"
+fake = "swarmlab.providers.fake:FakeProvider"
+
+[project.entry-points."swarmlab.fake_scripts"]
+flaggame_reader = "swarmlab.providers.fake:flaggame_reader"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

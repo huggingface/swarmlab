@@ -1,0 +1,204 @@
+"""Provider layer data types and base class (docs/INTERFACE-M1b.md §1).
+
+Decisions where the contract is silent:
+
+- `ChatRequest.model` is `"<prefix>:<model id>"`; `split_model(model)` splits on the first ":".
+  Providers receive the whole request and read the model id with `model_id(request)`.
+- `request_hash(request)` is SHA-256 of `canonical_json(request.model_dump(mode="json"))` (sorted
+  keys, no whitespace; `extra` included). `request_bytes(request)` returns exactly those bytes, so
+  storing them in the run's `BlobStore` gives a blob whose sha *is* the request hash.
+- Pricing is `model id -> (usd per M prompt, per M completion, per M cached prompt)`. The key
+  `"*"` is a wildcard used when the model id has no entry (the fake provider prices every model
+  that way). `model_pricing(model_id)` raises `UnknownModelPricing` (a `ValueError`) otherwise.
+  Tuples arriving as lists (from YAML or a spec round-trip) are normalised to tuples.
+- `estimate_prompt_tokens`: ceil(chars / 4) over every text part and string content, tool-call
+  arguments (canonical JSON), tool-message content and the tool schemas (canonical JSON), plus
+  1000 per image part.
+- `max_cost = (est * p_in + (max_tokens + (thinking_budget or 0)) * p_out) / 1e6` (the thinking
+  budget is added even where the provider ignores it: worst case).
+- `cost(request, usage) = ((prompt - cached) * p_in + cached * p_cached + completion * p_out) / 1e6`.
+  `prompt_tokens` includes cached tokens; `reasoning_tokens` is informational and assumed to be
+  part of `completion_tokens` (true for OpenAI-style usage and for Anthropic `output_tokens`).
+- Providers are services, not snapshot state: the runner never deep-copies or pickles them.
+  `calls` counts `complete()` invocations on the instance (tests use it).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from typing import Any, ClassVar, Literal
+
+from pydantic import BaseModel
+
+from ..base import Plugin
+from ..spec import canonical_json
+from ..tools import ToolCall, ToolSchema
+from ..view import Part
+
+PricingRow = tuple[float, float, float]
+
+
+class UnknownModelPricing(ValueError):
+    """A provider has no pricing entry for a model (raised at Experiment construction)."""
+
+
+class ProviderError(RuntimeError):
+    """A provider returned a non-retryable error (or retries were exhausted)."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class Usage(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_prompt_tokens: int = 0
+    reasoning_tokens: int = 0
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(**{k: getattr(self, k) + getattr(other, k) for k in Usage.model_fields})
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: list[Part] | str
+    tool_calls: list[ToolCall] | None = None  # assistant messages
+    tool_call_id: str | None = None  # tool messages
+
+
+class ChatRequest(BaseModel):
+    model: str  # "<provider>:<model id>"
+    messages: list[ChatMessage]
+    tools: list[ToolSchema] = []
+    tool_protocol: Literal["native", "json"] = "native"
+    max_tokens: int = 1024
+    temperature: float | None = None
+    top_p: float | None = None
+    seed: int | None = None
+    thinking_budget: int | None = None
+    extra: dict = {}
+
+
+class ChatResponse(BaseModel):
+    text: str
+    tool_calls: list[ToolCall]
+    usage: Usage
+    cost_usd: float
+    provider: str
+    model: str
+    served_by: str | None = None
+    latency_s: float
+    finish_reason: str
+    cached: bool = False
+
+
+def split_model(model: str) -> tuple[str, str]:
+    prefix, sep, model_id = model.partition(":")
+    if not sep or not prefix or not model_id:
+        raise ValueError(f"model must look like '<provider>:<model id>', got {model!r}")
+    return prefix, model_id
+
+
+def model_id(request: ChatRequest) -> str:
+    return split_model(request.model)[1]
+
+
+def request_bytes(request: ChatRequest) -> bytes:
+    return canonical_json(request.model_dump(mode="json")).encode()
+
+
+def request_hash(request: ChatRequest) -> str:
+    return hashlib.sha256(request_bytes(request)).hexdigest()
+
+
+def text_of(content: list[Part] | str) -> str:
+    """The text parts of a message joined by newlines (images dropped)."""
+    if isinstance(content, str):
+        return content
+    return "\n".join(p.text or "" for p in content if p.type == "text")
+
+
+def _normalise_pricing(pricing: dict | None) -> dict[str, PricingRow]:
+    out: dict[str, PricingRow] = {}
+    for k, v in (pricing or {}).items():
+        row = tuple(float(x) for x in v)
+        if len(row) != 3:
+            raise ValueError(f"pricing for {k!r} must be (prompt, completion, cached prompt) per M")
+        out[k] = row  # type: ignore[assignment]
+    return out
+
+
+class Provider(Plugin):
+    """Base class: subclasses set `name` and `pricing` and implement `complete`."""
+
+    name: str = ""
+    pricing: dict[str, PricingRow]
+    concurrency: int = 8
+    default_pricing: ClassVar[dict[str, PricingRow]] = {}
+
+    def _setup(self, pricing: dict | None, concurrency: int) -> None:
+        self.pricing = {**self.default_pricing, **_normalise_pricing(pricing)}
+        self.concurrency = int(concurrency)
+        self.calls = 0
+
+    async def complete(self, request: ChatRequest) -> ChatResponse:
+        raise NotImplementedError
+
+    # ---- pricing -----------------------------------------------------------------------------
+    def model_pricing(self, model: str) -> PricingRow:
+        """Pricing row for a bare model id (or a full "<prefix>:<id>" string)."""
+        if ":" in model and model.split(":", 1)[0] == self.name:
+            model = model.split(":", 1)[1]
+        row = self.pricing.get(model) or self.pricing.get("*")
+        if row is None:
+            raise UnknownModelPricing(
+                f"provider {self.name!r} has no pricing for model {model!r}; known: "
+                f"{sorted(self.pricing)}. Pass pricing={{...}} to the provider (Experiment.providers)."
+            )
+        return row
+
+    def estimate_prompt_tokens(self, request: ChatRequest) -> int:
+        chars = 0
+        images = 0
+        for m in request.messages:
+            if isinstance(m.content, str):
+                chars += len(m.content)
+            else:
+                for p in m.content:
+                    if p.type == "image":
+                        images += 1
+                    else:
+                        chars += len(p.text or "")
+            for tc in m.tool_calls or []:
+                chars += len(tc.name) + len(canonical_json(tc.args))
+        if request.tools:
+            chars += len(canonical_json([t.model_dump(mode="json") for t in request.tools]))
+        return math.ceil(chars / 4) + 1000 * images
+
+    def max_cost(self, request: ChatRequest) -> float:
+        p_in, p_out, _ = self.model_pricing(model_id(request))
+        out_tokens = request.max_tokens + (request.thinking_budget or 0)
+        return (self.estimate_prompt_tokens(request) * p_in + out_tokens * p_out) / 1e6
+
+    def cost(self, request: ChatRequest, usage: Usage) -> float:
+        p_in, p_out, p_cached = self.model_pricing(model_id(request))
+        cached = min(usage.cached_prompt_tokens, usage.prompt_tokens)
+        return ((usage.prompt_tokens - cached) * p_in + cached * p_cached
+                + usage.completion_tokens * p_out) / 1e6
+
+
+def parse_json_args(raw: Any) -> tuple[dict, bool]:
+    """Tool arguments as a dict: (args, ok). Non-JSON or non-object input -> ({"_raw": raw}, False)."""
+    if isinstance(raw, dict):
+        return raw, True
+    if raw is None or raw == "":
+        return {}, True
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {"_raw": raw}, False
+    if isinstance(value, dict):
+        return value, True
+    return {"_raw": raw}, False
