@@ -1,0 +1,641 @@
+"""The runner: live, replay, resume, fork (docs/INTERFACE.md §12).
+
+`Runner(run_dir, experiment, options, *, parent=None, run_id=None)` owns one run directory:
+
+```
+run.json  events.jsonl  discarded.jsonl  blobs/  snapshots/<round:06d>.json  artifacts/{spec.yaml,git.txt}
+```
+
+Per-run state is built from deep copies of the experiment's world, medium (board), metrics and
+one deep copy of each participant prototype per agent (agent i is `agent_id(i)`), so an
+`Experiment` can be run many times. Participants are bound with `derive(seed, "agent", agent)`,
+the world is reset with `derive(seed, "world")`, metrics that `needs_truth()` get
+`set_truth(world.verify())`. The scheduler is always `SeededShuffle` in M1a.
+
+Round `r` (phase-commit, `commit == "round_end"`):
+
+1. `order = scheduler.order(r, live, derive(seed, "schedule", r))`; log `round_started`.
+2. Turns run concurrently (asyncio, `Semaphore(options.concurrency)`); each turn builds its
+   `View` (observation, last round's outcomes, pushed items when `board.delivery == "push"`,
+   tool schemas) and awaits `participant.turn(view, executor)`. `EndTurn` -> `end_turn`,
+   `TurnCapReached` -> `cap`, any other exception -> `error` (traceback in `turn_ended.error`),
+   normal return -> `no_tool`; a returned `TurnUsage` goes to `turn_ended.usage`.
+3. After all turns, each agent's buffered events are appended in `order`.
+4. Buffered posts go to `board.buffer_post` in `order` (each agent's in call order), then
+   `board.commit(r, live, derive(seed, "topology", r), blobs)`; log `post*`, `delivery*`.
+5. `world.commit(actions in order)`; log `action_committed*`; outcomes become next round's
+   `View.outcomes` as `{"action_id", "tool", "accepted", "feedback"}` dicts.
+6. Metrics are folded over this round's logical events (every event from `round_started`
+   through the last `action_committed`, parsed back from JSON so live and replay feed identical
+   objects); log `metric*`.
+7. If `r % snapshot_every == 0` the snapshot manifest is written *before* `round_committed`
+   (its `log_seq` is the seq that `round_committed` will get), so a committed round always has
+   its snapshot on disk. Then `round_committed`, `run.json`, and the `snapshot` event
+   (`manifest_path` is relative to the run dir, `snapshots/<round:06d>.json`).
+
+Immediate mode (`commit == "immediate"`) runs turns one at a time in `order`; each `post` and
+world action commits at once inside the executor. The resulting `post*`, `delivery*`,
+`action_committed*` events are logged after the turn events in application order, so the log has
+the same shape in both modes.
+
+Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else
+`r == max_rounds` -> `run_ended(max_rounds)`. Budgets are recorded only (M1a).
+
+`run.json` (rewritten atomically after every commit): run_id, experiment, arm, spec, spec_hash,
+git_commit, dirty, parent_run, fork_round, restored (what a fork restored), status
+("running" | "ended"), end_reason, last_round (last committed round), score (`world.score()`
+after the last commit).
+
+Recovery (`resume()`): if the log has `run_ended`, nothing to do. Else find the last
+`round_committed` (round c); keep the log through it plus a directly following `snapshot` /
+`run_started` event; move every dropped event (logical and operational) to `discarded.jsonl`;
+restore all plugins, `outcomes_prev` and `live` from snapshot c; re-append the `snapshot` event if
+the crash lost it; continue live from c + 1. M1a requires a snapshot at c (always true with
+`snapshot_every == 1`), else `RecoveryError`. With no committed round the log is cut back to
+`run_started` and the run restarts from round 1.
+
+Replay (`replay()`) never calls participants or the world's mutating paths except `reset` on a
+private copy (to obtain the truth for metrics) and `restore` (to recompute the score). It folds
+the metrics over the log's logical events and checks every logged `metric` event, then restores
+the world from the latest snapshot at or before the last committed round and checks `score()`
+against `run.json`. Any difference raises `ReplayMismatch`.
+
+Fork (`fork(at_round, experiment=None, out=None)`): the child dir is
+`<out or parent's parent dir>/<parent_id>__f<at_round>_<n>` (first free n from 1). The parent's
+`events.jsonl` is copied byte-identically up to and including round `at_round`'s
+`round_committed` line and the `snapshot` line right after it (so copied events still carry the
+parent's run id in `run`; this is intended), the manifest `snapshots/<at_round>.json` is copied
+byte-identically with its plugin blobs and the content blobs of every copied delivery. Then the
+child appends its own `run_started` (round = at_round, `parent_run`, `fork_round`), restores and
+runs live from `at_round + 1` under `experiment` (default: the parent's). Restore rules under an
+edited experiment: the board restores itself (WP3: inboxes always, nested plugin state when the
+nested spec matches); the world is restored when its `type` equals the parent's (WP2's FlagGame
+keeps its own constructor config across restore, so e.g. a changed `guess_limit` applies to the
+continuation; a world whose snapshot carries config would revert it); a participant is restored
+only when its spec equals the parent's spec for that agent, else it starts fresh (bound, no
+memory); a metric is restored when its spec is in the parent's metric list, else it starts fresh
+at the fork round. The number of participants must not change.
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import shutil
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from ._io import atomic_write_bytes
+from .blobs import BlobStore
+from .events import (
+    OPERATIONAL_TYPES,
+    ActionCommittedEvent,
+    DeliveryEvent,
+    Event,
+    EventLog,
+    MetricEvent,
+    PostEvent,
+    RoundCommittedEvent,
+    RoundStartedEvent,
+    RunEndedEvent,
+    RunStartedEvent,
+    SnapshotEvent,
+    parse_event,
+    write_jsonl,
+)
+from .executor import RoundExecutor
+from .ids import AgentId, agent_id, fork_run_id
+from .ids import run_id as make_run_id
+from .metrics.base import Metric
+from .metrics.base import get as get_metric
+from .rng import derive
+from .scheduler import SeededShuffle
+from .snapshot import SnapshotManifest, SnapshotStore
+from .spec import PluginSpec, RunOptions, RunSpec, dump_runspec_yaml, git_identity, spec_hash
+from .tools import EndTurn, TurnCapReached
+from .view import View
+
+if TYPE_CHECKING:
+    from .experiment import Experiment
+
+# events metrics are fed (every logical event of a round up to the commit bookkeeping)
+NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "run_ended"})
+REPO_DIR = Path(__file__).resolve().parent.parent
+
+
+class ReplayMismatch(RuntimeError):
+    """Replaying the log does not reproduce a logged metric or the recorded score."""
+
+
+class RecoveryError(RuntimeError):
+    """The run directory cannot be resumed."""
+
+
+@dataclass
+class ForkOrigin:
+    parent_run: str
+    at_round: int
+    parent_spec: RunSpec
+
+
+def _jsonable(value: Any) -> Any:
+    return json.loads(json.dumps(value, default=str))
+
+
+def build_metric(m: str | Metric) -> Metric:
+    return get_metric(m) if isinstance(m, str) else copy.deepcopy(m)
+
+
+def metric_spec(m: Metric) -> PluginSpec:
+    return PluginSpec(**m.spec())
+
+
+class Runner:
+    def __init__(
+        self,
+        run_dir: Path | str,
+        experiment: Experiment,
+        options: RunOptions,
+        *,
+        parent: ForkOrigin | None = None,
+        run_id: str | None = None,
+    ) -> None:
+        self.dir = Path(run_dir)
+        self.experiment = experiment
+        self.options = options
+        self.parent = parent
+        self.spec: RunSpec = experiment.to_spec(**options.model_dump())
+        meta = self._read_meta()
+        if meta is not None:
+            self.run_id = meta["run_id"]
+        else:
+            self.run_id = run_id or make_run_id(experiment.name, experiment.arm, options.seed)
+        self.parent_run = parent.parent_run if parent else (meta or {}).get("parent_run")
+        self.fork_round = parent.at_round if parent else (meta or {}).get("fork_round")
+        self.restored: dict[str, Any] = (meta or {}).get("restored") or {}
+        self.status = "running"
+        self.end_reason: str | None = None
+        self.last_round = 0
+        self._round_events: list[Event] = []
+
+    # ---- paths and metadata ------------------------------------------------------------------
+    @property
+    def log_path(self) -> Path:
+        return self.dir / "events.jsonl"
+
+    def _read_meta(self) -> dict | None:
+        p = self.dir / "run.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
+    @staticmethod
+    def _read_meta_at(run_dir: Path | str) -> dict:
+        p = Path(run_dir) / "run.json"
+        if not p.exists():
+            raise FileNotFoundError(f"{run_dir} is not a run directory (no run.json)")
+        return json.loads(p.read_text())
+
+    def _write_meta(self) -> None:
+        git_commit, dirty = self._git
+        data = {
+            "run_id": self.run_id,
+            "experiment": self.spec.experiment,
+            "arm": self.spec.arm,
+            "spec": self.spec.model_dump(mode="json"),
+            "spec_hash": spec_hash(self.spec),
+            "git_commit": git_commit,
+            "dirty": dirty,
+            "parent_run": self.parent_run,
+            "fork_round": self.fork_round,
+            "restored": self.restored,
+            "status": self.status,
+            "end_reason": self.end_reason,
+            "last_round": self.last_round,
+            "score": _jsonable(self.world.score()),
+        }
+        text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        atomic_write_bytes(self.dir / "run.json", text.encode())
+
+    def _write_artifacts(self) -> None:
+        art = self.dir / "artifacts"
+        art.mkdir(parents=True, exist_ok=True)
+        dump_runspec_yaml(self.spec, art / "spec.yaml")
+        git_commit, dirty = self._git
+        atomic_write_bytes(art / "git.txt", f"commit: {git_commit}\ndirty: {str(dirty).lower()}\n".encode())
+
+    # ---- state -------------------------------------------------------------------------------
+    def _build(self) -> None:
+        exp = self.experiment
+        self.agents: list[AgentId] = [agent_id(i) for i in range(len(exp.participants))]
+        self.world = copy.deepcopy(exp.world)
+        self.board = copy.deepcopy(exp.medium)
+        self.board.commit_mode = self.options.commit
+        self.scheduler = SeededShuffle()
+        self.metrics: list[Metric] = [build_metric(m) for m in exp.metrics]
+        names = [m.name for m in self.metrics]
+        if len(set(names)) != len(names):
+            raise ValueError(f"metric names must be unique, got {names}")
+        self.participants = {a: copy.deepcopy(p) for a, p in zip(self.agents, exp.participants, strict=True)}
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.blobs = BlobStore(self.dir / "blobs")
+        self.snapshots = SnapshotStore(self.dir, self.blobs)
+        self.live_agents: list[AgentId] = list(self.agents)
+        self.outcomes_prev: dict[str, list[dict]] = {}
+        self._git = git_identity(REPO_DIR)
+
+    def _init_fresh(self) -> None:
+        seed = self.options.seed
+        for a, p in self.participants.items():
+            p.bind(a, derive(seed, "agent", a))
+        self.world.reset(derive(seed, "world"), list(self.agents))
+        self._set_truth()
+
+    def _set_truth(self) -> None:
+        if any(m.needs_truth() for m in self.metrics):
+            truth = self.world.verify()
+            for m in self.metrics:
+                if m.needs_truth():
+                    m.set_truth(truth)
+
+    def _plugin_blobs(self) -> dict[str, bytes]:
+        out = {"world": self.world.snapshot(), "board": self.board.snapshot(),
+               "scheduler": self.scheduler.snapshot()}
+        for a, p in self.participants.items():
+            out[f"participant:{a}"] = p.snapshot()
+        for m in self.metrics:
+            out[f"metric:{m.name}"] = m.snapshot()
+        return out
+
+    def _restore(self, manifest: SnapshotManifest, parent_spec: RunSpec | None) -> None:
+        """Restore every plugin from `manifest`; `parent_spec` (forks) enables the match rules."""
+        blobs = self.snapshots.load(manifest)
+        same = parent_spec is None
+        if parent_spec is not None and len(parent_spec.participants) != len(self.agents):
+            raise ValueError("a fork cannot change the number of participants")
+        restored: dict[str, Any] = {"world": False, "participants": [], "metrics": []}
+        if same or parent_spec.world.type == self.spec.world.type:
+            self.world.restore(blobs["world"])
+            restored["world"] = True
+        self.board.restore(blobs["board"])
+        self.scheduler.restore(blobs["scheduler"])
+        for i, (a, p) in enumerate(self.participants.items()):
+            key = f"participant:{a}"
+            if key in blobs and (same or parent_spec.participants[i] == self.spec.participants[i]):
+                p.restore(blobs[key])
+                restored["participants"].append(a)
+        for m in self.metrics:
+            key = f"metric:{m.name}"
+            if key in blobs and (same or metric_spec(m) in parent_spec.metrics):
+                m.restore(blobs[key])
+                restored["metrics"].append(m.name)
+        self._set_truth()
+        self.outcomes_prev = {a: list(v) for a, v in manifest.outcomes_prev.items()}
+        self.live_agents = [AgentId(a) for a in manifest.live]
+        self.last_round = manifest.round
+        if not same:
+            self.restored = restored
+
+    # ---- logging -----------------------------------------------------------------------------
+    def _append(self, cls: type[Event], round: int, agent: str | None = None, **kw: Any) -> Event:
+        ev = cls(run=self.run_id, round=round, agent=agent, **kw)
+        self._log_event(ev)
+        return ev
+
+    def _log_event(self, ev: Event) -> None:
+        self.log.append(ev)
+        if ev.type not in OPERATIONAL_TYPES:
+            self._round_events.append(ev)
+
+    def _run_started(self, round: int) -> None:
+        git_commit, dirty = self._git
+        self._append(RunStartedEvent, round, spec_hash=spec_hash(self.spec), git_commit=git_commit,
+                     dirty=dirty, run_spec=self.spec.model_dump(mode="json"),
+                     parent_run=self.parent_run, fork_round=self.fork_round)
+
+    # ---- modes -------------------------------------------------------------------------------
+    def live(self) -> Runner:
+        """Start the run from round 0 (or, for a fork child, from the fork round)."""
+        if self.log_path.exists() and self.log_path.stat().st_size and self.parent is None:
+            raise FileExistsError(f"{self.log_path} already exists; use resume() or a new out dir")
+        self._build()
+        self._write_artifacts()
+        self.log = EventLog(self.log_path)
+        try:
+            self._init_fresh()
+            if self.parent is None:
+                self._run_started(0)
+                start = 1
+            else:
+                manifest = self.snapshots.read(self.parent.at_round)
+                self._restore(manifest, self.parent.parent_spec)
+                self._run_started(self.parent.at_round)
+                start = self.parent.at_round + 1
+            self._write_meta()
+            asyncio.run(self._loop(start))
+        finally:
+            self.log.close()
+        return self
+
+    def resume(self) -> Runner:
+        """Recover after a crash (§12 `recover()`) and continue live."""
+        meta = self._read_meta()
+        if meta is None:
+            raise RecoveryError(f"{self.dir} has no run.json")
+        self.spec = RunSpec.model_validate(meta["spec"])
+        self._build()
+        self.log = EventLog(self.log_path)
+        try:
+            events = list(self.log)
+            if any(e.type == "run_ended" for e in events):
+                self.status, self.end_reason = "ended", meta.get("end_reason")
+                self.last_round = meta.get("last_round", 0)
+                return self
+            self._init_fresh()
+            start = self.recover(events)
+            asyncio.run(self._loop(start))
+        finally:
+            self.log.close()
+        return self
+
+    def recover(self, events: list[Event] | None = None) -> int:
+        """Truncate to the last commit, restore its snapshot; return the next round to run."""
+        events = list(self.log) if events is None else events
+        lc = self.log.last_committed()
+        if lc is None:
+            starts = [e.seq for e in events if e.type == "run_started"]
+            if not starts:
+                raise RecoveryError("log has no run_started event")
+            keep = starts[-1]
+            committed = None
+        else:
+            committed, keep = lc
+            for e in events:
+                if e.seq <= keep:
+                    continue
+                if e.seq == keep + 1 and (
+                    (e.type == "snapshot" and e.round == committed) or e.type == "run_started"
+                ):
+                    keep = e.seq
+                else:
+                    break
+        dropped = self.log.truncate_after(keep)
+        if dropped:
+            write_jsonl(self.dir / "discarded.jsonl", dropped)
+        if committed is None:
+            self.last_round = 0
+            self._write_meta()
+            return 1
+        manifest = self.snapshots.latest(max_round=committed)
+        if manifest is None or manifest.round != committed:
+            raise RecoveryError(
+                f"no snapshot for committed round {committed}; M1a resume requires snapshot_every == 1"
+            )
+        self._restore(manifest, None)
+        kept = [e for e in events if e.seq <= keep]
+        has_snap = any(e.type == "snapshot" and e.round == committed for e in kept)
+        if not has_snap:
+            self._append(SnapshotEvent, committed, manifest_path=self._manifest_rel(committed))
+        self._write_meta()
+        return committed + 1
+
+    def fork(self, at_round: int, experiment: Experiment | None = None,
+             out: Path | str | None = None, *, max_rounds: int | None = None) -> Runner:
+        """Copy the parent's prefix and snapshot at `at_round` into a new run and continue live."""
+        meta = self._read_meta()
+        if meta is None:
+            raise ValueError(f"{self.dir} is not a run directory")
+        parent_spec = RunSpec.model_validate(meta["spec"])
+        parent_id = meta["run_id"]
+        raw = self.log_path.read_bytes()
+        lines = raw.splitlines(keepends=True)
+        end = None
+        for i, line in enumerate(lines):
+            ev = parse_event(line)
+            if ev.type == "round_committed" and ev.round == at_round:
+                end = i + 1
+                if end < len(lines):
+                    nxt = parse_event(lines[end])
+                    if nxt.type == "snapshot" and nxt.round == at_round:
+                        end += 1
+                break
+        if end is None:
+            raise ValueError(f"round {at_round} is not committed in {self.dir}")
+        src_snaps = SnapshotStore(self.dir)
+        if at_round not in src_snaps.list_rounds():
+            raise ValueError(f"no snapshot for round {at_round} in {self.dir}")
+        out_dir = Path(out) if out is not None else self.dir.parent
+        n = 1
+        while (out_dir / fork_run_id(parent_id, at_round, n)).exists():
+            n += 1
+        child_id = fork_run_id(parent_id, at_round, n)
+        child_dir = out_dir / child_id
+        child_dir.mkdir(parents=True)
+        prefix = lines[:end]
+        (child_dir / "events.jsonl").write_bytes(b"".join(prefix))
+        dst_snaps = SnapshotStore(child_dir)
+        shutil.copyfile(src_snaps.path(at_round), dst_snaps.path(at_round))
+        manifest = src_snaps.read(at_round)
+        shas = set(manifest.plugins.values())
+        for line in prefix:
+            ev = parse_event(line)
+            if ev.type == "delivery":
+                shas.add(ev.content_hash)
+        for sha in sorted(shas):
+            dst = dst_snaps.blobs.path(sha)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src_snaps.blobs.path(sha), dst)
+        options = parent_spec.options
+        if max_rounds is not None:
+            options = options.model_copy(update={"max_rounds": max_rounds})
+        if experiment is None:
+            experiment = self.experiment
+        child = Runner(child_dir, experiment, options,
+                       parent=ForkOrigin(parent_id, at_round, parent_spec), run_id=child_id)
+        return child.live()
+
+    def replay(self) -> dict:
+        """Fold metrics over the log and recompute the score; raise ReplayMismatch on a difference."""
+        meta = self._read_meta()
+        if meta is None:
+            raise ValueError(f"{self.dir} is not a run directory")
+        self.spec = RunSpec.model_validate(meta["spec"])
+        self._build()
+        self.world.reset(derive(self.options.seed, "world"), list(self.agents))
+        self._set_truth()
+        fork_round = meta.get("fork_round") or 0
+        restored = meta.get("restored") or {}
+        if fork_round:
+            blobs = self.snapshots.load(self.snapshots.read(fork_round))
+            for m in self.metrics:
+                if m.name in restored.get("metrics", []):
+                    m.restore(blobs[f"metric:{m.name}"])
+            self._set_truth()
+        log = EventLog(self.log_path)
+        by_name = {m.name: m for m in self.metrics}
+        last_committed = 0
+        checked = 0
+        for ev in log:
+            if ev.type in OPERATIONAL_TYPES or ev.round <= fork_round:
+                continue
+            if ev.type == "round_committed":
+                last_committed = ev.round
+            if ev.type not in NOT_FED:
+                for m in self.metrics:
+                    m.update(ev)
+            elif ev.type == "metric" and ev.name in by_name:
+                value, denom = by_name[ev.name].value()
+                if (value, denom) != (ev.value, ev.denominator):
+                    raise ReplayMismatch(
+                        f"round {ev.round} metric {ev.name}: log has ({ev.value}, {ev.denominator}), "
+                        f"replay gives ({value}, {denom})"
+                    )
+                checked += 1
+        log.close()
+        last_committed = max(last_committed, fork_round)
+        score = None
+        manifest = self.snapshots.latest(max_round=last_committed)
+        if manifest is not None and manifest.round == meta.get("last_round"):
+            world_ok = manifest.round != fork_round or restored.get("world", True)
+            if world_ok:
+                self.world.restore(self.snapshots.load(manifest)["world"])
+                score = _jsonable(self.world.score())
+                if score != meta.get("score"):
+                    raise ReplayMismatch(
+                        f"score after round {manifest.round}: run.json has {meta.get('score')}, "
+                        f"replay gives {score}"
+                    )
+        return {"last_round": last_committed, "metrics_checked": checked, "score": score}
+
+    # ---- the round loop ----------------------------------------------------------------------
+    async def _loop(self, start: int) -> None:
+        r = start
+        while True:
+            reason = self._end_reason(r - 1)
+            if reason is not None:
+                self._end(r - 1, reason)
+                return
+            await self._round(r)
+            r += 1
+
+    def _end_reason(self, committed: int) -> str | None:
+        if committed >= 1 and self.world.terminal():
+            return "terminal"
+        if committed >= self.options.max_rounds:
+            return "max_rounds"
+        return None
+
+    def _end(self, round: int, reason: str) -> None:
+        self._append(RunEndedEvent, round, reason=reason)
+        self.log.sync()
+        self.status, self.end_reason = "ended", reason
+        self._write_meta()
+
+    def _manifest_rel(self, round: int) -> str:
+        return self.snapshots.path(round).relative_to(self.dir).as_posix()
+
+    async def _turn(self, agent: AgentId, ex: RoundExecutor, round: int,
+                    sem: asyncio.Semaphore | None) -> None:
+        if sem is not None:
+            async with sem:
+                await self._turn_inner(agent, ex, round)
+        else:
+            await self._turn_inner(agent, ex, round)
+
+    async def _turn_inner(self, agent: AgentId, ex: RoundExecutor, round: int) -> None:
+        ex.begin_turn(agent)
+        pushed: list[dict] = []
+        if self.board.delivery == "push":
+            pushed = [
+                {"delivery_id": d.delivery_id, "post_id": d.post_id,
+                 "eligible_round": d.eligible_round, "content": self.board.content(d, self.blobs)}
+                for d in self.board.pushable(agent, round, self.board.push_limit)
+            ]
+        view = View(round=round, agent=agent, observation=self.world.observe(agent),
+                    outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
+                    tools=ex.schemas(agent))
+        usage: dict = {}
+        error = None
+        try:
+            result = await self.participants[agent].turn(view, ex)
+            kind = "no_tool"
+            if result is not None and hasattr(result, "model_dump"):
+                usage = result.model_dump(mode="json")
+        except EndTurn:
+            kind = "end_turn"
+        except TurnCapReached:
+            kind = "cap"
+        except Exception:  # noqa: BLE001 - any participant failure ends its turn as "error"
+            kind = "error"
+            error = traceback.format_exc()
+        ex.end_turn_event(agent, kind, usage, error)
+
+    async def _round(self, r: int) -> None:
+        seed = self.options.seed
+        self._round_events = []
+        order = self.scheduler.order(r, list(self.live_agents), derive(seed, "schedule", r))
+        self._append(RoundStartedEvent, r, order=list(order))
+        ex = RoundExecutor(
+            run=self.run_id, round=r, world=self.world, board=self.board, blobs=self.blobs,
+            agents=list(self.live_agents), commit=self.options.commit,
+            max_calls_per_turn=self.options.max_calls_per_turn,
+            topology_rng=lambda: derive(seed, "topology", r),
+        )
+        if self.options.commit == "round_end":
+            sem = asyncio.Semaphore(max(1, self.options.concurrency))
+            await asyncio.gather(*(self._turn(a, ex, r, sem) for a in order))
+        else:
+            for a in order:
+                await self._turn(a, ex, r, None)
+        for a in order:
+            for ev in ex.events(a):
+                self._log_event(ev)
+        # commit
+        if self.options.commit == "round_end":
+            for a in order:
+                for channel, text, fields in ex.buffered_posts(a):
+                    self.board.buffer_post(a, r, channel, text, fields)
+            posts, deliveries = self.board.commit(r, list(self.live_agents),
+                                                  derive(seed, "topology", r), self.blobs)
+            actions = [x for a in order for x in ex.buffered_actions(a)]
+            outcomes = self.world.commit(actions)
+            applied = [(a, aid, act, out) for (a, aid, act), out in zip(actions, outcomes, strict=True)]
+        else:
+            posts, deliveries = ex.committed.posts, ex.committed.deliveries
+            applied = ex.committed.actions
+        for p in posts:
+            self._append(PostEvent, r, p.agent, post_id=p.post_id, channel=p.channel, text=p.text,
+                         fields=dict(p.fields))
+        for d in deliveries:
+            self._append(DeliveryEvent, r, d.recipient, post_id=d.post_id, recipient=d.recipient,
+                         delivery_id=d.delivery_id, eligible_round=d.eligible_round,
+                         content_hash=d.content_hash)
+        self.outcomes_prev = {a: [] for a in self.live_agents}
+        for a, aid, act, out in applied:
+            feedback = _jsonable(out.feedback)
+            self._append(ActionCommittedEvent, r, a, action_id=aid, action=act.model_dump(mode="json"),
+                         accepted=out.accepted, feedback=feedback)
+            self.outcomes_prev.setdefault(a, []).append(
+                {"action_id": aid, "tool": act.name, "accepted": out.accepted, "feedback": feedback})
+        # metrics
+        fed = [parse_event(ev.model_dump_json()) for ev in self._round_events if ev.type not in NOT_FED]
+        for m in self.metrics:
+            for ev in fed:
+                m.update(ev)
+        for m in self.metrics:
+            value, denom = m.value()
+            self._append(MetricEvent, r, name=m.name, value=value, denominator=denom)
+        # snapshot (before the commit marker), commit marker, run.json, snapshot event
+        snap = r % max(1, self.options.snapshot_every) == 0
+        if snap:
+            manifest = SnapshotManifest(
+                run=self.run_id, round=r, log_seq=self.log.next_seq,
+                outcomes_prev=self.outcomes_prev, live=list(self.live_agents),
+            )
+            self.snapshots.write(manifest, self._plugin_blobs())
+        self._append(RoundCommittedEvent, r, n_posts=len(posts), n_actions=len(applied),
+                     n_deliveries=len(deliveries))
+        self.last_round = r
+        self._write_meta()
+        if snap:
+            self._append(SnapshotEvent, r, manifest_path=self._manifest_rel(r))
