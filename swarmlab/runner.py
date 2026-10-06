@@ -755,11 +755,12 @@ class Runner:
                           + [ChatMessage(role="user", content=question)], tools=[],
                           **participant.model_request_defaults())
         cost = 0.0
+        names = probe.candidates_from_context(participant.probe_context())
         try:
             resp = await ex.infer(agent, req, "measurement")
             cost += self.gate.provider_for(req.model).cost(req, resp.usage)
             raw = resp.text
-            ok, parsed = probe.parse(raw)
+            ok, parsed = probe.parse(raw, names)
             coder = probe.coder_model()
             if not ok and coder:
                 creq = ChatRequest(model=coder, max_tokens=256, temperature=0.0, tools=[], messages=[
@@ -768,7 +769,7 @@ class Runner:
                 ])
                 cresp = await ex.infer(agent, creq, "measurement")
                 cost += self.gate.provider_for(creq.model).cost(creq, cresp.usage)
-                ok, parsed = probe.parse(cresp.text)
+                ok, parsed = probe.parse(cresp.text, names)
                 parsed = {**parsed, "coded": True}
         except MeasurementBudgetReached:
             self._probes_stopped = True

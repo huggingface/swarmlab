@@ -4,10 +4,32 @@
 class Probe(Plugin):
     name: str; every: int = 1
     def question(self, agent, round) -> str        # Jinja2 template rendered with agent, round
-    def parse(self, text) -> tuple[bool, dict]     # (ok, parsed)
+    def parse(self, text, candidates=None) -> tuple[bool, dict]   # (ok, parsed)
     def coder_model(self) -> str | None            # cheap model for free-text parsing; None = local only
+    def candidates_from_context(self, context) -> list[str] | None   # known answer names, if any
 class BeliefProbe(Probe):   entry_point = "belief"
 ```
+
+Candidates hook: the runner calls `probe.candidates_from_context(participant.probe_context())`
+once per agent and passes the result to every `parse` of that probe answer (also the coder
+model's reply). The base returns None. `BeliefProbe` reads the names from the latest FlagGame
+observation in the context (`flaggame.parse_observation` on a text part that starts with the
+"Candidate flags:" preamble); any other world yields None and parsing stays name-agnostic.
+
+Tolerant parsing (`BeliefProbe.parse`, after the 2026-10-06 smoke where 9 of 12 Qwen3.5-9B answers
+did not parse, mostly because reasoning used the whole token budget):
+
+- reasoning is removed first (`strip_reasoning`: closed `<think>...</think>` blocks, a dangling
+  `</think>` prefix, an unterminated `<think>` tail);
+- the first JSON object anywhere in the text is used (prose and code fences around it are fine);
+  if there is none, a `"candidate": "<name>"` pair inside truncated JSON is still accepted and
+  marked `parsed["partial"] = True`;
+- the candidate key may be `candidate`, `answer`, `guess` or `flag` (keys matched
+  case-insensitively, first match in that order);
+- with known candidate names, the value is matched case-insensitively, also after stripping a
+  leading "candidate"/"flag" word and surrounding punctuation ("candidate c" -> "C"); a value that
+  matches no name keeps its text and is marked `parsed["unknown_candidate"] = True` (still ok: the
+  agent answered, it is just wrong).
 
 Runner hook (swarmlab/runner.py `_probe_round`): in round r, after the world and board commit
 (`action_committed*`) and before the round's `metric*` events, for every probe with
@@ -64,6 +86,30 @@ CODER_SYSTEM = (
 
 _ENV = jinja2.Environment(undefined=jinja2.StrictUndefined, autoescape=False)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_CANDIDATE_KEYS = ("candidate", "answer", "guess", "flag")
+_PAIR_RE = re.compile(r'"(candidate|answer|guess|flag)"\s*:\s*"([^"\n]{1,64})"', re.IGNORECASE)
+_PREFIX_RE = re.compile(r"^(?:candidate|flag)\s*[:#]?\s*", re.IGNORECASE)
+
+
+def strip_reasoning(text: str | None) -> str:
+    """`text` without `<think>...</think>` blocks, a dangling `...</think>` prefix (the opening
+    tag was in the prompt template) or an unterminated `<think>...` tail."""
+    body = _THINK_RE.sub("", text or "")
+    if "</think>" in body:
+        body = body.rsplit("</think>", 1)[1]
+    return re.sub(r"<think>.*\Z", "", body, flags=re.DOTALL)
+
+
+def match_candidate(value: str, candidates: list[str] | None) -> str | None:
+    """The known candidate `value` names (case-insensitive, prefix/punctuation tolerant), or None."""
+    if not candidates:
+        return None
+    by_lower = {c.lower(): c for c in candidates}
+    v = value.strip().strip("\"'`*.,;:!()[]{}<> ").strip()
+    for attempt in (v, _PREFIX_RE.sub("", v).strip("\"'`*.,;:!()[]{}<> ")):
+        if attempt.lower() in by_lower:
+            return by_lower[attempt.lower()]
+    return None
 
 
 def parse_json_object(text: str) -> dict | None:
@@ -111,11 +157,15 @@ class Probe(Plugin):
     def question(self, agent: Any, round: int) -> str:
         return _ENV.from_string(self.template).render(agent=str(agent), round=round)
 
-    def parse(self, text: str) -> tuple[bool, dict]:
+    def parse(self, text: str, candidates: list[str] | None = None) -> tuple[bool, dict]:
         raise NotImplementedError
 
     def coder_model(self) -> str | None:
         return getattr(self, "_coder_model", None)
+
+    def candidates_from_context(self, context: list[ChatMessage]) -> list[str] | None:
+        """Known answer names for this agent (passed to `parse`), or None when unknown."""
+        return None
 
 
 class BeliefProbe(Probe):
@@ -132,15 +182,43 @@ class BeliefProbe(Probe):
         self.template = question
         self._coder_model = coder_model
 
-    def parse(self, text: str) -> tuple[bool, dict]:
-        obj = parse_json_object(text)
+    def candidates_from_context(self, context: list[ChatMessage]) -> list[str] | None:
+        from .world.flaggame import PREAMBLE, parse_observation
+
+        for m in reversed(context):
+            if m.role != "user" or isinstance(m.content, str):
+                continue
+            for part in m.content:
+                if part.type == "text" and (part.text or "").lstrip().startswith(PREAMBLE):
+                    try:
+                        names = list(parse_observation(part.text or "")[0])
+                    except ValueError:
+                        continue
+                    if names:
+                        return names
+        return None
+
+    def parse(self, text: str, candidates: list[str] | None = None) -> tuple[bool, dict]:
+        body = strip_reasoning(text)
+        obj = parse_json_object(body)
+        parsed: dict[str, Any] = {}
         if obj is None:
-            return False, {"error": "no JSON object"}
-        cand = obj.get("candidate")
+            pair = _PAIR_RE.search(body)
+            if pair is None:
+                return False, {"error": "no JSON object"}
+            obj = {pair.group(1).lower(): pair.group(2)}
+            parsed["partial"] = True
+        lower = {str(k).lower(): v for k, v in obj.items()}
+        cand = next((lower[k] for k in _CANDIDATE_KEYS if k in lower), None)
+        if isinstance(cand, (int, float)) and not isinstance(cand, bool):
+            cand = str(cand)
         if not isinstance(cand, str) or not cand.strip():
             return False, {"error": "no candidate", "answer": obj}
-        parsed: dict[str, Any] = {"candidate": cand.strip()}
-        conf = obj.get("confidence")
+        known = match_candidate(cand, candidates)
+        parsed = {"candidate": known or cand.strip(), **parsed}
+        if candidates and known is None:
+            parsed["unknown_candidate"] = True
+        conf = lower.get("confidence")
         if isinstance(conf, (int, float)) and not isinstance(conf, bool):
             parsed["confidence"] = float(conf)
         return True, parsed

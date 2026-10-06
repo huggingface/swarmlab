@@ -1,8 +1,32 @@
 """LLMAgent: the in-process model loop (docs/INTERFACE-M1b.md §4).
 
-`LLMAgent(model, system_prompt=None, memory="full", window_rounds=3, max_tokens=1024,
-temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker")`,
-entry point `llm`.
+`LLMAgent(model, system_prompt=None, memory="full", window_rounds=3, max_tokens=2048,
+temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker",
+extra=None, text_tool_fallback=False)`, entry point `llm`.
+
+**max_tokens** defaults to 2048 (was 1024). In the 2026-10-06 smoke, Qwen3.5-9B with thinking on
+spent the whole 1024-token budget reasoning (`finish_reason="length"`, empty text, no tool call)
+on 7 of 12 turns. Reasoning models need room, or thinking turned off through `extra`; a
+`length` finish is noted in the turn (below).
+
+**extra** (dict, default `{}`) goes to `ChatRequest.extra` on every request this agent makes,
+probes included (`model_request_defaults()` carries it): provider-specific body fields the adapter
+merges into the request. For Qwen3 on DeepInfra/vLLM via an OpenAI-compatible provider:
+`extra={"chat_template_kwargs": {"enable_thinking": False}}`; OpenAI-style
+`{"reasoning_effort": ...}` or `{"reasoning": {...}}` pass the same way. It is part of the request
+hash, so it separates cache entries and belongs to the arm's spec.
+
+**text_tool_fallback** (native protocol only, default False because it is an experimental
+condition): when a response has no native tool calls but its text spells out calls to offered
+tools, they are parsed (`parse_text_tool_calls`: Hermes/Qwen `<tool_call>{...}</tool_call>`
+blocks, then `name(key="value", ...)` call syntax, then a JSON call list as in the json
+protocol) and executed like json-protocol calls (results come back as a `[tool results]` user
+message, since there are no provider tool-call ids). Each trigger is logged (logger
+`swarmlab.participants.llm`) and noted in the turn.
+
+**Turn notes.** `turn()` returns an `LLMTurnUsage` (a `TurnUsage` with `finish_reasons`, one per
+model call, and `notes`, e.g. `"length"` when a response hit `max_tokens` and
+`"text_tool_fallback:<n>"`); the runner puts it into `turn_ended.usage`.
 
 **System prompt.** A Jinja2 template rendered once, at the agent's first turn, with `agent`,
 `role`, `description` (`View.description`, i.e. `World.description()`) and `tools`
@@ -50,23 +74,29 @@ re-sent every round anyway). The system prompt is always kept.
 
 **Probing.** `probe_context()` returns `[system] + memory` as fresh `ChatMessage` objects (callers
 cannot mutate the agent's memory through them); `model_request_defaults()` returns `model,
-temperature, max_tokens, thinking_budget`.
+temperature, max_tokens, thinking_budget, extra`.
 
 `TurnUsage.calls` counts executed tool calls; tokens and cost are filled in by the executor.
 """
 from __future__ import annotations
 
+import ast
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import jinja2
+from pydantic import Field
 
+from ..probes import strip_reasoning
 from ..providers.base import ChatMessage, ChatRequest
 from ..tools import AgentTools, ToolCall, ToolSchema
 from ..view import Part, View
 from .base import Participant, TurnUsage
+
+log = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 DEFAULT_SYSTEM_TEMPLATE = PROMPTS_DIR / "default_system.j2"
@@ -159,6 +189,75 @@ def parse_tool_json(text: str) -> list[tuple[str, dict]] | None:
     return out
 
 
+_TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+
+
+def _call_syntax(body: str, names: set[str]) -> list[tuple[str, dict]]:
+    """`name(key=value, ...)` calls to known tools, values Python/JSON literals, in text order."""
+    out: list[tuple[int, str, dict]] = []
+    for name in names:
+        for m in re.finditer(rf"(?<![\w.]){re.escape(name)}\s*\(", body):
+            depth, end = 0, None
+            for i in range(m.end() - 1, len(body)):
+                if body[i] == "(":
+                    depth += 1
+                elif body[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            if end is None:
+                continue
+            snippet = re.sub(r"\s+", " ", body[m.start():end])
+            snippet = re.sub(r"\btrue\b", "True", re.sub(r"\bfalse\b", "False", snippet))
+            snippet = re.sub(r"\bnull\b", "None", snippet)
+            try:
+                node = ast.parse(snippet, mode="eval").body
+                if not isinstance(node, ast.Call) or node.args:
+                    continue
+                args = {kw.arg: ast.literal_eval(kw.value) for kw in node.keywords if kw.arg}
+            except (SyntaxError, ValueError):
+                continue
+            out.append((m.start(), name, args))
+    return [(n, a) for _, n, a in sorted(out, key=lambda t: t[0])]
+
+
+def parse_text_tool_calls(text: str, tools: list[ToolSchema]) -> list[tuple[str, dict]]:
+    """Tool calls a model wrote as text instead of calling natively (empty list if none).
+
+    Tried in order, the first form that yields calls to offered tools wins: Hermes/Qwen
+    `<tool_call>{"name", "arguments"}</tool_call>` blocks; `name(key="value")` call syntax; a JSON
+    call list or object (`parse_tool_json`). Reasoning is ignored (`probes.strip_reasoning`). Calls to tools that are
+    not offered are dropped.
+    """
+    names = {t.name for t in tools}
+    body = strip_reasoning(text)
+    calls: list[tuple[str, dict]] = []
+    for block in _TOOL_CALL_TAG_RE.findall(body):
+        try:
+            calls += parse_tool_json(block) or []
+        except ToolJsonError:
+            continue
+    calls = [c for c in calls if c[0] in names]
+    if calls:
+        return calls
+    calls = _call_syntax(body, names)
+    if calls:
+        return calls
+    try:
+        calls = parse_tool_json(body) or []
+    except ToolJsonError:
+        return []
+    return [c for c in calls if c[0] in names]
+
+
+class LLMTurnUsage(TurnUsage):
+    """`TurnUsage` plus per-turn diagnostics (lands in `turn_ended.usage`)."""
+
+    finish_reasons: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 def _result_payload(res: Any) -> dict:
     return {"ok": res.ok, "result": res.result, "error": res.error}
 
@@ -172,12 +271,14 @@ class LLMAgent(Participant):
         system_prompt: str | None = None,
         memory: Literal["full", "window"] = "full",
         window_rounds: int = 3,
-        max_tokens: int = 1024,
+        max_tokens: int = 2048,
         temperature: float | None = None,
         tool_protocol: Literal["native", "json"] = "native",
         thinking_budget: int | None = None,
         max_calls: int | None = None,
         role: str = "worker",
+        extra: dict | None = None,
+        text_tool_fallback: bool = False,
     ) -> None:
         if memory not in ("full", "window"):
             raise ValueError(f"memory must be 'full' or 'window', got {memory!r}")
@@ -197,6 +298,8 @@ class LLMAgent(Participant):
         self.thinking_budget = thinking_budget
         self.max_calls = max_calls
         self.role = role
+        self.extra = dict(extra or {})
+        self.text_tool_fallback = bool(text_tool_fallback)
         # conversation state (plain data, snapshotted by Persistable)
         self.system: str | None = None
         self.rounds: list[dict] = []
@@ -208,7 +311,8 @@ class LLMAgent(Participant):
 
     def model_request_defaults(self) -> dict:
         return {"model": self.model, "temperature": self.temperature,
-                "max_tokens": self.max_tokens, "thinking_budget": self.thinking_budget}
+                "max_tokens": self.max_tokens, "thinking_budget": self.thinking_budget,
+                "extra": dict(self.extra)}
 
     # ---- the loop ----------------------------------------------------------------------------
     def _render_system(self, view: View) -> str:
@@ -246,7 +350,7 @@ class LLMAgent(Participant):
         return ChatRequest(messages=self.probe_context(), tools=tools,
                            tool_protocol=self.tool_protocol, **self.model_request_defaults())
 
-    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
+    async def turn(self, view: View, tools: AgentTools) -> LLMTurnUsage:
         if self.system is None:
             self.system = self._render_system(view)
         if self.memory == "window":
@@ -256,14 +360,29 @@ class LLMAgent(Participant):
         executed = 0
         model_calls = 0
         retried = False
+        usage = LLMTurnUsage()
         while self.max_calls is None or model_calls < self.max_calls:
             resp = await tools.infer(self._request(view.tools))
             model_calls += 1
+            usage.finish_reasons.append(resp.finish_reason)
+            if resp.finish_reason == "length" and "length" not in usage.notes:
+                usage.notes.append("length")  # ran out of max_tokens (often mid-reasoning)
             if self.tool_protocol == "native":
                 if not resp.tool_calls:
+                    text_calls = (parse_text_tool_calls(resp.text, view.tools)
+                                  if self.text_tool_fallback and resp.text else [])
                     if resp.text:
                         self._append(ChatMessage(role="assistant", content=resp.text))
-                    break
+                    if not text_calls:
+                        break
+                    log.info("%s round %s: text_tool_fallback parsed %d call(s): %s", self.agent,
+                             view.round, len(text_calls), [n for n, _ in text_calls])
+                    usage.notes.append(f"text_tool_fallback:{len(text_calls)}")
+                    n, ended = await self._run_json(text_calls, tools)
+                    executed += n
+                    if ended:
+                        break
+                    continue
                 self._append(ChatMessage(role="assistant", content=resp.text,
                                          tool_calls=resp.tool_calls))
                 n, ended = await self._run_native(resp.tool_calls, tools)
@@ -284,7 +403,8 @@ class LLMAgent(Participant):
             executed += n
             if ended:
                 break
-        return TurnUsage(calls=executed)
+        usage.calls = executed
+        return usage
 
     async def _run_native(self, calls: list[ToolCall], tools: AgentTools) -> tuple[int, bool]:
         answered = 0

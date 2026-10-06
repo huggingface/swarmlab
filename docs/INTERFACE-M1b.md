@@ -89,16 +89,18 @@ Events added: `inference_attempt{call_id, provider, model, request_hash, reserve
 ```python
 class LLMAgent(Participant):   entry_point = "llm"
     def __init__(self, model: str, system_prompt: str | None = None, memory: Literal["full","window"] = "full",
-                 window_rounds: int = 3, max_tokens: int = 1024, temperature: float | None = None,
+                 window_rounds: int = 3, max_tokens: int = 2048, temperature: float | None = None,
                  tool_protocol: Literal["native","json"] = "native", thinking_budget: int | None = None,
-                 max_calls: int | None = None, role: str = "worker")
+                 max_calls: int | None = None, role: str = "worker", extra: dict | None = None,
+                 text_tool_fallback: bool = False)
 ```
+- **Provider passthrough and diagnostics** (added after the 2026-10-06 smoke): `extra` goes to `ChatRequest.extra` on every request including probes; `text_tool_fallback` (opt-in, native protocol) executes tool calls the model wrote as text; `turn()` returns `LLMTurnUsage` with `finish_reasons` and `notes` (`"length"`, `"text_tool_fallback:<n>"`). Details in `swarmlab/participants/llm.py`.
 - **System prompt**: Jinja2 template; the default template (`participants/prompts/default_system.j2`) states the agent's id and role, that it acts in rounds, that actions are tool calls, that `end_turn` ends its turn, and lists the tools from `view.tools` with descriptions. It must not instruct the agent to read the board or to collaborate; that is the experiment's business. `system_prompt` overrides the template text (a string, or `file:<path>`). The rendered prompt is a spec parameter by construction (it is in `params`).
 - **Round message**: one user message per round with: `Round {r}.`, the observation parts (text and image parts passed through), the previous round's outcomes rendered as short lines, pushed inbox items if any. Nothing else.
 - **Loop**: `infer` -> if `tool_calls`: execute each in order through `tools.call`, append the assistant message and one tool message per result, continue; if no tool calls: the turn ends (`no_tool`). If `end_turn` was among the calls, finish executing that response's calls, then return. Own `max_calls` (if set) stops the loop before the runner's cap; the runner's cap still raises `TurnCapReached`.
 - **Tool protocol**: `native` uses the provider's tool API. `json` adds an instruction to the system prompt to answer with a JSON array `[{"name":..., "args":{...}}]`, parses tolerant JSON from the text, and feeds a parse error back as a tool message so the model can retry once per cap.
 - **Memory**: `full` keeps every message. `window` keeps the system prompt plus the last `window_rounds` rounds of messages; the observation is re-sent each round anyway, which is the "environment is the memory" policy. The messages list is plain data so `Persistable` works unchanged.
-- **Probing support**: `probe_context() -> list[ChatMessage]` returns the current messages (system included); `model_request_defaults() -> dict` returns model, temperature, max_tokens, thinking_budget so probes run on the agent's own model and settings.
+- **Probing support**: `probe_context() -> list[ChatMessage]` returns the current messages (system included); `model_request_defaults() -> dict` returns model, temperature, max_tokens, thinking_budget, extra so probes run on the agent's own model and settings.
 
 Worlds gain an optional `description() -> str` (default `""`) used by the default system prompt to describe the task; FlagGame implements it.
 
@@ -108,11 +110,14 @@ Worlds gain an optional `description() -> str` (default `""`) used by the defaul
 class Probe(Plugin):
     name: str; every: int = 1
     def question(self, agent, round) -> str                      # Jinja2 rendered
-    def parse(self, text) -> tuple[bool, dict]                   # (ok, parsed)
+    def parse(self, text, candidates=None) -> tuple[bool, dict]  # (ok, parsed)
     def coder_model(self) -> str | None                          # cheap model for free-text parsing; None = parse locally
+    def candidates_from_context(self, context) -> list[str] | None  # known answer names, passed to parse
 class BeliefProbe(Probe):   entry_point = "belief"
     # question: "Which candidate do you currently believe the flag is? Answer with JSON {"candidate": "<name>", "confidence": <0..1>} and nothing else."
-    # parse: tolerant JSON; ok requires a candidate string
+    # parse: tolerant JSON (reasoning stripped, first object anywhere, aliases answer/guess/flag,
+    #        truncated "candidate": "X" pairs); ok requires a candidate string, matched
+    #        case-insensitively to the names from the latest FlagGame observation when known
 ```
 Runner, after commit, for every live agent whose participant implements `probe_context()` (scripted agents are skipped and a `probe` event with `ok=False, parsed={"skipped": "no_context"}` is written once per run per agent): build `ChatRequest(messages=context + [user(question)], tools=[], **model_request_defaults())`, call `infer(category="measurement")`, parse, log `probe`. The participant's memory is not modified (assert in tests). If `coder_model` is set and local parsing fails, a second `infer` on the coder model with a fixed extraction prompt is made, also under `measurement`.
 

@@ -239,7 +239,8 @@ def test_probe_context_is_a_copy():
     ctx[1].content = "changed"
     assert agent.snapshot() == before
     assert agent.model_request_defaults() == {"model": "fake:reader", "temperature": None,
-                                              "max_tokens": 1024, "thinking_budget": None}
+                                              "max_tokens": 2048, "thinking_budget": None,
+                                              "extra": {}}
 
 
 def test_constructor_validation():
