@@ -59,6 +59,34 @@ def test_belief_metrics_empty():
     assert feed(Entropy(), [guess("a000", "A")]) == (0.0, 1)
 
 
+def test_belief_denominator_is_all_live_agents_with_explicit_none():
+    """B2: 4 live agents, 2 guess: agents without a guess are a 'none' category."""
+    evs = [guess("a000", "A"), guess("a001", "B"), guess("a009", "A")]  # a009 is not live
+    live = ["a000", "a001", "a002", "a003"]
+
+    def run(m):
+        m.set_agents(live)
+        return feed(m, evs)
+
+    acc = Accuracy()
+    acc.set_truth({"truth": "A"})
+    assert run(acc) == (0.25, 4)
+    assert run(Consensus()) == (0.25, 4)            # never-guessers lower consensus
+    assert run(Polarization()) == (2.0, 4)          # A, B at 25%; "none" (50%) is not a camp
+    assert run(Polarization(threshold=0.3)) == (0.0, 4)
+    h, n = run(Entropy())
+    assert n == 4 and math.isclose(h, 1.5)          # {A: .25, B: .25, none: .5}
+    nobody = Consensus()
+    nobody.set_agents(live)
+    assert nobody.value() == (0.0, 4)
+    silent = Entropy()
+    silent.set_agents(live)
+    assert silent.value() == (0.0, 4)
+    empty = Accuracy()
+    empty.set_agents([])
+    assert empty.value() == (None, 0)
+
+
 def rs(r):
     return RoundStartedEvent(run="r", round=r, order=[])
 

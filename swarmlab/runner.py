@@ -252,6 +252,13 @@ class Runner:
             p.bind(a, derive(seed, "agent", a))
         self.world.reset(derive(seed, "world"), list(self.agents))
         self._set_truth()
+        self._set_agents()
+
+    def _set_agents(self) -> None:
+        """Tell metrics the live agent list (at reset, restore, and whenever it changes)."""
+        self._metric_agents = list(self.live_agents)
+        for m in self.metrics:
+            m.set_agents(list(self.live_agents))
 
     def _set_truth(self) -> None:
         if any(m.needs_truth() for m in self.metrics):
@@ -294,6 +301,7 @@ class Runner:
         self._set_truth()
         self.outcomes_prev = {a: list(v) for a, v in manifest.outcomes_prev.items()}
         self.live_agents = [AgentId(a) for a in manifest.live]
+        self._set_agents()
         self.last_round = manifest.round
         if not same:
             self.restored = restored
@@ -465,6 +473,7 @@ class Runner:
         self._build()
         self.world.reset(derive(self.options.seed, "world"), list(self.agents))
         self._set_truth()
+        self._set_agents()
         fork_round = meta.get("fork_round") or 0
         restored = meta.get("restored") or {}
         if fork_round:
@@ -482,6 +491,9 @@ class Runner:
                 continue
             if ev.type == "round_committed":
                 last_committed = ev.round
+            if ev.type == "round_started" and sorted(ev.order) != sorted(self._metric_agents):
+                self.live_agents = [AgentId(a) for a in ev.order]
+                self._set_agents()
             if ev.type not in NOT_FED:
                 for m in self.metrics:
                     m.update(ev)
@@ -575,6 +587,8 @@ class Runner:
     async def _round(self, r: int) -> None:
         seed = self.options.seed
         self._round_events = []
+        if self.live_agents != getattr(self, "_metric_agents", None):
+            self._set_agents()
         order = self.scheduler.order(r, list(self.live_agents), derive(seed, "schedule", r))
         self._append(RoundStartedEvent, r, order=list(order))
         ex = RoundExecutor(

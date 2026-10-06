@@ -148,3 +148,41 @@ def test_shared_prototype_is_copied_per_agent(tmp_path):
     # the default medium is not shared between experiments
     other = Experiment(name="x", world=FlagGame(), participants=[proto])
     assert other.medium is not exp.medium
+
+
+class SlowGuesser(Participant):
+    """Agent i first guesses in round i+1 (a candidate chosen by its rng), so most agents start
+    with no guess: the belief denominator must still be every live agent."""
+
+    async def turn(self, view, tools):
+        from swarmlab.world.flaggame import parse_observation
+
+        idx = int(self.agent[1:])
+        if view.round >= idx + 1:
+            cands, _ = parse_observation(view.observation.parts[0].text)
+            await tools.call("guess", {"candidate": self.rng.choice(sorted(cands))})
+        return TurnUsage()
+
+
+def test_belief_accuracy_equals_world_score_every_round(tmp_path):
+    from swarmlab import Board
+    from swarmlab.snapshot import SnapshotStore
+    from swarmlab.world.flaggame import FlagGame
+
+    exp = Experiment(name="b2", world=FlagGame(), medium=Board(),
+                     participants=[SlowGuesser()] * 6,
+                     metrics=["belief.accuracy", "belief.consensus"])
+    hits = 0
+    for seed in range(4):
+        run = exp.run(seed=seed, max_rounds=6, out=tmp_path)
+        store = SnapshotStore(run.dir)
+        acc = {e["round"]: e for e in run.events if e["type"] == "metric" and e["name"] == "belief.accuracy"}
+        assert sorted(acc) == list(range(1, 7))
+        for r, e in acc.items():
+            world = FlagGame()
+            world.restore(store.load(store.read(r))["world"])
+            assert e["denominator"] == 6
+            assert e["value"] == world.score()["accuracy"], (seed, r)
+            hits += e["value"] > 0
+        run.replay()
+    assert hits  # some rounds have a right guess, so equality is not 0 == 0 everywhere

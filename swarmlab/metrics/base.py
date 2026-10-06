@@ -23,6 +23,9 @@ class Metric(Persistable, Plugin):
     def set_truth(self, truth: dict) -> None:
         pass
 
+    def set_agents(self, agents: list[Any]) -> None:
+        """The runner calls this at reset and whenever the live agent list changes. No-op default."""
+
     @staticmethod
     def from_fn(name: str, fn: Callable[[list[Any]], tuple[float | None, int]]) -> Metric:
         """One-liner metric: fn receives all logical events seen so far."""
