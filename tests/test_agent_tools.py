@@ -82,3 +82,27 @@ def test_yield_kinds_and_usage_after_end_turn(tmp_path):
     rets = [e for e in run.events if e["type"] == "tool_returned" and e["agent"] == "a001"]
     assert rets[-1]["result"]["error"] == "turn_ended"
     assert not [e for e in run.events if e["type"] == "action_committed"]
+
+
+class PrivacyProbe(Participant):
+    """A5: the view must not carry the world's evaluator-only data."""
+
+    async def turn(self, view, tools):
+        assert view.observation.private == {}
+        assert "crop_y" not in view.model_dump_json()
+        return TurnUsage()
+
+
+def test_private_is_stripped_from_view_and_logged_on_turn_started(tmp_path):
+    exp = Experiment(name="priv", world=FlagGame(), medium=Board(), participants=[PrivacyProbe()] * 3)
+    run = exp.run(seed=4, max_rounds=2, out=tmp_path)
+    ended = [e for e in run.events if e["type"] == "turn_ended"]
+    assert ended and all(e["yield_kind"] == "no_tool" for e in ended), ended[0].get("error")
+    started = [e for e in run.events if e["type"] == "turn_started"]
+    world = FlagGame()
+    from swarmlab.rng import derive
+
+    world.reset(derive(4, "world"), ["a000", "a001", "a002"])
+    for e in started:
+        assert e["private"] == world.observe(e["agent"]).private
+        assert set(e["private"]) == {"crop_y", "crop_x"}

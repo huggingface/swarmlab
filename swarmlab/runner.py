@@ -16,7 +16,8 @@ Round `r` (phase-commit, `commit == "round_end"`):
 
 1. `order = scheduler.order(r, live, derive(seed, "schedule", r))`; log `round_started`.
 2. Turns run concurrently (asyncio, `Semaphore(options.concurrency)`); each turn builds its
-   `View` (observation, last round's outcomes, pushed items when `board.delivery == "push"`,
+   `View` (observation with `private` emptied, the private dict going to `turn_started.private`
+   instead; last round's outcomes, pushed items when `board.delivery == "push"`,
    tool schemas) and awaits `participant.turn(view, AgentTools(executor, agent))`. A normal return -> `end_turn` if
    the agent called `end_turn()` during the turn, else `no_tool`; `TurnCapReached` -> `cap`; any
    other exception -> `error` (traceback in `turn_ended.error`). An exception wins over an earlier
@@ -544,7 +545,9 @@ class Runner:
             await self._turn_inner(agent, ex, round)
 
     async def _turn_inner(self, agent: AgentId, ex: RoundExecutor, round: int) -> None:
-        ex.begin_turn(agent)
+        obs = self.world.observe(agent)
+        ex.begin_turn(agent, _jsonable(obs.private))
+        obs = obs.model_copy(update={"private": {}})  # private never reaches the participant
         pushed: list[dict] = []
         if self.board.delivery == "push":
             pushed = [
@@ -552,7 +555,7 @@ class Runner:
                  "eligible_round": d.eligible_round, "content": self.board.content(d, self.blobs)}
                 for d in self.board.pushable(agent, round, self.board.push_limit)
             ]
-        view = View(round=round, agent=agent, observation=self.world.observe(agent),
+        view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
                     tools=ex.schemas(agent))
         usage: dict = {}

@@ -158,8 +158,8 @@ class RoundExecutor:
         self._st(agent).events.append(ev)
         return ev
 
-    def begin_turn(self, agent: AgentId) -> None:
-        self._ev(TurnStartedEvent, agent)
+    def begin_turn(self, agent: AgentId, private: dict | None = None) -> None:
+        self._ev(TurnStartedEvent, agent, private=dict(private or {}))
 
     def end_turn_event(
         self, agent: AgentId, yield_kind: str, usage: dict | None = None, error: str | None = None

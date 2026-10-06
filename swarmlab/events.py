@@ -67,6 +67,7 @@ class RoundStartedEvent(Event):
 
 class TurnStartedEvent(Event):
     type: Literal["turn_started"] = "turn_started"
+    private: dict = {}  # the observation's evaluator-only data, stripped from the agent's view
 
 
 class ToolCalledEvent(Event):
