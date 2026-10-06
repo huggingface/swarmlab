@@ -2,6 +2,9 @@
 # comparing a broadcast board with a gossip board.
 #   swarmlab validate examples/flaggame_m1a.yaml
 #   swarmlab run examples/flaggame_m1a.yaml --arm gossip --seed 3
+# The `llm` arm (M1b) runs 8 LLMAgents on the deterministic fake provider (`fake:reader`, no
+# network, no spend) with a belief probe every round:
+#   swarmlab run examples/flaggame_m1a.yaml --arm llm --seed 1
 name: flaggame-m1a
 budget: {soft_usd: 0, hard_usd: 0}   # scripted agents spend nothing
 options:
@@ -19,3 +22,16 @@ arms:
       - {type: evidence_aggregator, count: 16}
     medium: {topology: gossip}
     metrics: [belief.consensus, belief.accuracy, belief.entropy, comm.read_rate, comm.hops]
+  llm:
+    world: {type: flaggame, params: {n_candidates: 8, rival_edits: 1}}
+    participants:
+      - {type: llm, count: 8, params: {model: "fake:reader", max_tokens: 256}}
+    medium: {topology: broadcast}
+    metrics:
+      - belief.consensus
+      - belief.accuracy
+      - {type: belief.consensus, params: {source: "probe:belief"}}
+      - {type: belief.accuracy, params: {source: "probe:belief"}}
+    probes: [belief]
+    options: {max_rounds: 6}
+    budget: {hard_usd: 1.0, measurement_usd: 0.25}   # fake pricing (1, 5, 0.1) per M tokens
