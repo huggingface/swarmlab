@@ -10,9 +10,71 @@ A scientific testbed for finding the primitives that make heterogeneous groups o
 
 Everything that happens in a run is an **event** in one append-only, sequence-numbered log. The runner advances the world in **rounds**. By default a round is **phase-commit**: every agent's turn runs concurrently against the round-start state, and all writes commit together at round end in seeded order, so a message becomes available to its eligible recipients in the next round, for every topology and every N. Whether a recipient reads it is an experimental outcome. Replay is a fold over the log. Resume is replay-to-commit plus continue. A paired run is two runs from round 0 that differ in one declared way. Interventions and probes are events too.
 
+## Experimenter interface
+
+The scientist describes the task, the agents, how they interact, and what to measure. The framework handles tool dispatch, inference concurrency, recording, spending limits, checkpoints, replay, and result collection. Python is the first-class entrypoint; YAML and the CLI construct and execute the same object. The test of the interface is: can someone change the hypothesis without touching the execution machinery?
+
+**1. Run an existing task with built-in agents and communication.**
+```python
+from swarmlab import Experiment, Board, Budget
+from swarmlab.worlds import FlagGame
+from swarmlab.participants import EvidenceAggregator
+
+exp = Experiment(
+    name="flag-gossip",
+    world=FlagGame(n_candidates=8),
+    participants=[EvidenceAggregator()] * 16,
+    medium=Board(topology="gossip"),
+    metrics=["belief.consensus", "belief.accuracy", "comm.read_rate"],
+    budget=Budget(soft_usd=0, hard_usd=0),      # scripted agents spend nothing
+)
+run = exp.run(seed=3, max_rounds=20)
+run.score                 # final evaluator-side score
+run.metrics["belief.consensus"]   # per-round values with denominators
+run.events                # the logical event trajectory
+run.view()                # builds and returns the replay page
+run.fork(at_round=4).run()        # live fork; Run.load(path) replays from disk
+```
+
+**2. Change one scientific mechanism, here message visibility.**
+```python
+from swarmlab import Policy
+
+class OddAgentsSeeNothing(Policy):
+    def apply(self, reader, post, round):
+        if int(reader[1:]) % 2:
+            return None                      # withhold
+        return round + 1, post.text          # available next round, unchanged
+
+exp = Experiment(..., medium=Board(topology="broadcast", policies=[OddAgentsSeeNothing()]))
+```
+A policy is a function of reader, post, and round. It knows nothing about inboxes, snapshots, or the event log.
+
+**3. Implement a new task with the smallest World interface.**
+```python
+from swarmlab import World, Outcome, text_observation, tool
+
+class Counter(World):
+    def reset(self, rng, agents):
+        self.total = 0
+    def observe(self, agent):
+        return text_observation(f"total so far: {self.total}")
+    @tool("add", "Add n to the shared total", {"n": "integer"})
+    def add(self, agent, n: int) -> Outcome:
+        self.total += n
+        return Outcome(accepted=True, feedback={"added": n})
+    def score(self):
+        return {"total": self.total}
+```
+Persistence, action ordering at commit, status tools, and validation have working defaults on the base class. A world overrides `commit` only when it needs conflict semantics, and `snapshot`/`restore` only when its state is not plain Python data.
+
+Scientific extension points, and only these: **World** (information, permitted actions, dynamics, scoring), **Medium** topology and policies (who communicates under what rules), **Participant** (reasoning, memory, behaviour; a configurable built-in LLM loop ships with the framework), **Intervention** (perturb the swarm), **Metric** and **Probe** (measure outcomes and dynamics). Each is a small class with a working base implementation.
+
 ## Architecture
 
 ```
+  Experiment (Python) ◄── YAML / CLI build the same object
+      │ .run(seed, …) → Run (score · metrics · events · view · fork)
   Spec ──► Runner (Scheduler · Tool Executor) ◄── Manager (ledger · budgets · launch · publish)
              │ │ │
      World   Medium   Participants ──► Providers

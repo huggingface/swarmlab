@@ -1,5 +1,5 @@
 """What an agent sees at the start of its turn (docs/INTERFACE.md §7)."""
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -25,3 +25,7 @@ class View(BaseModel):
     outcomes: list[dict]  # this agent's action_committed feedback from the previous round
     pushed: list[dict]  # delivered inbox items when delivery == "push", else []
     tools: list[ToolSchema]
+
+
+def text_observation(text: str, **private: Any) -> Observation:
+    return Observation(parts=[Part(type="text", text=text)], private=dict(private))

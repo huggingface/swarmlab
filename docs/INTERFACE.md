@@ -1,322 +1,318 @@
 # swarmlab M1a interface contract
 
-Scope: the first working slice from DESIGN.md. Scripted participants, phase-commit runner with tool executor, event log with commit markers and per-round snapshots, board with inboxes, FlagGame text variant, replay, resume, fork, minimal viewer. No model is called in M1a. Everything here is binding for implementers; anything not here is the implementer's choice and must be documented in the module docstring.
+Scope: the first working slice from DESIGN.md. Scripted participants, phase-commit runner with tool executor, event log with commit markers and per-round snapshots, board with inboxes, FlagGame text variant, replay, resume, fork, minimal viewer, and the public `Experiment` API. No model is called in M1a. Everything here is binding for implementers; anything not here is the implementer's choice and must be documented in the module docstring.
 
-Conventions: Python 3.12, `pydantic` v2 models for all data crossing a boundary, `typing.Protocol` for plugin interfaces, `asyncio` in the runner. Rounds are 1-based; round 0 is the initial state. All randomness comes from `swarmlab.rng`, never from the global `random`.
+Conventions: Python 3.12+ (the dev env runs 3.14), `pydantic` v2 models for data crossing a boundary, abstract base classes with working defaults for plugins, `asyncio` in the runner. Rounds are 1-based; round 0 is the initial state. All randomness comes from `swarmlab.rng`, never from the global `random`.
+
+Guiding test (DESIGN.md, Experimenter interface): a scientist changes the hypothesis without touching execution machinery. Plugins are small classes; persistence, action ordering, validation, and status tools have defaults on the base classes.
+
+## 0. Public API
+
+```python
+class Experiment(BaseModel, arbitrary_types_allowed=True):
+    name: str
+    world: World
+    participants: list[Participant]          # prototypes; one fresh copy is bound per agent
+    medium: Board = Board()
+    metrics: list[str | Metric] = []
+    budget: Budget = Budget()
+    probes: list = []; interventions: list = []   # M1b
+
+    def run(self, seed: int, max_rounds: int, *, commit: Literal["round_end","immediate"] = "round_end",
+            max_calls_per_turn: int = 20, snapshot_every: int = 1, out: Path | str = "runs",
+            concurrency: int = 32) -> "Run": ...
+    def to_spec(self, seed, max_rounds, **run_options) -> RunSpec: ...   # resolved, hashable
+    @classmethod
+    def from_spec(cls, spec: RunSpec) -> "Experiment": ...                # via entry points
+    @classmethod
+    def from_yaml(cls, path, arm: str) -> "Experiment": ...
+    def to_yaml(self, path) -> None: ...
+
+class Run:
+    dir: Path; spec: RunSpec; id: RunId
+    score: dict                                 # final evaluator-side world score
+    metrics: dict[str, list[tuple[int, float | None, int]]]   # name -> [(round, value, denominator)]
+    events: Iterator[Event]                     # logical view by default; events_all for operational too
+    status: Literal["running","ended"]; end_reason: str | None
+    def view(self) -> Path: ...                 # builds view.html, returns its path
+    def fork(self, at_round: int, experiment: Experiment | None = None) -> Experiment: ...
+    def resume(self) -> "Run": ...
+    @classmethod
+    def load(cls, dir) -> "Run": ...            # replays the log; never calls plugins' mutating paths
+```
+
+`participants=[EvidenceAggregator()] * 16` is valid: the runner deep-copies each prototype per agent and calls `bind`. Every plugin instance exposes `spec() -> dict` as `{"type": <entry-point name>, "params": {...}}` built from its constructor kwargs; `to_spec` serialises the experiment from those, and `from_spec` rebuilds it through entry points. A plugin defined inline in a script (no entry point) is allowed for Python use; `to_spec` records `type` as `module:Class` and `from_spec` imports it, so identity and replay still work on the same code tree.
+
+YAML is the serialised `Experiment` plus arms: `Experiment.from_yaml(path, arm)` and the CLI build the same object and call `run`.
 
 ## 1. Package layout
 
 ```
 swarmlab/
-  __init__.py
-  ids.py           AgentId, RunId, PostId, ActionId, CallId, DeliveryId (NewType str)
-  rng.py           derive(seed, *labels) -> random.Random
-  spec.py          Experiment, Arm, RunSpec, resolve(), spec_hash()
-  events.py        Event union, EventLog
-  blobs.py         BlobStore (content-addressed)
-  tools.py         ToolSchema, ToolCall, ToolResult, ToolExecutor protocol
-  view.py          View, Observation, Part
-  world/base.py    World protocol, Action, Ack, Outcome
+  __init__.py      re-exports: Experiment, Run, Budget, Board, Policy, Topology, World, Participant,
+                   Metric, Outcome, Action, tool, text_observation
+  ids.py           AgentId, RunId, PostId, ActionId, CallId, DeliveryId         [done]
+  rng.py           derive(seed, *labels) -> random.Random                       [done]
+  base.py          Persistable mixin (pickle-based snapshot/restore), Plugin (spec())  [done]
+  spec.py          Budget, RunSpec, spec_hash(), YAML load/dump
+  events.py        Event union, EventLog, logical_view()
+  blobs.py         BlobStore
+  tools.py         ToolSchema, ToolCall, ToolResult, ToolExecutor, EndTurn, TurnCapReached  [done]
+  view.py          Part, Observation, View, text_observation()                  [done]
+  world/base.py    World base class, Action, Ack, Outcome, @tool                [done]
   world/flaggame.py
-  medium/board.py  Board, Post, Delivery, Topology, VisibilityPolicy
-  medium/topology.py  broadcast, gossip, groups
-  participants/base.py  Participant protocol, TurnUsage
+  medium/base.py   Policy, Topology base classes                                [done]
+  medium/board.py  Board, Post, Delivery, DelayPolicy
+  medium/topology.py  Broadcast, Gossip, Groups
+  participants/base.py  Participant base class, TurnUsage                       [done]
   participants/scripted.py  Silent, EvidenceAggregator, Enumerator
-  scheduler.py     Scheduler protocol, SeededShuffle
-  executor.py      RoundExecutor (the ToolExecutor implementation)
+  scheduler.py     Scheduler base, SeededShuffle
+  executor.py      RoundExecutor
   runner.py        Runner: live, replay, resume, fork
+  experiment.py    Experiment, Run
   snapshot.py      SnapshotManifest, SnapshotStore
-  metrics/base.py  Metric protocol, registry
+  metrics/base.py  Metric base class, registry                                  [done]
   metrics/belief.py, metrics/comm.py
-  viewer/build.py  run dir -> single html
+  viewer/build.py
   cli.py
 tests/
-  test_determinism.py  test_recovery.py  test_fork.py  + unit tests per module
 ```
+Files marked `[done]` exist on `main` and are the shared vocabulary; extend them only by adding, never by renaming.
 
 ## 2. Identifiers and randomness
 
-- `AgentId` is `a` + zero-padded index (`a000`). `RunId` is `<experiment>__<arm>__s<seed>`; a fork appends `__f<round>_<n>`.
-- `rng.derive(seed: int, *labels: str) -> random.Random` hashes `(seed, labels)` with SHA-256 to seed a `random.Random`. Fixed label roots: `("world",)`, `("private", agent)`, `("schedule", round)`, `("topology", round)`, `("agent", agent)`, `("scripted", agent)`. Changing one component's draws must not change another's.
+- `AgentId` is `a` + zero-padded index (`a000`). `RunId` is `<experiment>__s<seed>` for a Python-defined experiment, `<experiment>__<arm>__s<seed>` from YAML; a fork appends `__f<round>_<n>`.
+- `rng.derive(seed, *labels) -> random.Random`. Fixed label roots: `("world",)`, `("private", agent)`, `("schedule", round)`, `("topology", round)`, `("agent", agent)`, `("scripted", agent)`.
 
 ## 3. Spec
 
 ```python
 class Budget(BaseModel):
-    soft_usd: float = 0.0        # M1a: unused, carried for schema stability
-    hard_usd: float = 0.0
-    measurement_usd: float = 0.0
-
-class WorldSpec(BaseModel):   type: str; params: dict = {}
+    soft_usd: float = 0.0; hard_usd: float = 0.0; measurement_usd: float = 0.0   # M1a: recorded, not enforced
+class PluginSpec(BaseModel): type: str; params: dict = {}
 class MediumSpec(BaseModel):
-    topology: str = "broadcast"          # entry-point name
-    topology_params: dict = {}
-    delivery: Literal["pull", "push"] = "pull"
-    push_limit: int = 20                 # items pushed into the view when delivery == "push"
-    policies: list[dict] = []            # visibility policies, applied in order
-    channels: list[str] = ["main"]
-class ParticipantGroup(BaseModel):
-    count: int; type: str; role: str = "worker"; model: str | None = None; params: dict = {}
-class SchedulerSpec(BaseModel):
-    commit: Literal["round_end", "immediate"] = "round_end"
-    max_rounds: int
-    max_calls_per_turn: int = 20
-    snapshot_every: int = 1
-class Arm(BaseModel):
-    world: WorldSpec; medium: MediumSpec; participants: list[ParticipantGroup]
-    scheduler: SchedulerSpec; metrics: list[str] = []
-    probes: list[dict] = []; interventions: list[dict] = []   # M1b
-class Experiment(BaseModel):
-    name: str; seeds: list[int]; arms: dict[str, Arm]; budget: Budget = Budget()
-class RunSpec(BaseModel):     # fully resolved, one arm × one seed
-    experiment: str; arm: str; seed: int; arm_spec: Arm; budget: Budget
+    topology: PluginSpec = PluginSpec(type="broadcast")
+    delivery: Literal["pull", "push"] = "pull"; push_limit: int = 20
+    policies: list[PluginSpec] = []; channels: list[str] = ["main"]
+class RunOptions(BaseModel):
+    seed: int; max_rounds: int; commit: Literal["round_end", "immediate"] = "round_end"
+    max_calls_per_turn: int = 20; snapshot_every: int = 1; concurrency: int = 32
+class RunSpec(BaseModel):
+    experiment: str; arm: str | None = None
+    world: PluginSpec; participants: list[PluginSpec]      # one entry per agent, in agent order
+    medium: MediumSpec; metrics: list[PluginSpec]; budget: Budget; options: RunOptions
 ```
 
-`resolve(experiment: Experiment, arm: str, seed: int) -> RunSpec`. `spec_hash(run_spec) -> str` is SHA-256 of the canonical JSON (sorted keys, no whitespace). Run identity is `(git_commit, dirty, spec_hash)`; the runner records all three on `RunStarted` and archives the raw YAML to `artifacts/spec.yaml`.
-
-Participant indices are assigned in group order, so group 1's agents are `a000..`, group 2 continues.
+`spec_hash(run_spec)` is SHA-256 of canonical JSON (sorted keys, no whitespace). Run identity is `(git_commit, dirty, spec_hash)`; the runner records all three on `run_started` and archives the serialised spec to `artifacts/spec.yaml`. YAML files hold `name`, `arms: {arm: {world, participants: [{type, count, params}], medium, metrics}}`, `budget`, and `options`; `participants[].count` expands to repeated entries.
 
 ## 4. Events
 
-Every event has `seq: int` (dense, 0-based, assigned by the log on append), `run: RunId`, `round: int`, `agent: AgentId | None`, `ts: float` (wall clock, informational), `type: str`. Payload fields per type:
+Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: int`, `agent: AgentId | None`, `ts: float` (informational), `type: str`.
 
 | type | fields | when |
 |---|---|---|
-| `run_started` | `spec_hash, git_commit, dirty, seed, run_spec, parent_run, fork_round` | once |
+| `run_started` | `spec_hash, git_commit, dirty, run_spec, parent_run, fork_round` | once |
 | `round_started` | `order: list[AgentId]` | per round |
 | `turn_started` | | per agent turn |
 | `tool_called` | `call_id, tool, args` | each tool call inside a turn |
 | `tool_returned` | `call_id, result, pending: bool` | each tool return |
 | `inference_attempt` | `call_id, provider, model, request_hash, reserved_usd` | M1b; operational |
 | `inference_response` | `call_id, response_hash, usage, cost_usd, latency_s` | M1b; operational |
-| `turn_ended` | `yield_kind: Literal["no_tool","end_turn","cap","error"], calls: int, usage` | per agent turn |
-| `read` | `delivery_ids: list[DeliveryId]` | each board read, inside the turn |
+| `turn_ended` | `yield_kind: "no_tool"|"end_turn"|"cap"|"error", calls, usage` | per agent turn |
+| `read` | `delivery_ids` | each board read, inside the turn |
 | `post` | `post_id, channel, text, fields` | at commit, per accepted post |
 | `delivery` | `post_id, recipient, delivery_id, eligible_round, content_hash` | at commit, per fan-out |
-| `action_committed` | `action_id, action, accepted: bool, feedback: dict` | at commit, per buffered action |
-| `world_changed` | `payload: dict` (world-defined, opaque) | at commit, optional |
+| `action_committed` | `action_id, action, accepted, feedback` | at commit, per buffered action |
+| `world_changed` | `payload` (opaque) | at commit, optional |
 | `metric` | `name, value, denominator` | after fold, per metric |
-| `round_committed` | `n_posts, n_actions, n_deliveries` | per round, last event of the round |
+| `round_committed` | `n_posts, n_actions, n_deliveries` | last logical event of the round |
 | `snapshot` | `manifest_path` | after `round_committed`, every `snapshot_every` |
-| `run_ended` | `reason: Literal["terminal","max_rounds","soft_budget","hard_ceiling","error"]` | once |
+| `run_ended` | `reason: "terminal"|"max_rounds"|"soft_budget"|"hard_ceiling"|"error"` | once |
 
-**Logical versus operational.** `inference_attempt`, `inference_response`, and the `ts` field are operational. `logical_view(events)` strips them. Acceptance tests compare logical views.
+**Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them. Acceptance tests compare logical views.
 
-**Order rule for determinism.** Turns run concurrently in live mode, but their events are buffered per agent and appended to the log at commit in the round's seeded order, agent by agent, each agent's events in call order. Then `post`, `delivery`, `action_committed`, `world_changed`, `metric`, `round_committed`, `snapshot`. Operational events may be appended as they happen.
+**Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events may be appended as they happen.
 
-`EventLog(path)` offers `append(event) -> seq`, `__iter__`, `last_committed() -> (round, seq) | None`, `truncate_after(seq)`. Storage is one JSONL file, one event per line, fsync on `round_committed`.
+`EventLog(path)`: `append(event) -> seq`, `__iter__`, `last_committed() -> (round, seq) | None`, `truncate_after(seq)`. One JSONL file, fsync on `round_committed`.
 
 ## 5. Blobs
 
-`BlobStore(dir)`: `put(bytes) -> sha256`, `get(sha) -> bytes`. Delivered content, inference requests and responses, and snapshot plugin state live here. Events reference blobs by hash.
+`BlobStore(dir)`: `put(bytes) -> sha256`, `get(sha) -> bytes`. Delivered content, inference bodies, and snapshot plugin state live here; events reference blobs by hash.
 
-## 6. Tools
+## 6. Tools and the executor
 
-```python
-class ToolSchema(BaseModel): name: str; description: str; parameters: dict  # JSON schema
-class ToolCall(BaseModel):   call_id: CallId; name: str; args: dict
-class ToolResult(BaseModel): call_id: CallId; ok: bool; result: dict; pending: bool = False; error: str | None = None
+`ToolSchema`, `ToolCall`, `ToolResult`, `ToolExecutor`, `EndTurn`, `TurnCapReached` are in `tools.py` as shipped. The executor is the only mutation path. Namespaces: world tools from `World.tool_schemas()`; board tools `read_board(channel?, limit?)` and `post(channel, text, fields?)`; `my_status()` and `collective_status()` if the world enables them; `end_turn()` always. A call outside the agent's allowlist returns `ok=False, error="not_allowed"` and is logged.
 
-class ToolExecutor(Protocol):
-    def schemas(self, agent: AgentId) -> list[ToolSchema]: ...
-    async def call(self, agent: AgentId, name: str, args: dict) -> ToolResult: ...
-```
-
-The executor is the only mutation path. Tool namespaces: world tools come from `World.tools(agent)`; board tools are `read_board(channel?, limit?)`, `post(channel, text, fields?)`; registry tools are M3; `end_turn()` is always present. A call outside the agent's allowlist returns `ok=False, error="not_allowed"` and is logged.
-
-Under `commit == "round_end"`: `post` and world actions return `pending=True` with `{"id": ...}`; `read_board` returns eligible undelivered inbox items for this round (items whose `eligible_round <= round`), marks them read, and logs a `read` event; status tools answer from round-start state plus the agent's own buffered actions where the world supports it. Under `commit == "immediate"`: every call applies at once and returns the real outcome with `pending=False`.
+Under `commit == "round_end"`: `post` and world actions return `pending=True` with `{"id": ...}`; `read_board` returns eligible unread inbox items (`eligible_round <= round`), marks them read, logs `read`; status tools answer from round-start state. Under `commit == "immediate"`: every call applies at once and returns the real outcome with `pending=False`.
 
 ## 7. View
 
-```python
-class Part(BaseModel):  type: Literal["text", "image"]; text: str | None = None; image_png_b64: str | None = None
-class Observation(BaseModel): parts: list[Part]; private: dict = {}   # `private` is world-defined, never shared
-class View(BaseModel):
-    round: int; agent: AgentId
-    observation: Observation
-    outcomes: list[dict]            # this agent's action_committed feedback from the previous round
-    pushed: list[dict]              # delivered inbox items when delivery == "push", else []
-    tools: list[ToolSchema]
-```
+`Part`, `Observation`, `View` as shipped in `view.py`, plus `text_observation(text: str, **private) -> Observation`.
 
 ## 8. World
 
+`world/base.py` as shipped defines `Action`, `Ack`, `Outcome(accepted, feedback, action_id=None)`, the `@tool(name, description, params)` decorator, and the `World` base class:
+
 ```python
-class Action(BaseModel): name: str; args: dict
-class Ack(BaseModel):    ok: bool; error: str | None = None          # pre-commit sanity only
-class Outcome(BaseModel): action_id: ActionId; accepted: bool; feedback: dict  # agent-visible; never correctness
-
-class World(Protocol):
-    name: str
-    def reset(self, rng: random.Random, params: dict, agents: list[AgentId]) -> None: ...
-    def tools(self, agent: AgentId) -> list[ToolSchema]: ...        # world actions + enabled status tools
+class World(Persistable, Plugin):
+    # required
+    def reset(self, rng: random.Random, agents: list[AgentId]) -> None: ...
     def observe(self, agent: AgentId) -> Observation: ...
-    def validate(self, agent: AgentId, action: Action) -> Ack: ...  # no mutation
-    def commit(self, actions: list[tuple[AgentId, ActionId, Action]]) -> list[Outcome]: ...  # already in seeded order
-    def my_status(self, agent: AgentId) -> dict: ...
-    def collective_status(self) -> dict: ...
-    def score(self) -> dict: ...          # evaluator-only
-    def terminal(self) -> bool: ...
-    def verify(self) -> dict: ...         # hidden truth, evaluator-only
-    def snapshot(self) -> bytes: ...
-    def restore(self, blob: bytes) -> None: ...
+    def score(self) -> dict: ...                       # evaluator-only
+    # actions: methods decorated with @tool(name, description, params); signature (self, agent, **args) -> Outcome
+    # defaults, override when needed
+    def validate(self, agent, action) -> Ack            # checks the tool exists and args match the schema
+    def commit(self, actions: list[tuple[AgentId, ActionId, Action]]) -> list[Outcome]
+                                                        # calls the decorated method per action, in the given order
+    def my_status(self, agent) -> dict | None           # None (default) means the tool is not exposed
+    def collective_status(self) -> dict | None
+    def terminal(self) -> bool                          # False
+    def verify(self) -> dict                            # {}
+    def tool_schemas(self) -> list[ToolSchema]          # from @tool decorations plus enabled status tools
+    # snapshot()/restore() from Persistable: pickle of __dict__ minus `params`
 ```
-
-Status tools are exposed only if `params.status_tools` lists them (`["my_status", "collective_status"]` by default). Nothing returned by `tools`, `observe`, `validate`, `commit`, `my_status`, or `collective_status` may reveal correctness; `score` and `verify` are called only by the runner.
+Constructor kwargs are stored on `self.params` and returned by `spec()`. Nothing returned by `observe`, `validate`, `commit`, status tools, or tool schemas may reveal correctness; `score` and `verify` are called only by the runner.
 
 ### FlagGame (text variant)
 
-Params with defaults: `height=8, width=12, palette=6, n_candidates=8, rival_similarity=0.85, crop_h=3, crop_w=4, candidate_names="letters"` (`A..H`), `status_tools=["my_status","collective_status"]`, `guess_limit=None`.
+Constructor kwargs with defaults: `height=8, width=12, palette=6, n_candidates=8, rival_similarity=0.85, crop_h=3, crop_w=4, candidate_names="letters"`, `status_tools=("my_status","collective_status")`, `guess_limit=None`.
 
-- `reset` draws the truth flag from `("world",)` as a structured colour grid (horizontal or vertical stripes, or blocks), the rival by copying the truth and recolouring a `1 - rival_similarity` fraction of cells, and distractors as fresh structured flags. Candidates are shuffled and named; the mapping is hidden state. Each agent's crop is a random `crop_h × crop_w` window from `("private", agent)`.
-- `observe` returns one text part: the candidate list (name plus full grid rendered as rows of colour letters) and the agent's crop rendered the same way with its position withheld. The `private` dict holds the crop coordinates for the evaluator.
-- Tools: `guess(candidate: str)`. `validate` checks the name exists and the guess limit. `commit` records the latest guess per agent; `Outcome.feedback` is `{"recorded": true}` only.
-- `my_status` → `{"current_guess": str | None, "guesses_made": int}`. `collective_status` → `{"guess_counts": {name: int}, "agents_with_guess": int}`.
-- `terminal` is always False; the run ends on `max_rounds`.
-- `score` → `{"accuracy": share of live agents whose latest guess is the truth, "n_guessed": int, "truth": name}`. `verify` → `{"truth": name, "rival": name, "candidates": ..., "crops": {agent: (y, x)}}`.
+- `reset` draws the truth flag from `("world",)` as a structured colour grid (stripes or blocks), the rival by recolouring a `1 - rival_similarity` fraction of the truth's cells, distractors as fresh structured flags; candidates are shuffled and named, the mapping is hidden. Each agent's crop is a random `crop_h × crop_w` window from `("private", agent)`.
+- `observe`: one text part with the named candidate grids and the agent's crop rendered the same way, position withheld; `private` holds the crop coordinates.
+- `@tool("guess", ...)`: records the latest guess; `Outcome.feedback == {"recorded": True}`. Guess limit enforced in `validate`.
+- `my_status` → `{"current_guess", "guesses_made"}`; `collective_status` → `{"guess_counts", "agents_with_guess"}`. Both return `None` when disabled via `status_tools`.
+- `terminal` is False; `score` → `{"accuracy", "n_guessed", "truth"}`; `verify` → truth, rival, candidates, crop positions.
 
-## 9. Medium: board, inboxes, topology, policies
+## 9. Medium
+
+`medium/base.py` as shipped:
 
 ```python
-class Post(BaseModel):     post_id: PostId; round: int; agent: AgentId; channel: str; text: str; fields: dict = {}
-class Delivery(BaseModel): delivery_id: DeliveryId; post_id: PostId; recipient: AgentId; eligible_round: int; content_hash: str; read_round: int | None = None
-
-class Topology(Protocol):
-    def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]: ...
-class VisibilityPolicy(Protocol):
-    def apply(self, reader: AgentId, post: Post, round: int) -> tuple[int, str] | None: ...
-    # returns (eligible_round, content) or None to withhold
-
-class Board:
-    def buffer_post(self, agent, round, channel, text, fields) -> PostId
-    def commit(self, round, agents, topology, policies, rng) -> tuple[list[Post], list[Delivery]]
-    def read(self, agent, round, channel=None, limit=50) -> list[Delivery]   # eligible, unread; marks read_round
-    def pushable(self, agent, round, limit) -> list[Delivery]             # same set, for push delivery
-    def snapshot(self) -> bytes ; def restore(self, blob) -> None
+class Policy(Persistable, Plugin):
+    def apply(self, reader: AgentId, post: "Post", round: int) -> tuple[int, str] | None:
+        return round + 1, post.text          # default: available next round, unchanged
+class Topology(Persistable, Plugin):
+    def recipients(self, post: "Post", agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
+        return [a for a in agents if a != post.agent]   # default: broadcast
 ```
 
-`commit` turns buffered posts into `Post` records in seeded order, computes recipients per topology (the author is never a recipient), applies policies in order (the first policy returning `None` withholds; otherwise the last transformed content and the maximum eligible round win), stores content in the blob store, and creates one `Delivery` per recipient. The default eligible round is `round + 1`. Deliveries are the medium's inboxes; a global cursor does not exist.
-
-Topologies in M1a: `broadcast` (all agents), `gossip(k=1)` (per round, each agent's posts go to `k` partners drawn from `("topology", round)`; the schedule is a pure function of the seed), `groups(size)` (fixed groups by index). Policy in M1a: `delay(rounds, readers=None)` sets `eligible_round = round + 1 + rounds`. Policies are entry points so M1b can add transforms.
+`medium/board.py`:
+```python
+class Post(BaseModel):     post_id, round, agent, channel, text, fields: dict = {}
+class Delivery(BaseModel): delivery_id, post_id, recipient, eligible_round, content_hash, read_round: int | None = None
+class Board(Persistable, Plugin):
+    def __init__(self, topology: str | Topology = "broadcast", delivery="pull", push_limit=20,
+                 policies: list[Policy] = (), channels=("main",)) ...
+    def buffer_post(self, agent, round, channel, text, fields) -> PostId
+    def commit(self, round, agents, rng, blobs) -> tuple[list[Post], list[Delivery]]
+    def read(self, agent, round, channel=None, limit=50) -> list[Delivery]    # eligible, unread; marks read_round
+    def pushable(self, agent, round, limit) -> list[Delivery]
+```
+`commit` turns buffered posts into `Post` records in seeded order, computes recipients (author never included), applies policies in order (the first returning `None` withholds; otherwise the last content and the maximum eligible round win), stores content in blobs, creates one `Delivery` per recipient. There is no global cursor. Topologies: `Broadcast`, `Gossip(k=1)` (per round each agent's posts go to `k` partners from `("topology", round)`), `Groups(size)`. Policy: `DelayPolicy(rounds, readers=None)`. Under `commit == "immediate"` the default eligible round is `round`.
 
 ## 10. Participants
 
+`participants/base.py` as shipped:
 ```python
-class TurnUsage(BaseModel): calls: int = 0; prompt_tokens: int = 0; completion_tokens: int = 0; cost_usd: float = 0.0
-class Participant(Protocol):
-    def bind(self, agent: AgentId, rng: random.Random, params: dict) -> None: ...
-    async def turn(self, view: View, tools: ToolExecutor) -> TurnUsage: ...
-    def snapshot(self) -> bytes: ...
-    def restore(self, blob: bytes) -> None: ...
+class TurnUsage(BaseModel): calls=0; prompt_tokens=0; completion_tokens=0; cost_usd=0.0
+class Participant(Persistable, Plugin):
+    agent: AgentId; rng: random.Random
+    def bind(self, agent, rng) -> None            # default stores both; override to add state
+    async def turn(self, view: View, tools: ToolExecutor) -> TurnUsage: ...   # required
 ```
+A turn ends when `turn` returns, or the executor raises `TurnCapReached` or `EndTurn`; `yield_kind` is recorded accordingly (`end_turn`, `cap`, `error`, else `no_tool`).
 
-A turn ends when `turn` returns or when the executor raises `TurnCapReached` after `max_calls_per_turn` tool calls or `EndTurn` after `end_turn()`. The runner records `yield_kind` as `end_turn` if `end_turn()` was called, `cap` on the cap, `error` on an exception, else `no_tool`.
-
-Scripted participants in M1a, all in `participants/scripted.py`:
-- `Silent`: round 1 guesses the candidate whose grid contains its crop (ties broken by rng); never posts or reads; `end_turn()`.
-- `EvidenceAggregator`: round 1 posts `"crop: <rows>"`; every round reads the board, collects all crops seen, guesses the candidate consistent with the most crops (ties by rng); `end_turn()`.
-- `Enumerator`: cycles through candidates one guess per round, reads `my_status` and `collective_status` every round, and raises if any tool result or view field ever contains the strings `"correct"`, `"truth"`, or the truth name supplied out of band by the test. Used only by the isolation test.
+Scripted participants in M1a: `Silent` (round 1 guesses the candidate containing its crop, never posts or reads, `end_turn`), `EvidenceAggregator` (round 1 posts `"crop: <rows>"`; every round reads the board, pools crops, guesses the most consistent candidate, `end_turn`), `Enumerator` (cycles candidates, reads both status tools, raises if any tool result or view field contains `"correct"`, `"truth"`, or the truth name supplied out of band by the test).
 
 ## 11. Scheduler
 
 ```python
-class Scheduler(Protocol):
-    def order(self, round: int, live: list[AgentId], rng: random.Random) -> list[AgentId]: ...
+class Scheduler(Persistable, Plugin):
+    def order(self, round, live, rng) -> list[AgentId]: ...
+class SeededShuffle(Scheduler)   # shuffles live with ("schedule", round)
 ```
-`SeededShuffle` shuffles `live` with `("schedule", round)`. The commit policy lives on the runner, read from `SchedulerSpec.commit`.
+The commit policy is a run option read by the runner.
 
 ## 12. Runner
 
-`Runner(run_dir, run_spec)` builds plugins from entry points, then executes one of:
-
-- `live()`: rounds until `terminal`, `max_rounds`, or budget. 
-- `replay()`: iterates the log, feeds every event to metrics and the viewer builder, calls no plugin method that mutates; verifies that the final `score` recomputed from snapshots equals the recorded one.
-- `resume()`: `recover()` then `live()`.
-- `fork(at_round, new_run_spec=None)`: new run dir, `run_started` with `parent_run` and `fork_round`, copy snapshot `at_round` and the log prefix up to that round's `round_committed`, then `live()` under the new spec.
+`Runner(run_dir, experiment, options)` executes `live()`, `replay()`, `resume()`, `fork(at_round, experiment=None)` exactly as specified below. `Experiment.run` and `Run` wrap it; nothing else calls it.
 
 Phase-commit round `r`:
-
 ```
-order = scheduler.order(r, live, derive(seed, "schedule", r));  log round_started(order)
-for each agent concurrently (bounded by a semaphore from params.concurrency, default 32):
+order = scheduler.order(r, live, derive(seed,"schedule",r)); log round_started(order)
+for each agent concurrently (semaphore = options.concurrency):
     view = View(r, agent, world.observe(agent), outcomes_prev[agent], board.pushable(...) if push else [], executor.schemas(agent))
-    run participant.turn(view, executor) with per-agent event buffer; executor buffers posts and actions
+    run participant.turn(view, executor) with a per-agent event buffer; executor buffers posts and actions
 append each agent's buffered events in `order`
-posts, deliveries = board.commit(r, agents, topology, policies, derive(seed, "topology", r)); log post*, delivery*
-outcomes = world.commit(actions in `order`, each agent's actions in call order); log action_committed*; outcomes_prev = by agent
-log world_changed? ; fold metrics; log metric*
+posts, deliveries = board.commit(r, agents, derive(seed,"topology",r), blobs); log post*, delivery*
+outcomes = world.commit(actions in `order`, each agent's in call order); log action_committed*; outcomes_prev = by agent
+fold metrics on this round's logical events; log metric*
 log round_committed; if r % snapshot_every == 0: write snapshot; log snapshot
 ```
+Sequential (`immediate`): agents run one at a time in `order`; every tool call applies immediately through single-item `board.commit` / `world.commit`; `read_board` sees deliveries with `eligible_round <= r` including same-round posts.
 
-Sequential (`immediate`) round: same, but agents run one at a time in `order`, every tool call applies immediately through `board.commit`/`world.commit` of a single-item list, and `read_board` sees deliveries whose `eligible_round <= r` including same-round posts (default policy under `immediate` sets `eligible_round = round`).
+`recover()`: `last_committed()`; `truncate_after(seq)`; load the latest snapshot with `round <= committed`; if older than the last commit, replay logical events between them into plugins (M1a may require `snapshot_every == 1` and document it). Operational events from the discarded round go to `discarded.jsonl`.
 
-`recover()`: find `last_committed()`; `truncate_after(seq)`; load the latest snapshot with `round <= committed round`; if the snapshot is older than the last commit, replay the logical events between them into plugins (M1a may assert `snapshot_every == 1` and skip this path, documenting it). Operational events from the discarded round stay in a sidecar `discarded.jsonl` so spend is retained for accounting.
+`fork(at_round, experiment)`: new run dir, `run_started` with `parent_run` and `fork_round`, copy snapshot `at_round` and the log prefix up to that round's `round_committed`, continue live under the (possibly new) experiment.
 
 ## 13. Snapshot
 
 ```python
 class SnapshotManifest(BaseModel):
-    run: RunId; round: int; log_seq: int   # seq of the round_committed event
-    plugins: dict[str, str]                # "world" | "board" | f"participant:{agent}" | "scheduler" | "metrics" -> blob sha
-    outcomes_prev: dict[AgentId, list[dict]]
-    live: list[AgentId]
+    run: RunId; round: int; log_seq: int
+    plugins: dict[str, str]       # "world" | "board" | "scheduler" | f"participant:{agent}" | f"metric:{name}" -> blob sha
+    outcomes_prev: dict[AgentId, list[dict]]; live: list[AgentId]
 ```
-`SnapshotStore(run_dir)`: `write(manifest, blobs) -> path`, `latest(max_round=None) -> SnapshotManifest | None`, `load(manifest) -> dict[str, bytes]`. Manifests at `snapshots/<round:06d>.json`.
+`SnapshotStore(run_dir)`: `write(manifest, blobs) -> path`, `latest(max_round=None)`, `load(manifest) -> dict[str, bytes]`. Manifests at `snapshots/<round:06d>.json`. Plugins never see the manifest; they only implement `snapshot()`/`restore()`, which `Persistable` provides by default.
 
 ## 14. Metrics
 
+`metrics/base.py` as shipped:
 ```python
-class Metric(Protocol):
+class Metric(Persistable, Plugin):
     name: str
-    def update(self, event: Event) -> None: ...
-    def value(self) -> tuple[float | None, int]:  ...   # (value, denominator)
-    def snapshot(self) -> bytes ; def restore(self, blob) -> None
+    def update(self, event: Event) -> None: ...                  # required
+    def value(self) -> tuple[float | None, int]: ...             # (value, denominator); required
+    def needs_truth(self) -> bool: return False                  # runner injects world.verify() via set_truth
+    def set_truth(self, truth: dict) -> None: ...
+registry: get(name) -> Metric via entry points; Metric.from_fn(name, fn) for one-liners
 ```
-M1a metrics, fed only logical events: `belief.accuracy` (needs truth; the runner injects `verify()` into belief metrics at reset, never into events agents can see), `belief.consensus`, `belief.polarization(threshold=0.2)`, `belief.entropy`, `comm.read_rate` (share of turns with at least one `read`), `comm.posts_per_round`, `comm.hops` (per post: rounds from commit to first read, averaged). Denominator is live agents with a committed guess for belief metrics, or turns for comm metrics.
+M1a metrics: `belief.accuracy` (needs truth), `belief.consensus`, `belief.polarization(threshold=0.2)`, `belief.entropy`, `comm.read_rate`, `comm.posts_per_round`, `comm.hops`. Denominators: live agents with a committed guess for belief metrics, turns for comm metrics.
 
 ## 15. Run directory
 
 ```
-runs/<run_id>/
-  run.json          RunSpec + identity + status (updated at each commit)
-  events.jsonl      the log
-  discarded.jsonl   operational events from recovered rounds
-  blobs/<sha>
-  snapshots/<round>.json
-  artifacts/spec.yaml, git.txt, lock.txt
-  view.html         produced by `viewer.build`
+runs/<run_id>/  run.json  events.jsonl  discarded.jsonl  blobs/<sha>  snapshots/<round>.json  artifacts/{spec.yaml,git.txt,lock.txt}  view.html
 ```
 
 ## 16. CLI (M1a subset)
 
 ```
 swarmlab validate spec.yaml
-swarmlab run spec.yaml --arm A --seed 1 [--out runs/]
-swarmlab replay RUN_DIR
-swarmlab resume RUN_DIR
-swarmlab fork RUN_DIR --at R [--spec edited.yaml] [--out runs/]
-swarmlab view RUN_DIR
+swarmlab run spec.yaml --arm A --seed 1 [--max-rounds N] [--out runs/]
+swarmlab replay RUN_DIR | resume RUN_DIR | fork RUN_DIR --at R [--spec edited.yaml] | view RUN_DIR
 ```
-All commands accept `--json` and print a single JSON object on stdout; exit code 0 on success, 2 on validation error, 1 otherwise.
+`--json` on every command; exit 0 success, 2 validation error, 1 otherwise. The CLI builds an `Experiment` and calls the same `run`/`Run` API as Python.
 
 ## 17. Viewer (minimal)
 
-`viewer.build(run_dir) -> view.html`: a single self-contained page with a round slider; per round, the Flag Game candidate grids and each agent's current guess, the board as committed that round, each agent's inbox with delivered content and read marks, and the per-agent event list for the round. Built from the log and snapshots only. Vanilla JS, no external requests.
+`viewer.build(run_dir) -> view.html`: self-contained page with a round slider; per round the Flag Game candidate grids and each agent's current guess, the board as committed, each agent's inbox with delivered content and read marks, and the per-agent event list. Built from the log and snapshots only. Vanilla JS, no external requests.
 
 ## 18. Acceptance tests
 
-1. **Determinism**: two `live()` runs of the same `RunSpec` into different dirs produce identical `logical_view` sequences and identical final `score()`.
-2. **Recovery**: run to round 6; kill the process (SIGKILL from the test harness) during round 7 after at least one agent's turn; `resume()`; the logical view and final score equal an uninterrupted run; `discarded.jsonl` holds the partial round's operational events.
-3. **Fork**: `fork(at_round=4)` with the same spec reproduces rounds 1 to 4 of the parent exactly in the logical view and the snapshot at 4 is byte-identical to the parent's; rounds after 4 run live.
+1. **Determinism**: two `exp.run(seed=…)` of the same experiment into different dirs produce identical `logical_view` sequences and identical `score`.
+2. **Recovery**: run to round 6; SIGKILL during round 7 after at least one turn; `Run.load(dir).resume()`; logical view and score equal an uninterrupted run; `discarded.jsonl` holds the partial round's operational events.
+3. **Fork**: `run.fork(at_round=4).run()` reproduces rounds 1 to 4 of the parent exactly in the logical view, the snapshot at 4 is byte-identical, rounds after 4 run live.
+4. **API**: the three examples in DESIGN.md's Experimenter interface run as written (with `Counter` and `OddAgentsSeeNothing` as test fixtures) and round-trip through `to_spec`/`from_spec`.
 
-Unit tests must cover: `rng.derive` independence, spec hashing, board commit with each topology and the delay policy, FlagGame rival and crop generation, the executor's pending semantics, log truncation, and the Enumerator never seeing correctness in a 20-round run.
+Unit tests must cover: `rng.derive` independence, spec hashing and YAML round-trip, board commit with each topology and the delay policy, FlagGame rival and crop generation, executor pending semantics, log truncation, `Persistable` round-trip, the `@tool` decorator and default `commit`, and the Enumerator never seeing correctness in a 20-round run.
 
 ## 19. Work packages
 
-- **WP1 core**: `ids, rng, spec, events, blobs, snapshot` plus their unit tests.
-- **WP2 world**: `world/base, world/flaggame` plus tests.
-- **WP3 medium**: `medium/board, medium/topology`, policies, plus tests.
-- **WP4 runner**: `tools, view, executor, scheduler, runner, participants/base, participants/scripted, metrics/*` plus the three acceptance tests.
-- **WP5 surface**: `cli, viewer/build`, README, example spec `examples/flaggame_m1a.yaml`.
+- **WP1 core**: `spec.py, events.py, blobs.py, snapshot.py` plus unit tests (incl. `rng`, `ids`, `base`).
+- **WP2 world**: `world/flaggame.py` plus tests; may add helpers to `world/base.py` without changing shipped names.
+- **WP3 medium**: `medium/board.py, medium/topology.py` plus tests.
+- **WP4 runner and API**: `scheduler.py, executor.py, runner.py, experiment.py, participants/scripted.py, metrics/belief.py, metrics/comm.py` plus the four acceptance tests.
+- **WP5 surface**: `cli.py, viewer/build.py`, README, `examples/flaggame_m1a.yaml`, `examples/*.py` mirroring the three DESIGN examples.
 
-WP1 to WP3 are independent and start together against this document. WP4 starts when WP1 lands and stubs WP2 and WP3 until they land. WP5 starts after WP4.
+WP1 to WP3 start together against this document and the shipped base files. WP4 starts when WP1 lands and stubs WP2 and WP3 until they land. WP5 after WP4.
