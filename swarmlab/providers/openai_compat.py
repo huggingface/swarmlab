@@ -1,12 +1,21 @@
 """OpenAICompatProvider: chat-completions over `httpx.AsyncClient` (docs/INTERFACE-M1b.md §1).
 
 `OpenAICompatProvider(name, base_url=None, api_key_env=None, pricing=None, concurrency=8,
-timeout_s=90.0, max_retries=2)`. Presets (`preset(name, **overrides)`): `hf`
+timeout_s=90.0, max_retries=2, self_hosted=None)`. Presets (`preset(name, **overrides)`): `hf`
 (`https://router.huggingface.co/v1`, `HF_TOKEN`), `openai` (`https://api.openai.com/v1`, `OPENAI_API_KEY`), `vllm` (`base_url`
 required, no key). A preset's `base_url`/`api_key_env` fill in when not given explicitly, so
 `OpenAICompatProvider("hf", pricing={...})` is the HF router with prices. Presets ship with an
 empty pricing table: open-model prices vary by served provider, so the experimenter supplies them
 (an unpriced model is an error at `Experiment` construction).
+
+Self-hosted serving (WP8, HF Jobs): `self_hosted` marks a provider whose calls are paid as compute
+time (a GPU job running vLLM), not per token. `None` (the default) means "self-hosted iff the
+name is `vllm`". A self-hosted provider is normally priced `(0, 0, 0)`, so the ledger shows $0
+while still counting calls and tokens; reports label that $0 as compute-time
+(`Run.summary()["self_hosted"]`). The flag is a constructor kwarg, so it is recorded in the run
+spec (`providers.<prefix>.params.self_hosted`; left out when None, so older spec hashes hold). `served_by` falls back to the provider name
+(`"vllm"`) when the server sends no `x-inference-provider` header and the provider is
+self-hosted.
 
 Mapping:
 
@@ -142,8 +151,12 @@ class OpenAICompatProvider(Provider):
 
     def __init__(self, name: str, base_url: str | None = None, api_key_env: str | None = None,
                  pricing: dict | None = None, concurrency: int = 8,
-                 timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES) -> None:
+                 timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES,
+                 self_hosted: bool | None = None) -> None:
         preset = PRESETS.get(name, {})
+        self.self_hosted = (name == "vllm") if self_hosted is None else bool(self_hosted)
+        if self_hosted is None:  # keep pre-WP8 specs (and their spec_hash) unchanged
+            getattr(self, "params", {}).pop("self_hosted", None)
         self.name = name
         self.base_url = (base_url or preset.get("base_url") or "").rstrip("/")
         if not self.base_url:
@@ -201,7 +214,8 @@ class OpenAICompatProvider(Provider):
         return ChatResponse(
             text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage),
             provider=self.name, model=model_id(request),
-            served_by=resp.headers.get("x-inference-provider"),
+            served_by=resp.headers.get("x-inference-provider")
+            or (self.name if self.self_hosted else None),
             latency_s=time.monotonic() - start, finish_reason=finish,
             attempts=attempt + 1, retried_after_timeout=timed_out,
         )

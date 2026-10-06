@@ -155,6 +155,7 @@ class Provider(Plugin):
     concurrency: int = 8
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_retries: int = DEFAULT_MAX_RETRIES
+    self_hosted: bool = False  # paid as compute time (e.g. vLLM in a GPU job), not per token
     default_pricing: ClassVar[dict[str, PricingRow]] = {}
     _backoff_s: float = 1.0
 

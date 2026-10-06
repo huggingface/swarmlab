@@ -66,7 +66,8 @@ Decisions where the contract is silent:
   `total_usd_flat` accompanies `total_usd` when `seeds` is given.
 - `Run.summary()` is the CLI's run summary: run_dir, run_id, arm, seed, spec_hash, status,
   end_reason, last_round, score, metrics (last value per name), spend (+ parent_run/fork_round
-  for a fork). `Run.load(dir, run_id=None)` accepts a run dir, or a parent dir plus run id.
+  for a fork; + `self_hosted`: the model prefixes served self-hosted, e.g. `["vllm"]`, only when
+  there are any, so a $0 spend reads as compute time, not free). `Run.load(dir, run_id=None)` accepts a run dir, or a parent dir plus run id.
 """
 from __future__ import annotations
 
@@ -464,6 +465,9 @@ class Run:
             "metrics": metrics,
             "spend": self.spend,
         }
+        hosted = self_hosted_prefixes((meta.get("spec") or {}).get("providers") or {})
+        if hosted:
+            out["self_hosted"] = hosted
         if meta.get("parent_run"):
             out["parent_run"] = meta["parent_run"]
             out["fork_round"] = meta.get("fork_round")
@@ -471,6 +475,18 @@ class Run:
 
     def __repr__(self) -> str:
         return f"Run({self.id!r}, status={self.status!r}, dir={str(self.dir)!r})"
+
+
+def self_hosted_prefixes(providers: dict) -> list[str]:
+    """Model prefixes whose provider spec is self-hosted (`params.self_hosted`, or an
+    OpenAI-compatible provider named `vllm` that does not say otherwise)."""
+    out = []
+    for prefix, spec in providers.items():
+        params = (spec or {}).get("params") or {}
+        flag = params.get("self_hosted")
+        if flag is True or (flag is None and params.get("name") == "vllm"):
+            out.append(prefix)
+    return sorted(out)
 
 
 def participant_model(p: Any) -> str | None:

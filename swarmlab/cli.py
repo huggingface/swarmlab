@@ -109,7 +109,7 @@ def _human(data: dict[str, Any]) -> str:
     if data["metrics"]:
         lines.append("  metrics " + ", ".join(
             f"{k}={_fmt(m['value'])}" for k, m in data["metrics"].items()))
-    for key in ("parent_run", "fork_round", "replay", "view", "skipped"):
+    for key in ("parent_run", "fork_round", "replay", "view", "skipped", "self_hosted"):
         if key in data:
             lines.append(f"  {key} {data[key]}")
     return "\n".join(lines)
@@ -217,9 +217,12 @@ def _table(rows: list[dict[str, Any]]) -> str:
     for r in rows:
         spend = r.get("spend") or {}
         total = (spend.get("swarm") or 0) + (spend.get("measurement") or 0) if spend else None
+        money = _usd(total)
+        if r.get("self_hosted"):
+            money += " +compute (self-hosted)"
         body.append((r.get("run_id") or "?", r["outcome"], str(r.get("end_reason") or "-"),
                      _score_text(r.get("score")) if r["outcome"] != "failed" else r.get("error", ""),
-                     _usd(total)))
+                     money))
     widths = [max(len(h), *(len(b[i]) for b in body)) for i, h in enumerate(head)]
     widths[3] = min(widths[3], 60)
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)

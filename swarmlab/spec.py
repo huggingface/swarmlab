@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Literal
@@ -320,7 +321,9 @@ def load_runspec_yaml(path: Path | str) -> RunSpec:
 def git_identity(repo_dir: Path | str = ".") -> tuple[str, bool]:
     """(HEAD commit sha, dirty) for the git work tree containing `repo_dir`.
 
-    Returns ("unknown", True) when `repo_dir` is not inside a git repository or git is missing.
+    Returns ("unknown", True) when `repo_dir` is not inside a git repository or git is missing,
+    unless `SWARMLAB_GIT_COMMIT` is set (an installed wheel, e.g. inside an HF Job: the launcher
+    records the commit it built from; `SWARMLAB_GIT_DIRTY=1` marks a dirty build).
     Dirty means tracked files differ from HEAD (untracked files are ignored).
     """
 
@@ -336,5 +339,8 @@ def git_identity(repo_dir: Path | str = ".") -> tuple[str, bool]:
         commit = git("rev-parse", "HEAD").strip()
         dirty = bool(git("status", "--porcelain", "--untracked-files=no").strip())
     except (OSError, subprocess.CalledProcessError):
+        env_commit = os.environ.get("SWARMLAB_GIT_COMMIT", "").strip()
+        if env_commit:
+            return env_commit, os.environ.get("SWARMLAB_GIT_DIRTY", "1").strip() not in ("0", "")
         return "unknown", True
     return commit, dirty

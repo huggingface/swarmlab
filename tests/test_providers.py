@@ -541,3 +541,41 @@ async def test_fake_scripted_escape_hatch_and_model_named_script():
     assert flaggame_reader(r, random.Random(0)).tool_calls == []  # nothing offered, no listing
     with pytest.raises(ValueError):
         await FakeProvider().complete(r.model_copy(update={"model": "fake:no_such_script"}))
+
+
+async def test_vllm_self_hosted_zero_price_served_by():
+    """WP8: the vllm preset is self-hosted by default, prices at zero cleanly and records
+    served_by="vllm" when the server sends no x-inference-provider header."""
+
+    def handler(request: httpx.Request):
+        assert str(request.url) == "http://127.0.0.1:8000/v1/chat/completions"
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json=completion({"content": "hi"}))
+
+    p = OpenAICompatProvider("vllm", base_url="http://127.0.0.1:8000/v1",
+                             pricing={"Qwen/Qwen3.5-9B": (0, 0, 0)}, self_hosted=True)
+    p._transport = httpx.MockTransport(handler)
+    r = req(model="vllm:Qwen/Qwen3.5-9B", max_tokens=2048)
+    resp = await p.complete(r)
+    assert p.self_hosted and resp.served_by == "vllm"
+    assert resp.cost_usd == 0.0 and p.max_cost(r) == 0.0
+    assert resp.usage.prompt_tokens == 80 and resp.usage.completion_tokens == 10
+    assert p.spec()["params"]["self_hosted"] is True
+
+
+def test_self_hosted_default_keeps_spec_params():
+    """self_hosted=None is left out of params, so pre-WP8 provider specs hash the same."""
+    hf = OpenAICompatProvider("hf", pricing={"m": (1, 2, 0.5)})
+    assert "self_hosted" not in hf.spec()["params"] and hf.self_hosted is False
+    vllm = OpenAICompatProvider("vllm", base_url="http://x/v1")
+    assert "self_hosted" not in vllm.spec()["params"] and vllm.self_hosted is True
+    assert OpenAICompatProvider("openai", self_hosted=True).self_hosted is True
+
+
+async def test_router_served_by_not_overridden_when_not_self_hosted():
+    def handler(request: httpx.Request):
+        return httpx.Response(200, json=completion({"content": "x"}))
+
+    p = compat(handler)
+    resp = await p.complete(req(model="hf:m"))
+    assert resp.served_by is None
