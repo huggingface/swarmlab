@@ -134,3 +134,63 @@ Where the viewer finds state per round r:
 - For a fork, rounds up to `fork_round` (in `run.json`) are the parent's copied events; their `run`
   field names the parent.
 - `run.json` has the final score and the status.
+
+## Post-review changes (2026-10-06, `docs/notes/m1a-review-2026-10-06.md`)
+
+One commit per finding on branch `fix-m1a-review`.
+
+- **A2 identity.** `Plugin.type_name()` honours `entry_point` only from `cls.__dict__`. Subclasses of
+  registered plugins serialise as `module:Class`, and `tests/helpers.py` no longer sets
+  `entry_point = None`. `Persistable.snapshot()` skips `params` and every `_`-prefixed attribute.
+- **B1 AgentTools.** `participant.turn(view, tools)` now gets `swarmlab.tools.AgentTools(executor,
+  agent)`, which exposes `agent`, `schemas()` and `call(name, args)` only. The executor is held in a
+  name-mangled slot; the handle has no `__dict__`. Participants call `tools.call("guess", {...})`.
+  The `RoundExecutor` API (`ex.call(agent, ...)`) is unchanged and runner-internal.
+- **A4 end_turn.** `end_turn` sets a per-agent flag (`RoundExecutor.turn_ended(agent)`) and returns
+  `ok=True`. Later calls are logged and return `ok=False, error="turn_ended"`. The cap is checked
+  first, so a loop after `end_turn` still ends as `cap`. Yield kinds:
+  - `cap` on `TurnCapReached`.
+  - `error` on any other exception. An exception wins over an earlier `end_turn`.
+  - On a normal return, `end_turn` if the flag is set, else `no_tool`. The returned `TurnUsage` is
+    kept in both cases.
+  `EndTurn` is still defined but is never raised. The scripted participants now return real
+  `TurnUsage(calls=...)`.
+- **A5 private.** The runner observes first, logs `turn_started.private`, and gives the participant
+  a copy of the observation with `private={}`. The viewer reads crops from the world snapshot, so
+  it needed no change.
+- **A1 FlagGame.** Candidates are `n_candidates // 2` twin pairs (`rival_edits`, default 1, whole
+  bands recoloured). `n_candidates` must be even and `palette >= 3`. See WP2.md.
+  - The crop-free heuristic now scores about chance (`test_no_crop_free_shortcut`).
+  - With 16 pooled crops the truth is unique in about 95% of seeds (it was about 90% before). In
+    the other seeds a candidate from another pair contains every crop, because crops carry no
+    position. Seed 11 of `flaggame_m1a.yaml` is such a seed: broadcast accuracy there is 0.625,
+    not 1.0.
+- **B2 belief.** `Metric.set_agents(agents)` is a no-op by default. The runner calls it after reset
+  and restore, and at round start whenever `live_agents` changed. Replay calls it at start and
+  whenever `round_started.order` changes the live set. The belief denominator is all live agents,
+  with `"none"` for agents that have not guessed. `belief.accuracy` equals `score()["accuracy"]`
+  every round.
+- **B3 operational events.** `Runner.log_operational(event)` appends `inference_attempt` and
+  `inference_response` straight to the log, bypassing the per-agent buffer. It raises for any
+  other type. M1b's `tools.infer` should call it.
+- **B4 post ids.** `post.provisional_id` is the id the author's ack returned: `tmp-<agent>-<n>`
+  under round_end, equal to `post_id` under immediate. The executor keeps
+  `buffered_post_ids(agent)` parallel to `buffered_posts(agent)`. The viewer shows
+  `(ack tmp-...)` next to the post id.
+- **D2 run.json first.** `live()` now writes `run.json`, then `run_started`. On `resume()` of a
+  directory whose log has no `run_started`, the runner moves any stray events to
+  `discarded.jsonl`, appends `run_started` and starts from round 1.
+- **C2.**
+  - Inside a running event loop, `live()` and `resume()` run the round loop with `asyncio.run` in
+    a worker thread and block until it finishes.
+  - Re-running into a directory that holds a different `spec_hash` raises a `FileExistsError` that
+    names both hashes.
+- **A6 comm.hops.** A read feeds a post only if it came before the post call. The cut is the
+  author's read count at the `post` `tool_called`, linked through the ack id to
+  `post.provisional_id`. A read also counts only if `eligible_round <= read round`. The value is
+  the running max, and the denominator is the number of posts read at least once.
+  - The reviewer's post-then-read case (3 agents, broadcast, round_end) gives `[1, 1, 2, 2, 3]`,
+    not the `[1, 1, 2, 3, 4]` in the review. A round-r post reflects only reads from rounds before
+    r, and it is first readable in round r+1, so each hop costs two rounds. The test docstring
+    walks through the chain.
+  - Read-then-post gives `[1, 2, 3, 4, 5]`.
