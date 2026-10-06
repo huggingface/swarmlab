@@ -100,7 +100,10 @@ swarmlab estimate SPEC [--arm A] [--seed N] [--prompt-growth G]
 swarmlab replay RUN_DIR
 swarmlab resume RUN_DIR [--budget-hard X]   swarmlab fork RUN_DIR --at 4 [--spec edited.yaml]
 swarmlab view RUN_DIR
+swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 2h] [--launch]
+swarmlab job status JOB_ID    swarmlab job logs JOB_ID [--follow]    swarmlab job fetch RUN_ID [--out runs/]
 ```
+`swarmlab job ...` runs a spec whose models are `vllm:<model>` in an HF Job with vLLM serving the model in the same job, and brings run dirs back from the bucket; `job run` only prints the `hf jobs run` command and the estimate unless `--launch` (docs/handoff/WP8.md).
 Every command takes `--json` and then prints one JSON object. Exit codes: 0 success, 2 invalid spec, 1 any other error (including a declined confirmation or a failed run).
 
 ## Run directory
