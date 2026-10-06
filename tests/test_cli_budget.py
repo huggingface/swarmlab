@@ -33,10 +33,13 @@ def test_estimate_command():
 
 def test_run_prints_estimate_only_with_a_budget(tmp_path):
     res, _ = invoke("run", EXAMPLE, "--arm", "llm", "--seed", 1, "--max-rounds", 2, "--out", tmp_path)
+    assert res.exit_code == 1 and "--yes" in res.stderr  # a budget asks first; no TTY answers no
+    res, _ = invoke("run", EXAMPLE, "--arm", "llm", "--seed", 1, "--max-rounds", 2, "--out", tmp_path,
+                    "--yes")
     assert res.exit_code == 0, res.output
     assert res.stdout.startswith("estimate: arm=llm worst-case $")
     res, data = invoke("run", EXAMPLE, "--arm", "llm", "--seed", 2, "--max-rounds", 2, "--out", tmp_path,
-                       "--json")
+                       "--json", "--yes")
     assert res.exit_code == 0 and data["status"] == "ended"  # stdout is still one JSON object
     assert "estimate:" in res.stderr
     res, _ = invoke("run", EXAMPLE, "--arm", "broadcast", "--seed", 1, "--max-rounds", 1, "--out", tmp_path)
@@ -46,7 +49,7 @@ def test_run_prints_estimate_only_with_a_budget(tmp_path):
 def test_resume_with_budget_flags(tmp_path):
     spec = tmp_path / "tiny.yaml"
     spec.write_text(TINY)
-    res, data = invoke("run", spec, "--seed", 1, "--out", tmp_path, "--json")
+    res, data = invoke("run", spec, "--seed", 1, "--out", tmp_path, "--json", "--yes")
     assert res.exit_code == 0, res.output
     assert data["end_reason"] == "hard_ceiling"
     run_dir = data["run_dir"]

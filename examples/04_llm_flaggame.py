@@ -2,7 +2,8 @@
 
 Runs on the deterministic fake provider (`fake:reader`: no network, no spend) by default. To use
 Claude Haiku 4.5 instead, set MODEL = "anthropic:claude-haiku-4-5" (needs ANTHROPIC_API_KEY or
-ANTHROPIC_KEY; the budget below caps the spend).
+ANTHROPIC_KEY; the budget below caps the spend), or "hf:Qwen/Qwen3.5-9B:deepinfra" (needs HF_TOKEN;
+the price comes from the HF router catalog, see `swarmlab models`).
 
     uv run python examples/04_llm_flaggame.py
 """

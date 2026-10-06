@@ -1,0 +1,51 @@
+# __NAME__: a starter swarmlab experiment (written by `swarmlab init __NAME__`).
+#
+# The Flag Game: every agent sees crops of a hidden flag and the group must agree on which of 8
+# candidates it is. Two arms compare a broadcast board (everyone reads every post) with a gossip
+# board (each post reaches a few neighbours). 8 LLM agents per arm run on the deterministic fake
+# model `fake:reader`: no network, no keys, no spend.
+#
+#   swarmlab validate __NAME__.yaml        # check the file and build every arm
+#   swarmlab run __NAME__.yaml             # every arm x every seed below, into runs/<run id>
+#   swarmlab view runs/__NAME____gossip__s1
+#
+# Switching to a real model: change `model:` below (both arms), e.g.
+#   model: "anthropic:claude-haiku-4-5"          # needs ANTHROPIC_API_KEY (and the anthropic extra)
+#   model: "hf:Qwen/Qwen3.5-9B:deepinfra"        # needs HF_TOKEN; price comes from the HF router
+# `swarmlab models --tools --search qwen` lists models, who serves them and their prices; the
+# part after the second ":" pins the serving provider. Then set a budget (USD) below: `run`
+# prints a worst-case estimate and asks before spending. soft_usd ends the run at the next round
+# boundary once agent spend reaches it; hard_usd is an absolute ceiling on agent + probe spend
+# (the round in flight is discarded; `swarmlab resume RUN --budget-hard X` continues);
+# measurement_usd caps the probes.
+# A budget of 0 means "not enforced", so set one before using a paid model.
+name: __NAME__
+seeds: [1, 2]
+budget: {soft_usd: 0, hard_usd: 0, measurement_usd: 0}
+options:
+  max_rounds: 6
+arms:
+  broadcast:
+    world: {type: flaggame, params: {n_candidates: 8}}
+    participants:
+      - {type: llm, count: 8, params: {model: "fake:reader", max_tokens: 512, max_calls: 6}}
+    medium: {topology: broadcast}
+    probes: [belief]                     # asks every agent for its belief after each round
+    metrics:
+      - belief.consensus                 # from the agents' guesses
+      - belief.accuracy
+      - {type: belief.consensus, params: {source: "probe:belief"}}   # from the probe answers
+      - {type: belief.accuracy, params: {source: "probe:belief"}}
+      - comm.read_rate
+  gossip:
+    world: {type: flaggame, params: {n_candidates: 8}}
+    participants:
+      - {type: llm, count: 8, params: {model: "fake:reader", max_tokens: 512, max_calls: 6}}
+    medium: {topology: gossip}
+    probes: [belief]
+    metrics:
+      - belief.consensus
+      - belief.accuracy
+      - {type: belief.consensus, params: {source: "probe:belief"}}
+      - {type: belief.accuracy, params: {source: "probe:belief"}}
+      - comm.read_rate

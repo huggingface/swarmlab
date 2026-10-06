@@ -12,6 +12,7 @@ Decisions where the contract is silent:
       providers:                                   # optional (M1b): overrides by model prefix
         vllm: {type: openai_compat, params: {name: vllm, base_url: "http://host:8000/v1"}}
       options: {max_rounds: 20, commit: round_end}  # optional; any RunOptions field
+      seeds: [1, 2, 3]                             # optional; seeds `swarmlab run` runs per arm
       arms:
         A:
           world: {type: flaggame, params: {n_candidates: 8}}   # or the bare string "flaggame"
@@ -28,6 +29,9 @@ Decisions where the contract is silent:
   `{type, params}`, defaults filled), so `arm_to_runspec` and `dump_experiment_yaml` accept it.
 - `git_identity` treats untracked files as clean (`git status --porcelain --untracked-files=no`),
   so run output written inside the repo does not mark later runs dirty.
+- `seeds` (additive) is the list of seeds `swarmlab run SPEC` (no `--seed`) and
+  `experiment_seeds(doc)` use; absent or empty means `[0]`. It is not part of any `RunSpec`, so
+  it never changes a `spec_hash`. The normalised document omits it when empty.
 - Validation failures raise `SpecError` (a `ValueError`); the CLI maps it to exit code 2.
 """
 from __future__ import annotations
@@ -166,6 +170,7 @@ class ExperimentDoc(BaseModel):
     budget: Budget = Budget()
     options: dict = {}
     providers: dict[str, PluginSpec] = {}
+    seeds: list[int] = []
 
     @field_validator("providers", mode="before")
     @classmethod
@@ -195,7 +200,17 @@ def validate_experiment_doc(doc: dict) -> dict:
         unknown = set(mapping) - allowed
         if unknown:
             raise SpecError(f"{label}: unknown keys {sorted(unknown)}; allowed {sorted(allowed)}")
-    return parsed.model_dump(mode="json")
+    if len(set(parsed.seeds)) != len(parsed.seeds):
+        raise SpecError(f"seeds: duplicates in {parsed.seeds}")
+    out = parsed.model_dump(mode="json")
+    if not out["seeds"]:
+        out.pop("seeds")
+    return out
+
+
+def experiment_seeds(doc: dict) -> list[int]:
+    """The document's `seeds`, or `[0]` when it lists none."""
+    return list(doc.get("seeds") or [0])
 
 
 def load_experiment_yaml(path: Path | str) -> dict:
