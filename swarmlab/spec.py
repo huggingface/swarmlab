@@ -321,11 +321,14 @@ def load_runspec_yaml(path: Path | str) -> RunSpec:
 def git_identity(repo_dir: Path | str = ".") -> tuple[str, bool]:
     """(HEAD commit sha, dirty) for the git work tree containing `repo_dir`.
 
-    Returns ("unknown", True) when `repo_dir` is not inside a git repository or git is missing,
-    unless `SWARMLAB_GIT_COMMIT` is set (an installed wheel, e.g. inside an HF Job: the launcher
-    records the commit it built from; `SWARMLAB_GIT_DIRTY=1` marks a dirty build).
+    `SWARMLAB_GIT_COMMIT`, when set, wins (an installed wheel, e.g. inside an HF Job: the
+    launcher states the commit it built from; `SWARMLAB_GIT_DIRTY=1` marks a dirty build).
+    Returns ("unknown", True) when `repo_dir` is not inside a git repository or git is missing.
     Dirty means tracked files differ from HEAD (untracked files are ignored).
     """
+    env_commit = os.environ.get("SWARMLAB_GIT_COMMIT", "").strip()
+    if env_commit:
+        return env_commit, os.environ.get("SWARMLAB_GIT_DIRTY", "1").strip() not in ("0", "")
 
     def git(*args: str) -> str:
         return subprocess.run(
@@ -339,8 +342,5 @@ def git_identity(repo_dir: Path | str = ".") -> tuple[str, bool]:
         commit = git("rev-parse", "HEAD").strip()
         dirty = bool(git("status", "--porcelain", "--untracked-files=no").strip())
     except (OSError, subprocess.CalledProcessError):
-        env_commit = os.environ.get("SWARMLAB_GIT_COMMIT", "").strip()
-        if env_commit:
-            return env_commit, os.environ.get("SWARMLAB_GIT_DIRTY", "1").strip() not in ("0", "")
         return "unknown", True
     return commit, dirty

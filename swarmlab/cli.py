@@ -39,6 +39,8 @@ Decisions where the contract is silent:
   command asks for confirmation on stderr unless `--yes`; declining (or no TTY to answer)
   exits 1 before anything runs. A failed run does not stop the others; the exit code is then 1
   (2 if every failure was a SpecError).
+- `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server) are documented in
+  `swarmlab/jobs/` and docs/handoff/WP8.md. `job run` only prints unless `--launch`.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
   `doctor.py`) and in `init`'s help.
 """
@@ -109,7 +111,7 @@ def _human(data: dict[str, Any]) -> str:
     if data["metrics"]:
         lines.append("  metrics " + ", ".join(
             f"{k}={_fmt(m['value'])}" for k, m in data["metrics"].items()))
-    for key in ("parent_run", "fork_round", "replay", "view", "skipped", "self_hosted"):
+    for key in ("parent_run", "fork_round", "replay", "view", "skipped", "self_hosted", "fetched"):
         if key in data:
             lines.append(f"  {key} {data[key]}")
     return "\n".join(lines)
@@ -576,6 +578,140 @@ def init(
         return {"ok": True, "yaml": str(yaml_path), "python": str(directory / f"{name}.py"),
                 "text": (f"wrote {yaml_path} and {directory / f'{name}.py'}\n"
                          f"next: swarmlab run {yaml_path}")}
+
+    _execute(go, as_json)
+
+
+# ---- HF Jobs (WP8) -----------------------------------------------------------------------------
+job_app = typer.Typer(
+    name="job", no_args_is_help=True,
+    help="Run a spec in an HF Job next to a vLLM server; check, follow and fetch it.")
+app.add_typer(job_app, name="job")
+
+
+def _seed_list(text: str | None) -> list[int] | None:
+    if text is None:
+        return None
+    try:
+        return [int(x) for x in text.replace(" ", "").split(",") if x]
+    except ValueError as e:
+        raise SpecError(f"--seeds must be comma-separated integers, got {text!r}") from e
+
+
+@job_app.command("run")
+def job_run(
+    spec: Annotated[Path, typer.Argument(help="Experiment YAML whose models are vllm:<model>.")],
+    model: Annotated[str, typer.Option("--model", help="HF model id vLLM serves, e.g. Qwen/Qwen3.5-9B.")],
+    flavor: Annotated[str, typer.Option("--flavor", help="HF Jobs hardware flavor.")] = "a100-large",
+    arm: Annotated[list[str] | None, typer.Option(
+        "--arm", help="Arm to run (repeatable; default: every arm).")] = None,
+    seeds: Annotated[str | None, typer.Option(
+        "--seeds", help="Comma-separated seeds (default: the YAML's seeds).")] = None,
+    timeout: Annotated[str | None, typer.Option(
+        "--timeout", help="Job timeout, e.g. 2h (default: 1.5x the estimate).")] = None,
+    bucket: Annotated[str, typer.Option("--bucket", help="Bucket for stage files and runs.")] = (
+        "hf://buckets/cmpatino/swarmlab-runs"),
+    image: Annotated[str | None, typer.Option("--image", help="Docker image (default: uv python3.12).")] = None,
+    vllm_version: Annotated[str | None, typer.Option("--vllm-version", help="vLLM pip version.")] = None,
+    max_model_len: Annotated[int | None, typer.Option("--max-model-len", help="vLLM --max-model-len.")] = None,
+    revision: Annotated[str | None, typer.Option("--revision", help="Model revision to pin.")] = None,
+    per_round: Annotated[float | None, typer.Option(
+        "--per-round", help="Seconds per round for the estimate (default 30 + 2*N).")] = None,
+    stage_dir: Annotated[Path | None, typer.Option(
+        "--stage-dir", help="Also write the stage files (spec, bootstrap, plan, wheel) here.")] = None,
+    launch: Annotated[bool, typer.Option(
+        "--launch", help="Upload the stage dir and submit the job (otherwise only print).")] = False,
+    allow_dirty: Annotated[bool, typer.Option(
+        "--allow-dirty", help="Launch from a checkout with uncommitted changes.")] = False,
+    ledger: Annotated[Path, typer.Option("--ledger", help="Local launch ledger (JSONL).")] = Path(
+        "runs/jobs.jsonl"),
+    as_json: JsonOpt = False,
+) -> None:
+    """Print (and with --launch submit) an HF Job: vLLM serving MODEL + `swarmlab run` per arm x seed."""
+    from .jobs import launch as jl
+
+    def go() -> dict[str, Any]:
+        kw: dict[str, Any] = {}
+        for key, val in (("image", image), ("vllm_version", vllm_version),
+                         ("max_model_len", max_model_len), ("revision", revision),
+                         ("per_round_s", per_round), ("timeout", timeout)):
+            if val is not None:
+                kw[key] = val
+        plan = jl.plan_job(spec, model=model, flavor=flavor, arms=arm or None,
+                           seeds=_seed_list(seeds), bucket=bucket, **kw)
+        data: dict[str, Any] = {"ok": True, "plan": plan.as_dict(), "launched": False}
+        text = jl.describe(plan)
+        if stage_dir is not None:
+            jl.stage(plan, stage_dir)
+            data["stage_dir"] = str(stage_dir)
+            text += f"\nstaged locally: {stage_dir}"
+        if not launch:
+            text += "\nnot launched (pass --launch to upload the stage dir and submit)"
+        else:
+            if plan.dirty and not allow_dirty:
+                raise SpecError("the checkout has uncommitted changes; commit first or pass "
+                                "--allow-dirty")
+            row = jl.submit(plan, hf=jl.which_hf(), ledger=ledger)
+            data.update(launched=True, job=row)
+            text += (f"\nlaunched job {row['job_id']}  {row['url']}\n"
+                     f"follow: swarmlab job logs {row['job_id']} --follow\n"
+                     f"status: swarmlab job status {row['job_id']}\n"
+                     f"fetch:  swarmlab job fetch <run_id> --tag {plan.tag}")
+        data["text"] = text
+        return data if as_json else {"text": text}
+
+    _execute(go, as_json)
+
+
+@job_app.command("status")
+def job_status(
+    job_id: Annotated[str, typer.Argument(help="HF Job id.")],
+    as_json: JsonOpt = False,
+) -> None:
+    """Stage, flavor, running time and compute cost so far of a job."""
+    from .jobs import remote
+
+    def go() -> dict[str, Any]:
+        st = remote.status(job_id)
+        if as_json:
+            return {"ok": True, **st}
+        cost = f"${st['cost_usd']:.2f}" if st["cost_usd"] is not None else "-"
+        return {"text": (f"job {st['job_id']}  stage={st['stage']}  flavor={st['flavor']}  "
+                         f"running={st['running_secs'] or 0}s  compute={cost}  tag={st['tag']}"
+                         + (f"\n  message: {st['message']}" if st["message"] else "")
+                         + (f"\n  {st['url']}" if st["url"] else ""))}
+
+    _execute(go, as_json)
+
+
+@job_app.command("logs")
+def job_logs(
+    job_id: Annotated[str, typer.Argument(help="HF Job id.")],
+    follow: Annotated[bool, typer.Option("--follow", "-f", help="Stream until the job ends.")] = False,
+) -> None:
+    """Print a job's logs (`hf jobs logs`)."""
+    from .jobs import remote
+
+    code = remote.logs(job_id, follow)
+    if code:
+        raise typer.Exit(code)
+
+
+@job_app.command("fetch")
+def job_fetch(
+    run_id: Annotated[str, typer.Argument(help="Run id, or <tag>/<run id>.")],
+    out: Annotated[Path, typer.Option("--out", help="Parent directory for the run dir.")] = Path("runs"),
+    bucket: Annotated[str, typer.Option("--bucket", help="Bucket (or a local dir with the same layout).")] = (
+        "hf://buckets/cmpatino/swarmlab-runs"),
+    tag: Annotated[str | None, typer.Option("--tag", help="Job tag (default: newest holding the run).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Download a run dir from the bucket so `Run.load`, `view` and `fork` work locally."""
+    from .jobs import remote
+
+    def go() -> dict[str, Any]:
+        d = remote.fetch(run_id, out, bucket, tag)
+        return {**summary(Run(d)), "fetched": str(d)}
 
     _execute(go, as_json)
 
