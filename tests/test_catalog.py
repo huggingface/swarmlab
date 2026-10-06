@@ -4,8 +4,10 @@ import time
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from swarmlab import Experiment
+from swarmlab.cli import app
 from swarmlab.participants import LLMAgent
 from swarmlab.providers import UnknownModelPricing, catalog, catalog_priced, resolve
 from swarmlab.providers.openai_compat import OpenAICompatProvider
@@ -110,3 +112,15 @@ def test_unknown_price_message_names_override_and_command(cached):
     msg = str(e.value)
     assert "providers:" in msg and "swarmlab models" in msg and "Qwen/Unknown-1B" in msg
 
+
+def test_models_command(cached):
+    res = CliRunner().invoke(app, ["models", "--provider", "hf", "--tools", "--search", "qwen3.5",
+                                   "--json"])
+    assert res.exit_code == 0, res.output
+    ids = {m["id"] for m in json.loads(res.stdout)["models"]}
+    assert ids == {"hf:Qwen/Qwen3.5-9B:together", "hf:Qwen/Qwen3.5-9B:ovhcloud",
+                   "hf:Qwen/Qwen3.5-9B:deepinfra"}
+    res = CliRunner().invoke(app, ["models", "--search", "haiku"])
+    assert res.exit_code == 0 and "anthropic:claude-haiku-4-5" in res.stdout and "5.00" in res.stdout
+    res = CliRunner().invoke(app, ["models", "--provider", "nope"])
+    assert res.exit_code == 2

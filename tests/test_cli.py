@@ -70,8 +70,9 @@ def test_broken_spec_exits_2(tmp_path, text):
 def test_run_unknown_arm_and_missing_arm_exit_2(spec, tmp_path):
     res, _ = invoke("run", spec, "--arm", "Z", "--seed", 1, "--out", tmp_path)
     assert res.exit_code == 2 and "unknown arm" in res.stderr
-    res, _ = invoke("run", spec, "--seed", 1, "--out", tmp_path)       # two arms, no --arm
-    assert res.exit_code == 2
+    res, _ = invoke("run", spec, "--seed", 1, "--out", tmp_path)       # two arms, no --arm: both
+    assert res.exit_code == 0, res.output
+    assert "cli-small__A__s1" in res.stdout and "cli-small__B__s1" in res.stdout
 
 
 def test_run_replay_resume_fork_view(spec, tmp_path):
@@ -106,8 +107,10 @@ def test_run_replay_resume_fork_view(spec, tmp_path):
     res, v = invoke("view", run_dir, "--json")
     assert res.exit_code == 0 and Path(v["view"]).exists() and v["view"].endswith("view.html")
 
-    res, _ = invoke("run", spec, "--arm", "A", "--seed", 2, "--out", out)   # log exists already
-    assert res.exit_code == 1
+    res, _ = invoke("run", spec, "--arm", "A", "--seed", 2, "--out", out)   # same spec: skipped
+    assert res.exit_code == 0 and "skipped" in res.stdout
+    res, _ = invoke("run", spec, "--arm", "A", "--seed", 2, "--max-rounds", 3, "--out", out)
+    assert res.exit_code == 1 and "different configuration" in res.stderr   # other spec, same dir
 
 
 def test_human_output_and_errors(spec, tmp_path):

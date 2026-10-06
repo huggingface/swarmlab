@@ -27,6 +27,20 @@ Decisions where the contract is silent:
   calls_per_turn: the worst case as above). `resume` takes `--budget-soft/--budget-hard/
   --budget-measurement`; given any of them, the effective budget (`run.json["budget"]`) is
   updated with those fields and passed to `Run.resume(budget=...)`.
+- Setup UX: `run SPEC` without `--arm`/`--seed` runs every arm (document order) x every seed in
+  the YAML's `seeds:` (default `[0]`); `--arm`/`--seed` narrow it. With one arm and a `--seed`
+  (the M1a form) the output is the single run summary as before; otherwise it is
+  `{"ok", "estimate": {"arms": {arm: est}, "total_usd", "runs"}, "runs": [summary + "outcome"]}`
+  where outcome is `ran`, `skipped` (out/<run_id> holds a run with the same spec_hash; printed as
+  "exists, skipping") or `failed` (with `error`). A run dir holding a different spec_hash is a
+  failure unless `--rerun`, which writes `out/<run_id>__r<N>` (also for same-hash runs). Before
+  running, the per-arm estimate and the total are printed (stderr under `--json`) whenever any
+  arm has a non-zero budget or a model-backed participant. When any budget is non-zero the
+  command asks for confirmation on stderr unless `--yes`; declining (or no TTY to answer)
+  exits 1 before anything runs. A failed run does not stop the others; the exit code is then 1
+  (2 if every failure was a SpecError).
+- `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
+  `doctor.py`) and in `init`'s help.
 """
 from __future__ import annotations
 
@@ -39,11 +53,12 @@ from typing import Annotated, Any
 import typer
 
 from .experiment import Experiment, Run
-from .spec import Budget, RunOptions, SpecError, load_experiment_yaml
+from .spec import Budget, RunOptions, SpecError, experiment_seeds, load_experiment_yaml
 
 app = typer.Typer(
     name="swarmlab",
-    help="Run, replay, resume, fork, and view swarmlab experiments.",
+    help="Set up, run, replay, resume, fork, and view swarmlab experiments.\n\n"
+         "Quickstart: swarmlab doctor; swarmlab init demo; swarmlab run demo.yaml",
     no_args_is_help=True,
     add_completion=False,
     pretty_exceptions_enable=False,
@@ -72,26 +87,7 @@ def _build(spec: Path, arm: str | None) -> Experiment:
 
 
 def summary(run: Run) -> dict[str, Any]:
-    meta = run.meta
-    metrics = {
-        name: {"value": vals[-1][1], "denominator": vals[-1][2], "round": vals[-1][0]}
-        for name, vals in run.metrics.items()
-        if vals
-    }
-    out = {
-        "run_dir": str(run.dir),
-        "run_id": run.id,
-        "spec_hash": meta.get("spec_hash"),
-        "status": run.status,
-        "end_reason": run.end_reason,
-        "last_round": meta.get("last_round"),
-        "score": run.score,
-        "metrics": metrics,
-    }
-    if meta.get("parent_run"):
-        out["parent_run"] = meta["parent_run"]
-        out["fork_round"] = meta.get("fork_round")
-    return out
+    return run.summary()
 
 
 def _fmt(v: Any) -> str:
@@ -99,6 +95,8 @@ def _fmt(v: Any) -> str:
 
 
 def _human(data: dict[str, Any]) -> str:
+    if "text" in data:
+        return str(data["text"])
     if "run_id" not in data:
         return "\n".join(f"{k}: {v}" for k, v in data.items())
     lines = [
@@ -111,7 +109,7 @@ def _human(data: dict[str, Any]) -> str:
     if data["metrics"]:
         lines.append("  metrics " + ", ".join(
             f"{k}={_fmt(m['value'])}" for k, m in data["metrics"].items()))
-    for key in ("parent_run", "fork_round", "replay", "view"):
+    for key in ("parent_run", "fork_round", "replay", "view", "skipped"):
         if key in data:
             lines.append(f"  {key} {data[key]}")
     return "\n".join(lines)
@@ -149,11 +147,25 @@ def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
             "calls_per_turn": calls_per_turn}
 
 
-def _estimate_line(est: dict[str, Any]) -> str:
+def _budget_text(budget: dict[str, float]) -> str:
+    parts = [f"{k.removesuffix('_usd')}=${v:g}" for k, v in budget.items() if v > 0]
+    return "budget " + (" ".join(parts) if parts else "none (0 = not enforced)")
+
+
+def _only_fake(ests: Any) -> bool:
+    models = [m for est in ests for m in est["by_model"]]
+    return bool(models) and all(m.startswith("fake:") for m in models)
+
+
+def _estimate_line(est: dict[str, Any], seeds: int | None = None) -> str:
     by_model = ", ".join(f"{m}=${v:.4f}" for m, v in est["by_model"].items()) or "no model calls"
-    return (f"estimate: arm={est['arm']} worst-case ${est['usd']:.4f} "
+    per = f"worst-case ${est['usd']:.4f}"
+    if seeds is not None:
+        per += f" per run x {seeds} seed(s) = ${est['usd'] * seeds:.4f}"
+    return (f"estimate: arm={est['arm']} {per} "
             f"({est['llm_agents']} model agents x {est['rounds']} rounds x "
-            f"{est['calls_per_turn']} calls/turn, {est['probe_calls']} probe calls; {by_model}); budget {est['budget']}")
+            f"{est['calls_per_turn']} calls/turn, {est['probe_calls']} probe calls; {by_model}); "
+            f"{_budget_text(est['budget'])}")
 
 
 # ---- commands --------------------------------------------------------------------------------
@@ -181,30 +193,142 @@ def validate(
     _execute(go, as_json)
 
 
+def _say(line: str, as_json: bool) -> None:
+    """Progress output: stdout, or stderr under --json (stdout keeps one JSON object)."""
+    print(line, file=sys.stderr if as_json else sys.stdout, flush=True)
+
+
+def _has_budget(exp: Experiment) -> bool:
+    return any(v > 0 for v in exp.budget.model_dump().values())
+
+
+def _usd(v: Any) -> str:
+    return f"${v:.4f}" if isinstance(v, (int, float)) else "-"
+
+
+def _score_text(score: dict | None) -> str:
+    return ", ".join(f"{k}={_fmt(v)}" for k, v in (score or {}).items()) or "-"
+
+
+def _table(rows: list[dict[str, Any]]) -> str:
+    head = ("run", "outcome", "end", "score", "spend")
+    body = []
+    for r in rows:
+        spend = r.get("spend") or {}
+        total = (spend.get("swarm") or 0) + (spend.get("measurement") or 0) if spend else None
+        body.append((r.get("run_id") or "?", r["outcome"], str(r.get("end_reason") or "-"),
+                     _score_text(r.get("score")) if r["outcome"] != "failed" else r.get("error", ""),
+                     _usd(total)))
+    widths = [max(len(h), *(len(b[i]) for b in body)) for i, h in enumerate(head)]
+    widths[3] = min(widths[3], 60)
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    lines = [fmt.format(*head)] + [
+        fmt.format(*[c if len(c) <= 60 else c[:57] + "..." for c in b]) for b in body]
+    return "\n".join(lines)
+
+
+def _confirm(prompt: str) -> None:
+    try:
+        ok = typer.confirm(prompt, default=False, err=True)
+    except typer.Abort:
+        ok = False
+    if not ok:
+        print("not confirmed; nothing ran (pass --yes to skip this question)", file=sys.stderr)
+        raise typer.Exit(1)
+
+
 @app.command()
 def run(
     spec: Annotated[Path, typer.Argument(help="Experiment YAML.")],
-    seed: Annotated[int, typer.Option("--seed", help="Run seed.")],
-    arm: Annotated[str | None, typer.Option("--arm", help="Arm name (optional if only one).")] = None,
+    seed: Annotated[int | None, typer.Option(
+        "--seed", help="Run only this seed (default: every seed in the YAML's `seeds:`).")] = None,
+    arm: Annotated[str | None, typer.Option(
+        "--arm", help="Run only this arm (default: every arm).")] = None,
     max_rounds: Annotated[int | None, typer.Option("--max-rounds", help="Override options.max_rounds.")] = None,
     out: Annotated[Path, typer.Option("--out", help="Parent directory for run dirs.")] = Path("runs"),
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask before spending.")] = False,
+    rerun: Annotated[bool, typer.Option(
+        "--rerun", help="Run again into runs/<id>__r<N> even if runs/<id> exists.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
-    """Run one arm of an experiment with one seed."""
+    """Run an experiment: every arm x every seed of the YAML, or the arm/seed you pick."""
+    try:
+        doc = load_experiment_yaml(spec)
+        arms = [arm] if arm is not None else list(doc["arms"])
+        seeds = [seed] if seed is not None else experiment_seeds(doc)
+        exps = {a: _build(spec, a) for a in arms}
+        for a, exp in exps.items():
+            if max_rounds is None and "max_rounds" not in exp.options:
+                raise SpecError(f"{spec}: arm {a!r}: no max_rounds in options; pass --max-rounds")
+        ests = {a: _estimate(exp, seeds[0], max_rounds) for a, exp in exps.items()}
+    except SpecError as e:
+        _fail(e, 2, as_json)
+    except Exception as e:  # noqa: BLE001
+        _fail(e, 1, as_json)
+    single = seed is not None and len(arms) == 1
+    budgeted = any(_has_budget(e) for e in exps.values())
+    n_runs = len(arms) * len(seeds)
+    total = sum(est["usd"] for est in ests.values()) * len(seeds)
+    if budgeted or any(est["llm_agents"] for est in ests.values()):
+        for est in ests.values():
+            _say(_estimate_line(est, None if single else len(seeds)), as_json)
+        if not single:
+            ceiling = sum(e.budget.hard_usd for e in exps.values()) * len(seeds)
+            _say(f"estimate total: ${total:.4f} worst case over {n_runs} run(s)"
+                 + (f"; hard ceilings sum to ${ceiling:.2f}" if ceiling > 0 else ""), as_json)
+        if _only_fake(ests.values()):
+            _say("  (fake: models only: prices are nominal, nothing is billed)", as_json)
+    if budgeted and not yes:
+        _confirm(f"Start {n_runs} run(s), worst case ${total:.4f}?")
 
-    def go() -> dict[str, Any]:
-        exp = _build(spec, arm)
-        if max_rounds is None and "max_rounds" not in exp.options:
-            raise SpecError(f"{spec}: no max_rounds in options; pass --max-rounds")
-        if any(v > 0 for v in exp.budget.model_dump().values()):
-            line = _estimate_line(_estimate(exp, seed, max_rounds))
+    rows: list[dict[str, Any]] = []
+    for a in arms:
+        exp = exps[a]
+        for sd in seeds:
+            rid = exp.run_id(sd)
+            try:
+                state, found = exp.existing(sd, max_rounds, out)
+                if state == "same" and not rerun and found is not None:
+                    _say(f"{rid}: exists, skipping ({found.dir})", as_json)
+                    rows.append({**found.summary(), "outcome": "skipped"})
+                    continue
+                if state == "different" and not rerun:
+                    raise FileExistsError(
+                        f"{out / rid} holds a run of a different configuration (spec_hash "
+                        "differs); pass --rerun or another --out")
+                target = Experiment.rerun_dir(out, rid) if state != "new" else None
+                if not single:
+                    _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
+                r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
+                rows.append({**r.summary(), "outcome": "ran"})
+            except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
+                msg = f"{type(e).__name__}: {e}"
+                print(f"error: {rid}: {msg}", file=sys.stderr)
+                rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "failed",
+                             "error": msg, "spec_error": isinstance(e, SpecError)})
+    failed = [r for r in rows if r["outcome"] == "failed"]
+    code = 0 if not failed else (2 if all(r["spec_error"] for r in failed) else 1)
+    if single:
+        r = rows[0]
+        if failed:
             if as_json:
-                print(line, file=sys.stderr)
-            else:
-                typer.echo(line)
-        return summary(exp.run(seed=seed, max_rounds=max_rounds, out=out))
-
-    _execute(go, as_json)
+                typer.echo(json.dumps({"ok": False, "error": r["error"], "exit_code": code}))
+            raise typer.Exit(code)
+        data = {k: v for k, v in r.items() if k != "outcome"}
+        if r["outcome"] == "skipped":
+            data["skipped"] = True
+        typer.echo(json.dumps(data, default=str) if as_json else _human(data))
+        return
+    for r in rows:
+        r.pop("spec_error", None)
+    if as_json:
+        typer.echo(json.dumps({"ok": not failed, "exit_code": code, "runs": rows,
+                               "estimate": {"arms": ests, "total_usd": total, "runs": n_runs}},
+                              default=str))
+    else:
+        typer.echo(_table(rows))
+    if code:
+        raise typer.Exit(code)
 
 
 @app.command()
@@ -297,6 +421,100 @@ def view(
     def go() -> dict[str, Any]:
         r = Run(run_dir)
         return {**summary(r), "view": str(r.view())}
+
+    _execute(go, as_json)
+
+
+@app.command()
+def models(
+    provider: Annotated[str | None, typer.Option(
+        "--provider", help="Only this provider prefix: hf or anthropic.")] = None,
+    tools: Annotated[bool, typer.Option("--tools", help="Only models with native tool calling.")] = False,
+    search: Annotated[str | None, typer.Option("--search", help="Substring of the model id.")] = None,
+    refresh: Annotated[bool, typer.Option("--refresh", help="Refetch the HF router listing now.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """List models you can put in a spec, who serves them, tool support and USD per M tokens."""
+
+    def go() -> dict[str, Any]:
+        from .providers import catalog
+
+        if provider not in (None, "hf", "anthropic"):
+            raise SpecError(f"--provider must be hf or anthropic, got {provider!r}")
+        rows = catalog.entries(provider, tools=tools, search=search, refresh=refresh)
+        if as_json:
+            return {"ok": True, "models": [r.as_dict() for r in rows]}
+        if not rows:
+            hint = ("" if provider == "anthropic" else
+                    f" (HF router listing unavailable or no match; cache: {catalog.cache_path()})")
+            return {"text": "no models found" + hint}
+        head = ("model (use in spec)", "tools", "context", "$/M in", "$/M out")
+
+        def price(v: float | None) -> str:
+            return f"{v:.2f}" if v is not None else "-"
+
+        body = [(r.spec_id, {True: "yes", False: "no", None: "?"}[r.tools],
+                 str(r.context_length or "-"), price(r.input), price(r.output)) for r in rows]
+        widths = [max(len(h), *(len(b[i]) for b in body)) for i, h in enumerate(head)]
+        fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+        lines = [fmt.format(*head)] + [fmt.format(*b) for b in body]
+        note = f"{len(rows)} model(s)."
+        if any(r.provider == "hf" for r in rows):
+            note += (" An hf id without ':served_by' lets the router pick the provider and is"
+                     " priced at the most expensive listed one.")
+        lines.append(note)
+        return {"text": "\n".join(lines)}
+
+    _execute(go, as_json)
+
+
+@app.command()
+def doctor(
+    specs: Annotated[list[Path] | None, typer.Argument(
+        help="Experiment YAMLs to check against (models, keys, extras).")] = None,
+    offline: Annotated[bool, typer.Option("--offline", help="Skip the network checks.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Check Python, extras, API keys, provider reachability and the git checkout."""
+    from . import doctor as doc
+
+    results = doc.checks(specs or [], offline=offline)
+    good = doc.ok(results)
+    if as_json:
+        typer.echo(json.dumps({"ok": good, "checks": [c.as_dict() for c in results]}))
+    else:
+        typer.echo(doc.report(results))
+    if not good:
+        raise typer.Exit(1)
+
+
+@app.command()
+def init(
+    name: Annotated[str, typer.Argument(help="Experiment name; writes NAME.yaml and NAME.py.")] = "demo",
+    directory: Annotated[Path, typer.Option("--dir", help="Where to write the files.")] = Path("."),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite existing files.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Write a starter experiment: NAME.yaml (two arms, fake LLM agents) and NAME.py (same, in Python)."""
+
+    def go() -> dict[str, Any]:
+        import re
+        from importlib.resources import files
+
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", name):
+            raise SpecError(f"name {name!r}: use letters, digits, '_' or '-', starting with a letter")
+        targets = {directory / f"{name}.yaml": "starter.yaml.tmpl", directory / f"{name}.py": "starter.py.tmpl"}
+        existing = [str(t) for t in targets if t.exists()]
+        if existing and not force:
+            raise FileExistsError(f"{', '.join(existing)} already exist(s); pass --force to overwrite")
+        directory.mkdir(parents=True, exist_ok=True)
+        for target, template in targets.items():
+            text = (files("swarmlab") / "templates" / template).read_text()
+            target.write_text(text.replace("__NAME__", name))
+        yaml_path = directory / f"{name}.yaml"
+        return {"ok": True, "yaml": str(yaml_path), "python": str(directory / f"{name}.py"),
+                "text": (f"wrote {yaml_path} and {directory / f'{name}.py'}\n"
+                         f"next: swarmlab run {yaml_path}")}
 
     _execute(go, as_json)
 

@@ -1,0 +1,47 @@
+"""__NAME__: the same experiment as __NAME__.yaml, in the Python API (written by `swarmlab init`).
+
+    python __NAME__.py          # or: uv run python __NAME__.py
+
+Switching to a real model: set MODEL to "anthropic:claude-haiku-4-5" (needs ANTHROPIC_API_KEY
+and the anthropic extra) or "hf:Qwen/Qwen3.5-9B:deepinfra" (needs HF_TOKEN; the price comes from
+the HF router listing, see `swarmlab models`), and set BUDGET: soft_usd stops starting new
+turns, hard_usd is an absolute ceiling, measurement_usd caps the probes; 0 means not enforced.
+"""
+from swarmlab import Board, Budget, Experiment
+from swarmlab.metrics.belief import Accuracy, Consensus
+from swarmlab.participants import LLMAgent
+from swarmlab.probes import BeliefProbe
+from swarmlab.worlds import FlagGame
+
+MODEL = "fake:reader"  # deterministic fake model: no network, no spend
+BUDGET = Budget(soft_usd=0, hard_usd=0, measurement_usd=0)
+SEEDS = [1, 2]
+MAX_ROUNDS = 6
+
+
+def arm(topology: str) -> Experiment:
+    return Experiment(
+        name="__NAME__",
+        arm=topology,  # run ids are __NAME____<arm>__s<seed>, as from the YAML
+        world=FlagGame(n_candidates=8),
+        participants=[LLMAgent(model=MODEL, max_tokens=512, max_calls=6)] * 8,
+        medium=Board(topology=topology),
+        probes=[BeliefProbe()],
+        metrics=["belief.consensus", "belief.accuracy",
+                 Consensus(source="probe:belief"), Accuracy(source="probe:belief"),
+                 "comm.read_rate"],
+        budget=BUDGET,
+    )
+
+
+ARMS = {"broadcast": arm("broadcast"), "gossip": arm("gossip")}
+
+if __name__ == "__main__":
+    for name, exp in ARMS.items():  # fake: models have nominal prices, nothing is billed
+        est = exp.estimate(seed=SEEDS[0], max_rounds=MAX_ROUNDS, calls_per_turn=6, seeds=SEEDS)
+        print(f"{name}: worst case ${est['total_usd']:.4f} over {est['runs']} runs")
+    for exp in ARMS.values():
+        for run in exp.run_all(SEEDS, MAX_ROUNDS, out="runs"):  # skips runs already on disk
+            s = run.summary()
+            print(s["run_id"], s["end_reason"], s["score"], s["spend"])
+    print("view one with: swarmlab view runs/__NAME____gossip__s1")

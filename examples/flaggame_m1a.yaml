@@ -1,11 +1,13 @@
 # DESIGN.md example 1 as YAML: 16 scripted evidence aggregators on the Flag Game,
 # comparing a broadcast board with a gossip board.
 #   swarmlab validate examples/flaggame_m1a.yaml
+#   swarmlab run examples/flaggame_m1a.yaml --yes       # every arm x every seed below
 #   swarmlab run examples/flaggame_m1a.yaml --arm gossip --seed 3
 # The `llm` arm (M1b) runs 8 LLMAgents on the deterministic fake provider (`fake:reader`, no
 # network, no spend) with a belief probe every round:
 #   swarmlab run examples/flaggame_m1a.yaml --arm llm --seed 1
 name: flaggame-m1a
+seeds: [1, 2]
 budget: {soft_usd: 0, hard_usd: 0}   # scripted agents spend nothing
 options:
   max_rounds: 20
