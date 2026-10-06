@@ -12,16 +12,22 @@ The palette is the first `palette` letters of `COLOURS` ("rgbykwopcmnt": red, gr
 yellow, black/k, white, orange, purple, cyan, magenta, brown/n, teal), so `palette <= 12`.
 Colours are lowercase so they never collide with "letters" candidate names.
 
-Structured flags (truth and distractors) are one of: horizontal stripes (2-4 bands), vertical
-stripes (2-4 bands), 2x2 blocks, 2x3 blocks (2 rows by 3 columns). Bands/blocks split the grid
-as evenly as possible; neighbouring bands/blocks never share a colour.
+Structured flags are one of: horizontal stripes (2-4 bands), vertical stripes (2-4 bands), 2x2
+blocks, 2x3 blocks (2 rows by 3 columns). Bands/blocks split the grid as evenly as possible;
+neighbouring bands/blocks never share a colour.
 
-The rival is a copy of the truth with `k = max(1, round((1 - rival_similarity) * height * width))`
-distinct cells recoloured, each to a different colour than it had, so the rival always differs
-from the truth (even at `rival_similarity=1.0`). Crops that avoid every recoloured cell are
-contained in both truth and rival: that is how "the rival is favoured by some crops".
-Distractors are fresh structured flags; generation retries until all candidates are distinct
-(ValueError after 1000 attempts, e.g. if `n_candidates` exceeds what the palette allows).
+Twin pairs (review A1: no shortcut from the observation alone). Candidates are `n_candidates // 2`
+near-twin pairs (`n_candidates` must be even and >= 2). A pair is a structured flag plus a variant
+in which `min(rival_edits, number of bands/blocks)` distinct whole bands/blocks are recoloured, one
+after another, each to a palette colour different from its own and from its current neighbours.
+So both members are clean structured flags of the same layout and the variant always differs.
+The truth is a uniformly random member of a uniformly random pair and the rival is its twin. Since
+every candidate has a twin generated the same way and the truth's pair and side are drawn after
+generation, no similarity or cleanliness heuristic over the candidates singles out the truth.
+Crops that avoid the recoloured bands are contained in both truth and rival: that is how "the
+rival is favoured by some crops". Generation redraws a pair until every candidate is distinct
+(ValueError after 1000 attempts, e.g. if `n_candidates` exceeds what the palette allows), and
+`palette >= 3` is required so a band between two differently coloured neighbours can change.
 
 Candidates are shuffled and then named in order: "letters" -> A, B, C, ... (max 26),
 "numbers" -> 1, 2, 3, ... The name of the truth is therefore uniformly random.
@@ -29,7 +35,8 @@ Candidates are shuffled and then named in order: "letters" -> A, B, C, ... (max 
 Randomness
 ----------
 `reset(rng, agents)` receives one stream (the runner passes `derive(seed, "world")`). Draws, in
-order: truth, rival, distractors, shuffle, then one 64-bit value `s_i = rng.getrandbits(64)` per
+order: the pairs (base then variant, pair by pair), the truth's pair index, the truth's side
+(base or variant), shuffle, then one 64-bit value `s_i = rng.getrandbits(64)` per
 agent in the order of `agents`. Agent i's crop is drawn from `derive(s_i, "private", agent_i)`.
 Crops are thus a pure function of the world rng and the agent list (the contract's
 `("private", agent)` root is honoured as a label under a world-derived seed, since `reset` has no
@@ -139,7 +146,10 @@ def _splits(n: int, parts: int) -> list[int]:
     return [min(parts - 1, i * parts // n) for i in range(n)]
 
 
-def _structured_flag(rng: random.Random, height: int, width: int, colours: str) -> Grid:
+def _structured_blocks(
+    rng: random.Random, height: int, width: int, colours: str
+) -> list[list[str]]:
+    """A random layout as a rows_n x cols_n block grid of colours (neighbours differ)."""
     layout = rng.choice(_LAYOUTS)
     if layout == "h_stripes":
         rows_n, cols_n = rng.randint(2, min(4, height)), 1
@@ -160,18 +170,46 @@ def _structured_flag(rng: random.Random, height: int, width: int, colours: str) 
                 banned.add(block[by - 1][bx])
             row.append(rng.choice([c for c in colours if c not in banned]))
         block.append(row)
-    ys, xs = _splits(height, rows_n), _splits(width, cols_n)
+    return block
+
+
+def _render(block: list[list[str]], height: int, width: int) -> Grid:
+    ys, xs = _splits(height, len(block)), _splits(width, len(block[0]))
     return ["".join(block[ys[y]][xs[x]] for x in range(width)) for y in range(height)]
 
 
-def _recolour(rng: random.Random, grid: Grid, k: int, colours: str) -> Grid:
-    height, width = len(grid), len(grid[0])
-    cells = rng.sample(range(height * width), k)
-    out = [list(r) for r in grid]
-    for c in cells:
-        y, x = divmod(c, width)
-        out[y][x] = rng.choice([col for col in colours if col != out[y][x]])
-    return ["".join(r) for r in out]
+def _neighbours(block: list[list[str]], by: int, bx: int) -> set[str]:
+    out = set()
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        y, x = by + dy, bx + dx
+        if 0 <= y < len(block) and 0 <= x < len(block[0]):
+            out.add(block[y][x])
+    return out
+
+
+def _variant(rng: random.Random, block: list[list[str]], edits: int, colours: str) -> list[list[str]] | None:
+    """Recolour `edits` distinct whole blocks (clamped to the block count); None if impossible."""
+    out = [list(r) for r in block]
+    cells = [(y, x) for y in range(len(out)) for x in range(len(out[0]))]
+    rng.shuffle(cells)
+    done = 0
+    for y, x in cells:
+        if done == min(edits, len(cells)):
+            break
+        options = [c for c in colours if c != out[y][x] and c not in _neighbours(out, y, x)]
+        if options:
+            out[y][x] = rng.choice(options)
+            done += 1
+    return out if done == min(edits, len(cells)) else None
+
+
+def _twin_pair(rng: random.Random, height: int, width: int, colours: str, edits: int) -> tuple[Grid, Grid]:
+    for _ in range(_MAX_ATTEMPTS):
+        block = _structured_blocks(rng, height, width, colours)
+        var = _variant(rng, block, edits, colours)
+        if var is not None:
+            return _render(block, height, width), _render(var, height, width)
+    raise ValueError("could not generate a twin pair")
 
 
 def _names(kind: str, n: int) -> list[str]:
@@ -186,7 +224,7 @@ def _names(kind: str, n: int) -> list[str]:
 
 # ---- world ------------------------------------------------------------------------------------
 _CONFIG = (
-    "height", "width", "palette", "n_candidates", "rival_similarity", "crop_h", "crop_w",
+    "height", "width", "palette", "n_candidates", "rival_edits", "crop_h", "crop_w",
     "candidate_names", "status_tools", "guess_limit",
 )
 
@@ -202,29 +240,29 @@ class FlagGame(World):
         width: int = 12,
         palette: int = 6,
         n_candidates: int = 8,
-        rival_similarity: float = 0.85,
+        rival_edits: int = 1,
         crop_h: int = 3,
         crop_w: int = 4,
         candidate_names: str = "letters",
         status_tools: tuple[str, ...] | list[str] = ("my_status", "collective_status"),
         guess_limit: int | None = None,
     ) -> None:
-        if not 2 <= palette <= len(COLOURS):
-            raise ValueError(f"palette must be in 2..{len(COLOURS)}")
-        if n_candidates < 2:
-            raise ValueError("n_candidates must be >= 2 (truth and rival)")
+        if not 3 <= palette <= len(COLOURS):
+            raise ValueError(f"palette must be in 3..{len(COLOURS)}")
+        if n_candidates < 2 or n_candidates % 2:
+            raise ValueError("n_candidates must be even and >= 2 (candidates come in twin pairs)")
         if not (1 <= crop_h <= height and 1 <= crop_w <= width):
             raise ValueError("crop must fit inside the flag")
         if height < 2 or width < 2:
             raise ValueError("flag must be at least 2x2")
-        if not 0.0 <= rival_similarity <= 1.0:
-            raise ValueError("rival_similarity must be in [0, 1]")
+        if not isinstance(rival_edits, int) or rival_edits < 1:
+            raise ValueError("rival_edits must be an integer >= 1")
         unknown = set(status_tools) - {"my_status", "collective_status"}
         if unknown:
             raise ValueError(f"unknown status tools {sorted(unknown)}")
         _names(candidate_names, n_candidates)  # validates
         self.height, self.width, self.palette = height, width, palette
-        self.n_candidates, self.rival_similarity = n_candidates, rival_similarity
+        self.n_candidates, self.rival_edits = n_candidates, rival_edits
         self.crop_h, self.crop_w = crop_h, crop_w
         self.candidate_names = candidate_names
         self.status_tools = tuple(status_tools)
@@ -242,24 +280,28 @@ class FlagGame(World):
     def reset(self, rng: random.Random, agents: list[AgentId]) -> None:
         colours = COLOURS[: self.palette]
         h, w = self.height, self.width
-        truth = _structured_flag(rng, h, w, colours)
-        k = max(1, round((1 - self.rival_similarity) * h * w))
-        rival = _recolour(rng, truth, k, colours)
-        flags = [truth, rival]
+        pairs: list[tuple[Grid, Grid]] = []
+        seen: list[Grid] = []
         attempts = 0
-        while len(flags) < self.n_candidates:
+        while len(pairs) < self.n_candidates // 2:
             attempts += 1
             if attempts > _MAX_ATTEMPTS:
                 raise ValueError("could not generate enough distinct candidate flags")
-            f = _structured_flag(rng, h, w, colours)
-            if f not in flags:
-                flags.append(f)
+            base, var = _twin_pair(rng, h, w, colours, self.rival_edits)
+            if base in seen or var in seen:
+                continue
+            pairs.append((base, var))
+            seen += [base, var]
+        flags = [f for pair in pairs for f in pair]  # pair i -> indices 2i, 2i+1
+        pair = rng.randrange(len(pairs))
+        side = rng.randrange(2)
+        truth_i, rival_i = 2 * pair + side, 2 * pair + 1 - side
         order = list(range(len(flags)))
         rng.shuffle(order)
         names = _names(self.candidate_names, self.n_candidates)
         self.candidates = {names[pos]: flags[i] for pos, i in enumerate(order)}
-        self.truth = names[order.index(0)]
-        self.rival = names[order.index(1)]
+        self.truth = names[order.index(truth_i)]
+        self.rival = names[order.index(rival_i)]
         seeds = [rng.getrandbits(64) for _ in agents]
         self.agents = [str(a) for a in agents]
         self.crops = {}

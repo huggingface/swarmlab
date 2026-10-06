@@ -34,14 +34,14 @@ contains(grid: list[str], crop: list[str]) -> bool
 FlagGame.crop_rows(agent) -> list[str]   # evaluator/test convenience
 ```
 
-`parse_observation(world.observe(a).parts[0].text)` returns exactly `world.candidates` and `world.crop_rows(a)`. The truth is always in `candidates_containing(...)`. With default settings the rival is also consistent with about 43% of crops.
+`parse_observation(world.observe(a).parts[0].text)` returns exactly `world.candidates` and `world.crop_rows(a)`. The truth is always in `candidates_containing(...)`. With default settings (twin pairs, post-review) the rival is also consistent with about 53% of crops, and about 67% of crops match more than one candidate.
 
 ## Decisions where the contract was silent
 
 - **Per-agent crop streams.** `reset` gets only the world rng. After generating the flags it draws `s_i = rng.getrandbits(64)` once per agent, in `agents` order. Agent i's crop then comes from `derive(s_i, "private", agent_i)`, so crops depend only on (world rng, agent list). The contract's `("private", agent)` root therefore sits under a world-derived seed, not the run seed.
 - **Structured flags.** Layouts are horizontal stripes (2-4 bands), vertical stripes (2-4), 2x2 blocks and 2x3 blocks. Neighbouring bands and blocks never share a colour.
-- **Rival.** Exactly `max(1, round((1 - rival_similarity) * h * w))` distinct cells are recoloured to a different colour, so the rival always differs, even at similarity 1.0.
-- **Distinctness.** Distractors are regenerated until all candidates differ. A ValueError is raised after 1000 attempts.
+- **Rival (changed after the M1a review, finding A1).** `rival_similarity` is gone. Candidates are `n_candidates // 2` twin pairs: a structured flag plus a variant with `rival_edits` (default 1) whole bands/blocks recoloured to a colour that differs from the band's own and its neighbours', so both members are clean structured flags. The truth is a random member of a random pair; the rival is its twin. `n_candidates` must be even and `palette >= 3`. A crop-free "nearest pair, cleaner member" heuristic now scores about chance (test `test_no_crop_free_shortcut`).
+- **Distinctness.** Pairs are redrawn until all candidates differ. A ValueError is raised after 1000 attempts.
 - **Naming.** Candidates are shuffled and then named ("letters": A..Z, max 26; "numbers": 1..n), so the truth's name is uniform.
 - **Validation.** `validate` calls super, then rejects unknown candidates, agents not passed to `reset`, and guesses past `guess_limit`. The `guess` method re-checks the same conditions and returns `accepted=False, feedback={"error": ...}`, because several guesses buffered in one round are validated against round-start state.
 - **`collective_status`.** `guess_counts` always lists every candidate name in name order, zeros included, so the key set carries no information. `my_status` for an agent with no state returns `{"current_guess": None, "guesses_made": 0}`.

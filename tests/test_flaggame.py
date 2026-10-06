@@ -45,21 +45,97 @@ def test_crops_depend_on_world_rng_and_agents_only():
     assert {k: a.crops[k] for k in b.crops} == b.crops
 
 
+def _runs(seq):
+    return sum(1 for i, c in enumerate(seq) if i == 0 or c != seq[i - 1])
+
+
+def _clean(grid):
+    """A clean structured flag: <= 4 runs of identical rows, each row <= 4 colour runs."""
+    return _runs(grid) <= 4 and all(_runs(row) <= 4 for row in grid)
+
+
+def _hamming(a, b):
+    return sum(x != y for ra, rb in zip(a, b) for x, y in zip(ra, rb))
+
+
 @pytest.mark.parametrize("seed", range(20))
-def test_rival_fraction_and_distinct(seed):
+def test_twin_pairs_clean_and_distinct(seed):
     w = make(seed)
     truth, rival = w.candidates[w.truth], w.candidates[w.rival]
-    diff = sum(t != r for tr, rr in zip(truth, rival) for t, r in zip(tr, rr))
-    assert diff == round(0.15 * 8 * 12)
+    assert truth != rival
     grids = [tuple(g) for g in w.candidates.values()]
     assert len(set(grids)) == len(grids) == 8
     assert all(len(g) == 8 and all(len(r) == 12 for r in g) for g in grids)
     assert all(set("".join(g)) <= set("rgbykw") for g in grids)
+    assert all(_clean(g) for g in grids)  # no noisy candidate, the rival included
+    assert w.verify()["rival"] == w.rival
 
 
-def test_rival_always_differs_even_at_full_similarity():
-    w = make(1, rival_similarity=1.0)
-    assert w.candidates[w.truth] != w.candidates[w.rival]
+def test_rival_differs_by_whole_bands():
+    # the smallest band/block on an 8x12 flag is 16 cells (2x3 blocks of 4x4), so a variant never
+    # differs by a few noisy cells; it is still a clean structured flag
+    for seed in range(50):
+        for edits in (1, 2):
+            w = make(seed, rival_edits=edits)
+            t, r = w.candidates[w.truth], w.candidates[w.rival]
+            assert _hamming(t, r) >= 16 and _clean(r) and _clean(t)
+
+
+def test_constructor_rejects_odd_candidates_and_tiny_palette():
+    with pytest.raises(ValueError):
+        FlagGame(n_candidates=7)
+    with pytest.raises(ValueError):
+        FlagGame(n_candidates=0)
+    with pytest.raises(ValueError):
+        FlagGame(palette=2)
+    with pytest.raises(ValueError):
+        FlagGame(rival_edits=0)
+    make(1, n_candidates=2)  # a single pair works
+
+
+def _crop_free_heuristic(candidates):
+    """The reviewer's zero-evidence rule: nearest pair by Hamming distance, then the cleaner member
+    (fewer distinct colours, then fewer colour changes); ties go to the first in name order."""
+    names = list(candidates)
+    best = None
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            d = _hamming(candidates[a], candidates[b])
+            if best is None or d < best[0]:
+                best = (d, a, b)
+    _, a, b = best
+
+    def mess(n):
+        g = candidates[n]
+        changes = sum(_runs(row) - 1 for row in g) + sum(_runs(col) - 1 for col in zip(*g))
+        return (len(set("".join(g))), changes)
+
+    return b if mess(b) < mess(a) else a
+
+
+def test_no_crop_free_shortcut():
+    """A1 anti-shortcut: without crops, the reviewer's heuristic scores near chance (1/8).
+
+    Before the fix it chose the truth in 100% of seeds. Bounds are ~4.5 sigma around 0.125 for
+    400 Bernoulli draws (sd ~0.017).
+    """
+    hits = 0
+    for seed in range(400):
+        w = make(seed, agents=AGENTS[:1])
+        hits += _crop_free_heuristic(w.candidates) == w.truth
+    acc = hits / 400
+    assert 0.05 <= acc <= 0.22, acc
+
+
+def test_truth_side_and_pair_are_uniform():
+    """The truth is the pair's base about as often as its variant (no cleanliness bias)."""
+    cleaner = 0
+    for seed in range(400):
+        w = make(seed, agents=AGENTS[:1])
+        t, r = w.candidates[w.truth], w.candidates[w.rival]
+        cleaner += len(set("".join(t))) < len(set("".join(r)))
+        cleaner -= len(set("".join(t))) > len(set("".join(r)))
+    assert abs(cleaner) < 60
 
 
 def test_crops_contained_in_truth_and_rival_sometimes_matches():
@@ -89,8 +165,8 @@ def test_observe_round_trip_and_private():
 
 
 def test_numbers_names_round_trip():
-    w = make(2, candidate_names="numbers", n_candidates=5)
-    assert list(w.candidates) == ["1", "2", "3", "4", "5"]
+    w = make(2, candidate_names="numbers", n_candidates=6)
+    assert list(w.candidates) == ["1", "2", "3", "4", "5", "6"]
     cands, _ = parse_observation(w.observe(AGENTS[1]).parts[0].text)
     assert cands == w.candidates
 

@@ -8,13 +8,13 @@ options:
   max_rounds: 20
 arms:
   broadcast:
-    world: {type: flaggame, params: {n_candidates: 8}}
+    world: {type: flaggame, params: {n_candidates: 8, rival_edits: 1}}
     participants:
       - {type: evidence_aggregator, count: 16}
     medium: {topology: broadcast}
     metrics: [belief.consensus, belief.accuracy, belief.entropy, comm.read_rate, comm.hops]
   gossip:
-    world: {type: flaggame, params: {n_candidates: 8}}
+    world: {type: flaggame, params: {n_candidates: 8, rival_edits: 1}}
     participants:
       - {type: evidence_aggregator, count: 16}
     medium: {topology: gossip}
