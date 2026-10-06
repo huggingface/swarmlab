@@ -1,0 +1,55 @@
+# M2: Flag Game proving experiment (DESIGN.md Build plan).
+# Two topologies x two commit policies x two models, at N=16 (and N=64 in a second stage).
+# Phase 1 = N=16 only; see experiments/README.md for the staging rationale.
+name: m2-flaggame
+seeds: [1, 2, 3]
+options: { max_rounds: 10, commit: round_end }
+budget: { soft_usd: 1.5, hard_usd: 2.5, measurement_usd: 0.5 }   # qwen default; haiku arms override below
+arms:
+  bc-haiku:
+    budget: { soft_usd: 10.0, hard_usd: 14.0, measurement_usd: 3.0 }
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - { type: llm, count: 16, params: { model: "anthropic:claude-haiku-4-5", max_tokens: 1024 } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round, comm.hops]
+  gossip-haiku:
+    budget: { soft_usd: 10.0, hard_usd: 14.0, measurement_usd: 3.0 }
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: gossip, params: { k: 1 } } }
+    participants:
+      - { type: llm, count: 16, params: { model: "anthropic:claude-haiku-4-5", max_tokens: 1024 } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round, comm.hops]
+  bc-haiku-seq:
+    budget: { soft_usd: 10.0, hard_usd: 14.0, measurement_usd: 3.0 }
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    options: { commit: immediate, max_rounds: 10 }
+    participants:
+      - { type: llm, count: 16, params: { model: "anthropic:claude-haiku-4-5", max_tokens: 1024 } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round, comm.hops]
+  bc-qwen:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - { type: llm, count: 16, params: { model: "hf:Qwen/Qwen3.5-9B:deepinfra", max_tokens: 2048, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round, comm.hops]
+  gossip-qwen:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: gossip, params: { k: 1 } } }
+    participants:
+      - { type: llm, count: 16, params: { model: "hf:Qwen/Qwen3.5-9B:deepinfra", max_tokens: 2048, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round, comm.hops]
+  bc-qwen-seq:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    options: { commit: immediate, max_rounds: 10 }
+    participants:
+      - { type: llm, count: 16, params: { model: "hf:Qwen/Qwen3.5-9B:deepinfra", max_tokens: 2048, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round, comm.hops]
