@@ -1,0 +1,189 @@
+{
+ "object": "list",
+ "data": [
+  {
+   "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+   "object": "model",
+   "created": 1789006678,
+   "owned_by": "deepseek-ai",
+   "architecture": {
+    "input_modalities": [
+     "text",
+     "image"
+    ],
+    "output_modalities": [
+     "text"
+    ]
+   },
+   "providers": [
+    {
+     "provider": "novita",
+     "status": "live",
+     "context_length": 1048576,
+     "pricing": {
+      "input": 0.3,
+      "output": 1.2
+     },
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": false,
+     "first_token_latency_ms": 1214,
+     "throughput": 102.20789772593206,
+     "is_model_author": false
+    },
+    {
+     "provider": "fireworks-ai",
+     "status": "live",
+     "context_length": 1048576,
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": true,
+     "first_token_latency_ms": 459.6,
+     "throughput": 126.43773133373843,
+     "is_model_author": false
+    },
+    {
+     "provider": "featherless-ai",
+     "status": "live",
+     "is_free": false,
+     "is_model_author": false
+    },
+    {
+     "provider": "baseten",
+     "status": "live",
+     "context_length": 1048576,
+     "pricing": {
+      "input": 0.3,
+      "output": 1.2
+     },
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": true,
+     "first_token_latency_ms": 404.6,
+     "throughput": 211.03588172982745,
+     "is_model_author": false
+    },
+    {
+     "provider": "deepinfra",
+     "status": "live",
+     "context_length": 1048576,
+     "pricing": {
+      "input": 0.2,
+      "output": 0.6
+     },
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": true,
+     "first_token_latency_ms": 339.4,
+     "throughput": 105.99888782038613,
+     "is_model_author": false
+    }
+   ]
+  },
+  {
+   "id": "Qwen/Qwen3.5-9B",
+   "object": "model",
+   "created": 1772197106,
+   "owned_by": "Qwen",
+   "architecture": {
+    "input_modalities": [
+     "text",
+     "image"
+    ],
+    "output_modalities": [
+     "text"
+    ]
+   },
+   "providers": [
+    {
+     "provider": "together",
+     "status": "live",
+     "context_length": 262144,
+     "pricing": {
+      "input": 0.17,
+      "output": 0.25
+     },
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": true,
+     "first_token_latency_ms": 398.4,
+     "throughput": 93.88815949492,
+     "is_model_author": false
+    },
+    {
+     "provider": "featherless-ai",
+     "status": "live",
+     "is_free": false,
+     "is_model_author": false
+    },
+    {
+     "provider": "ovhcloud",
+     "status": "live",
+     "context_length": 262144,
+     "pricing": {
+      "input": 0.12,
+      "output": 0.18
+     },
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": true,
+     "first_token_latency_ms": 249.8,
+     "throughput": 39.578810105227355,
+     "is_model_author": false
+    },
+    {
+     "provider": "deepinfra",
+     "status": "live",
+     "context_length": 262144,
+     "pricing": {
+      "input": 0.1,
+      "output": 0.15
+     },
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": true,
+     "first_token_latency_ms": 348.4,
+     "throughput": 23.775098318076306,
+     "is_model_author": false
+    }
+   ]
+  },
+  {
+   "id": "Qwen/Qwen3-8B",
+   "object": "model",
+   "created": 1745725341,
+   "owned_by": "Qwen",
+   "architecture": {
+    "input_modalities": [
+     "text"
+    ],
+    "output_modalities": [
+     "text"
+    ]
+   },
+   "providers": [
+    {
+     "provider": "nscale",
+     "status": "live",
+     "context_length": 40960,
+     "pricing": {
+      "input": 0.07,
+      "output": 0.18
+     },
+     "is_free": false,
+     "supports_tools": true,
+     "supports_structured_output": false,
+     "first_token_latency_ms": 945.4,
+     "throughput": 115.0147289752369,
+     "is_model_author": false
+    },
+    {
+     "provider": "featherless-ai",
+     "status": "live",
+     "is_free": false,
+     "is_model_author": false
+    }
+   ]
+  }
+ ]
+}
