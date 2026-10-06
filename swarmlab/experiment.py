@@ -218,10 +218,8 @@ class Run:
 
     # ---- operations --------------------------------------------------------------------------
     def view(self) -> Path:
-        try:
-            from .viewer.build import build as build_view  # type: ignore[import-not-found]
-        except ImportError as e:
-            raise NotImplementedError("WP5") from e
+        from .viewer.build import build as build_view
+
         return build_view(self.dir)
 
     def fork(self, at_round: int, experiment: Experiment | None = None) -> ForkHandle:
