@@ -14,7 +14,10 @@ def agent_id(index: int) -> AgentId:
     return AgentId(f"a{index:03d}")
 
 
-def run_id(experiment: str, arm: str, seed: int) -> RunId:
+def run_id(experiment: str, arm: str | None, seed: int) -> RunId:
+    """`<experiment>__<arm>__s<seed>` from YAML; `<experiment>__s<seed>` when `arm` is None."""
+    if arm is None:
+        return RunId(f"{experiment}__s{seed}")
     return RunId(f"{experiment}__{arm}__s{seed}")
 
 

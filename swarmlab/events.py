@@ -106,6 +106,7 @@ class TurnEndedEvent(Event):
     yield_kind: Literal["no_tool", "end_turn", "cap", "error"]
     calls: int
     usage: dict = {}
+    error: str | None = None  # traceback text when yield_kind == "error" (added by WP4)
 
 
 class ReadEvent(Event):
