@@ -136,14 +136,15 @@ def _fail(e: BaseException, code: int, as_json: bool) -> None:
 
 
 def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
-              calls_per_turn: int | None = None) -> dict[str, Any]:
+              calls_per_turn: int | None = None, prompt_growth: int = 0) -> dict[str, Any]:
     rounds = max_rounds if max_rounds is not None else exp.options.get("max_rounds")
     if rounds is None:
         raise SpecError("no max_rounds in options; pass --max-rounds")
     if calls_per_turn is None:
         calls_per_turn = int(exp.options.get("max_calls_per_turn",
                                              RunOptions.model_fields["max_calls_per_turn"].default))
-    return {**exp.estimate(seed, int(rounds), calls_per_turn=calls_per_turn),
+    return {**exp.estimate(seed, int(rounds), calls_per_turn=calls_per_turn,
+                           prompt_growth=prompt_growth),
             "calls_per_turn": calls_per_turn}
 
 
@@ -331,21 +332,78 @@ def run(
         raise typer.Exit(code)
 
 
+def _estimate_table(ests: dict[str, dict[str, Any]], n_seeds: int, growth: bool) -> str:
+    head = ["arm", "model agents", "rounds", "calls/run", "probe calls", "per run", "seeds", "total"]
+    if growth:
+        head += ["per run +growth", "total +growth"]
+    body = []
+    for a, e in ests.items():
+        row = [a, str(e["llm_agents"]), str(e["rounds"]), str(e["calls"]), str(e["probe_calls"]),
+               _usd(e["usd_flat"]), str(n_seeds), _usd(e["usd_flat"] * n_seeds)]
+        if growth:
+            row += [_usd(e["usd"]), _usd(e["usd"] * n_seeds)]
+        body.append(row)
+    widths = [max(len(h), *(len(b[i]) for b in body)) for i, h in enumerate(head)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    return "\n".join([fmt.format(*head)] + [fmt.format(*b) for b in body])
+
+
 @app.command()
 def estimate(
     spec: Annotated[Path, typer.Argument(help="Experiment YAML.")],
-    arm: Annotated[str | None, typer.Option("--arm", help="Arm name (optional if only one).")] = None,
-    seed: Annotated[int, typer.Option("--seed", help="Run seed.")] = 0,
+    arm: Annotated[str | None, typer.Option(
+        "--arm", help="Estimate only this arm (default: every arm).")] = None,
+    seed: Annotated[int | None, typer.Option(
+        "--seed", help="Estimate only this seed (default: every seed in the YAML's `seeds:`).")] = None,
     max_rounds: Annotated[int | None, typer.Option("--max-rounds", help="Override options.max_rounds.")] = None,
     calls_per_turn: Annotated[int | None, typer.Option(
         "--calls-per-turn", help="Model calls per turn (default: options.max_calls_per_turn).")] = None,
+    prompt_growth: Annotated[int, typer.Option(
+        "--prompt-growth", metavar="TOKENS_PER_ROUND",
+        help="Prompt tokens added per round (full-memory context growth); round r is priced at "
+             "prompt_tokens + growth * (r - 1).")] = 0,
     as_json: JsonOpt = False,
 ) -> None:
-    """Print a rough worst-case dollar estimate for one arm (no run, no provider call)."""
+    """Print a rough worst-case dollar estimate: every arm x every seed, or the arm/seed you pick
+    (no run, no provider call)."""
 
     def go() -> dict[str, Any]:
-        est = _estimate(_build(spec, arm), seed, max_rounds, calls_per_turn)
-        return est if as_json else {"estimate": _estimate_line(est)[len("estimate: "):]}
+        if prompt_growth < 0:
+            raise SpecError("--prompt-growth must be >= 0")
+        doc = load_experiment_yaml(spec)
+        if arm is not None and arm not in doc["arms"]:
+            raise SpecError(f"{spec}: unknown arm {arm!r}; available: {sorted(doc['arms'])}")
+        arms = [arm] if arm is not None else list(doc["arms"])
+        seeds = [seed] if seed is not None else experiment_seeds(doc)
+        ests = {a: _estimate(_build(spec, a), seeds[0], max_rounds, calls_per_turn, prompt_growth)
+                for a in arms}
+        if seed is not None and len(arms) == 1:  # the single-run form: one estimate dict
+            est = ests[arms[0]]
+            if as_json:
+                return est
+            text = _estimate_line(est)[len("estimate: "):]
+            if prompt_growth > 0:
+                text += (f"\nflat (no growth): ${est['usd_flat']:.4f}; with prompt growth "
+                         f"{prompt_growth} tokens/round: ${est['usd']:.4f}")
+            return {"estimate": text}
+        n_runs = len(arms) * len(seeds)
+        total_flat = sum(e["usd_flat"] for e in ests.values()) * len(seeds)
+        total = sum(e["usd"] for e in ests.values()) * len(seeds)
+        data: dict[str, Any] = {"ok": True, "arms": ests, "seeds": seeds, "runs": n_runs,
+                                "prompt_growth": prompt_growth, "total_usd": total,
+                                "total_usd_flat": total_flat}
+        if as_json:
+            return data
+        lines = [_estimate_table(ests, len(seeds), prompt_growth > 0),
+                 f"estimate total: ${total_flat:.4f} worst case over {n_runs} run(s)"]
+        if prompt_growth > 0:
+            lines.append(f"with prompt growth {prompt_growth} tokens/round: ${total:.4f} worst case")
+        ceiling = sum(float(e["budget"].get("hard_usd") or 0) for e in ests.values()) * len(seeds)
+        if ceiling > 0:
+            lines.append(f"hard ceilings sum to ${ceiling:.2f}")
+        if _only_fake(ests.values()):
+            lines.append("(fake: models only: prices are nominal, nothing is billed)")
+        return {"text": "\n".join(lines)}
 
     _execute(go, as_json)
 

@@ -59,6 +59,11 @@ Decisions where the contract is silent:
   `rerun=True` to write `out/<run_id>__r<N>` with the smallest free N >= 2).
 - `estimate(..., seeds=None)`: when `seeds` is given the result adds `runs = len(seeds)` and
   `total_usd = usd * runs` (the agent count does not depend on the seed).
+- `estimate(..., prompt_growth=0)` models full-memory context growth: a call in round r
+  (1-based) is priced with `prompt_tokens + prompt_growth * (r - 1)` prompt tokens (a probe
+  after round r likewise). `usd`, `by_model` and `measurement_usd` use the growth-adjusted
+  tokens; `usd_flat` is the same estimate with growth 0 (equal to `usd` when growth is 0), and
+  `total_usd_flat` accompanies `total_usd` when `seeds` is given.
 - `Run.summary()` is the CLI's run summary: run_dir, run_id, arm, seed, spec_hash, status,
   end_reason, last_round, score, metrics (last value per name), spend (+ parent_run/fork_round
   for a fork). `Run.load(dir, run_id=None)` accepts a run dir, or a parent dir plus run id.
@@ -152,12 +157,18 @@ class Experiment(BaseModel):
 
     def estimate(self, seed: int, max_rounds: int, calls_per_turn: int = 2,
                  prompt_tokens: int = 3000, completion_tokens: int = 300,
-                 seeds: list[int] | None = None) -> dict:
+                 seeds: list[int] | None = None, prompt_growth: int = 0) -> dict:
+        rounds = range(1, max_rounds + 1)
+        # sum over rounds of the prompt tokens of one call per round (flat and growth-adjusted)
+        flat_tokens = prompt_tokens * max_rounds
+        grown_tokens = sum(prompt_tokens + prompt_growth * (r - 1) for r in rounds)
         by_model: dict[str, float] = {}
+        by_model_flat: dict[str, float] = {}
         llm = 0
         calls = 0
         probe_calls = 0
         measurement = 0.0
+        measurement_flat = 0.0
         for p in self.participants:
             model = participant_model(p)
             if model is None:
@@ -165,26 +176,35 @@ class Experiment(BaseModel):
             llm += 1
             provider, mid = self.provider_for(model)
             p_in, p_out, _ = provider.model_pricing(mid)
-            per_call = (prompt_tokens * p_in + completion_tokens * p_out) / 1e6
             own = getattr(p, "max_calls", None)
             cpt = min(calls_per_turn, own) if isinstance(own, int) and own > 0 else calls_per_turn
             calls += cpt * max_rounds
-            by_model[model] = by_model.get(model, 0.0) + per_call * cpt * max_rounds
+            out_usd = completion_tokens * p_out * max_rounds
+            by_model[model] = by_model.get(model, 0.0) + cpt * (grown_tokens * p_in + out_usd) / 1e6
+            by_model_flat[model] = (by_model_flat.get(model, 0.0)
+                                    + cpt * (flat_tokens * p_in + out_usd) / 1e6)
             if callable(getattr(p, "probe_context", None)):
                 for probe in self.probes:
-                    n = max_rounds // max(1, probe.every)
-                    probe_calls += n
-                    measurement += per_call * n
+                    every = max(1, probe.every)
+                    probed = [r for r in rounds if r % every == 0]
+                    probe_calls += len(probed)
+                    tokens = sum(prompt_tokens + prompt_growth * (r - 1) for r in probed)
+                    measurement += (tokens * p_in + completion_tokens * p_out * len(probed)) / 1e6
+                    measurement_flat += (prompt_tokens * p_in
+                                         + completion_tokens * p_out) * len(probed) / 1e6
         out = {
             "arm": self.arm, "agents": len(self.participants), "llm_agents": llm,
             "rounds": max_rounds, "calls": calls,
             "usd": sum(by_model.values()) + measurement, "by_model": by_model,
             "probe_calls": probe_calls, "measurement_usd": measurement,
             "budget": self.budget.model_dump(mode="json"),
+            "prompt_tokens": prompt_tokens, "prompt_growth": prompt_growth,
+            "usd_flat": sum(by_model_flat.values()) + measurement_flat,
         }
         if seeds is not None:
             out["runs"] = len(seeds)
             out["total_usd"] = out["usd"] * len(seeds)
+            out["total_usd_flat"] = out["usd_flat"] * len(seeds)
         return out
 
     # ---- running -----------------------------------------------------------------------------

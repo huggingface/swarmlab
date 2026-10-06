@@ -88,7 +88,7 @@ class Counter(World):
 - **Prices** are never typed by hand. `swarmlab models [--provider hf|anthropic] [--tools] [--search qwen]` lists models, who serves them, tool support and USD per million tokens. `hf` prices come from the router listing (cached 24 h in `~/.cache/swarmlab/catalog.json`); a bare `hf:Org/Model` is priced at its most expensive listed provider. The price used is written into the run spec. To override, or for a model the catalog does not price, add `providers: {hf: {type: openai_compat, params: {name: hf, pricing: {"Org/Model:prov": [in, out, cached]}}}}`.
 - **Timeouts**: each provider call attempt is cut off after `timeout_s` (default 90 s) and timeouts, connection errors, 429 and 5xx are retried up to `max_retries` times (default 2) with jittered 1/2/4 s backoff; the budget reservation is held across retries. A phase-commit round waits for its slowest call, so tighten these for slow-tailed routers: `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 60, max_retries: 3}}}` (`type: anthropic` takes the same two params).
 - Each `inference_response` event records `attempts`; a call that still fails after its retries raises `ProviderError`.
-- **Budgets** (USD, per run): `soft_usd` ends the run at the next round boundary once agent spend reaches it; `hard_usd` is an absolute ceiling on agent + probe spend (the round in flight is discarded and `swarmlab resume RUN --budget-hard X` continues); `measurement_usd` caps probes. 0 means "not enforced", so set `hard_usd` before using a paid model. When any budget is non-zero `run` asks before starting (`--yes` skips the question); `swarmlab estimate spec.yaml --arm A` prints the estimate alone.
+- **Budgets** (USD, per run): `soft_usd` ends the run at the next round boundary once agent spend reaches it; `hard_usd` is an absolute ceiling on agent + probe spend (the round in flight is discarded and `swarmlab resume RUN --budget-hard X` continues); `measurement_usd` caps probes. 0 means "not enforced", so set `hard_usd` before using a paid model. When any budget is non-zero `run` asks before starting (`--yes` skips the question); `swarmlab estimate spec.yaml` prints the estimate alone (every arm x seed; `--arm`/`--seed` narrow it, `--prompt-growth TOKENS` models a context that grows each round under full memory).
 
 ## CLI
 
@@ -96,7 +96,8 @@ class Counter(World):
 swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S]
 swarmlab init [NAME]                     swarmlab validate SPEC
 swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [--rerun]
-swarmlab estimate SPEC [--arm A]         swarmlab replay RUN_DIR
+swarmlab estimate SPEC [--arm A] [--seed N] [--prompt-growth G]
+swarmlab replay RUN_DIR
 swarmlab resume RUN_DIR [--budget-hard X]   swarmlab fork RUN_DIR --at 4 [--spec edited.yaml]
 swarmlab view RUN_DIR
 ```
