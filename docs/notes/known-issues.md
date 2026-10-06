@@ -5,3 +5,7 @@
 - Fake-provider runs report a non-zero "spend" (the fake pricing table); label it as simulated in the CLI table.
 - The OpenAI-compatible adapter ignores `reasoning_content`; hidden reasoning tokens are neither stored nor counted when thinking is on.
 - Haiku `thinking_budget` is unsupported across tool turns (thinking blocks are not carried); left unset.
+- Sequential commit (`commit: immediate`) with a high-latency provider is impractical: every call is on the critical path, so DeepInfra's tail (p90 112 s, max 343 s observed) made one N=16 round take about 30 minutes. Mitigation is the per-request timeout+retry (default 90 s, 2 retries); the structural answer is to prefer phase-commit for slow providers or run sequential at small N.
+- A fork's `Run.spend` includes the parent's prefix spend (correct for the ledger, confusing in tables); show "inherited" and "new" separately.
+- Probe-sourced metrics must be declared with `params: {source: "probe:<name>"}`; a string shorthand `belief.consensus@probe:belief` in the metrics list would be friendlier. M2 phase 1 computed them offline (`tools/m2_report.py`) because the spec omitted them.
+- `Experiment.estimate` assumes the per-turn call cap every turn and overstates real spend 4-6x; add a mode seeded from a measured run (calls/turn and tokens/round).
