@@ -18,6 +18,15 @@ Decisions where the contract is silent:
   to the parent's arm when the edited YAML has it, else to the only arm.
 - `validate` resolves every arm through `Experiment.from_yaml`, so unknown plugin types and bad
   constructor params are caught, not just YAML shape.
+- M1b (WP7): `run` prints `Experiment.estimate(seed, max_rounds, calls_per_turn=...)` before
+  running whenever any budget field is non-zero: one line `estimate: arm=... worst-case $X ...`
+  on stdout, or on stderr under `--json` (stdout keeps exactly one JSON object). The estimate uses
+  `calls_per_turn = options.max_calls_per_turn` (every turn hitting the runner's cap: the worst
+  case), plus one call per probed agent per probed round. `swarmlab estimate SPEC [--arm A]
+  [--seed N] [--max-rounds R] [--calls-per-turn C]` prints the same dict (default
+  calls_per_turn: the worst case as above). `resume` takes `--budget-soft/--budget-hard/
+  --budget-measurement`; given any of them, the effective budget (`run.json["budget"]`) is
+  updated with those fields and passed to `Run.resume(budget=...)`.
 """
 from __future__ import annotations
 
@@ -30,7 +39,7 @@ from typing import Annotated, Any
 import typer
 
 from .experiment import Experiment, Run
-from .spec import SpecError, load_experiment_yaml
+from .spec import Budget, RunOptions, SpecError, load_experiment_yaml
 
 app = typer.Typer(
     name="swarmlab",
@@ -128,6 +137,25 @@ def _fail(e: BaseException, code: int, as_json: bool) -> None:
     raise typer.Exit(code)
 
 
+def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
+              calls_per_turn: int | None = None) -> dict[str, Any]:
+    rounds = max_rounds if max_rounds is not None else exp.options.get("max_rounds")
+    if rounds is None:
+        raise SpecError("no max_rounds in options; pass --max-rounds")
+    if calls_per_turn is None:
+        calls_per_turn = int(exp.options.get("max_calls_per_turn",
+                                             RunOptions.model_fields["max_calls_per_turn"].default))
+    return {**exp.estimate(seed, int(rounds), calls_per_turn=calls_per_turn),
+            "calls_per_turn": calls_per_turn}
+
+
+def _estimate_line(est: dict[str, Any]) -> str:
+    by_model = ", ".join(f"{m}=${v:.4f}" for m, v in est["by_model"].items()) or "no model calls"
+    return (f"estimate: arm={est['arm']} worst-case ${est['usd']:.4f} "
+            f"({est['llm_agents']} model agents x {est['rounds']} rounds x "
+            f"{est['calls_per_turn']} calls/turn, {est['probe_calls']} probe calls; {by_model}); budget {est['budget']}")
+
+
 # ---- commands --------------------------------------------------------------------------------
 @app.command()
 def validate(
@@ -168,7 +196,32 @@ def run(
         exp = _build(spec, arm)
         if max_rounds is None and "max_rounds" not in exp.options:
             raise SpecError(f"{spec}: no max_rounds in options; pass --max-rounds")
+        if any(v > 0 for v in exp.budget.model_dump().values()):
+            line = _estimate_line(_estimate(exp, seed, max_rounds))
+            if as_json:
+                print(line, file=sys.stderr)
+            else:
+                typer.echo(line)
         return summary(exp.run(seed=seed, max_rounds=max_rounds, out=out))
+
+    _execute(go, as_json)
+
+
+@app.command()
+def estimate(
+    spec: Annotated[Path, typer.Argument(help="Experiment YAML.")],
+    arm: Annotated[str | None, typer.Option("--arm", help="Arm name (optional if only one).")] = None,
+    seed: Annotated[int, typer.Option("--seed", help="Run seed.")] = 0,
+    max_rounds: Annotated[int | None, typer.Option("--max-rounds", help="Override options.max_rounds.")] = None,
+    calls_per_turn: Annotated[int | None, typer.Option(
+        "--calls-per-turn", help="Model calls per turn (default: options.max_calls_per_turn).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Print a rough worst-case dollar estimate for one arm (no run, no provider call)."""
+
+    def go() -> dict[str, Any]:
+        est = _estimate(_build(spec, arm), seed, max_rounds, calls_per_turn)
+        return est if as_json else {"estimate": _estimate_line(est)[len("estimate: "):]}
 
     _execute(go, as_json)
 
@@ -185,10 +238,25 @@ def replay(
 @app.command()
 def resume(
     run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
+    budget_soft: Annotated[float | None, typer.Option("--budget-soft", help="New soft budget (USD).")] = None,
+    budget_hard: Annotated[float | None, typer.Option("--budget-hard", help="New hard ceiling (USD).")] = None,
+    budget_measurement: Annotated[float | None, typer.Option(
+        "--budget-measurement", help="New measurement budget (USD).")] = None,
     as_json: JsonOpt = False,
 ) -> None:
-    """Resume an interrupted run from its last committed round."""
-    _execute(lambda: summary(Run(run_dir).resume()), as_json)
+    """Resume an interrupted (or budget-ended) run from its last committed round."""
+
+    def go() -> dict[str, Any]:
+        r = Run(run_dir)
+        changes = {k: v for k, v in (("soft_usd", budget_soft), ("hard_usd", budget_hard),
+                                     ("measurement_usd", budget_measurement)) if v is not None}
+        budget = None
+        if changes:
+            current = r.meta.get("budget") or r.meta["spec"]["budget"]
+            budget = Budget(**{**current, **changes})
+        return summary(r.resume(budget=budget))
+
+    _execute(go, as_json)
 
 
 @app.command()

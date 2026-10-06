@@ -38,7 +38,8 @@ Decisions where the contract is silent:
   accepted for symmetry with `run` (the agent count does not depend on it).
 - M1b (WP7): `probes` holds `Probe` objects; strings and `{type, params}` mappings are built
   through the `swarmlab.probes` entry points at construction, and a probe's `coder_model()` is
-  priced there like participant models. `estimate` also counts one probe call per probed agent per
+  priced there like participant models. `estimate` caps `calls_per_turn` at a participant's own
+  `max_calls` when it has one, and also counts one probe call per probed agent per
   probed round (`probe_calls`, priced like a turn call, `measurement_usd`, included in `usd`).
   `Run.probes` reads the `probe` events: `{name: [(round, agent, parsed, ok), ...]}`.
 - `Run.spend` reads `run.json["ledger"]`: `{"swarm", "measurement", "reserved", "calls"}`.
@@ -123,6 +124,7 @@ class Experiment(BaseModel):
                  prompt_tokens: int = 3000, completion_tokens: int = 300) -> dict:
         by_model: dict[str, float] = {}
         llm = 0
+        calls = 0
         probe_calls = 0
         measurement = 0.0
         for p in self.participants:
@@ -133,7 +135,10 @@ class Experiment(BaseModel):
             provider, mid = self.provider_for(model)
             p_in, p_out, _ = provider.model_pricing(mid)
             per_call = (prompt_tokens * p_in + completion_tokens * p_out) / 1e6
-            by_model[model] = by_model.get(model, 0.0) + per_call * calls_per_turn * max_rounds
+            own = getattr(p, "max_calls", None)
+            cpt = min(calls_per_turn, own) if isinstance(own, int) and own > 0 else calls_per_turn
+            calls += cpt * max_rounds
+            by_model[model] = by_model.get(model, 0.0) + per_call * cpt * max_rounds
             if callable(getattr(p, "probe_context", None)):
                 for probe in self.probes:
                     n = max_rounds // max(1, probe.every)
@@ -141,7 +146,7 @@ class Experiment(BaseModel):
                     measurement += per_call * n
         return {
             "arm": self.arm, "agents": len(self.participants), "llm_agents": llm,
-            "rounds": max_rounds, "calls": llm * max_rounds * calls_per_turn,
+            "rounds": max_rounds, "calls": calls,
             "usd": sum(by_model.values()) + measurement, "by_model": by_model,
             "probe_calls": probe_calls, "measurement_usd": measurement,
             "budget": self.budget.model_dump(mode="json"),

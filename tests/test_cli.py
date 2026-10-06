@@ -42,8 +42,10 @@ def spec(tmp_path):
 def test_validate_example_and_small(spec):
     res, data = invoke("validate", EXAMPLE, "--json")
     assert res.exit_code == 0, res.output
-    assert data["ok"] and set(data["arms"]) == {"broadcast", "gossip"}
-    assert all(a["n_agents"] == 16 and a["max_rounds"] == 20 for a in data["arms"].values())
+    assert data["ok"] and set(data["arms"]) == {"broadcast", "gossip", "llm"}
+    assert all(data["arms"][a]["n_agents"] == 16 and data["arms"][a]["max_rounds"] == 20
+               for a in ("broadcast", "gossip"))
+    assert data["arms"]["llm"]["n_agents"] == 8 and data["arms"]["llm"]["max_rounds"] == 6
     res, _ = invoke("validate", spec)
     assert res.exit_code == 0 and "cli-small" in res.stdout
 
