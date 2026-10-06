@@ -37,6 +37,7 @@ delay = "swarmlab.medium.board:DelayPolicy"
 silent = "swarmlab.participants.scripted:Silent"
 evidence_aggregator = "swarmlab.participants.scripted:EvidenceAggregator"
 enumerator = "swarmlab.participants.scripted:Enumerator"
+llm = "swarmlab.participants.llm:LLMAgent"
 
 [project.entry-points."swarmlab.metrics"]
 "belief.accuracy" = "swarmlab.metrics.belief:Accuracy"
@@ -46,6 +47,9 @@ enumerator = "swarmlab.participants.scripted:Enumerator"
 "comm.read_rate" = "swarmlab.metrics.comm:ReadRate"
 "comm.posts_per_round" = "swarmlab.metrics.comm:PostsPerRound"
 "comm.hops" = "swarmlab.metrics.comm:Hops"
+
+[project.entry-points."swarmlab.probes"]
+belief = "swarmlab.probes:BeliefProbe"
 
 [project.entry-points."swarmlab.providers"]
 anthropic = "swarmlab.providers.anthropic:AnthropicProvider"
@@ -61,6 +65,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["swarmlab"]
+artifacts = ["swarmlab/participants/prompts/*.j2", "swarmlab/viewer/*.html"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

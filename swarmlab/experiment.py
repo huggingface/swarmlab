@@ -36,6 +36,11 @@ Decisions where the contract is silent:
   `prompt_tokens * p_in + completion_tokens * p_out`; participants without a model cost 0. Returns
   `{"arm", "agents", "llm_agents", "rounds", "calls", "usd", "by_model", "budget"}`. `seed` is
   accepted for symmetry with `run` (the agent count does not depend on it).
+- M1b (WP7): `probes` holds `Probe` objects; strings and `{type, params}` mappings are built
+  through the `swarmlab.probes` entry points at construction, and a probe's `coder_model()` is
+  priced there like participant models. `estimate` also counts one probe call per probed agent per
+  probed round (`probe_calls`, priced like a turn call, `measurement_usd`, included in `usd`).
+  `Run.probes` reads the `probe` events: `{name: [(round, agent, parsed, ok), ...]}`.
 - `Run.spend` reads `run.json["ledger"]`: `{"swarm", "measurement", "reserved", "calls"}`.
   `Run.resume(budget=None)` passes the budget through to the runner (see `Runner.resume`).
 - When a `Run` came from `Experiment.run`, `fork`/`resume` reuse that in-memory experiment
@@ -54,6 +59,7 @@ from .ids import run_id as make_run_id
 from .medium.board import Board
 from .metrics.base import Metric
 from .participants.base import Participant
+from .probes import Probe, build_probe
 from .providers import resolve as resolve_provider
 from .providers.base import Provider, split_model
 from .registry import build
@@ -90,9 +96,14 @@ class Experiment(BaseModel):
 
     def __init__(self, **data: Any) -> None:
         super().__init__(**data)
+        self.probes = [p if isinstance(p, Probe) else build_probe(p) for p in self.probes]
+        names = [p.name for p in self.probes]
+        if len(set(names)) != len(names):
+            raise ValueError(f"probe names must be unique, got {names}")
         # after validation, so UnknownModelPricing propagates as itself (not a ValidationError)
-        for p in self.participants:
-            model = participant_model(p)
+        models = [participant_model(p) for p in self.participants]
+        models += [p.coder_model() for p in self.probes]
+        for model in models:
             if model is not None:
                 provider, mid = self.provider_for(model)
                 provider.model_pricing(mid)
@@ -112,6 +123,8 @@ class Experiment(BaseModel):
                  prompt_tokens: int = 3000, completion_tokens: int = 300) -> dict:
         by_model: dict[str, float] = {}
         llm = 0
+        probe_calls = 0
+        measurement = 0.0
         for p in self.participants:
             model = participant_model(p)
             if model is None:
@@ -121,10 +134,16 @@ class Experiment(BaseModel):
             p_in, p_out, _ = provider.model_pricing(mid)
             per_call = (prompt_tokens * p_in + completion_tokens * p_out) / 1e6
             by_model[model] = by_model.get(model, 0.0) + per_call * calls_per_turn * max_rounds
+            if callable(getattr(p, "probe_context", None)):
+                for probe in self.probes:
+                    n = max_rounds // max(1, probe.every)
+                    probe_calls += n
+                    measurement += per_call * n
         return {
             "arm": self.arm, "agents": len(self.participants), "llm_agents": llm,
             "rounds": max_rounds, "calls": llm * max_rounds * calls_per_turn,
-            "usd": sum(by_model.values()), "by_model": by_model,
+            "usd": sum(by_model.values()) + measurement, "by_model": by_model,
+            "probe_calls": probe_calls, "measurement_usd": measurement,
             "budget": self.budget.model_dump(mode="json"),
         }
 
@@ -170,6 +189,7 @@ class Experiment(BaseModel):
             budget=self.budget,
             options=RunOptions(seed=seed, max_rounds=max_rounds, **run_options),
             providers={k: PluginSpec(**p.spec()) for k, p in (self.providers or {}).items()},
+            probes=[PluginSpec(**p.spec()) for p in self.probes],
         )
 
     @classmethod
@@ -184,6 +204,7 @@ class Experiment(BaseModel):
             metrics=[build(m, "swarmlab.metrics") for m in spec.metrics],
             budget=spec.budget,
             providers={k: build(p, "swarmlab.providers") for k, p in spec.providers.items()} or None,
+            probes=[build(p, "swarmlab.probes") for p in spec.probes],
         )
 
     @classmethod
@@ -280,6 +301,15 @@ class Run:
         for ev in self.events_all:
             if ev.type == "metric":
                 out.setdefault(ev.name, []).append((ev.round, ev.value, ev.denominator))
+        return out
+
+    @property
+    def probes(self) -> dict[str, list[tuple[int, str, dict, bool]]]:
+        """Probe answers by probe name: `(round, agent, parsed, ok)` in log order."""
+        out: dict[str, list[tuple[int, str, dict, bool]]] = {}
+        for ev in self.events_all:
+            if ev.type == "probe":
+                out.setdefault(ev.probe, []).append((ev.round, str(ev.agent), dict(ev.parsed), ev.ok))
         return out
 
     # ---- operations --------------------------------------------------------------------------

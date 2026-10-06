@@ -119,7 +119,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._io import atomic_write_bytes
 from .blobs import BlobStore
-from .budget import Gate, HardCeilingReached, Ledger
+from .budget import Gate, HardCeilingReached, Ledger, MeasurementBudgetReached
 from .events import (
     OPERATIONAL_TYPES,
     ActionCommittedEvent,
@@ -130,6 +130,7 @@ from .events import (
     EventLog,
     MetricEvent,
     PostEvent,
+    ProbeEvent,
     RoundCommittedEvent,
     RoundStartedEvent,
     RunEndedEvent,
@@ -144,6 +145,8 @@ from .ids import run_id as make_run_id
 from .inference import Inference, InferenceCache
 from .metrics.base import Metric
 from .metrics.base import get as get_metric
+from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
+from .providers.base import ChatMessage, ChatRequest
 from .rng import derive
 from .scheduler import SeededShuffle
 from .snapshot import SnapshotManifest, SnapshotStore
@@ -301,6 +304,13 @@ class Runner:
         if len(set(names)) != len(names):
             raise ValueError(f"metric names must be unique, got {names}")
         self.participants = {a: copy.deepcopy(p) for a, p in zip(self.agents, exp.participants, strict=True)}
+        self.probes: list[Probe] = [build_probe(p) for p in exp.probes]
+        pnames = [p.name for p in self.probes]
+        if len(set(pnames)) != len(pnames):
+            raise ValueError(f"probe names must be unique, got {pnames}")
+        self._probes_stopped = False
+        self._probe_hard_ceiling = False
+        self._probe_no_context: set[tuple[str, str]] = set()
         self.dir.mkdir(parents=True, exist_ok=True)
         self.blobs = BlobStore(self.dir / "blobs")
         self.snapshots = SnapshotStore(self.dir, self.blobs)
@@ -687,6 +697,10 @@ class Runner:
 
     # ---- the round loop ----------------------------------------------------------------------
     async def _loop(self, start: int) -> None:
+        self._probe_no_context = {
+            (e.probe, str(e.agent)) for e in self.log
+            if e.type == "probe" and (e.parsed or {}).get("skipped") == "no_context"
+        }
         r = start
         while True:
             reason = self._end_reason(r - 1)
@@ -698,7 +712,68 @@ class Runner:
             except HardCeilingReached:
                 self._abort_round(r)
                 return
+            if self._probe_hard_ceiling:  # a probe hit the ceiling after round r was committed
+                self._end(r, "hard_ceiling")
+                return
             r += 1
+
+    # ---- probes (docs/INTERFACE-M1b.md §5; details in swarmlab/probes.py) ------------------------
+    async def _probe_round(self, r: int, order: list[AgentId], ex: RoundExecutor) -> None:
+        for probe in self.probes:
+            if r % max(1, probe.every) or self._probes_stopped:
+                continue
+            targets: list[AgentId] = []
+            for a in order:
+                if a not in self.live_agents:
+                    continue
+                if not callable(getattr(self.participants[a], "probe_context", None)):
+                    if (probe.name, str(a)) not in self._probe_no_context:
+                        self._probe_no_context.add((probe.name, str(a)))
+                        self._append(ProbeEvent, r, a, probe=probe.name, question_hash="",
+                                     raw_hash="", parsed={"skipped": "no_context"}, ok=False)
+                    continue
+                targets.append(a)
+            if not targets:
+                continue
+            results = await asyncio.gather(*(self._probe_one(probe, a, r, ex) for a in targets))
+            for a, fields in zip(targets, results, strict=True):
+                self._append(ProbeEvent, r, a, **fields)
+
+    async def _probe_one(self, probe: Probe, agent: AgentId, r: int, ex: RoundExecutor) -> dict:
+        """One agent's probe: the `probe` event fields (budget exceptions become skipped events)."""
+        participant = self.participants[agent]
+        question = probe.question(agent, r)
+        q_hash = self.blobs.put_text(question)
+        req = ChatRequest(messages=probe_messages(participant.probe_context())
+                          + [ChatMessage(role="user", content=question)], tools=[],
+                          **participant.model_request_defaults())
+        cost = 0.0
+        try:
+            resp = await ex.infer(agent, req, "measurement")
+            cost += self.gate.provider_for(req.model).cost(req, resp.usage)
+            raw = resp.text
+            ok, parsed = probe.parse(raw)
+            coder = probe.coder_model()
+            if not ok and coder:
+                creq = ChatRequest(model=coder, max_tokens=256, temperature=0.0, tools=[], messages=[
+                    ChatMessage(role="system", content=CODER_SYSTEM),
+                    ChatMessage(role="user", content=f"Question:\n{question}\n\nReply:\n{raw}"),
+                ])
+                cresp = await ex.infer(agent, creq, "measurement")
+                cost += self.gate.provider_for(creq.model).cost(creq, cresp.usage)
+                ok, parsed = probe.parse(cresp.text)
+                parsed = {**parsed, "coded": True}
+        except MeasurementBudgetReached:
+            self._probes_stopped = True
+            return {"probe": probe.name, "question_hash": q_hash, "raw_hash": "",
+                    "parsed": {"skipped": "measurement_budget"}, "ok": False, "cost_usd": cost}
+        except HardCeilingReached:
+            self._probes_stopped = True
+            self._probe_hard_ceiling = True
+            return {"probe": probe.name, "question_hash": q_hash, "raw_hash": "",
+                    "parsed": {"skipped": "hard_ceiling"}, "ok": False, "cost_usd": cost}
+        return {"probe": probe.name, "question_hash": q_hash, "raw_hash": self.blobs.put_text(raw),
+                "parsed": _jsonable(parsed), "ok": ok, "cost_usd": cost}
 
     def _end_reason(self, committed: int) -> str | None:
         if committed >= 1 and self.world.terminal():
@@ -752,7 +827,7 @@ class Runner:
             ]
         view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
-                    tools=ex.schemas(agent))
+                    tools=ex.schemas(agent), description=self.world.description())
         usage: dict = {}
         error = None
         try:
@@ -832,6 +907,8 @@ class Runner:
                          accepted=out.accepted, feedback=feedback)
             self.outcomes_prev.setdefault(a, []).append(
                 {"action_id": aid, "tool": act.name, "accepted": out.accepted, "feedback": feedback})
+        # probes (after the commit, before metrics, so probe-sourced metrics see this round)
+        await self._probe_round(r, order, ex)
         # metrics
         fed = [parse_event(ev.model_dump_json()) for ev in self._round_events if ev.type not in NOT_FED]
         for m in self.metrics:

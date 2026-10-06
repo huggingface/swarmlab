@@ -108,6 +108,7 @@ class RunSpec(BaseModel):
     budget: Budget
     options: RunOptions
     providers: dict[str, PluginSpec] = {}  # M1b: provider overrides by model prefix
+    probes: list[PluginSpec] = []  # M1b: probes run after each commit (swarmlab/probes.py)
 
 
 def canonical_json(data: Any) -> str:
@@ -116,7 +117,10 @@ def canonical_json(data: Any) -> str:
 
 def spec_hash(run_spec: RunSpec) -> str:
     """SHA-256 hex of the canonical JSON of the resolved spec."""
-    return hashlib.sha256(canonical_json(run_spec.model_dump(mode="json")).encode()).hexdigest()
+    data = run_spec.model_dump(mode="json")
+    if not data.get("probes"):  # M1b field; omitted when empty so earlier specs keep their hash
+        data.pop("probes", None)
+    return hashlib.sha256(canonical_json(data).encode()).hexdigest()
 
 
 # ---- experiment YAML --------------------------------------------------------------------------
@@ -135,6 +139,7 @@ class ArmDoc(BaseModel):
     participants: list[ParticipantGroup] = Field(min_length=1)
     medium: MediumSpec = MediumSpec()
     metrics: list[PluginSpec] = []
+    probes: list[PluginSpec] = []
     options: dict = {}
     budget: dict = {}
 
@@ -148,7 +153,7 @@ class ArmDoc(BaseModel):
     def _participants(cls, v: Any) -> Any:
         return [_coerce_plugin(x) for x in v] if isinstance(v, (list, tuple)) else v
 
-    @field_validator("metrics", mode="before")
+    @field_validator("metrics", "probes", mode="before")
     @classmethod
     def _metrics(cls, v: Any) -> Any:
         return [_coerce_plugin(x) for x in v] if isinstance(v, (list, tuple)) else v
@@ -239,6 +244,7 @@ def arm_to_runspec(doc: dict, arm: str, seed: int, **option_overrides: Any) -> R
             participants=participants,
             medium=MediumSpec(**a["medium"]),
             metrics=[PluginSpec(**m) for m in a["metrics"]],
+            probes=[PluginSpec(**p) for p in a["probes"]],
             budget=Budget(**{**norm["budget"], **a["budget"]}),
             options=RunOptions(**options),
             providers={k: PluginSpec(**v) for k, v in norm["providers"].items()},
@@ -274,6 +280,7 @@ def runspec_to_doc(run_spec: RunSpec, arm: str | None = None) -> dict:
                     "participants": groups,
                     "medium": run_spec.medium.model_dump(mode="json"),
                     "metrics": [m.model_dump(mode="json") for m in run_spec.metrics],
+                    "probes": [p.model_dump(mode="json") for p in run_spec.probes],
                 }
             },
         }

@@ -16,6 +16,15 @@ Guesses by agents that are not live are ignored. With no live agents the value i
 - `belief.polarization(threshold=0.2)`: number of candidates (not "none") held by at least
   `threshold` of the live agents (DESIGN.md: "beliefs above a threshold share"), as a float.
 - `belief.entropy`: Shannon entropy in bits of the belief distribution including "none".
+
+M1b `source` param (docs/INTERFACE-M1b.md §6), on every belief metric: `"world"` (default, the
+committed guesses above) or `"probe:<name>"`, which reads `probe` events of that probe instead:
+`ok` with a string `parsed["candidate"]` sets the agent's belief, any other answer (a failed
+parse) resets it to `"none"`, and skipped probes (`parsed["skipped"]`: scripted agents, an
+exhausted measurement budget) leave it unchanged. The metric's `name` gains the suffix
+`@probe:<name>` (`belief.consensus@probe:belief`), so the same entry point can run twice side by
+side; the runner requires unique names, not unique entry points. Same denominator rules.
+`source="world"` is left out of `params`, so M1a specs and their hashes are unchanged.
 """
 from __future__ import annotations
 
@@ -28,8 +37,23 @@ from .base import Metric
 NONE = "none"
 
 
+def _check_source(source: str) -> str:
+    if source != "world" and not (source.startswith("probe:") and len(source) > len("probe:")):
+        raise ValueError(f"source must be 'world' or 'probe:<name>', got {source!r}")
+    return source
+
+
 class _BeliefMetric(Metric):
-    def __init__(self) -> None:
+    def __init__(self, source: str = "world") -> None:
+        self._init(source)
+
+    def _init(self, source: str) -> None:
+        self.source = _check_source(source)
+        if source == "world" and isinstance(getattr(self, "params", None), dict):
+            self.params.pop("source", None)  # the default stays out of the spec (M1a spec hashes)
+        self.probe = source[len("probe:"):] if source != "world" else None
+        base = type(self).name
+        self.name = base if self.probe is None else f"{base}@{source}"
         self.beliefs: dict[str, str] = {}
         self.agents: list[str] | None = None
 
@@ -37,6 +61,9 @@ class _BeliefMetric(Metric):
         self.agents = sorted(str(a) for a in agents)
 
     def update(self, event: Any) -> None:
+        if self.probe is not None:
+            self._update_probe(event)
+            return
         if getattr(event, "type", None) != "action_committed" or not event.accepted:
             return
         action = event.action or {}
@@ -45,6 +72,18 @@ class _BeliefMetric(Metric):
         candidate = (action.get("args") or {}).get("candidate")
         if isinstance(candidate, str) and event.agent is not None:
             self.beliefs[event.agent] = candidate
+
+    def _update_probe(self, event: Any) -> None:
+        if getattr(event, "type", None) != "probe" or event.probe != self.probe or event.agent is None:
+            return
+        parsed = event.parsed or {}
+        if "skipped" in parsed:  # not asked (scripted agent, budget): the last answer stands
+            return
+        candidate = parsed.get("candidate")
+        if event.ok and isinstance(candidate, str):
+            self.beliefs[event.agent] = candidate
+        else:  # a failed parse counts as "none"
+            self.beliefs.pop(event.agent, None)
 
     def _distribution(self) -> tuple[Counter[str], int]:
         """(counts of candidate beliefs among live agents, number of live agents without one)."""
@@ -67,8 +106,8 @@ class Accuracy(_BeliefMetric):
     entry_point: ClassVar[str | None] = "belief.accuracy"
     name = "belief.accuracy"
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, source: str = "world") -> None:
+        self._init(source)
         self.truth: str | None = None
 
     def needs_truth(self) -> bool:
@@ -93,8 +132,8 @@ class Polarization(_BeliefMetric):
     entry_point: ClassVar[str | None] = "belief.polarization"
     name = "belief.polarization"
 
-    def __init__(self, threshold: float = 0.2) -> None:
-        super().__init__()
+    def __init__(self, threshold: float = 0.2, source: str = "world") -> None:
+        self._init(source)
         self.threshold = threshold
 
     def _value(self, counts: Counter[str], none: int, n: int) -> float:
