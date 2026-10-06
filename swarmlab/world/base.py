@@ -129,5 +129,13 @@ class World(Persistable, Plugin):
     def terminal(self) -> bool:
         return False
 
+    def description(self) -> str:
+        """Agent-facing task description (M1b), used by prompt templates; "" when not provided.
+
+        Must not reveal correctness, and should describe the task only: how agents coordinate
+        (for example whether to read the board) is the experiment's business.
+        """
+        return ""
+
     def verify(self) -> dict:
         return {}

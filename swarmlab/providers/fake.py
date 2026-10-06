@@ -14,7 +14,7 @@ The provider fills in what the script leaves unset: `provider`, `model`, `latenc
 `completion_tokens = max(1, ceil(len(text + tool-call JSON) / 4))`.
 
 Built-in `flaggame_reader` (FlagGame text observations). Within one turn (the messages after the
-last `user` message):
+last `user` message that is not a json-protocol `[tool results]` message):
 
 1. If `read_board` is offered and has not been called this turn: call `post` with
    `"crop:\\n<rows>"` first if `post` is offered and the conversation shows no earlier `post` of a
@@ -59,6 +59,7 @@ from .base import (
 
 Script = Callable[[ChatRequest, random.Random], ChatResponse]
 
+RESULTS_PREFIX = "[tool results]"  # LLMAgent's json-protocol results message (participants/llm.py)
 _CROP_RE = re.compile(r"crop:[ \t]*((?:\n[ \t]*[a-z]+[ \t]*)+)")
 _HEADER_RE = re.compile(r"^([A-Za-z0-9_]+):$")
 _ROW_RE = re.compile(r"^[a-z]+$")
@@ -145,7 +146,9 @@ def _response(request: ChatRequest, rng: random.Random, calls: list[tuple[str, d
 def flaggame_reader(request: ChatRequest, rng: random.Random) -> ChatResponse:
     tools = {t.name for t in request.tools}
     msgs = request.messages
-    last_user = max((i for i, m in enumerate(msgs) if m.role == "user"), default=-1)
+    # json-protocol tool results come back as user messages starting with "[tool results]"
+    last_user = max((i for i, m in enumerate(msgs) if m.role == "user"
+                     and not text_of(m.content).startswith(RESULTS_PREFIX)), default=-1)
     this_turn = [name for m in msgs[last_user + 1:] for name, _ in _assistant_calls(m)]
     listing = next((text_of(m.content) for m in reversed(msgs)
                     if m.role == "user" and PREAMBLE in text_of(m.content)), "")

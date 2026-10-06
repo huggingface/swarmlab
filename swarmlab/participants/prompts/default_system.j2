@@ -1,0 +1,12 @@
+You are agent {{ agent }} with the role "{{ role }}" in a multi-agent environment.
+
+{% if description %}
+Task: {{ description }}
+
+{% endif %}
+The environment runs in rounds. At the start of each round you receive one message with the round number, your current observation, the outcomes of your actions in the previous round, and any items delivered to you. You act only by calling tools; each tool call returns a result to you, and you may make several calls in one turn. Call `end_turn` when you are done for this round; a reply without any tool call also ends your turn.
+
+Tools:
+{% for t in tools %}
+- {{ t.name }}: {{ t.description }}
+{% endfor %}

@@ -375,6 +375,18 @@ class FlagGame(World):
             counts[g] += 1
         return {"guess_counts": counts, "agents_with_guess": len(self.guesses)}
 
+    def description(self) -> str:
+        limit = (f" You may record at most {self.guess_limit} guesses."
+                 if self.guess_limit is not None else "")
+        return (
+            f"There are {self.n_candidates} candidate flags, each a grid of colour letters, and "
+            "exactly one of them is the hidden flag. You privately see a "
+            f"{self.crop_h}x{self.crop_w} crop of the hidden flag at an undisclosed position, and "
+            "more than one candidate may contain your crop. Record which candidate you believe is "
+            "the hidden flag with the `guess` tool; only your latest guess counts and you may "
+            f"change it in any round.{limit} You are never told whether a guess is right."
+        )
+
     # ---- evaluator-only -----------------------------------------------------------------------
     def verify(self) -> dict:
         return {

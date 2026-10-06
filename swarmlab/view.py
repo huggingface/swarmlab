@@ -25,6 +25,7 @@ class View(BaseModel):
     outcomes: list[dict]  # this agent's action_committed feedback from the previous round
     pushed: list[dict]  # delivered inbox items when delivery == "push", else []
     tools: list[ToolSchema]
+    description: str = ""  # M1b: World.description(), the task text for prompt templates
 
 
 def text_observation(text: str, **private: Any) -> Observation:
