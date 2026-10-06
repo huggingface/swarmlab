@@ -38,16 +38,17 @@ def table(head, rows):
 def mseries(run, name):
     try:
         return {r: v for r, v, _ in run.metrics.get(name, [])}
-    except Exception:
+    except Exception:  # noqa: BLE001 - a broken run is reported as missing data
         return {}
 
 
 def scan(run):
     """One pass over the typed events: everything the report needs."""
-    d = dict(guess_by_round={}, turns=Counter(), reads=Counter(), read_deliv=Counter(), read_turns=Counter(),
-             agents_read=set(), agents=set(), yields=Counter(), finish=Counter(), err=0, cached=0, nresp=0,
-             posts=Counter(), t0=None, t1=None, turn_n=Counter(), length=0)
-    cur, rd_this = {}, defaultdict(set)
+    d = {"guess_by_round": {}, "turns": Counter(), "reads": Counter(), "read_deliv": Counter(),
+         "read_turns": Counter(), "agents_read": set(), "agents": set(), "yields": Counter(),
+         "finish": Counter(), "err": 0, "cached": 0, "nresp": 0, "posts": Counter(), "t0": None,
+         "t1": None, "turn_n": Counter(), "length": 0}
+    cur = {}
     last_round = 0
     for ev in run.events_all:
         t, r, a = ev.type, ev.round, ev.agent
@@ -120,12 +121,12 @@ def main():
         parts = run.id.split("__")
         arm = parts[1] if len(parts) >= 3 else (run.meta.get("arm") or "?")
         arms[arm].append((run, scan(run)))
-    L = [f"# M2 phase-1 Flag Game report", "", f"Runs dir: `{a.runs_dir}`; skipped (not ended / unreadable): {', '.join(skipped) or 'none'}", ""]
+    L = ["# M2 phase-1 Flag Game report", "", f"Runs dir: `{a.runs_dir}`; skipped (not ended / unreadable): {', '.join(skipped) or 'none'}", ""]
 
     # summary
     rows = []
     for arm, rs in sorted(arms.items()):
-        fin = lambda n: [(mseries(r, n) or {}).get(max(mseries(r, n) or [0])) for r, _ in rs]  # noqa: E731
+        fin = lambda n, rs=rs: [(mseries(r, n) or {}).get(max(mseries(r, n) or [0])) for r, _ in rs]
         acc, con = fin("belief.accuracy"), fin("belief.consensus")
         rt = []
         for r, _ in rs:
@@ -173,7 +174,7 @@ def main():
             if truth is not None:
                 dist = ", ".join(f"{k}{'(T)' if k == truth else '(R)' if k == rival else ''}:{v}"
                                  for k, v in sorted(c.items(), key=lambda kv: -kv[1]))
-            sh = lambda k: f(c.get(k, 0) / n, 2) if k is not None else NA  # noqa: E731
+            sh = lambda k, c=c, n=n: f(c.get(k, 0) / n, 2) if k is not None else NA
             other = f((n - c.get(truth, 0) - c.get(rival, 0)) / n, 2) if truth is not None else NA
             rows.append([run.id, truth or NA, rival or NA, {True: "yes", False: "NO", None: NA}[match],
                          dist, sh(rival), sh(truth), other])
@@ -186,7 +187,7 @@ def main():
         for run, d in rs:
             try:
                 pr = run.probes.get("belief", [])
-            except Exception:
+            except Exception:  # noqa: BLE001 - a broken run is reported as missing data
                 pr = []
             truth = probe_ctx.get(run.id, (None, None))[0]
             byr = defaultdict(dict)
