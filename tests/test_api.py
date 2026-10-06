@@ -1,5 +1,4 @@
 """Acceptance 4: the three DESIGN.md Experimenter-interface examples, and spec round-trips."""
-import pytest
 
 from swarmlab import Experiment, Outcome, Participant, Policy, Run, World, text_observation, tool
 from swarmlab.spec import RunSpec, spec_hash
@@ -58,8 +57,8 @@ def test_example_1_existing_task(tmp_path):
     events = list(run.events)
     assert events[0]["type"] == "run_started" and events[-1]["type"] == "run_ended"
     assert len({e["agent"] for e in events if e["type"] == "turn_started"}) == 16
-    with pytest.raises(NotImplementedError, match="WP5"):
-        run.view()                                   # viewer lands in WP5
+    page = run.view()
+    assert page == run.dir / "view.html" and page.exists()
     fork = run.fork(at_round=4).run()
     assert fork.status == "ended" and fork.meta["fork_round"] == 4
     assert Run.load(run.dir).score == run.score

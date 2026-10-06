@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e2e1dc;
+  --accent: #2b59c3; --accent-soft: #e6ecfa; --ok: #1f7a3d; --bad: #b3261e; --warn: #9a6700;
+  --cell-border: rgba(0,0,0,.18); --chip: #f0efeb; --hl: #fff4c2;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --panel: #1f1f1d; --fg: #e8e7e3; --muted: #9b9a94; --line: #34332f;
+    --accent: #8fb0ff; --accent-soft: #23304d; --ok: #6fcf8b; --bad: #ff8a80; --warn: #e3b341;
+    --cell-border: rgba(255,255,255,.22); --chip: #2a2a27; --hl: #4a4220;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+header { padding: 14px 20px 10px; border-bottom: 1px solid var(--line); background: var(--panel); }
+h1 { font-size: 17px; margin: 0 0 4px; font-weight: 600; }
+.sub { color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.sub b { color: var(--fg); font-weight: 600; }
+.controls { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 10px;
+  padding: 8px 20px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.controls input[type=range] { flex: 1 1 240px; accent-color: var(--accent); }
+button { font: inherit; padding: 3px 10px; border: 1px solid var(--line); background: var(--chip);
+  color: var(--fg); border-radius: 6px; cursor: pointer; }
+button:disabled { opacity: .4; cursor: default; }
+#roundLabel { min-width: 110px; font-weight: 600; }
+label.chk { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+.metrics { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 20px; }
+.metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; min-width: 120px; }
+.metric .name { color: var(--muted); font-size: 11px; }
+.metric .val { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.metric .den { color: var(--muted); font-size: 11px; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; padding: 0 20px 24px; }
+@media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); padding: 0 12px 24px; } }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; min-width: 0; }
+section h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+section h2 .hint { color: var(--muted); font-weight: 400; font-size: 12px; }
+.col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+tr.sel td { background: var(--accent-soft); }
+tr.new td { background: var(--hl); }
+.agent { color: var(--accent); cursor: pointer; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+.flags { display: flex; flex-wrap: wrap; gap: 12px; }
+.flag { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 4px; border-radius: 6px; border: 2px solid transparent; }
+.flag.truth { border-color: var(--ok); }
+.flag .lbl { font-weight: 600; }
+.grid { display: inline-grid; vertical-align: middle; border: 1px solid var(--cell-border); }
+.grid i { display: block; width: 9px; height: 9px; }
+.grid.small i { width: 6px; height: 6px; }
+.bar { height: 4px; background: var(--accent); border-radius: 2px; }
+.post { border-bottom: 1px solid var(--line); padding: 5px 0; }
+.post:last-child { border-bottom: 0; }
+pre { margin: 2px 0 0; white-space: pre-wrap; word-break: break-word; }
+.chip { display: inline-block; background: var(--chip); border-radius: 5px; padding: 1px 6px; margin: 1px 3px 1px 0; }
+.chip.pending { outline: 1px dashed var(--warn); }
+.chip.err { outline: 1px solid var(--bad); }
+select { font: inherit; background: var(--chip); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+.empty { color: var(--muted); font-style: italic; }
+.scroll { max-height: 420px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title"></h1>
+  <div class="sub" id="sub"></div>
+</header>
+<div class="controls">
+  <button id="prev" title="previous round (←)">◀ prev</button>
+  <input type="range" id="slider" min="1" max="1" value="1" aria-label="round">
+  <button id="next" title="next round (→)">next ▶</button>
+  <span id="roundLabel"></span>
+  <label class="chk" id="truthWrap"><input type="checkbox" id="reveal"> reveal truth</label>
+</div>
+<div class="metrics" id="metrics"></div>
+<main>
+  <div class="col">
+    <section id="flagPanel">
+      <h2>Flag Game <span class="hint">candidates; bar = share of agents guessing it</span></h2>
+      <div class="flags" id="flags"></div>
+    </section>
+    <section id="guessPanel">
+      <h2>Guesses <span class="hint">committed, as of this round</span></h2>
+      <div class="scroll"><table id="guesses"></table></div>
+    </section>
+    <section id="actionsPanel">
+      <h2>Committed actions <span class="hint">this round</span></h2>
+      <div class="scroll"><table id="actions"></table></div>
+    </section>
+  </div>
+  <div class="col">
+    <section>
+      <h2>Board <span class="hint">posts committed this round</span></h2>
+      <div class="scroll" id="posts"></div>
+    </section>
+    <section>
+      <h2>Inbox <select id="agentSel" aria-label="agent"></select>
+        <span class="hint">deliveries up to this round; highlighted = new this round</span></h2>
+      <div class="scroll"><table id="inbox"></table></div>
+    </section>
+    <section>
+      <h2>Action queue <span class="hint">tool calls per agent, in turn order</span></h2>
+      <div class="scroll"><table id="queue"></table></div>
+    </section>
+  </div>
+</main>
+<script type="application/json" id="swarmlab-data">__DATA__</script>
+<script>
+(function () {
+  "use strict";
+  var D = JSON.parse(document.getElementById("swarmlab-data").textContent);
+  var M = D.meta, EV = D.events, LAST = M.last_round || 0;
+  var COLOURS = { r: "#d62728", g: "#2ca02c", b: "#1f77b4", y: "#f2c80f", k: "#111111", w: "#ffffff",
+    o: "#ff7f0e", p: "#7b4fa0", c: "#17becf", m: "#e377c2", n: "#8c564b", t: "#0f766e" };
+  var isFlag = !!(D.world && D.world.kind === "flaggame");
+  var byRound = {}, postAuthor = {};
+  EV.forEach(function (e) {
+    (byRound[e.round] = byRound[e.round] || []).push(e);
+    if (e.type === "post") postAuthor[e.post_id] = e.agent;
+  });
+  var hashRound = parseInt((location.hash.match(/r=(\d+)/) || [])[1], 10);
+  var state = { round: Math.min(Math.max(1, hashRound || 1), Math.max(1, LAST)), agent: D.agents[0] || null, reveal: false };
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+  function fmt(v) {
+    if (v === null || v === undefined) return "–";
+    if (typeof v === "number") return Number.isInteger(v) ? String(v) : v.toFixed(3);
+    return typeof v === "object" ? JSON.stringify(v) : String(v);
+  }
+  function agentLink(a) { return '<span class="agent" data-agent="' + esc(a) + '">' + esc(a) + "</span>"; }
+  function argsSummary(args) {
+    if (!args || !Object.keys(args).length) return "";
+    var s = Object.keys(args).map(function (k) {
+      var v = args[k], t = typeof v === "string" ? JSON.stringify(v) : JSON.stringify(v);
+      return k + "=" + t;
+    }).join(", ");
+    return s.length > 90 ? s.slice(0, 89) + "…" : s;
+  }
+  function gridHtml(rows, small) {
+    if (!rows || !rows.length) return "";
+    var w = rows[0].length, cells = "";
+    rows.forEach(function (row) {
+      for (var i = 0; i < row.length; i++) {
+        var c = COLOURS[row[i]] || "#999";
+        cells += '<i style="background:' + c + '" title="' + esc(row[i]) + '"></i>';
+      }
+    });
+    return '<div class="grid' + (small ? " small" : "") + '" style="grid-template-columns:repeat(' + w + ',max-content)">' + cells + "</div>";
+  }
+
+  // ---- folding -------------------------------------------------------------------------------
+  function guessesAt(r) {
+    var cur = {}, changed = {}, prev = {};
+    for (var k = 1; k <= r; k++) {
+      (byRound[k] || []).forEach(function (e) {
+        if (e.type !== "action_committed" || !e.accepted || !e.action || e.action.name !== "guess") return;
+        if (k === r && !(e.agent in prev)) prev[e.agent] = cur[e.agent];
+        cur[e.agent] = e.action.args.candidate;
+      });
+    }
+    Object.keys(prev).forEach(function (a) { if (prev[a] !== cur[a]) changed[a] = true; });
+    return { cur: cur, changed: changed };
+  }
+  function inboxAt(r, agent) {
+    var list = [], idx = {};
+    for (var k = 1; k <= r; k++) {
+      (byRound[k] || []).forEach(function (e) {
+        if (e.type === "delivery" && e.recipient === agent) {
+          var d = { id: e.delivery_id, post: e.post_id, from: postAuthor[e.post_id], sent: k,
+            eligible: e.eligible_round, content: e.content, read: null };
+          idx[e.delivery_id] = d; list.push(d);
+        } else if (e.type === "read" && e.agent === agent) {
+          (e.delivery_ids || []).forEach(function (id) { if (idx[id] && idx[id].read === null) idx[id].read = k; });
+        }
+      });
+    }
+    return list;
+  }
+  function queueAt(r) {
+    var evs = byRound[r] || [], order = [], per = {};
+    evs.forEach(function (e) {
+      if (e.type === "round_started") order = e.order.slice();
+      if (!e.agent) return;
+      var q = per[e.agent] = per[e.agent] || { calls: [], byId: {}, yield: null, error: null, reads: 0 };
+      if (e.type === "tool_called") { var c = { id: e.call_id, tool: e.tool, args: e.args, ret: null }; q.calls.push(c); q.byId[e.call_id] = c; }
+      else if (e.type === "tool_returned" && q.byId[e.call_id]) { q.byId[e.call_id].ret = e; }
+      else if (e.type === "turn_ended") { q.yield = e.yield_kind; q.error = e.error; }
+    });
+    return { order: order, per: per };
+  }
+
+  // ---- rendering -----------------------------------------------------------------------------
+  function renderHeader() {
+    $("title").textContent = M.run_id;
+    var score = {};
+    Object.keys(M.score || {}).forEach(function (k) { if (k !== "truth" || state.reveal) score[k] = M.score[k]; });
+    var bits = [
+      ["experiment", M.experiment + (M.arm ? " / " + M.arm : "")],
+      ["spec", (M.spec_hash || "").slice(0, 12)],
+      ["status", M.status], ["end", M.end_reason || "–"],
+      ["score", Object.keys(score).map(function (k) { return k + "=" + fmt(score[k]); }).join(", ") || "–"],
+      ["world", M.world ? M.world.type : "–"],
+      ["topology", M.medium && M.medium.topology ? M.medium.topology.type : "–"],
+      ["agents", D.agents.length]
+    ];
+    if (M.parent_run) bits.push(["fork of", M.parent_run + " @ round " + M.fork_round]);
+    $("sub").innerHTML = bits.map(function (b) { return "<span>" + esc(b[0]) + " <b>" + esc(b[1]) + "</b></span>"; }).join("");
+  }
+  function renderMetrics(r) {
+    var ms = (byRound[r] || []).filter(function (e) { return e.type === "metric"; });
+    $("metrics").innerHTML = ms.length ? ms.map(function (m) {
+      return '<div class="metric"><div class="name">' + esc(m.name) + '</div><div class="val">' + esc(fmt(m.value)) +
+        '</div><div class="den">n = ' + esc(m.denominator) + "</div></div>";
+    }).join("") : '<span class="empty">no metrics this round</span>';
+  }
+  function renderFlag(r) {
+    var g = guessesAt(r), counts = {}, total = 0;
+    Object.keys(g.cur).forEach(function (a) { counts[g.cur[a]] = (counts[g.cur[a]] || 0) + 1; total++; });
+    var cands = D.world.candidates;
+    $("flags").innerHTML = Object.keys(cands).map(function (name) {
+      var n = counts[name] || 0, pct = total ? Math.round(100 * n / total) : 0;
+      var isTruth = state.reveal && D.truth === name;
+      return '<div class="flag' + (isTruth ? " truth" : "") + '"><div class="lbl">' + esc(name) + (isTruth ? ' <span class="ok">✓ truth</span>' : "") +
+        "</div>" + gridHtml(cands[name]) + '<div style="width:100%"><div class="bar" style="width:' + pct + '%"></div></div>' +
+        '<div class="muted">' + n + " agent" + (n === 1 ? "" : "s") + "</div></div>";
+    }).join("");
+    var rows = D.agents.map(function (a) {
+      var guess = g.cur[a], right = state.reveal && guess !== undefined ? (guess === D.truth ? ' <span class="ok">✓</span>' : ' <span class="bad">✗</span>') : "";
+      return "<tr" + (a === state.agent ? ' class="sel"' : "") + "><td>" + agentLink(a) + "</td><td>" +
+        gridHtml((D.world.crops || {})[a], true) + "</td><td><b>" + esc(guess === undefined ? "–" : guess) + "</b>" + right +
+        "</td><td>" + (g.changed[a] ? '<span class="warn">● changed</span>' : "") + "</td></tr>";
+    }).join("");
+    $("guesses").innerHTML = "<tr><th>agent</th><th>crop</th><th>guess</th><th>this round</th></tr>" + rows;
+  }
+  function renderActions(r) {
+    var acts = (byRound[r] || []).filter(function (e) { return e.type === "action_committed"; });
+    $("actions").innerHTML = acts.length ? "<tr><th>agent</th><th>action</th><th>accepted</th><th>feedback</th></tr>" +
+      acts.map(function (e) {
+        return "<tr><td>" + agentLink(e.agent) + "</td><td class=mono>" + esc(e.action.name) + "(" + esc(argsSummary(e.action.args)) + ")</td><td>" +
+          (e.accepted ? '<span class="ok">yes</span>' : '<span class="bad">no</span>') + "</td><td class=mono>" + esc(fmt(e.feedback)) + "</td></tr>";
+      }).join("") : '<tr><td class="empty">no actions committed</td></tr>';
+  }
+  function renderPosts(r) {
+    var posts = (byRound[r] || []).filter(function (e) { return e.type === "post"; });
+    var nDel = (byRound[r] || []).filter(function (e) { return e.type === "delivery"; }).length;
+    $("posts").innerHTML = posts.length ? posts.map(function (p) {
+      return '<div class="post">' + agentLink(p.agent) + ' <span class="muted">#' + esc(p.channel) + " · " + esc(p.post_id) + "</span><pre>" + esc(p.text) + "</pre></div>";
+    }).join("") + '<div class="muted" style="margin-top:4px">' + nDel + " deliveries created</div>" : '<div class="empty">no posts this round</div>';
+  }
+  function renderInbox(r) {
+    if (!state.agent) { $("inbox").innerHTML = ""; return; }
+    var list = inboxAt(r, state.agent);
+    if (!list.length) { $("inbox").innerHTML = '<tr><td class="empty">nothing delivered to ' + esc(state.agent) + " yet</td></tr>"; return; }
+    $("inbox").innerHTML = "<tr><th>from</th><th>post</th><th>sent</th><th>eligible</th><th>read</th><th>content</th></tr>" +
+      list.map(function (d) {
+        var read = d.read !== null ? '<span class="ok">r' + d.read + "</span>" :
+          (d.eligible > r ? '<span class="muted">not yet</span>' : '<span class="warn">unread</span>');
+        var fresh = d.sent === r || d.read === r;
+        return "<tr" + (fresh ? ' class="new"' : "") + "><td>" + (d.from ? agentLink(d.from) : "?") + "</td><td class=mono>" + esc(d.post) +
+          "</td><td>r" + d.sent + "</td><td>r" + esc(d.eligible) + "</td><td>" + read + "</td><td><pre>" +
+          esc(d.content == null ? "(content missing)" : d.content) + "</pre></td></tr>";
+      }).join("");
+  }
+  function renderQueue(r) {
+    var q = queueAt(r);
+    var agents = q.order.length ? q.order : Object.keys(q.per);
+    $("queue").innerHTML = "<tr><th>#</th><th>agent</th><th>calls</th><th>yield</th></tr>" + agents.map(function (a, i) {
+      var p = q.per[a] || { calls: [], yield: null };
+      var calls = p.calls.map(function (c) {
+        var ret = c.ret, cls = "chip", tail = "";
+        if (ret) {
+          if (ret.result && ret.result.ok === false) { cls += " err"; tail = ' <span class="bad">✗ ' + esc(ret.result.error) + "</span>"; }
+          else if (ret.pending) { cls += " pending"; tail = ' <span class="warn">pending</span>'; }
+          else if (ret.result && ret.result.summary) { tail = ' <span class="muted">→ ' + esc(ret.result.summary) + "</span>"; }
+        }
+        return '<span class="' + cls + '"><span class="mono">' + esc(c.tool) + "(" + esc(argsSummary(c.args)) + ")</span>" + tail + "</span>";
+      }).join("");
+      var y = p.yield ? (p.yield === "error" ? '<span class="bad" title="' + esc(p.error) + '">error</span>' : esc(p.yield)) : "–";
+      return "<tr" + (a === state.agent ? ' class="sel"' : "") + "><td class=muted>" + (i + 1) + "</td><td>" + agentLink(a) + "</td><td>" +
+        (calls || '<span class="empty">no calls</span>') + "</td><td>" + y + "</td></tr>";
+    }).join("");
+  }
+  function render() {
+    var r = state.round;
+    $("slider").value = r;
+    $("roundLabel").textContent = LAST ? "Round " + r + " / " + LAST : "No committed rounds";
+    $("prev").disabled = r <= 1; $("next").disabled = r >= LAST;
+    $("agentSel").value = state.agent || "";
+    renderHeader(); renderMetrics(r);
+    if (isFlag) renderFlag(r);
+    renderActions(r); renderPosts(r); renderInbox(r); renderQueue(r);
+  }
+  function go(r) { state.round = Math.min(Math.max(1, r), Math.max(1, LAST)); render(); }
+
+  // ---- wiring --------------------------------------------------------------------------------
+  $("slider").max = Math.max(1, LAST);
+  $("flagPanel").hidden = !isFlag; $("guessPanel").hidden = !isFlag;
+  $("truthWrap").hidden = !(isFlag && D.truth);
+  $("actionsPanel").hidden = isFlag;
+  $("agentSel").innerHTML = D.agents.map(function (a) { return '<option value="' + esc(a) + '">' + esc(a) + "</option>"; }).join("");
+  $("slider").addEventListener("input", function (e) { go(parseInt(e.target.value, 10)); });
+  $("prev").addEventListener("click", function () { go(state.round - 1); });
+  $("next").addEventListener("click", function () { go(state.round + 1); });
+  $("reveal").addEventListener("change", function (e) { state.reveal = e.target.checked; render(); });
+  $("agentSel").addEventListener("change", function (e) { state.agent = e.target.value; render(); });
+  document.addEventListener("click", function (e) {
+    var t = e.target.closest ? e.target.closest(".agent") : null;
+    if (t) { state.agent = t.getAttribute("data-agent"); render(); }
+  });
+  document.addEventListener("keydown", function (e) {
+    var tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" && e.target.type === "range") return;   // the slider handles its own arrows
+    if (tag === "select" || tag === "textarea") return;
+    if (e.key === "ArrowLeft") { go(state.round - 1); e.preventDefault(); }
+    else if (e.key === "ArrowRight") { go(state.round + 1); e.preventDefault(); }
+    else if (e.key === "Home") { go(1); e.preventDefault(); }
+    else if (e.key === "End") { go(LAST); e.preventDefault(); }
+  });
+  render();
+})();
+</script>
+</body>
+</html>
