@@ -26,7 +26,7 @@ import json
 import re
 from typing import Any, ClassVar
 
-from ..tools import ToolExecutor
+from ..tools import AgentTools
 from ..view import View
 from ..world.flaggame import candidates_containing, contains, parse_observation
 from .base import Participant, TurnUsage
@@ -41,14 +41,14 @@ def _observation_text(view: View) -> str:
 class Silent(Participant):
     entry_point: ClassVar[str | None] = "silent"
 
-    async def turn(self, view: View, tools: ToolExecutor) -> TurnUsage:
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
         calls = 0
         if view.round == 1:
             candidates, crop = parse_observation(_observation_text(view))
             names = candidates_containing(candidates, crop) or sorted(candidates)
-            await tools.call(self.agent, "guess", {"candidate": self.rng.choice(names)})
+            await tools.call("guess", {"candidate": self.rng.choice(names)})
             calls += 1
-        await tools.call(self.agent, "end_turn", {})
+        await tools.call("end_turn", {})
         return TurnUsage(calls=calls + 1)  # pragma: no cover - end_turn raises
 
 
@@ -60,14 +60,14 @@ class EvidenceAggregator(Participant):
         self.crops: list[list[str]] = []
         self.posted = False
 
-    async def turn(self, view: View, tools: ToolExecutor) -> TurnUsage:
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
         candidates, crop = parse_observation(_observation_text(view))
         if not self.crops:
             self.crops.append(list(crop))
         if not self.posted:
-            await tools.call(self.agent, "post", {"channel": "main", "text": CROP_PREFIX + "\n" + "\n".join(crop)})
+            await tools.call("post", {"channel": "main", "text": CROP_PREFIX + "\n" + "\n".join(crop)})
             self.posted = True
-        res = await tools.call(self.agent, "read_board", {"limit": 200})
+        res = await tools.call("read_board", {"limit": 200})
         for item in res.result.get("items", []) if res.ok else []:
             content = item.get("content", "")
             if content.startswith(CROP_PREFIX):
@@ -78,8 +78,8 @@ class EvidenceAggregator(Participant):
         scores = {n: sum(1 for c in self.crops if contains(candidates[n], c)) for n in names}
         best = max(scores.values())
         choice = self.rng.choice([n for n in names if scores[n] == best])
-        await tools.call(self.agent, "guess", {"candidate": choice})
-        await tools.call(self.agent, "end_turn", {})
+        await tools.call("guess", {"candidate": choice})
+        await tools.call("end_turn", {})
         return TurnUsage()  # pragma: no cover - end_turn raises
 
 
@@ -103,7 +103,7 @@ class Enumerator(Participant):
         if self.truth_name is not None and _bare(self.truth_name, text):
             raise AssertionError(f"{self.agent}: {label} names the truth: {text[:200]}")
 
-    async def turn(self, view: View, tools: ToolExecutor) -> TurnUsage:
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
         self._check_words("view", view.model_dump(mode="json"))
         text = _observation_text(view)
         candidates, _ = parse_observation(text)
@@ -116,11 +116,11 @@ class Enumerator(Participant):
         self._check_name("tools", json.dumps([t.model_dump() for t in view.tools], sort_keys=True))
         offered = {t.name for t in view.tools}
         idx = int(self.agent[1:]) if self.agent[1:].isdigit() else 0
-        results = [await tools.call(self.agent, "guess",
+        results = [await tools.call("guess",
                                     {"candidate": names[(view.round - 1 + idx) % len(names)]})]
         for status in ("my_status", "collective_status"):
             if status in offered:
-                results.append(await tools.call(self.agent, status, {}))
+                results.append(await tools.call(status, {}))
         for res in results:
             data = res.model_dump(mode="json")
             self._check_words("tool result", data)
@@ -132,5 +132,5 @@ class Enumerator(Participant):
                 body["guess_counts"] = sorted(counts.values())
             body.pop("current_guess", None)
             self._check_name("tool result", json.dumps({**data, "result": body}, sort_keys=True))
-        await tools.call(self.agent, "end_turn", {})
+        await tools.call("end_turn", {})
         return TurnUsage()  # pragma: no cover - end_turn raises

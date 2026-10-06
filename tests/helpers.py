@@ -32,8 +32,8 @@ class Chatter(Participant):
     """Posts its agent id, reads the board, then yields without end_turn (no_tool)."""
 
     async def turn(self, view, tools):
-        await tools.call(self.agent, "post", {"text": f"hello from {self.agent} r{view.round}"})
-        res = await tools.call(self.agent, "read_board", {})
+        await tools.call("post", {"text": f"hello from {self.agent} r{view.round}"})
+        res = await tools.call("read_board", {})
         self.seen = getattr(self, "seen", []) + [i["content"] for i in res.result["items"]]
         return TurnUsage(calls=2)
 

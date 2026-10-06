@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from ..base import Persistable, Plugin
 from ..ids import AgentId
-from ..tools import ToolExecutor
+from ..tools import AgentTools
 from ..view import View
 
 
@@ -26,5 +26,5 @@ class Participant(Persistable, Plugin):
         self.agent = agent
         self.rng = rng
 
-    async def turn(self, view: View, tools: ToolExecutor) -> TurnUsage:
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
         raise NotImplementedError

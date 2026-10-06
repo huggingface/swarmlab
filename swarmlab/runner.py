@@ -17,7 +17,7 @@ Round `r` (phase-commit, `commit == "round_end"`):
 1. `order = scheduler.order(r, live, derive(seed, "schedule", r))`; log `round_started`.
 2. Turns run concurrently (asyncio, `Semaphore(options.concurrency)`); each turn builds its
    `View` (observation, last round's outcomes, pushed items when `board.delivery == "push"`,
-   tool schemas) and awaits `participant.turn(view, executor)`. `EndTurn` -> `end_turn`,
+   tool schemas) and awaits `participant.turn(view, AgentTools(executor, agent))`. `EndTurn` -> `end_turn`,
    `TurnCapReached` -> `cap`, any other exception -> `error` (traceback in `turn_ended.error`),
    normal return -> `no_tool`; a returned `TurnUsage` goes to `turn_ended.usage`.
 3. After all turns, each agent's buffered events are appended in `order`.
@@ -114,7 +114,7 @@ from .rng import derive
 from .scheduler import SeededShuffle
 from .snapshot import SnapshotManifest, SnapshotStore
 from .spec import PluginSpec, RunOptions, RunSpec, dump_runspec_yaml, git_identity, spec_hash
-from .tools import EndTurn, TurnCapReached
+from .tools import AgentTools, EndTurn, TurnCapReached
 from .view import View
 
 if TYPE_CHECKING:
@@ -557,7 +557,7 @@ class Runner:
         usage: dict = {}
         error = None
         try:
-            result = await self.participants[agent].turn(view, ex)
+            result = await self.participants[agent].turn(view, AgentTools(ex, agent))
             kind = "no_tool"
             if result is not None and hasattr(result, "model_dump"):
                 usage = result.model_dump(mode="json")

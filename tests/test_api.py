@@ -33,7 +33,7 @@ class Adder(Participant):
         self.step = step
 
     async def turn(self, view, tools):
-        await tools.call(self.agent, "add", {"n": self.step})
+        await tools.call("add", {"n": self.step})
 
 
 def test_example_1_existing_task(tmp_path):
