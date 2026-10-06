@@ -1,0 +1,43 @@
+# M2 Flag Game on a self-hosted Qwen3.5-9B (vLLM inside an HF Job; docs/handoff/WP8.md).
+# Same task and agent setup as m2_flaggame.yaml's qwen arms, but served by vLLM next to the
+# runner instead of the HF router, which removes the router's latency tail and makes N=64
+# affordable. `swarmlab job run` injects `providers: {vllm: ...}` (base_url on the job's
+# localhost, pricing 0, self_hosted) into the copy it ships; this file has no providers block,
+# so it cannot run locally without a vLLM server (add one with `providers:` to do so).
+# Budget is zero on purpose: calls cost nothing per token; the cost is the job's GPU time.
+# Belief metrics are computed twice: from world guesses (default) and from the belief probe.
+name: m2-vllm-qwen9b
+seeds: [1]
+options: { max_rounds: 10, commit: round_end }
+budget: { soft_usd: 0, hard_usd: 0, measurement_usd: 0 }
+arms:
+  bc-qwen9b-16:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 2048, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+    probes: [ { type: belief } ]
+    metrics: &metrics
+      - belief.accuracy
+      - belief.consensus
+      - belief.polarization
+      - belief.entropy
+      - comm.read_rate
+      - comm.posts_per_round
+      - comm.hops
+      - { type: belief.consensus, params: { source: "probe:belief" } }
+      - { type: belief.accuracy, params: { source: "probe:belief" } }
+  gossip-qwen9b-16:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: gossip, params: { k: 1 } } }
+    participants:
+      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 2048, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+    probes: [ { type: belief } ]
+    metrics: *metrics
+  bc-qwen9b-64:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - { type: llm, count: 64, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 2048, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+    probes: [ { type: belief } ]
+    metrics: *metrics
