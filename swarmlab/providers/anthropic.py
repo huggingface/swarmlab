@@ -13,8 +13,12 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   the same Anthropic role are merged into one message, so all tool results of one assistant turn go
   back in a single user message (parallel tool use) and a user message right after tool results
   joins them.
-- Tools -> `{"name", "description", "input_schema"}` plus `"strict": True` when the schema has
-  `additionalProperties: false` and a `required` list. `tool_choice` is always `{"type": "auto"}`
+- Tools -> `{"name", "description", "input_schema"}` with the schema passed through
+  `ToolSchema.normalized()` first (defensive: the harness already emits normalised schemas), plus
+  `"strict": True` only when the normalised schema has no `strict_violations()` at any depth. (The
+  2026-10-06 smoke got `400 tools.4.custom: For 'object' type, 'additionalProperties' must be
+  explicitly set to false` because `post` was sent strict while its nested `fields: {"type":
+  "object"}` was open; a schema with a free-form nested object is now sent non-strict.) `tool_choice` is always `{"type": "auto"}`
   (sent only when tools are present). `tool_protocol == "json"` sends no tools.
 - `thinking_budget` -> `thinking={"type": "enabled", "budget_tokens": N}` only for models in
   `THINKING_BUDGET_MODELS` (Haiku 4.5); omitted otherwise. When thinking is enabled,
@@ -59,10 +63,10 @@ MAX_RETRIES = 3
 
 
 def tool_definition(schema: ToolSchema) -> dict:
-    params = dict(schema.parameters or {"type": "object", "properties": {}})
-    tool: dict[str, Any] = {"name": schema.name, "description": schema.description,
-                            "input_schema": params}
-    if params.get("additionalProperties") is False and "required" in params:
+    norm = schema.normalized()
+    tool: dict[str, Any] = {"name": norm.name, "description": norm.description,
+                            "input_schema": norm.parameters}
+    if not norm.strict_violations():
         tool["strict"] = True
     return tool
 

@@ -147,7 +147,9 @@ def test_anthropic_request_mapping():
     assert "temperature" not in kw  # not sent with thinking
     assert kw["tool_choice"] == {"type": "auto"}
     strict = {t["name"]: t.get("strict") for t in kw["tools"]}
-    assert strict == {"guess": True, "read_board": None}
+    assert strict == {"guess": True, "read_board": True}  # normalised before sending
+    loose = next(t for t in kw["tools"] if t["name"] == "read_board")["input_schema"]
+    assert loose["required"] == [] and loose["additionalProperties"] is False
     msgs = kw["messages"]
     assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
     assert msgs[0]["content"][1] == {"type": "image", "source": {

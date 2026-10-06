@@ -28,6 +28,13 @@ Decisions where the contract is silent:
 - `read_board(channel=None, limit=50)` returns `{"items": [{delivery_id, post_id, eligible_round,
   content}]}` with verbatim delivered content. Unknown channel or bad args: `ok=False`.
 - `post(channel="main", text, fields={})`: `text` must be a string, `channel` a board channel.
+  `fields` is accepted (scripted participants use it) but not advertised in the `post` schema: a
+  free-form object cannot be expressed under Anthropic strict tool use, and an advertised
+  `{"type": "object"}` made Haiku reject every request (smoke 2026-10-06). An arm that wants
+  typed fields should advertise them with explicit properties.
+- Schemas: every schema `schemas()` returns is `ToolSchema.normalized()` (`properties`,
+  `required`, `additionalProperties: false` at every object level), so it passes
+  `tools.strict_violations` and providers can send it strict.
 - World actions are validated with `world.validate` at call time against current (round-start in
   round_end mode) state; a failed `Ack` returns `ok=False, error=<ack.error>` and nothing is buffered.
   In immediate mode the action is committed at once and the result is
@@ -74,7 +81,7 @@ STATUS_TOOLS = ("my_status", "collective_status")
 END_TURN_SCHEMA = ToolSchema(
     name="end_turn",
     description="Finish your turn for this round.",
-    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
 
 
@@ -89,6 +96,7 @@ def board_schemas(board: Board) -> list[ToolSchema]:
                     "channel": {"type": "string", "enum": list(board.channels)},
                     "limit": {"type": "integer"},
                 },
+                "required": [],
                 "additionalProperties": False,
             },
         ),
@@ -100,7 +108,6 @@ def board_schemas(board: Board) -> list[ToolSchema]:
                 "properties": {
                     "channel": {"type": "string", "enum": list(board.channels)},
                     "text": {"type": "string"},
-                    "fields": {"type": "object"},
                 },
                 "required": ["text"],
                 "additionalProperties": False,
@@ -217,7 +224,7 @@ class RoundExecutor:
 
     def schemas(self, agent: AgentId) -> list[ToolSchema]:
         out = [*self._world_tools.values(), *board_schemas(self.board), END_TURN_SCHEMA]
-        return [s for s in out if self._allowed(agent, s.name)]
+        return [s.normalized() for s in out if self._allowed(agent, s.name)]
 
     async def call(self, agent: AgentId, name: str, args: dict | None = None) -> ToolResult:
         st = self._st(agent)

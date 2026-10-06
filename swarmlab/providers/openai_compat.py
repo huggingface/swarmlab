@@ -14,10 +14,16 @@ Mapping:
   `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` parts. Assistant
   tool calls -> `tool_calls: [{"id", "type": "function", "function": {"name", "arguments": <JSON>}}]`
   (content None when empty). Tool messages -> `{"role": "tool", "tool_call_id", "content": <text>}`.
-- `tools: [{"type": "function", "function": {"name", "description", "parameters"}}]` and
-  `tool_choice: "auto"` when `tool_protocol == "native"` and tools are present.
+- `tools: [{"type": "function", "function": {"name", "description", "parameters"}}]` (parameters
+  from `ToolSchema.normalized()`) and `tool_choice: "auto"` when `tool_protocol == "native"` and
+  tools are present.
 - `max_tokens`, `temperature`, `top_p`, `seed` when given; `thinking_budget` is ignored; `extra`
-  is merged into the body last.
+  is merged into the body last, as top-level body fields. This is the provider passthrough:
+  Qwen3 on DeepInfra/vLLM/SGLang turns thinking off with
+  `extra={"chat_template_kwargs": {"enable_thinking": False}}` (DeepInfra documents exactly this
+  body field for Qwen/Qwen3.5-9B; the HF router forwards the body to the provider), and
+  OpenAI-style reasoning knobs (`reasoning_effort`, `reasoning: {...}`) pass the same way. A key
+  `extra_body` (the OpenAI SDK's spelling) is flattened into the body too.
 - Response: `choices[0].message.content` (None -> ""), `tool_calls[].function.arguments` parsed as
   JSON; a non-JSON string becomes `{"_raw": <string>}` and `finish_reason = "bad_tool_args"`.
   Usage from `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`,
@@ -92,13 +98,17 @@ def build_body(request: ChatRequest) -> dict:
     if request.tools and request.tool_protocol == "native":
         body["tools"] = [{"type": "function", "function": {
             "name": t.name, "description": t.description, "parameters": t.parameters}}
-            for t in request.tools]
+            for t in (s.normalized() for s in request.tools)]
         body["tool_choice"] = "auto"
     for key in ("temperature", "top_p", "seed"):
         value = getattr(request, key)
         if value is not None:
             body[key] = value
-    body.update(request.extra)
+    extra = dict(request.extra)
+    nested = extra.pop("extra_body", None)
+    body.update(extra)
+    if isinstance(nested, dict):  # OpenAI-SDK habit: extra_body={...} means top-level body fields
+        body.update(nested)
     return body
 
 

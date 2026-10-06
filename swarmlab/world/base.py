@@ -37,6 +37,9 @@ class Outcome(BaseModel):
     action_id: ActionId | None = None  # filled in by the runner
 
 
+# The parameters of a tool without arguments: a complete, strict-compatible object schema.
+NO_ARGS: dict = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+
 _JSON_TYPES = {"integer", "number", "string", "boolean", "array", "object"}
 
 
@@ -55,7 +58,7 @@ def tool(name: str, description: str, params: dict[str, str | dict] | None = Non
         name=name,
         description=description,
         parameters={"type": "object", "properties": props, "required": list(props), "additionalProperties": False},
-    )
+    ).normalized()
 
     def deco(fn: Callable) -> Callable:
         fn.__swarmlab_tool__ = schema  # type: ignore[attr-defined]
@@ -90,10 +93,12 @@ class World(Persistable, Plugin):
     def tool_schemas(self) -> list[ToolSchema]:
         schemas = [fn.__swarmlab_tool__ for fn in self._actions().values()]  # type: ignore[attr-defined]
         if self.my_status(AgentId("a000")) is not None:
-            schemas.append(ToolSchema(name="my_status", description="Status of your own work.", parameters={"type": "object", "properties": {}}))
+            schemas.append(ToolSchema(name="my_status", description="Status of your own work.",
+                                      parameters=NO_ARGS))
         if self.collective_status() is not None:
-            schemas.append(ToolSchema(name="collective_status", description="Status of the swarm's work.", parameters={"type": "object", "properties": {}}))
-        return schemas
+            schemas.append(ToolSchema(name="collective_status", description="Status of the swarm's work.",
+                                      parameters=NO_ARGS))
+        return [s.normalized() for s in schemas]
 
     def validate(self, agent: AgentId, action: Action) -> Ack:
         fn = self._actions().get(action.name)
