@@ -23,6 +23,21 @@ Decisions where the contract is silent:
   `.run(out=None)` on it to execute the fork (`run.fork(4).run()`). `Run.resume()` resumes the
   same directory and returns a fresh `Run`. `Run.load(dir)` replays the log (raising
   `ReplayMismatch` on divergence) and returns the `Run`.
+- M1b: `providers: dict[str, Provider] | None` overrides the preset provider for a model prefix
+  (e.g. `{"vllm": OpenAICompatProvider("vllm", base_url=...)}` or a `FakeProvider` with test
+  pricing); it round-trips through `RunSpec.providers` / YAML `providers:`. At construction every
+  participant's model (`participant_model(p)`: a `model` attribute or `params["model"]` of the form
+  `"<prefix>:<id>"`) is resolved and priced, so an unknown prefix is a `ValueError` and an unpriced
+  model an `UnknownModelPricing` there, not at call time. The resolved providers are cached on the
+  experiment (`resolved_providers()`) and shared by its runs, so a provider's `calls` counter
+  sees every run of the experiment. Providers are never deep-copied or pickled.
+- `estimate(seed, max_rounds, calls_per_turn=2, prompt_tokens=3000, completion_tokens=300)`:
+  `agents * max_rounds * calls_per_turn` calls per model-backed participant, each priced at
+  `prompt_tokens * p_in + completion_tokens * p_out`; participants without a model cost 0. Returns
+  `{"arm", "agents", "llm_agents", "rounds", "calls", "usd", "by_model", "budget"}`. `seed` is
+  accepted for symmetry with `run` (the agent count does not depend on it).
+- `Run.spend` reads `run.json["ledger"]`: `{"swarm", "measurement", "reserved", "calls"}`.
+  `Run.resume(budget=None)` passes the budget through to the runner (see `Runner.resume`).
 - When a `Run` came from `Experiment.run`, `fork`/`resume` reuse that in-memory experiment
   (so plugins defined inline in a script work); a loaded `Run` rebuilds it with `from_spec`.
 """
@@ -32,13 +47,15 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .events import Event, EventLog, logical_view
 from .ids import run_id as make_run_id
 from .medium.board import Board
 from .metrics.base import Metric
 from .participants.base import Participant
+from .providers import resolve as resolve_provider
+from .providers.base import Provider, split_model
 from .registry import build
 from .runner import Runner
 from .spec import (
@@ -68,6 +85,48 @@ class Experiment(BaseModel):
     interventions: list = []
     arm: str | None = None
     options: dict = {}
+    providers: dict[str, Provider] | None = None
+    _resolved: dict[str, Provider] = PrivateAttr(default_factory=dict)
+
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+        # after validation, so UnknownModelPricing propagates as itself (not a ValidationError)
+        for p in self.participants:
+            model = participant_model(p)
+            if model is not None:
+                provider, mid = self.provider_for(model)
+                provider.model_pricing(mid)
+
+    def provider_for(self, model: str) -> tuple[Provider, str]:
+        """(provider, model id) for `"<prefix>:<id>"`: the override, else a cached preset."""
+        prefix, mid = split_model(model)
+        if prefix not in self._resolved:
+            self._resolved[prefix] = resolve_provider(model, self.providers)[0]
+        return self._resolved[prefix], mid
+
+    def resolved_providers(self) -> dict[str, Provider]:
+        """Providers by prefix: the overrides plus every preset resolved so far."""
+        return {**self._resolved, **(self.providers or {})}
+
+    def estimate(self, seed: int, max_rounds: int, calls_per_turn: int = 2,
+                 prompt_tokens: int = 3000, completion_tokens: int = 300) -> dict:
+        by_model: dict[str, float] = {}
+        llm = 0
+        for p in self.participants:
+            model = participant_model(p)
+            if model is None:
+                continue
+            llm += 1
+            provider, mid = self.provider_for(model)
+            p_in, p_out, _ = provider.model_pricing(mid)
+            per_call = (prompt_tokens * p_in + completion_tokens * p_out) / 1e6
+            by_model[model] = by_model.get(model, 0.0) + per_call * calls_per_turn * max_rounds
+        return {
+            "arm": self.arm, "agents": len(self.participants), "llm_agents": llm,
+            "rounds": max_rounds, "calls": llm * max_rounds * calls_per_turn,
+            "usd": sum(by_model.values()), "by_model": by_model,
+            "budget": self.budget.model_dump(mode="json"),
+        }
 
     # ---- running -----------------------------------------------------------------------------
     def _options(self, seed: int, max_rounds: int | None, **kw: Any) -> RunOptions:
@@ -110,6 +169,7 @@ class Experiment(BaseModel):
             metrics=metrics,
             budget=self.budget,
             options=RunOptions(seed=seed, max_rounds=max_rounds, **run_options),
+            providers={k: PluginSpec(**p.spec()) for k, p in (self.providers or {}).items()},
         )
 
     @classmethod
@@ -123,6 +183,7 @@ class Experiment(BaseModel):
             medium=Board(**medium),
             metrics=[build(m, "swarmlab.metrics") for m in spec.metrics],
             budget=spec.budget,
+            providers={k: build(p, "swarmlab.providers") for k, p in spec.providers.items()} or None,
         )
 
     @classmethod
@@ -193,6 +254,11 @@ class Run:
         return self._meta["end_reason"]
 
     @property
+    def spend(self) -> dict:
+        led = self._meta.get("ledger") or {}
+        return {k: led.get(k, 0) for k in ("swarm", "measurement", "reserved", "calls")}
+
+    @property
     def experiment(self) -> Experiment:
         if self._experiment is None:
             self._experiment = Experiment.from_spec(self.spec)
@@ -225,8 +291,8 @@ class Run:
     def fork(self, at_round: int, experiment: Experiment | None = None) -> ForkHandle:
         return ForkHandle(self, at_round, experiment)
 
-    def resume(self) -> Run:
-        Runner(self.dir, self.experiment, self.spec.options).resume()
+    def resume(self, budget: Budget | None = None) -> Run:
+        Runner(self.dir, self.experiment, self.spec.options).resume(budget=budget)
         return Run(self.dir, experiment=self._experiment)
 
     def replay(self) -> dict:
@@ -240,3 +306,11 @@ class Run:
 
     def __repr__(self) -> str:
         return f"Run({self.id!r}, status={self.status!r}, dir={str(self.dir)!r})"
+
+
+def participant_model(p: Any) -> str | None:
+    """The `"<prefix>:<id>"` model a participant calls, or None (scripted participants)."""
+    model = getattr(p, "model", None)
+    if not isinstance(model, str):
+        model = (getattr(p, "params", None) or {}).get("model")
+    return model if isinstance(model, str) and ":" in model else None

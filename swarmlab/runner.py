@@ -41,14 +41,41 @@ world action commits at once inside the executor. The resulting `post*`, `delive
 the same shape in both modes.
 
 Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else
-`r == max_rounds` -> `run_ended(max_rounds)`. Budgets are recorded only (M1a).
+`r == max_rounds` -> `run_ended(max_rounds)`, else (M1b) `soft_usd > 0` and
+`ledger.spent["swarm"] >= soft_usd` -> `run_ended(soft_budget)`, all checked at the round boundary.
+
+Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
+
+- Per run the runner owns a `Ledger`, a `Gate` (providers = `experiment.resolved_providers()`,
+  shared with the experiment, never copied) and an `Inference` service (blob store, the
+  `blobs/cache/` record/replay cache, operational logging via `log_operational`). Each round's
+  executor gets the service, so `AgentTools.infer` works; `self.executor` is the current round's
+  executor (WP7's probe hook calls `executor.infer(agent, request, "measurement")` after commit).
+- The effective budget is `run.json["budget"]` when present (set by `resume(budget=...)`), else the
+  spec's. `run.json` also holds `ledger` (`{swarm, measurement, reserved, calls}`) and `ledger_seq`
+  (the log seq the ledger accounts up to). The ledger is in every snapshot as `plugins["ledger"]`.
+- A `budget` event (logical) is appended after the round's `metric*` events and before
+  `round_committed`; metrics are not fed `budget`/`budget_changed`.
+- `HardCeilingReached` from any turn cancels the other turns (an `asyncio.TaskGroup`), discards
+  the round's buffered events and commits, appends `run_ended(hard_ceiling)` at round r - 1 and
+  writes `run.json` (spend kept, score of the last commit). A participant that swallows the
+  exception does not prevent this (the executor flags it).
+- `turn_ended.usage` is the participant's `TurnUsage` updated with the executor's nominal
+  inference totals (`prompt_tokens`, `completion_tokens`, `cached_prompt_tokens`,
+  `reasoning_tokens`, `cost_usd`, `inference_calls`) when the agent made swarm inference calls.
+- `replay()` builds a gate but never calls it; it raises `ReplayMismatch` if the gate's
+  `provider_calls` is non-zero and reports it as `provider_calls`.
+- `fork()` also copies the parent's cache entries for rounds <= the fork round and the request and
+  response blobs referenced by the copied operational events; the child restores the parent's
+  ledger from the fork snapshot.
 
 `run.json` (rewritten atomically after every commit): run_id, experiment, arm, spec, spec_hash,
 git_commit, dirty, parent_run, fork_round, restored (what a fork restored), status
 ("running" | "ended"), end_reason, last_round (last committed round), score (`world.score()`
 after the last commit).
 
-Recovery (`resume()`): if the log has `run_ended`, nothing to do. Else find the last
+Recovery (`resume(budget=None)`): if the log has `run_ended` with a reason other than
+`soft_budget`/`hard_ceiling`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
 `round_committed` (round c); keep the log through it plus a directly following `snapshot` /
 `run_started` event; move every dropped event (logical and operational) to `discarded.jsonl`;
 restore all plugins, `outcomes_prev` and `live` from snapshot c; re-append the `snapshot` event if
@@ -92,9 +119,12 @@ from typing import TYPE_CHECKING, Any
 
 from ._io import atomic_write_bytes
 from .blobs import BlobStore
+from .budget import Gate, HardCeilingReached, Ledger
 from .events import (
     OPERATIONAL_TYPES,
     ActionCommittedEvent,
+    BudgetChangedEvent,
+    BudgetEvent,
     DeliveryEvent,
     Event,
     EventLog,
@@ -111,12 +141,21 @@ from .events import (
 from .executor import RoundExecutor
 from .ids import AgentId, agent_id, fork_run_id
 from .ids import run_id as make_run_id
+from .inference import Inference, InferenceCache
 from .metrics.base import Metric
 from .metrics.base import get as get_metric
 from .rng import derive
 from .scheduler import SeededShuffle
 from .snapshot import SnapshotManifest, SnapshotStore
-from .spec import PluginSpec, RunOptions, RunSpec, dump_runspec_yaml, git_identity, spec_hash
+from .spec import (
+    Budget,
+    PluginSpec,
+    RunOptions,
+    RunSpec,
+    dump_runspec_yaml,
+    git_identity,
+    spec_hash,
+)
 from .tools import AgentTools, TurnCapReached
 from .view import View
 
@@ -124,7 +163,9 @@ if TYPE_CHECKING:
     from .experiment import Experiment
 
 # events metrics are fed (every logical event of a round up to the commit bookkeeping)
-NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "run_ended"})
+NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "run_ended", "budget",
+                     "budget_changed"})
+BUDGET_REASONS = ("soft_budget", "hard_ceiling")  # run_ended reasons that resume() continues from
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -189,6 +230,11 @@ class Runner:
         self.parent_run = parent.parent_run if parent else (meta or {}).get("parent_run")
         self.fork_round = parent.at_round if parent else (meta or {}).get("fork_round")
         self.restored: dict[str, Any] = (meta or {}).get("restored") or {}
+        if meta is not None:
+            self.budget = Budget.model_validate(meta.get("budget") or meta["spec"]["budget"])
+        else:
+            self.budget = experiment.budget
+        self._aborted_score: Any = None
         self.status = "running"
         self.end_reason: str | None = None
         self.last_round = 0
@@ -226,7 +272,11 @@ class Runner:
             "status": self.status,
             "end_reason": self.end_reason,
             "last_round": self.last_round,
-            "score": _jsonable(self.world.score()),
+            "score": self._aborted_score if self._aborted_score is not None
+            else _jsonable(self.world.score()),
+            "budget": self.budget.model_dump(mode="json"),
+            "ledger": self.ledger.to_dict(),
+            "ledger_seq": self.log.next_seq - 1 if getattr(self, "log", None) is not None else -1,
         }
         text = json.dumps(data, indent=2, sort_keys=True) + "\n"
         atomic_write_bytes(self.dir / "run.json", text.encode())
@@ -257,6 +307,11 @@ class Runner:
         self.live_agents: list[AgentId] = list(self.agents)
         self.outcomes_prev: dict[str, list[dict]] = {}
         self._git = git_identity(REPO_DIR)
+        self.ledger = Ledger()
+        self.gate = Gate(exp.resolved_providers(), self.ledger, self.budget)
+        self.cache = InferenceCache(self.dir / "blobs")
+        self.inference = Inference(run_id=self.run_id, gate=self.gate, blobs=self.blobs,
+                                   cache=self.cache, log_operational=self.log_operational)
 
     def _init_fresh(self) -> None:
         seed = self.options.seed
@@ -281,7 +336,7 @@ class Runner:
 
     def _plugin_blobs(self) -> dict[str, bytes]:
         out = {"world": self.world.snapshot(), "board": self.board.snapshot(),
-               "scheduler": self.scheduler.snapshot()}
+               "scheduler": self.scheduler.snapshot(), "ledger": self.ledger.snapshot()}
         for a, p in self.participants.items():
             out[f"participant:{a}"] = p.snapshot()
         for m in self.metrics:
@@ -300,6 +355,9 @@ class Runner:
             restored["world"] = True
         self.board.restore(blobs["board"])
         self.scheduler.restore(blobs["scheduler"])
+        if "ledger" in blobs:
+            self.ledger.restore(blobs["ledger"])
+            self.ledger.reserved_nano = {c: 0 for c in self.ledger.reserved_nano}
         for i, (a, p) in enumerate(self.participants.items()):
             key = f"participant:{a}"
             if key in blobs and (same or parent_spec.participants[i] == self.spec.participants[i]):
@@ -378,8 +436,16 @@ class Runner:
             self.log.close()
         return self
 
-    def resume(self) -> Runner:
-        """Recover after a crash (§12 `recover()`) and continue live."""
+    def resume(self, budget: Budget | None = None) -> Runner:
+        """Recover after a crash (§12 `recover()`) and continue live.
+
+        A run that ended with `soft_budget` or `hard_ceiling` is resumable too: its `run_ended`
+        (and, after a hard ceiling, the aborted round's events) go to `discarded.jsonl` like a
+        crashed round's. `budget`, when given, replaces the effective budget (stored as
+        `run.json["budget"]`; the archived spec and its hash are unchanged) and is logged as a
+        `budget_changed` event right after the recovered commit point. A run that ended for any
+        other reason is left untouched.
+        """
         meta = self._read_meta()
         if meta is None:
             raise RecoveryError(f"{self.dir} has no run.json")
@@ -388,20 +454,37 @@ class Runner:
         self.log = EventLog(self.log_path)
         try:
             events = list(self.log)
-            if any(e.type == "run_ended" for e in events):
+            ended = [e for e in events if e.type == "run_ended"]
+            if ended and ended[-1].reason not in BUDGET_REASONS:
                 self.status, self.end_reason = "ended", meta.get("end_reason")
                 self.last_round = meta.get("last_round", 0)
                 return self
             self._init_fresh()
-            start = self.recover(events)
+            start = self.recover(events, meta)
+            if budget is not None:
+                old = self.budget
+                self.budget = self.gate.budget = budget
+                self._append(BudgetChangedEvent, start - 1, old=old.model_dump(mode="json"),
+                             new=budget.model_dump(mode="json"))
+                self.log.sync()
+                self._write_meta()
             _run_coro(self._loop(start))
         finally:
             self.log.close()
         return self
 
-    def recover(self, events: list[Event] | None = None) -> int:
-        """Truncate to the last commit, restore its snapshot; return the next round to run."""
+    def recover(self, events: list[Event] | None = None, meta: dict | None = None) -> int:
+        """Truncate to the last commit, restore its snapshot; return the next round to run.
+
+        Spend survives: the ledger is `run.json["ledger"]` (accurate up to `run.json["ledger_seq"]`)
+        plus every operational event after that seq, kept or dropped: an `inference_response`
+        charges its `cost_usd` to its attempt's category, an attempt without a response (in flight
+        at the crash) charges its `reserved_usd`, and every non-cached attempt counts as a call.
+        A `budget_changed` event directly after the commit point is kept.
+        """
         events = list(self.log) if events is None else events
+        meta = self._read_meta() if meta is None else meta
+        ledger = self._recovered_ledger(events, meta or {})
         lc = self.log.last_committed()
         if lc is None:
             starts = [e.seq for e in events if e.type == "run_started"]
@@ -418,13 +501,17 @@ class Runner:
                 return 1
             keep = starts[-1]
             committed = None
+            for e in events:
+                if e.seq == keep + 1 and e.type == "budget_changed":
+                    keep = e.seq
         else:
             committed, keep = lc
             for e in events:
                 if e.seq <= keep:
                     continue
                 if e.seq == keep + 1 and (
-                    (e.type == "snapshot" and e.round == committed) or e.type == "run_started"
+                    (e.type == "snapshot" and e.round == committed)
+                    or e.type in ("run_started", "budget_changed")
                 ):
                     keep = e.seq
                 else:
@@ -434,6 +521,7 @@ class Runner:
             write_jsonl(self.dir / "discarded.jsonl", dropped)
         if committed is None:
             self.last_round = 0
+            self._adopt_ledger(ledger)
             self._write_meta()
             return 1
         manifest = self.snapshots.latest(max_round=committed)
@@ -442,12 +530,38 @@ class Runner:
                 f"no snapshot for committed round {committed}; M1a resume requires snapshot_every == 1"
             )
         self._restore(manifest, None)
+        self._adopt_ledger(ledger)
         kept = [e for e in events if e.seq <= keep]
         has_snap = any(e.type == "snapshot" and e.round == committed for e in kept)
         if not has_snap:
             self._append(SnapshotEvent, committed, manifest_path=self._manifest_rel(committed))
         self._write_meta()
         return committed + 1
+
+    def _recovered_ledger(self, events: list[Event], meta: dict) -> Ledger:
+        ledger = Ledger.from_dict(meta.get("ledger"))
+        since = meta.get("ledger_seq", -1) if meta.get("ledger") is not None else -1
+        attempts = {}
+        responses = {}
+        for e in events:
+            if e.seq <= since:
+                continue
+            if e.type == "inference_attempt":
+                attempts[e.call_id] = e
+            elif e.type == "inference_response":
+                responses[e.call_id] = e
+        for call_id, a in attempts.items():
+            r = responses.get(call_id)
+            if r is not None and r.cached:
+                continue
+            ledger.calls += 1
+            ledger.charge(a.category, r.cost_usd if r is not None else a.reserved_usd)
+        return ledger
+
+    def _adopt_ledger(self, ledger: Ledger) -> None:
+        self.ledger.spent_nano = dict(ledger.spent_nano)
+        self.ledger.reserved_nano = {c: 0 for c in ledger.reserved_nano}
+        self.ledger.calls = ledger.calls
 
     def fork(self, at_round: int, experiment: Experiment | None = None,
              out: Path | str | None = None, *, max_rounds: int | None = None) -> Runner:
@@ -491,7 +605,14 @@ class Runner:
             ev = parse_event(line)
             if ev.type == "delivery":
                 shas.add(ev.content_hash)
+            elif ev.type == "inference_attempt":
+                shas.add(ev.request_hash)
+            elif ev.type == "inference_response" and ev.response_hash:
+                shas.add(ev.response_hash)
+        InferenceCache(self.dir / "blobs").copy_to(InferenceCache(child_dir / "blobs"), at_round)
         for sha in sorted(shas):
+            if not src_snaps.blobs.path(sha).exists():
+                continue
             dst = dst_snaps.blobs.path(sha)
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(src_snaps.blobs.path(sha), dst)
@@ -546,6 +667,8 @@ class Runner:
                     )
                 checked += 1
         log.close()
+        if self.gate.provider_calls:
+            raise ReplayMismatch(f"replay made {self.gate.provider_calls} provider calls")
         last_committed = max(last_committed, fork_round)
         score = None
         manifest = self.snapshots.latest(max_round=last_committed)
@@ -559,7 +682,8 @@ class Runner:
                         f"score after round {manifest.round}: run.json has {meta.get('score')}, "
                         f"replay gives {score}"
                     )
-        return {"last_round": last_committed, "metrics_checked": checked, "score": score}
+        return {"last_round": last_committed, "metrics_checked": checked, "score": score,
+                "provider_calls": self.gate.provider_calls}
 
     # ---- the round loop ----------------------------------------------------------------------
     async def _loop(self, start: int) -> None:
@@ -569,7 +693,11 @@ class Runner:
             if reason is not None:
                 self._end(r - 1, reason)
                 return
-            await self._round(r)
+            try:
+                await self._round(r)
+            except HardCeilingReached:
+                self._abort_round(r)
+                return
             r += 1
 
     def _end_reason(self, committed: int) -> str | None:
@@ -577,7 +705,22 @@ class Runner:
             return "terminal"
         if committed >= self.options.max_rounds:
             return "max_rounds"
+        soft = self.budget.soft_usd
+        if soft > 0 and self.ledger.spent["swarm"] >= soft:
+            return "soft_budget"
         return None
+
+    def _abort_round(self, r: int) -> None:
+        """Hard ceiling inside round r: drop the round's buffers, end resumably at r - 1.
+
+        The log keeps `round_started(r)` and the round's operational events (spend audit); none
+        of the round's turn, post, delivery or action events are written. In-memory plugin state
+        may hold partial round-r changes, so `run.json` keeps the score of the last commit;
+        `resume()` restores everything from the snapshot of round r - 1.
+        """
+        meta = self._read_meta() or {}
+        self._aborted_score = meta.get("score")
+        self._end(r - 1, "hard_ceiling")
 
     def _end(self, round: int, reason: str) -> None:
         self._append(RunEndedEvent, round, reason=reason)
@@ -617,11 +760,18 @@ class Runner:
             kind = "end_turn" if ex.turn_ended(agent) else "no_tool"
             if result is not None and hasattr(result, "model_dump"):
                 usage = result.model_dump(mode="json")
+        except HardCeilingReached:
+            raise
         except TurnCapReached:
             kind = "cap"
         except Exception:  # noqa: BLE001 - any participant failure ends its turn as "error"
             kind = "error"
             error = traceback.format_exc()
+        if ex.hard_ceiling:  # the participant swallowed it; the round is aborted all the same
+            raise HardCeilingReached(f"{agent}: hard ceiling reached during the turn")
+        inferred = ex.inference_usage(agent)
+        if inferred is not None:
+            usage = {**usage, **inferred}
         ex.end_turn_event(agent, kind, usage, error)
 
     async def _round(self, r: int) -> None:
@@ -635,11 +785,17 @@ class Runner:
             run=self.run_id, round=r, world=self.world, board=self.board, blobs=self.blobs,
             agents=list(self.live_agents), commit=self.options.commit,
             max_calls_per_turn=self.options.max_calls_per_turn,
-            topology_rng=lambda: derive(seed, "topology", r),
+            topology_rng=lambda: derive(seed, "topology", r), inference=self.inference,
         )
+        self.executor = ex
         if self.options.commit == "round_end":
             sem = asyncio.Semaphore(max(1, self.options.concurrency))
-            await asyncio.gather(*(self._turn(a, ex, r, sem) for a in order))
+            try:
+                async with asyncio.TaskGroup() as tg:  # a HardCeilingReached cancels the siblings
+                    for a in order:
+                        tg.create_task(self._turn(a, ex, r, sem))
+            except* HardCeilingReached as eg:
+                raise eg.exceptions[0] from None
         else:
             for a in order:
                 await self._turn(a, ex, r, None)
@@ -684,6 +840,9 @@ class Runner:
         for m in self.metrics:
             value, denom = m.value()
             self._append(MetricEvent, r, name=m.name, value=value, denominator=denom)
+        led = self.ledger.spent
+        self._append(BudgetEvent, r, spent_swarm=led["swarm"], spent_measurement=led["measurement"],
+                     reserved=self.ledger.reserved, calls=self.ledger.calls)
         # snapshot (before the commit marker), commit marker, run.json, snapshot event
         snap = r % max(1, self.options.snapshot_every) == 0
         if snap:

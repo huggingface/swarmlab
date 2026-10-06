@@ -8,7 +8,9 @@ Decisions where the contract is silent:
 - Experiment YAML shape (validated by `load_experiment_yaml`; unknown keys are errors)::
 
       name: flag-gossip
-      budget: {soft_usd: 0, hard_usd: 0}          # optional
+      budget: {soft_usd: 0, hard_usd: 0, measurement_usd: 0}   # optional
+      providers:                                   # optional (M1b): overrides by model prefix
+        vllm: {type: openai_compat, params: {name: vllm, base_url: "http://host:8000/v1"}}
       options: {max_rounds: 20, commit: round_end}  # optional; any RunOptions field
       arms:
         A:
@@ -47,7 +49,7 @@ class SpecError(ValueError):
 
 
 class Budget(BaseModel):
-    """M1a: recorded on the spec, not enforced."""
+    """Enforced from M1b (swarmlab/budget.py); a field <= 0 is not enforced."""
 
     model_config = ConfigDict(extra="forbid")
     soft_usd: float = 0.0
@@ -105,6 +107,7 @@ class RunSpec(BaseModel):
     metrics: list[PluginSpec]
     budget: Budget
     options: RunOptions
+    providers: dict[str, PluginSpec] = {}  # M1b: provider overrides by model prefix
 
 
 def canonical_json(data: Any) -> str:
@@ -157,6 +160,12 @@ class ExperimentDoc(BaseModel):
     arms: dict[str, ArmDoc] = Field(min_length=1)
     budget: Budget = Budget()
     options: dict = {}
+    providers: dict[str, PluginSpec] = {}
+
+    @field_validator("providers", mode="before")
+    @classmethod
+    def _providers(cls, v: Any) -> Any:
+        return {k: _coerce_plugin(x) for k, x in v.items()} if isinstance(v, dict) else v
 
 
 _OPTION_FIELDS = set(RunOptions.model_fields)
@@ -232,6 +241,7 @@ def arm_to_runspec(doc: dict, arm: str, seed: int, **option_overrides: Any) -> R
             metrics=[PluginSpec(**m) for m in a["metrics"]],
             budget=Budget(**{**norm["budget"], **a["budget"]}),
             options=RunOptions(**options),
+            providers={k: PluginSpec(**v) for k, v in norm["providers"].items()},
         )
     except ValidationError as e:
         raise SpecError(str(e)) from e
@@ -257,6 +267,7 @@ def runspec_to_doc(run_spec: RunSpec, arm: str | None = None) -> dict:
             "name": run_spec.experiment,
             "budget": run_spec.budget.model_dump(mode="json"),
             "options": options,
+            "providers": {k: v.model_dump(mode="json") for k, v in run_spec.providers.items()},
             "arms": {
                 arm_name: {
                     "world": run_spec.world.model_dump(mode="json"),
