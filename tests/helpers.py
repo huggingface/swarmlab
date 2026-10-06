@@ -19,8 +19,6 @@ class PausingFlagGame(FlagGame):
     `round_committed`, which gives the recovery test a deterministic kill window.
     """
 
-    entry_point = None
-
     def commit(self, actions):
         self.commits = getattr(self, "commits", 0) + 1
         marker = os.environ.get(PAUSE_ENV)
@@ -60,3 +58,14 @@ def run_events(run, exclude=("seq", "ts")):
     from swarmlab.events import logical_view
 
     return logical_view(run.events_all, exclude=exclude)
+
+
+class LouderAggregator(EvidenceAggregator):
+    """Subclass of a registered participant; must serialise as itself, not as its parent."""
+
+    def __init__(self, volume: int = 2) -> None:
+        self.volume = volume
+
+
+class BigFlag(FlagGame):
+    """Subclass of the registered world with no constructor of its own."""

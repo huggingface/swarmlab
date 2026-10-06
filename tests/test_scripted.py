@@ -35,8 +35,6 @@ def test_enumerator_never_sees_correctness_in_20_rounds(tmp_path):
 
 
 class LeakyFlagGame(FlagGame):
-    entry_point = None
-
     def my_status(self, agent):
         st = super().my_status(agent)
         st["correct"] = st["current_guess"] == self.truth

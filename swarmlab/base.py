@@ -11,12 +11,18 @@ from typing import Any, ClassVar
 
 
 class Persistable:
-    """Default persistence: pickle of __dict__ minus `params`. Override for non-plain state."""
+    """Default persistence: pickle of __dict__ minus `params`, every attribute whose name starts
+    with `_` (transient caches), and any name in `_skip_in_snapshot`. Override for non-plain state.
+    """
 
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params",)
 
     def snapshot(self) -> bytes:
-        state = {k: v for k, v in self.__dict__.items() if k not in self._skip_in_snapshot}
+        skip = self._skip_in_snapshot
+        state = {
+            k: v for k, v in self.__dict__.items()
+            if k != "params" and not k.startswith("_") and k not in skip
+        }
         return pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
 
     def restore(self, blob: bytes) -> None:
@@ -29,6 +35,8 @@ class Plugin:
     Subclasses either call `super().__init__(**kwargs)` or rely on `__init_subclass__` wrapping,
     which captures the bound arguments of the subclass's own `__init__` automatically.
     `entry_point` is the name under the plugin's entry-point group; None means `module:Class`.
+    It is honoured only when defined on the class itself, so a subclass of a registered plugin
+    serialises as its own `module:Class`, never as its parent (INTERFACE §3).
     """
 
     entry_point: ClassVar[str | None] = None
@@ -62,8 +70,9 @@ class Plugin:
 
     @classmethod
     def type_name(cls) -> str:
-        if cls.entry_point:
-            return cls.entry_point
+        ep = cls.__dict__.get("entry_point")
+        if ep:
+            return ep
         return f"{cls.__module__}:{cls.__qualname__}"
 
     def spec(self) -> dict[str, Any]:

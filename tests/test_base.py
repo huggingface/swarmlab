@@ -196,3 +196,40 @@ def test_status_tool_exposed_when_enabled():
     w = StatusCounter()
     w.reset(random.Random(0), [])
     assert [s.name for s in w.tool_schemas()] == ["add", "my_status"]
+
+
+def test_subclass_of_registered_plugin_keeps_its_identity():
+    from swarmlab import Board, Experiment
+    from swarmlab.participants import EvidenceAggregator
+    from swarmlab.spec import spec_hash
+    from swarmlab.world.flaggame import FlagGame
+    from tests.helpers import BigFlag, LouderAggregator
+
+    assert EvidenceAggregator.type_name() == "evidence_aggregator"
+    assert FlagGame.type_name() == "flaggame"
+    assert LouderAggregator.type_name() == "tests.helpers:LouderAggregator"
+    assert BigFlag.type_name() == "tests.helpers:BigFlag"
+    exp = Experiment(name="sub", world=BigFlag(height=6), medium=Board(),
+                     participants=[LouderAggregator(volume=3), EvidenceAggregator()])
+    spec = exp.to_spec(seed=1, max_rounds=2)
+    back = Experiment.from_spec(spec)
+    assert type(back.world) is BigFlag and back.world.params["height"] == 6
+    assert type(back.participants[0]) is LouderAggregator and back.participants[0].volume == 3
+    assert type(back.participants[1]) is EvidenceAggregator
+    assert back.to_spec(seed=1, max_rounds=2) == spec
+    parent = Experiment(name="sub", world=FlagGame(height=6), medium=Board(),
+                        participants=[EvidenceAggregator(), EvidenceAggregator()])
+    assert spec_hash(parent.to_spec(seed=1, max_rounds=2)) != spec_hash(spec)
+
+
+def test_snapshot_skips_params_and_underscore_attributes():
+    class Cache(Persistable):
+        def __init__(self):
+            self.params = {"k": 1}
+            self.kept = 1
+            self._cache = object()  # unpicklable-in-spirit transient
+
+    import pickle
+
+    state = pickle.loads(Cache().snapshot())
+    assert state == {"kept": 1}
