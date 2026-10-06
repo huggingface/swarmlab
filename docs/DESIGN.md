@@ -46,13 +46,13 @@ class OddAgentsSeeNothing(Policy):
             return None                      # withhold
         return round + 1, post.text          # available next round, unchanged
 
-exp = Experiment(..., medium=Board(topology="broadcast", policies=[OddAgentsSeeNothing()]))
+exp = Experiment(..., medium=Board(topology="broadcast", policies=[OddAgentsSeeNothing()]))   # `...` as in example 1
 ```
 A policy is a function of reader, post, and round. It knows nothing about inboxes, snapshots, or the event log.
 
 **3. Implement a new task with the smallest World interface.**
 ```python
-from swarmlab import World, Outcome, text_observation, tool
+from swarmlab import Experiment, World, Outcome, Participant, TurnUsage, text_observation, tool
 
 class Counter(World):
     def reset(self, rng, agents):
@@ -65,6 +65,14 @@ class Counter(World):
         return Outcome(accepted=True, feedback={"added": n})
     def score(self):
         return {"total": self.total}
+
+class Adder(Participant):                    # the smallest participant: one action, then yield
+    async def turn(self, view, tools):
+        await tools.call(self.agent, "add", {"n": 1})
+        await tools.call(self.agent, "end_turn", {})
+        return TurnUsage(calls=2)
+
+Experiment(name="count", world=Counter(), participants=[Adder()] * 4).run(seed=0, max_rounds=5)
 ```
 Persistence, action ordering at commit, status tools, and validation have working defaults on the base class. A world overrides `commit` only when it needs conflict semantics, and `snapshot`/`restore` only when its state is not plain Python data.
 

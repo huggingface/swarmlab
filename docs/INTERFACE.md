@@ -36,7 +36,7 @@ class Run:
     events: Iterator[Event]                     # logical view by default; events_all for operational too
     status: Literal["running","ended"]; end_reason: str | None
     def view(self) -> Path: ...                 # builds view.html, returns its path
-    def fork(self, at_round: int, experiment: Experiment | None = None) -> Experiment: ...
+    def fork(self, at_round: int, experiment: Experiment | None = None) -> "ForkHandle": ...   # ForkHandle.run(out=None) -> Run
     def resume(self) -> "Run": ...
     @classmethod
     def load(cls, dir) -> "Run": ...            # replays the log; never calls plugins' mutating paths
@@ -283,7 +283,7 @@ M1a metrics: `belief.accuracy` (needs truth), `belief.consensus`, `belief.polari
 ## 15. Run directory
 
 ```
-runs/<run_id>/  run.json  events.jsonl  discarded.jsonl  blobs/<sha>  snapshots/<round>.json  artifacts/{spec.yaml,git.txt,lock.txt}  view.html
+runs/<run_id>/  run.json  events.jsonl  discarded.jsonl  blobs/<sha>  snapshots/<round>.json  artifacts/{spec.yaml,git.txt}   (lock.txt deferred to M4 publish)  view.html
 ```
 
 ## 16. CLI (M1a subset)
