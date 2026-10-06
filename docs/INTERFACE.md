@@ -17,6 +17,7 @@ class Experiment(BaseModel, arbitrary_types_allowed=True):
     metrics: list[str | Metric] = []
     budget: Budget = Budget()
     probes: list = []; interventions: list = []   # M1b
+    arm: str | None = None; options: RunOptions | None = None   # set when built from YAML; run() falls back to them
 
     def run(self, seed: int, max_rounds: int, *, commit: Literal["round_end","immediate"] = "round_end",
             max_calls_per_turn: int = 20, snapshot_every: int = 1, out: Path | str = "runs",
@@ -129,7 +130,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 | `snapshot` | `manifest_path` | after `round_committed`, every `snapshot_every` |
 | `run_ended` | `reason: "terminal"|"max_rounds"|"soft_budget"|"hard_ceiling"|"error"` | once |
 
-**Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them. Acceptance tests compare logical views.
+**Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them and also drops `seq`, because operational events are appended as they happen and shift later sequence numbers. Acceptance tests compare logical views.
 
 **Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events may be appended as they happen.
 
@@ -231,7 +232,7 @@ class Scheduler(Persistable, Plugin):
     def order(self, round, live, rng) -> list[AgentId]: ...
 class SeededShuffle(Scheduler)   # shuffles live with ("schedule", round)
 ```
-The commit policy is a run option read by the runner.
+The commit policy is a run option read by the runner. In M1a the scheduler is always `SeededShuffle` and is not part of the run spec.
 
 ## 12. Runner
 
@@ -247,13 +248,13 @@ append each agent's buffered events in `order`
 posts, deliveries = board.commit(r, agents, derive(seed,"topology",r), blobs); log post*, delivery*
 outcomes = world.commit(actions in `order`, each agent's in call order); log action_committed*; outcomes_prev = by agent
 fold metrics on this round's logical events; log metric*
-log round_committed; if r % snapshot_every == 0: write snapshot; log snapshot
+if r % snapshot_every == 0: write snapshot (so every committed round has one on disk); log round_committed; log snapshot
 ```
 Sequential (`immediate`): agents run one at a time in `order`; every tool call applies immediately through single-item `board.commit` / `world.commit`; `read_board` sees deliveries with `eligible_round <= r` including same-round posts.
 
 `recover()`: `last_committed()`; `truncate_after(seq)`; load the latest snapshot with `round <= committed`; if older than the last commit, replay logical events between them into plugins (M1a may require `snapshot_every == 1` and document it). Operational events from the discarded round go to `discarded.jsonl`.
 
-`fork(at_round, experiment)`: new run dir, `run_started` with `parent_run` and `fork_round`, copy snapshot `at_round` and the log prefix up to that round's `round_committed`, continue live under the (possibly new) experiment.
+`fork(at_round, experiment)`: new run dir, `run_started` with `parent_run` and `fork_round`, copy snapshot `at_round` and the log prefix up to that round's `round_committed`, continue live under the (possibly new) experiment. Plugin state is restored from the snapshot when the plugin matches: the world when its *type* matches (worlds keep their own constructor settings across restore, so a fork may change e.g. `guess_limit`), participants when their full `spec()` matches, metrics when present in the parent's list; what was restored is recorded in `run.json["restored"]`.
 
 ## 13. Snapshot
 
