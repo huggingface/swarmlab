@@ -4,8 +4,9 @@
 
 Switching to a real model: set MODEL to "anthropic:claude-haiku-4-5" (needs ANTHROPIC_API_KEY
 and the anthropic extra) or "hf:Qwen/Qwen3.5-9B:deepinfra" (needs HF_TOKEN; the price comes from
-the HF router listing, see `swarmlab models`), and set BUDGET: soft_usd stops starting new
-turns, hard_usd is an absolute ceiling, measurement_usd caps the probes; 0 means not enforced.
+the HF router listing, see `swarmlab models`), and set BUDGET: soft_usd ends the run at the
+next round boundary once agent spend reaches it, hard_usd is an absolute ceiling on agent + probe
+spend, measurement_usd caps the probes; 0 means not enforced.
 """
 from swarmlab import Board, Budget, Experiment
 from swarmlab.metrics.belief import Accuracy, Consensus

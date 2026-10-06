@@ -299,6 +299,15 @@ swarmlab replay RUN_DIR | resume RUN_DIR | fork RUN_DIR --at R [--spec edited.ya
 ```
 `--json` on every command; exit 0 success, 2 validation error, 1 otherwise. The CLI builds an `Experiment` and calls the same `run`/`Run` API as Python.
 
+Setup additions (after M1b; additive):
+```
+swarmlab doctor [SPEC...] [--offline]            # Python, extras, keys, provider reachability, git; exit 1 on a failed check
+swarmlab models [--provider hf|anthropic] [--tools] [--search S] [--refresh]   # model catalog with USD per M tokens
+swarmlab init [NAME] [--dir D] [--force]         # starter NAME.yaml + NAME.py (FlagGame, broadcast vs gossip, fake LLM agents)
+swarmlab run spec.yaml [--arm A] [--seed N] [--max-rounds N] [--out runs/] [--yes] [--rerun]
+```
+`run` without `--arm`/`--seed` runs every arm x every seed of the YAML's optional top-level `seeds:` (default `[0]`), sequentially into `runs/<run_id>`. It prints the per-arm and total worst-case estimate first, asks for confirmation when any budget is non-zero unless `--yes` (declining exits 1 before anything runs), skips a run whose directory holds the same `spec_hash` ("exists, skipping"; `--rerun` writes `runs/<run_id>__r<N>` instead), and ends with a table of run id, outcome, end reason, score and spend. A directory holding a different `spec_hash` fails that run (exit 1) unless `--rerun`. With one arm and `--seed` the output is the single-run summary as before. Python: `Experiment.arms_from_yaml(path)`, `Experiment.run_all(seeds, max_rounds, out=...) -> list[Run]`, `Experiment.estimate(..., seeds=[...])` (adds `runs`, `total_usd`), `Run.summary()`, `Run.load(dir)` or `Run.load("runs", run_id)`.
+
 ## 17. Viewer (minimal)
 
 `viewer.build(run_dir) -> view.html`: self-contained page with a round slider; per round the Flag Game candidate grids and each agent's current guess, the board as committed, each agent's inbox with delivered content and read marks, and the per-agent event list. Built from the log and snapshots only. Vanilla JS, no external requests.

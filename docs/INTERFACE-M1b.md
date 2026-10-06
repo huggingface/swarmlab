@@ -125,10 +125,14 @@ Belief metrics take `source: str = "world"`. `"world"` reads committed `guess` a
 - `ParticipantGroup.type = "llm"` with `params` as the constructor kwargs. The `model` string's prefix selects the provider; an `Experiment.providers: dict[str, Provider] | None` field lets a script override presets (for example a vLLM base url); YAML gets a top-level `providers:` map of `{prefix: {type, params}}`.
 - `Budget` is enforced as in §2. YAML `budget:` keys `soft_usd, hard_usd, measurement_usd`.
 - `Arm.probes: list[PluginSpec]` is now honoured.
+- (Setup, additive) Top-level `seeds: [int]` lists the seeds `swarmlab run spec.yaml` runs per arm; it is not part of a `RunSpec` and never changes a `spec_hash`.
+- (Setup, additive) `hf` prices come from the model catalog (`swarmlab/providers/catalog.py`: the HF router listing `GET https://router.huggingface.co/v1/models`, cached 24 h in `~/.cache/swarmlab/catalog.json`; plus a static Anthropic table with Claude Haiku 4.5 at 1.00 / 5.00 / 0.10). `resolve()` fills a missing price for `hf:Org/Model[:served_by]` from it (a bare id or `:fastest` takes the most expensive listed provider, `:cheapest` the cheapest; cached input is priced at the input price). An explicit `providers:` price wins. `Experiment` pins a catalog price into `providers.hf.params.pricing`, so the run spec records the price used and replay never needs the catalog. A model with no price anywhere still raises `UnknownModelPricing`, whose message names the `providers:` override and `swarmlab models`.
 
 ## 8. Public API additions
 
 `Run.spend -> dict` (swarm, measurement, reserved, calls); `Run.resume(budget=None)`; `Run.probes -> dict[name, list[(round, agent, parsed, ok)]]`; `Experiment.estimate(seed, max_rounds, calls_per_turn=2, prompt_tokens=3000, completion_tokens=300) -> dict` giving a rough worst-case dollar figure per arm from the pricing table, printed by the CLI before any run whose budget is non-zero.
+
+(Setup, additive) `Experiment.estimate(..., seeds=[...])` adds `runs` and `total_usd`; `Experiment.run_all(seeds, max_rounds=None, *, out="runs", skip_existing=True, rerun=False) -> list[Run]`; `Experiment.arms_from_yaml(path) -> dict[arm, Experiment]`; `Run.summary() -> dict`; `Run.load(dir, run_id=None)`.
 
 ## 9. Acceptance tests (M1b)
 

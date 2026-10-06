@@ -14,8 +14,10 @@
 #   model: "hf:Qwen/Qwen3.5-9B:deepinfra"        # needs HF_TOKEN; price comes from the HF router
 # `swarmlab models --tools --search qwen` lists models, who serves them and their prices; the
 # part after the second ":" pins the serving provider. Then set a budget (USD) below: `run`
-# prints a worst-case estimate and asks before spending. soft_usd stops starting new turns,
-# hard_usd is an absolute ceiling on swarm + measurement spend, measurement_usd caps the probes.
+# prints a worst-case estimate and asks before spending. soft_usd ends the run at the next round
+# boundary once agent spend reaches it; hard_usd is an absolute ceiling on agent + probe spend
+# (the round in flight is discarded; `swarmlab resume RUN --budget-hard X` continues);
+# measurement_usd caps the probes.
 # A budget of 0 means "not enforced", so set one before using a paid model.
 name: __NAME__
 seeds: [1, 2]

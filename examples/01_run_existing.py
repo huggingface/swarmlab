@@ -24,3 +24,6 @@ if __name__ == "__main__":
     fork = run.fork(at_round=4).run()                           # live fork
     print("fork:", fork.id, fork.score)
     print("replayed:", Run.load(run.dir).score)           # Run.load(path) replays from disk
+    for r in exp.run_all([4, 5], max_rounds=20):                # several seeds; skips existing runs
+        s = r.summary()
+        print(s["run_id"], s["end_reason"], s["score"])

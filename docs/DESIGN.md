@@ -201,6 +201,7 @@ swarmlab smoke spec.yaml         swarmlab fork RUN --at 40 --spec edited.yaml
 swarmlab status RUN              swarmlab metrics RUN|EXPERIMENT [--add my_metric]
 swarmlab view RUN                swarmlab publish EXPERIMENT
 ```
+Setup commands (implemented): `swarmlab doctor [SPEC...]` (environment, keys, reachability, git), `swarmlab models [--provider P] [--tools] [--search S]` (catalog with prices, so no price is typed by hand), `swarmlab init NAME` (starter YAML + Python), and `swarmlab run spec.yaml` with no `--arm`/`--seed` runs every arm x seed, skipping runs already on disk, after printing the estimate and asking before spending. A fresh clone reaches a running experiment with `swarmlab doctor`, `swarmlab init demo`, `swarmlab run demo.yaml`.
 All commands take `--json`. A skill and `AGENTS.md` ship in the repo and install into Claude Code, Codex, and OpenCode skill directories, encoding the workflow: spec, dry run with scripted agents, smoke at N=3, second-agent review of readiness and of the exact prompts each arm sees, budget reservation, launch, status, analyze, view, publish, resume or fork instead of rerun.
 
 ## Integrity
