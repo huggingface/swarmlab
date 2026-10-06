@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import random
 from collections.abc import Callable
-from typing import Any
 
 from pydantic import BaseModel
 
