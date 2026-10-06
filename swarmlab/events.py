@@ -118,6 +118,7 @@ class ReadEvent(Event):
 class PostEvent(Event):
     type: Literal["post"] = "post"
     post_id: str
+    provisional_id: str | None = None  # the id the author's post() ack returned (tmp-... under round_end)
     channel: str
     text: str
     fields: dict = {}

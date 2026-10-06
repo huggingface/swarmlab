@@ -23,7 +23,7 @@ def test_agent_tools_exposes_no_executor_world_or_board(tmp_path):
 
 
 async def test_agent_tools_acts_only_as_its_agent(tmp_path):
-    world, _, _, ex = setup(tmp_path)
+    _, _, _, ex = setup(tmp_path)
     tools = AgentTools(ex, AGENTS[0])
     res = await tools.call("guess", {"candidate": "A"})
     assert res.ok and res.result["id"].startswith(f"x0001-{AGENTS[0]}-")

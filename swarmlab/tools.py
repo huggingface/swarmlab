@@ -52,7 +52,7 @@ class ToolExecutor(Protocol):
 class AgentTools:
     """The agent-bound tool handle a participant receives in `turn(view, tools)`."""
 
-    __slots__ = ("__executor", "__agent")
+    __slots__ = ("__agent", "__executor")
 
     def __init__(self, executor: ToolExecutor, agent: AgentId) -> None:
         self.__executor = executor

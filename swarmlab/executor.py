@@ -11,7 +11,8 @@ Decisions where the contract is silent:
   world action ids `x{round:04d}-{agent}-{n:02d}` (n counts accepted-for-buffering actions, from 0),
   provisional post ids `tmp-{agent}-{n}` (round_end only; n from 0 within the round). Real post ids
   are assigned by the board when the runner calls `board.buffer_post` at commit, in seeded agent
-  order, so they never depend on async interleaving.
+  order, so they never depend on async interleaving. The runner records the provisional id on
+  the `post` event (`provisional_id`); under immediate commit it equals `post_id`.
 - Every call logs `tool_called` then `tool_returned`; `read_board` also logs `read` between them.
   `tool_returned.result` is `{"ok", "result", "error"}` (the `ToolResult` minus `call_id` and
   `pending`, which has its own field).
@@ -103,6 +104,7 @@ class _AgentState:
     events: list[Event] = field(default_factory=list)
     actions: list[tuple[AgentId, ActionId, Action]] = field(default_factory=list)
     posts: list[tuple[str, str, dict]] = field(default_factory=list)  # (channel, text, fields)
+    post_ids: list[str] = field(default_factory=list)  # provisional ids, parallel to `posts`
     calls: int = 0
     n_actions: int = 0
     ended: bool = False
@@ -180,6 +182,10 @@ class RoundExecutor:
 
     def buffered_posts(self, agent: AgentId) -> list[tuple[str, str, dict]]:
         return list(self._st(agent).posts)
+
+    def buffered_post_ids(self, agent: AgentId) -> list[str]:
+        """Provisional ids returned to the agent, parallel to `buffered_posts(agent)`."""
+        return list(self._st(agent).post_ids)
 
     def buffered_actions(self, agent: AgentId) -> list[tuple[AgentId, ActionId, Action]]:
         return list(self._st(agent).actions)
@@ -267,6 +273,7 @@ class RoundExecutor:
         if self.commit_mode == "round_end":
             provisional = f"tmp-{agent}-{len(st.posts)}"
             st.posts.append((channel, text, dict(fields)))
+            st.post_ids.append(provisional)
             return ToolResult(call_id=call_id, ok=True, result={"id": provisional}, pending=True)
         post_id = self.board.buffer_post(agent, self.round, channel, text, dict(fields))
         posts, deliveries = self.board.commit(self.round, self.agents, self._topology_rng(), self.blobs)

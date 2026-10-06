@@ -1,6 +1,16 @@
 """Acceptance 4: the three DESIGN.md Experimenter-interface examples, and spec round-trips."""
 
-from swarmlab import Experiment, Outcome, Participant, Policy, Run, World, text_observation, tool
+from swarmlab import (
+    Experiment,
+    Outcome,
+    Participant,
+    Policy,
+    Run,
+    TurnUsage,
+    World,
+    text_observation,
+    tool,
+)
 from swarmlab.spec import RunSpec, spec_hash
 
 
@@ -178,6 +188,7 @@ def test_belief_accuracy_equals_world_score_every_round(tmp_path):
         store = SnapshotStore(run.dir)
         acc = {e["round"]: e for e in run.events if e["type"] == "metric" and e["name"] == "belief.accuracy"}
         assert sorted(acc) == list(range(1, 7))
+        assert {e["yield_kind"] for e in run.events if e["type"] == "turn_ended"} == {"no_tool"}
         for r, e in acc.items():
             world = FlagGame()
             world.restore(store.load(store.read(r))["world"])

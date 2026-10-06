@@ -69,3 +69,18 @@ class LouderAggregator(EvidenceAggregator):
 
 class BigFlag(FlagGame):
     """Subclass of the registered world with no constructor of its own."""
+
+
+OPERATIONAL_HOOK: dict = {}
+
+
+class Inferrer(Participant):
+    """Calls OPERATIONAL_HOOK["fn"](agent, round) mid-turn (stands in for M1b's tools.infer)."""
+
+    async def turn(self, view, tools):
+        fn = OPERATIONAL_HOOK.get("fn")
+        if fn is not None:
+            fn(self.agent, view.round)
+        await tools.call("post", {"text": f"{self.agent} r{view.round}"})
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=2)

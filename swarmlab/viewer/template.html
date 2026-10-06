@@ -261,7 +261,8 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
     var posts = (byRound[r] || []).filter(function (e) { return e.type === "post"; });
     var nDel = (byRound[r] || []).filter(function (e) { return e.type === "delivery"; }).length;
     $("posts").innerHTML = posts.length ? posts.map(function (p) {
-      return '<div class="post">' + agentLink(p.agent) + ' <span class="muted">#' + esc(p.channel) + " · " + esc(p.post_id) + "</span><pre>" + esc(p.text) + "</pre></div>";
+      return '<div class="post">' + agentLink(p.agent) + ' <span class="muted">#' + esc(p.channel) + " · " + esc(p.post_id) +
+        (p.provisional_id && p.provisional_id !== p.post_id ? " (ack " + esc(p.provisional_id) + ")" : "") + "</span><pre>" + esc(p.text) + "</pre></div>";
     }).join("") + '<div class="muted" style="margin-top:4px">' + nDel + " deliveries created</div>" : '<div class="empty">no posts this round</div>';
   }
   function renderInbox(r) {

@@ -85,6 +85,7 @@ import copy
 import json
 import shutil
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -144,6 +145,17 @@ class ForkOrigin:
 
 def _jsonable(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
+
+
+def _run_coro(coro: Any) -> Any:
+    """`asyncio.run(coro)`, or, inside an already-running event loop (a notebook), the same in a
+    worker thread; the caller blocks until the run finishes either way."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="swarmlab-runner") as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
 def build_metric(m: str | Metric) -> Metric:
@@ -317,6 +329,18 @@ class Runner:
         if ev.type not in OPERATIONAL_TYPES:
             self._round_events.append(ev)
 
+    def log_operational(self, event: Event) -> int:
+        """Append an operational event (`inference_attempt`, `inference_response`) immediately.
+
+        Unlike turn events, which the executor buffers per agent until the round's turns finish,
+        operational events go straight to the log, so an attempt is on disk before the model is
+        called and spend survives an aborted round. They are never fed to metrics and
+        `logical_view` drops them. Returns the assigned seq.
+        """
+        if event.type not in OPERATIONAL_TYPES:
+            raise ValueError(f"{event.type!r} is not an operational event")
+        return self.log.append(event)
+
     def _run_started(self, round: int) -> None:
         git_commit, dirty = self._git
         self._append(RunStartedEvent, round, spec_hash=spec_hash(self.spec), git_commit=git_commit,
@@ -327,6 +351,14 @@ class Runner:
     def live(self) -> Runner:
         """Start the run from round 0 (or, for a fork child, from the fork round)."""
         if self.log_path.exists() and self.log_path.stat().st_size and self.parent is None:
+            meta = self._read_meta() or {}
+            old_hash, new_hash = meta.get("spec_hash"), spec_hash(self.spec)
+            if old_hash is not None and old_hash != new_hash:
+                raise FileExistsError(
+                    f"{self.dir} already holds a run of a different configuration "
+                    f"(existing spec_hash {old_hash}, this run's spec_hash {new_hash}); the run id "
+                    "covers only name, arm and seed, so use another out dir, name or arm"
+                )
             raise FileExistsError(f"{self.log_path} already exists; use resume() or a new out dir")
         self._build()
         self._write_artifacts()
@@ -334,15 +366,14 @@ class Runner:
         try:
             self._init_fresh()
             if self.parent is None:
-                self._run_started(0)
                 start = 1
             else:
                 manifest = self.snapshots.read(self.parent.at_round)
                 self._restore(manifest, self.parent.parent_spec)
-                self._run_started(self.parent.at_round)
                 start = self.parent.at_round + 1
-            self._write_meta()
-            asyncio.run(self._loop(start))
+            self._write_meta()  # before run_started: the dir is always resumable or removable
+            self._run_started(start - 1)
+            _run_coro(self._loop(start))
         finally:
             self.log.close()
         return self
@@ -363,7 +394,7 @@ class Runner:
                 return self
             self._init_fresh()
             start = self.recover(events)
-            asyncio.run(self._loop(start))
+            _run_coro(self._loop(start))
         finally:
             self.log.close()
         return self
@@ -375,7 +406,16 @@ class Runner:
         if lc is None:
             starts = [e.seq for e in events if e.type == "run_started"]
             if not starts:
-                raise RecoveryError("log has no run_started event")
+                if self.parent_run is not None:
+                    raise RecoveryError("fork child has no run_started event")
+                # crashed between writing run.json and appending run_started: start over
+                dropped = self.log.truncate_after(-1)
+                if dropped:
+                    write_jsonl(self.dir / "discarded.jsonl", dropped)
+                self.last_round = 0
+                self._write_meta()
+                self._run_started(0)
+                return 1
             keep = starts[-1]
             committed = None
         else:
@@ -607,10 +647,12 @@ class Runner:
             for ev in ex.events(a):
                 self._log_event(ev)
         # commit
+        provisional: dict[str, str] = {}
         if self.options.commit == "round_end":
             for a in order:
-                for channel, text, fields in ex.buffered_posts(a):
-                    self.board.buffer_post(a, r, channel, text, fields)
+                for (channel, text, fields), tmp in zip(ex.buffered_posts(a), ex.buffered_post_ids(a),
+                                                        strict=True):
+                    provisional[self.board.buffer_post(a, r, channel, text, fields)] = tmp
             posts, deliveries = self.board.commit(r, list(self.live_agents),
                                                   derive(seed, "topology", r), self.blobs)
             actions = [x for a in order for x in ex.buffered_actions(a)]
@@ -620,8 +662,9 @@ class Runner:
             posts, deliveries = ex.committed.posts, ex.committed.deliveries
             applied = ex.committed.actions
         for p in posts:
-            self._append(PostEvent, r, p.agent, post_id=p.post_id, channel=p.channel, text=p.text,
-                         fields=dict(p.fields))
+            self._append(PostEvent, r, p.agent, post_id=p.post_id,
+                         provisional_id=provisional.get(p.post_id, p.post_id), channel=p.channel,
+                         text=p.text, fields=dict(p.fields))
         for d in deliveries:
             self._append(DeliveryEvent, r, d.recipient, post_id=d.post_id, recipient=d.recipient,
                          delivery_id=d.delivery_id, eligible_round=d.eligible_round,
