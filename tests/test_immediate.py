@@ -23,9 +23,10 @@ def test_immediate_posts_are_readable_in_the_same_round(tmp_path):
     assert rets and not any(e["pending"] for e in rets)
     kinds = {e["yield_kind"] for e in events if e["type"] == "turn_ended"}
     assert kinds == {"no_tool"}
-    # hops: the last poster read posts of earlier posters who read earlier ones
+    # hops (review A6): Chatter posts before it reads, so a round-1 post reflects no reads (hop 1)
+    # even though later agents read earlier posts in the same round; their round-2 posts are hop 2
     hops = {r: v for r, v, _ in run.metrics["comm.hops"]}
-    assert hops[1] == 4.0
+    assert hops == {1: 1.0, 2: 2.0}
 
 
 def test_round_end_posts_are_next_round(tmp_path):

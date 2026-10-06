@@ -84,3 +84,19 @@ class Inferrer(Participant):
         await tools.call("post", {"text": f"{self.agent} r{view.round}"})
         await tools.call("end_turn", {})
         return TurnUsage(calls=2)
+
+
+class PostThenRead(Participant):
+    """The reviewer's A6 participant: post first, then read the board, every round."""
+
+    async def turn(self, view, tools):
+        await tools.call("post", {"text": f"{self.agent} r{view.round}"})
+        await tools.call("read_board", {})
+        return TurnUsage(calls=2)
+
+
+class ReadThenPost(Participant):
+    async def turn(self, view, tools):
+        await tools.call("read_board", {})
+        await tools.call("post", {"text": f"{self.agent} r{view.round}"})
+        return TurnUsage(calls=2)

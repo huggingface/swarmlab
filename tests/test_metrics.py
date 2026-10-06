@@ -8,6 +8,8 @@ from swarmlab.events import (
     PostEvent,
     ReadEvent,
     RoundStartedEvent,
+    ToolCalledEvent,
+    ToolReturnedEvent,
     TurnStartedEvent,
 )
 from swarmlab.metrics.base import get
@@ -99,13 +101,22 @@ def read(r, a, ids):
     return ReadEvent(run="r", round=r, agent=a, delivery_ids=ids)
 
 
-def post(r, a, pid):
-    return PostEvent(run="r", round=r, agent=a, post_id=pid, channel="main", text="t")
+def post(r, a, pid, ack=None):
+    return PostEvent(run="r", round=r, agent=a, post_id=pid, provisional_id=ack, channel="main",
+                     text="t")
 
 
-def deliv(r, pid, did, to):
+def pcall(r, a, ack):
+    """The post tool call and its ack, as the executor logs them inside the turn."""
+    cid = f"c{r}-{a}-{ack}"
+    return [ToolCalledEvent(run="r", round=r, agent=a, call_id=cid, tool="post", args={"text": "t"}),
+            ToolReturnedEvent(run="r", round=r, agent=a, call_id=cid,
+                              result={"ok": True, "result": {"id": ack}, "error": None}, pending=True)]
+
+
+def deliv(r, pid, did, to, eligible=None):
     return DeliveryEvent(run="r", round=r, agent=to, post_id=pid, recipient=to, delivery_id=did,
-                         eligible_round=r + 1, content_hash="0" * 64)
+                         eligible_round=r + 1 if eligible is None else eligible, content_hash="0" * 64)
 
 
 def test_read_rate_and_posts_per_round_are_per_round():
@@ -124,29 +135,47 @@ def test_hops_chain():
     h = Hops()
     assert h.value() == (None, 0)
     # round 1: a000 posts p1 delivered to a001
-    feed(h, [rs(1), ts(1, "a000"), post(1, "a000", "p1"), deliv(1, "p1", "d1", "a001")])
-    assert h.value() == (1.0, 1)
+    feed(h, [rs(1), ts(1, "a000"), *pcall(1, "a000", "t0"), post(1, "a000", "p1", "t0"),
+             deliv(1, "p1", "d1", "a001")])
+    assert h.value() == (1.0, 0)  # nothing read yet
     # round 2: a001 reads d1, then posts p2 -> hop 2; delivered to a002
-    feed(h, [rs(2), ts(2, "a001"), read(2, "a001", ["d1"]), post(2, "a001", "p2"),
-             deliv(2, "p2", "d2", "a002")])
+    feed(h, [rs(2), ts(2, "a001"), read(2, "a001", ["d1"]), *pcall(2, "a001", "t0"),
+             post(2, "a001", "p2", "t0"), deliv(2, "p2", "d2", "a002")])
     assert h.value() == (2.0, 1)
     # round 3: a002 reads d2 and posts p3 -> hop 3
-    feed(h, [rs(3), ts(3, "a002"), read(3, "a002", ["d2"]), post(3, "a002", "p3")])
-    assert h.value() == (3.0, 1)
+    feed(h, [rs(3), ts(3, "a002"), read(3, "a002", ["d2"]), *pcall(3, "a002", "t0"),
+             post(3, "a002", "p3", "t0")])
+    assert h.value() == (3.0, 2)
+
+
+def test_hops_ignores_reads_after_the_post_in_the_same_turn():
+    """A6: post then read in one turn: the read does not feed that post."""
+    h = Hops()
+    feed(h, [rs(1), ts(1, "a000"), *pcall(1, "a000", "t0"), post(1, "a000", "p1", "t0"),
+             deliv(1, "p1", "d1", "a001")])
+    feed(h, [rs(2), ts(2, "a001"), *pcall(2, "a001", "t0"), read(2, "a001", ["d1"]),
+             post(2, "a001", "p2", "t0")])
+    assert h.value() == (1.0, 1)
+    # without call events (older logs) only reads in earlier rounds count
+    old = Hops()
+    feed(old, [rs(1), post(1, "a000", "p1"), deliv(1, "p1", "d1", "a001"),
+               rs(2), read(2, "a001", ["d1"]), post(2, "a001", "p2")])
+    assert old.value() == (1.0, 1)
 
 
 def test_hops_immediate_same_round_reads_resolve_lazily():
     h = Hops()
     # immediate mode log shape: turns (with reads) first, then posts, then deliveries
-    evs = [rs(1), ts(1, "a000"), ts(1, "a001"), read(1, "a001", ["d1"]),
-           post(1, "a000", "p1"), post(1, "a001", "p2"), deliv(1, "p1", "d1", "a001")]
-    assert feed(h, evs) == (2.0, 2)
+    evs = [rs(1), ts(1, "a000"), *pcall(1, "a000", "p1"), ts(1, "a001"), read(1, "a001", ["d1"]),
+           *pcall(1, "a001", "p2"), post(1, "a000", "p1", "p1"), post(1, "a001", "p2", "p2"),
+           deliv(1, "p1", "d1", "a001", eligible=1)]
+    assert feed(h, evs) == (2.0, 1)
     state = h.snapshot()
     h.update(rs(2))
-    assert h.value() == (2.0, 0)
+    assert h.value() == (2.0, 1)
     h2 = Hops()
     h2.restore(state)
-    assert h2.value() == (2.0, 2)
+    assert h2.value() == (2.0, 1)
 
 
 @pytest.mark.parametrize("cls", [Consensus, Hops, ReadRate])
@@ -156,3 +185,44 @@ def test_metric_snapshot_roundtrip(cls):
     n = cls()
     n.restore(m.snapshot())
     assert n.value() == m.value()
+
+
+def _hops(tmp_path, participant, commit, name):
+    from swarmlab import Board, Experiment
+    from swarmlab.world.flaggame import FlagGame
+
+    exp = Experiment(name=name, world=FlagGame(), medium=Board(topology="broadcast"),
+                     participants=[participant] * 3, metrics=["comm.hops"])
+    run = exp.run(seed=0, max_rounds=5, out=tmp_path, commit=commit)
+    run.replay()
+    return [(e["value"], e["denominator"]) for e in run.events if e["type"] == "metric"]
+
+
+def test_hops_post_then_read_round_end(tmp_path):
+    """A6 end to end, the reviewer's post-then-read participant, 3 agents, broadcast, round_end.
+
+    Relay chain: a round-r post can only reflect reads made in rounds < r (its own turn reads
+    after posting), and a round-r post is first readable in round r+1. So one hop costs two rounds:
+      r1 posts: 1 (nothing read yet)           r1 reads: nothing eligible
+      r2 posts: 1 (r1 read nothing)            r2 reads: r1 posts (hop 1)
+      r3 posts: 2 (read hop-1 posts in r2)     r3 reads: r2 posts (hop 1)
+      r4 posts: 2 (best read so far is hop 1)  r4 reads: r3 posts (hop 2)
+      r5 posts: 3
+    giving [1, 1, 2, 2, 3]. The review note quoted [1, 1, 2, 3, 4], which would need a hop-2 post
+    to be read before the round-4 posts; under round_end a round-3 post is first readable in
+    round 4, after that round's posts. The old code gave [1, 2, 3, 4, 5] (it let the same-turn read
+    feed the post). Denominator: posts read at least once (3 per round from round 2 on, cumulative).
+    """
+    from .helpers import PostThenRead
+
+    got = _hops(tmp_path, PostThenRead(), "round_end", "ptr")
+    assert [v for v, _ in got] == [1.0, 1.0, 2.0, 2.0, 3.0]
+    assert [n for _, n in got] == [0, 3, 6, 9, 12]
+
+
+def test_hops_read_then_post_round_end(tmp_path):
+    """Reading before posting relays every round: [1, 2, 3, 4, 5]."""
+    from .helpers import ReadThenPost
+
+    got = _hops(tmp_path, ReadThenPost(), "round_end", "rtp")
+    assert [v for v, _ in got] == [1.0, 2.0, 3.0, 4.0, 5.0]
