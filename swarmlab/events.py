@@ -22,6 +22,8 @@ Decisions where the contract is silent:
   `truncate_after`) first cuts the file back to the last complete line. Reading never modifies
   the file. A malformed line *followed by valid lines* is real corruption and raises
   `EventLogCorrupt`.
+- M1b: `inference_attempt` gained `category`, `inference_response` gained `served_by`,
+  `finish_reason`, `cached`; new logical types `budget`, `budget_changed`, `probe`.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
 """
@@ -91,6 +93,7 @@ class InferenceAttemptEvent(Event):
     model: str
     request_hash: str
     reserved_usd: float = 0.0
+    category: Literal["swarm", "measurement"] = "swarm"
 
 
 class InferenceResponseEvent(Event):
@@ -100,6 +103,9 @@ class InferenceResponseEvent(Event):
     usage: dict = {}
     cost_usd: float = 0.0
     latency_s: float = 0.0
+    served_by: str | None = None
+    finish_reason: str = ""
+    cached: bool = False
 
 
 class TurnEndedEvent(Event):
@@ -165,6 +171,36 @@ class SnapshotEvent(Event):
     manifest_path: str
 
 
+class BudgetEvent(Event):
+    """Ledger state at a commit (M1b; logical). Written before `round_committed`."""
+
+    type: Literal["budget"] = "budget"
+    spent_swarm: float
+    spent_measurement: float
+    reserved: float
+    calls: int
+
+
+class BudgetChangedEvent(Event):
+    """`Run.resume(budget=...)` replaced the effective budget (M1b; logical)."""
+
+    type: Literal["budget_changed"] = "budget_changed"
+    old: dict
+    new: dict
+
+
+class ProbeEvent(Event):
+    """A probe's answer for one agent (M1b, written by WP7's probe hook; logical)."""
+
+    type: Literal["probe"] = "probe"
+    probe: str
+    question_hash: str
+    raw_hash: str
+    parsed: dict = {}
+    ok: bool
+    cost_usd: float = 0.0
+
+
 class RunEndedEvent(Event):
     type: Literal["run_ended"] = "run_ended"
     reason: Literal["terminal", "max_rounds", "soft_budget", "hard_ceiling", "error"]
@@ -174,7 +210,7 @@ _ALL = (
     RunStartedEvent, RoundStartedEvent, TurnStartedEvent, ToolCalledEvent, ToolReturnedEvent,
     InferenceAttemptEvent, InferenceResponseEvent, TurnEndedEvent, ReadEvent, PostEvent,
     DeliveryEvent, ActionCommittedEvent, WorldChangedEvent, MetricEvent, RoundCommittedEvent,
-    SnapshotEvent, RunEndedEvent,
+    SnapshotEvent, RunEndedEvent, BudgetEvent, BudgetChangedEvent, ProbeEvent,
 )
 EVENT_CLASSES: dict[str, type[Event]] = {c.model_fields["type"].default: c for c in _ALL}
 
@@ -182,7 +218,7 @@ AnyEvent = Annotated[
     RunStartedEvent | RoundStartedEvent | TurnStartedEvent | ToolCalledEvent | ToolReturnedEvent
     | InferenceAttemptEvent | InferenceResponseEvent | TurnEndedEvent | ReadEvent | PostEvent
     | DeliveryEvent | ActionCommittedEvent | WorldChangedEvent | MetricEvent | RoundCommittedEvent
-    | SnapshotEvent | RunEndedEvent,
+    | SnapshotEvent | RunEndedEvent | BudgetEvent | BudgetChangedEvent | ProbeEvent,
     Field(discriminator="type"),
 ]
 _ADAPTER: TypeAdapter[Event] = TypeAdapter(AnyEvent)

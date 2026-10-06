@@ -11,7 +11,7 @@ def test_agent_tools_exposes_no_executor_world_or_board(tmp_path):
     _, _, _, ex = setup(tmp_path)
     tools = AgentTools(ex, AGENTS[0])
     public = {n for n in dir(tools) if not n.startswith("_")}
-    assert public == {"agent", "schemas", "call"}
+    assert public == {"agent", "schemas", "call", "infer"}
     for name in ("world", "board", "executor", "blobs", "agents"):
         assert not hasattr(tools, name)
     assert not hasattr(tools, "__dict__")  # slots only: nothing can be attached by accident

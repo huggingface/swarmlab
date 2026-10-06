@@ -34,6 +34,14 @@ Decisions where the contract is silent:
   `{"id", "accepted", "feedback"}` with `pending=False`.
 - Status tools answer from the world's current state, which under round_end is round-start state
   because nothing commits during the turns.
+- Inference (M1b, `infer(agent, request, category)`): call ids `i{round:04d}-{agent}-{n:03d}`
+  (n counts this agent's inference calls in the round, from 1); inference calls do not count
+  toward `max_calls_per_turn`. The work is done by `swarmlab.inference.Inference` (cache, gate,
+  operational events). Per agent the executor sums the *nominal* usage and cost of its "swarm"
+  calls (`inference_usage(agent)`), which the runner merges into `turn_ended.usage`. A
+  `HardCeilingReached` sets `hard_ceiling` on the executor before propagating, so the runner aborts
+  the round even if a participant swallows the exception. Without an `Inference` (unit tests
+  that build a bare executor), `infer` raises `RuntimeError`.
 - Concurrency: `call` contains no `await`, so under asyncio each call is atomic. During round_end
   turns it only reads shared world state and touches the calling agent's own board inbox
   (`board.read`), so concurrent turns cannot observe each other.
@@ -45,6 +53,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from .budget import HardCeilingReached
 from .events import (
     Event,
     ReadEvent,
@@ -55,6 +64,7 @@ from .events import (
 )
 from .ids import ActionId, AgentId, CallId
 from .medium.board import Board, Delivery, Post
+from .providers.base import ChatRequest, ChatResponse, Usage
 from .tools import ToolResult, ToolSchema, TurnCapReached
 from .world.base import Action, Outcome, World
 
@@ -108,6 +118,10 @@ class _AgentState:
     calls: int = 0
     n_actions: int = 0
     ended: bool = False
+    n_infer: int = 0
+    infer_swarm: int = 0
+    usage: Usage = field(default_factory=Usage)
+    cost_usd: float = 0.0
 
 
 @dataclass
@@ -133,6 +147,7 @@ class RoundExecutor:
         max_calls_per_turn: int = 20,
         topology_rng: Callable[[], random.Random] | None = None,
         allowlist: dict[AgentId, set[str]] | None = None,
+        inference: Any = None,
     ) -> None:
         self.run = run
         self.round = round
@@ -144,6 +159,8 @@ class RoundExecutor:
         self.max_calls = max_calls_per_turn
         self._topology_rng = topology_rng or (lambda: random.Random(0))
         self.allowlist = allowlist
+        self.inference = inference
+        self.hard_ceiling = False
         self._state: dict[AgentId, _AgentState] = {}
         self.committed = Committed()
         self._world_tools = {s.name: s for s in world.tool_schemas()}
@@ -229,6 +246,31 @@ class RoundExecutor:
         else:
             res = self._err(call_id, "not_allowed")
         return self._ret(agent, res)
+
+    async def infer(self, agent: AgentId, request: ChatRequest, category: str = "swarm") -> ChatResponse:
+        if self.inference is None:
+            raise RuntimeError("inference is not available in this executor")
+        st = self._st(agent)
+        st.n_infer += 1
+        call_id = f"i{self.round:04d}-{agent}-{st.n_infer:03d}"
+        try:
+            resp, nominal = await self.inference.infer(agent=agent, round=self.round, call_id=call_id,
+                                                       request=request, category=category)
+        except HardCeilingReached:
+            self.hard_ceiling = True
+            raise
+        if category == "swarm":
+            st.infer_swarm += 1
+            st.usage = st.usage + nominal.usage
+            st.cost_usd += nominal.cost_usd
+        return resp
+
+    def inference_usage(self, agent: AgentId) -> dict | None:
+        """Summed nominal usage of this agent's swarm inference calls this round, or None."""
+        st = self._st(agent)
+        if not st.infer_swarm:
+            return None
+        return {**st.usage.model_dump(), "cost_usd": st.cost_usd, "inference_calls": st.infer_swarm}
 
     # ---- helpers -----------------------------------------------------------------------------
     @staticmethod

@@ -6,6 +6,8 @@ from swarmlab.events import (
     EVENT_CLASSES,
     OPERATIONAL_TYPES,
     ActionCommittedEvent,
+    BudgetChangedEvent,
+    BudgetEvent,
     DeliveryEvent,
     Event,
     EventLog,
@@ -14,6 +16,7 @@ from swarmlab.events import (
     InferenceResponseEvent,
     MetricEvent,
     PostEvent,
+    ProbeEvent,
     ReadEvent,
     RoundCommittedEvent,
     RoundStartedEvent,
@@ -62,6 +65,10 @@ def one_of_each() -> list[Event]:
         RoundCommittedEvent(run=R, round=1, n_posts=1, n_actions=1, n_deliveries=1),
         SnapshotEvent(run=R, round=1, manifest_path="snapshots/000001.json"),
         RunEndedEvent(run=R, round=1, reason="max_rounds"),
+        BudgetEvent(run=R, round=1, spent_swarm=0.5, spent_measurement=0.1, reserved=0.0, calls=3),
+        BudgetChangedEvent(run=R, round=1, old={"hard_usd": 1.0}, new={"hard_usd": 2.0}),
+        ProbeEvent(run=R, round=1, agent="a000", probe="belief", question_hash="q", raw_hash="r",
+                   parsed={"candidate": "A"}, ok=True, cost_usd=0.001),
     ]
 
 
@@ -70,6 +77,7 @@ def test_every_type_has_a_class():
         "run_started", "round_started", "turn_started", "tool_called", "tool_returned",
         "inference_attempt", "inference_response", "turn_ended", "read", "post", "delivery",
         "action_committed", "world_changed", "metric", "round_committed", "snapshot", "run_ended",
+        "budget", "budget_changed", "probe",
     }
     assert set(EVENT_CLASSES) == expected
     assert {e.type for e in one_of_each()} == expected
