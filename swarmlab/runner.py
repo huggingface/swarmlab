@@ -17,9 +17,10 @@ Round `r` (phase-commit, `commit == "round_end"`):
 1. `order = scheduler.order(r, live, derive(seed, "schedule", r))`; log `round_started`.
 2. Turns run concurrently (asyncio, `Semaphore(options.concurrency)`); each turn builds its
    `View` (observation, last round's outcomes, pushed items when `board.delivery == "push"`,
-   tool schemas) and awaits `participant.turn(view, AgentTools(executor, agent))`. `EndTurn` -> `end_turn`,
-   `TurnCapReached` -> `cap`, any other exception -> `error` (traceback in `turn_ended.error`),
-   normal return -> `no_tool`; a returned `TurnUsage` goes to `turn_ended.usage`.
+   tool schemas) and awaits `participant.turn(view, AgentTools(executor, agent))`. A normal return -> `end_turn` if
+   the agent called `end_turn()` during the turn, else `no_tool`; `TurnCapReached` -> `cap`; any
+   other exception -> `error` (traceback in `turn_ended.error`). An exception wins over an earlier
+   `end_turn()`. A returned `TurnUsage` goes to `turn_ended.usage` (also after `end_turn`).
 3. After all turns, each agent's buffered events are appended in `order`.
 4. Buffered posts go to `board.buffer_post` in `order` (each agent's in call order), then
    `board.commit(r, live, derive(seed, "topology", r), blobs)`; log `post*`, `delivery*`.
@@ -114,7 +115,7 @@ from .rng import derive
 from .scheduler import SeededShuffle
 from .snapshot import SnapshotManifest, SnapshotStore
 from .spec import PluginSpec, RunOptions, RunSpec, dump_runspec_yaml, git_identity, spec_hash
-from .tools import AgentTools, EndTurn, TurnCapReached
+from .tools import AgentTools, TurnCapReached
 from .view import View
 
 if TYPE_CHECKING:
@@ -558,11 +559,9 @@ class Runner:
         error = None
         try:
             result = await self.participants[agent].turn(view, AgentTools(ex, agent))
-            kind = "no_tool"
+            kind = "end_turn" if ex.turn_ended(agent) else "no_tool"
             if result is not None and hasattr(result, "model_dump"):
                 usage = result.model_dump(mode="json")
-        except EndTurn:
-            kind = "end_turn"
         except TurnCapReached:
             kind = "cap"
         except Exception:  # noqa: BLE001 - any participant failure ends its turn as "error"

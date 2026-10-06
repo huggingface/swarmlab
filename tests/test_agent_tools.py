@@ -46,3 +46,39 @@ def test_runner_passes_agent_tools(tmp_path):
     committed = [e for e in run.events if e["type"] == "action_committed"]
     assert sorted(e["agent"] for e in committed) == ["a000", "a001"]
     assert all(e["action_id"].split("-")[1] == e["agent"] for e in committed)
+
+
+class Yielder(Participant):
+    """Behaviour chosen by agent index: end_turn+usage, end_turn then late call, cap, error, no_tool."""
+
+    async def turn(self, view, tools):
+        i = int(self.agent[1:])
+        if i == 0:
+            await tools.call("end_turn", {})
+            return TurnUsage(calls=1, prompt_tokens=7, completion_tokens=3, cost_usd=0.5)
+        if i == 1:
+            await tools.call("end_turn", {})
+            self.late = (await tools.call("guess", {"candidate": "A"})).model_dump()
+            return TurnUsage(calls=2)
+        if i == 2:
+            while True:
+                await tools.call("my_status", {})
+        if i == 3:
+            raise RuntimeError("boom")
+        return TurnUsage(calls=0)
+
+
+def test_yield_kinds_and_usage_after_end_turn(tmp_path):
+    exp = Experiment(name="yield", world=FlagGame(), medium=Board(), participants=[Yielder()] * 5)
+    run = exp.run(seed=0, max_rounds=1, out=tmp_path, max_calls_per_turn=3)
+    ended = {e["agent"]: e for e in run.events if e["type"] == "turn_ended"}
+    assert {a: e["yield_kind"] for a, e in ended.items()} == {
+        "a000": "end_turn", "a001": "end_turn", "a002": "cap", "a003": "error", "a004": "no_tool"}
+    assert ended["a000"]["usage"] == {"calls": 1, "prompt_tokens": 7, "completion_tokens": 3,
+                                      "cost_usd": 0.5}
+    assert ended["a001"]["usage"]["calls"] == 2
+    assert "RuntimeError: boom" in ended["a003"]["error"]
+    # the guess after end_turn was rejected, logged, and never committed
+    rets = [e for e in run.events if e["type"] == "tool_returned" and e["agent"] == "a001"]
+    assert rets[-1]["result"]["error"] == "turn_ended"
+    assert not [e for e in run.events if e["type"] == "action_committed"]

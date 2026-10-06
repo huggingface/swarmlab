@@ -49,7 +49,7 @@ class Silent(Participant):
             await tools.call("guess", {"candidate": self.rng.choice(names)})
             calls += 1
         await tools.call("end_turn", {})
-        return TurnUsage(calls=calls + 1)  # pragma: no cover - end_turn raises
+        return TurnUsage(calls=calls + 1)
 
 
 class EvidenceAggregator(Participant):
@@ -64,7 +64,9 @@ class EvidenceAggregator(Participant):
         candidates, crop = parse_observation(_observation_text(view))
         if not self.crops:
             self.crops.append(list(crop))
+        calls = 0
         if not self.posted:
+            calls += 1
             await tools.call("post", {"channel": "main", "text": CROP_PREFIX + "\n" + "\n".join(crop)})
             self.posted = True
         res = await tools.call("read_board", {"limit": 200})
@@ -80,7 +82,7 @@ class EvidenceAggregator(Participant):
         choice = self.rng.choice([n for n in names if scores[n] == best])
         await tools.call("guess", {"candidate": choice})
         await tools.call("end_turn", {})
-        return TurnUsage()  # pragma: no cover - end_turn raises
+        return TurnUsage(calls=calls + 3)
 
 
 def _bare(name: str, text: str) -> bool:
@@ -133,4 +135,4 @@ class Enumerator(Participant):
             body.pop("current_guess", None)
             self._check_name("tool result", json.dumps({**data, "result": body}, sort_keys=True))
         await tools.call("end_turn", {})
-        return TurnUsage()  # pragma: no cover - end_turn raises
+        return TurnUsage(calls=len(results) + 1)

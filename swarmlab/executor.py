@@ -16,7 +16,11 @@ Decisions where the contract is silent:
   `tool_returned.result` is `{"ok", "result", "error"}` (the `ToolResult` minus `call_id` and
   `pending`, which has its own field).
 - Cap: the call that makes `calls > max_calls_per_turn` is logged with
-  `ok=False, error="cap"` and raises `TurnCapReached`. Calls after `end_turn` raise `EndTurn` again.
+  `ok=False, error="cap"` and raises `TurnCapReached`. The cap is checked first, so a participant
+  that keeps calling after `end_turn` still hits it.
+- `end_turn` never raises: it sets a per-agent flag (`turn_ended(agent)`) and returns `ok=True`.
+  Every later call in the same turn is logged and returns `ok=False, error="turn_ended"` without
+  side effects. `EndTurn` stays defined in `tools.py` but is not raised.
 - `end_turn` is always allowed. The optional per-agent allowlist filters every other tool
   (schemas and calls); a call outside it returns `ok=False, error="not_allowed"`. Unknown tools
   return the same error.
@@ -50,7 +54,7 @@ from .events import (
 )
 from .ids import ActionId, AgentId, CallId
 from .medium.board import Board, Delivery, Post
-from .tools import EndTurn, ToolResult, ToolSchema, TurnCapReached
+from .tools import ToolResult, ToolSchema, TurnCapReached
 from .world.base import Action, Outcome, World
 
 BOARD_TOOLS = ("read_board", "post")
@@ -167,6 +171,10 @@ class RoundExecutor:
     def events(self, agent: AgentId) -> list[Event]:
         return list(self._st(agent).events)
 
+    def turn_ended(self, agent: AgentId) -> bool:
+        """True once `agent` has called `end_turn` this round."""
+        return self._st(agent).ended
+
     def calls(self, agent: AgentId) -> int:
         return self._st(agent).calls
 
@@ -194,16 +202,14 @@ class RoundExecutor:
         st.calls += 1
         call_id = CallId(f"c{self.round:04d}-{agent}-{st.calls:03d}")
         self._ev(ToolCalledEvent, agent, call_id=call_id, tool=name, args=args)
-        if st.ended:
-            self._ret(agent, ToolResult(call_id=call_id, ok=False, result={}, error="turn_ended"))
-            raise EndTurn()
         if st.calls > self.max_calls:
             self._ret(agent, ToolResult(call_id=call_id, ok=False, result={}, error="cap"))
             raise TurnCapReached()
+        if st.ended:
+            return self._ret(agent, self._err(call_id, "turn_ended"))
         if name == "end_turn":
             st.ended = True
-            self._ret(agent, ToolResult(call_id=call_id, ok=True, result={}))
-            raise EndTurn()
+            return self._ret(agent, ToolResult(call_id=call_id, ok=True, result={}))
         if not self._allowed(agent, name):
             return self._ret(agent, self._err(call_id, "not_allowed"))
         if name == "read_board":

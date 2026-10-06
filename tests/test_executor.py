@@ -7,7 +7,7 @@ from swarmlab.executor import RoundExecutor
 from swarmlab.ids import agent_id
 from swarmlab.medium.board import Board
 from swarmlab.rng import derive
-from swarmlab.tools import EndTurn, TurnCapReached
+from swarmlab.tools import TurnCapReached
 from swarmlab.world.flaggame import FlagGame
 
 AGENTS = [agent_id(i) for i in range(4)]
@@ -75,16 +75,30 @@ async def test_invalid_action_and_unknown_tool(tmp_path):
     assert types(ex, AGENTS[1]) == ["tool_called", "tool_returned"]
 
 
-async def test_end_turn_raises(tmp_path):
+async def test_end_turn_returns_and_rejects_later_calls(tmp_path):
     _, _, _, ex = setup(tmp_path)
     a = AGENTS[2]
-    with pytest.raises(EndTurn):
-        await ex.call(a, "end_turn", {})
-    with pytest.raises(EndTurn):
-        await ex.call(a, "post", {"text": "late"})
+    assert not ex.turn_ended(a)
+    done = await ex.call(a, "end_turn", {})
+    assert done.ok and done.error is None and ex.turn_ended(a)
+    late = await ex.call(a, "post", {"text": "late"})
+    assert not late.ok and late.error == "turn_ended"
+    again = await ex.call(a, "end_turn", {})
+    assert not again.ok and again.error == "turn_ended"
     assert ex.buffered_posts(a) == []
+    assert types(ex, a) == ["tool_called", "tool_returned"] * 3  # rejected calls are still logged
+    assert ex.events(a)[3].result["error"] == "turn_ended"
     ex.end_turn_event(a, "end_turn")
-    assert types(ex, a)[-1] == "turn_ended" and ex.events(a)[-1].calls == 2
+    assert types(ex, a)[-1] == "turn_ended" and ex.events(a)[-1].calls == 3
+
+
+async def test_cap_applies_after_end_turn(tmp_path):
+    _, _, _, ex = setup(tmp_path, max_calls=2)
+    a = AGENTS[0]
+    await ex.call(a, "end_turn", {})
+    await ex.call(a, "my_status", {})
+    with pytest.raises(TurnCapReached):
+        await ex.call(a, "my_status", {})
 
 
 async def test_cap(tmp_path):
