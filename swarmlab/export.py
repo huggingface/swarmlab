@@ -63,6 +63,13 @@ Decisions where the contract is silent:
   - Scripted agents: per round a `user` message `Round <r>.` and, per tool call, one assistant
     message with that `toolCall` (`api: "swarmlab-scripted"`, `provider: "scripted"`, `model`:
     the participant type, zero usage) followed by its `toolResult`.
+- **Discarded rounds.** `tables/discarded_inference.parquet` holds the `inference_attempt`/
+  `inference_response` events of `discarded.jsonl` (rounds aborted at a hard ceiling or lost in
+  a crash), with the `inference` columns plus `charged_usd` (0 for a cache hit, `cost_usd` for a
+  response, `reserved_usd` for an attempt cancelled in flight: the gate charges the worst case).
+  `run.json["spend_discarded_usd"]` is their sum. The ledger (`spend`) includes what hard-ceiling
+  aborts charged, so `spend` minus the logged `inference.cost_usd` is about
+  `spend_discarded_usd`, not 0. `EXPORT_SCHEMA` 2 added this table.
 - `EXPORT_SCHEMA` is recorded in `run.json["export_schema"]`; outputs are deterministic for a
   given run directory and code version (no export timestamp), so re-publishing an unchanged run
   uploads nothing.
@@ -83,7 +90,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-EXPORT_SCHEMA = "swarmlab-export/1"
+EXPORT_SCHEMA = "swarmlab-export/2"
 INLINE_LIMIT = 64 * 1024
 FULL_BLOBS_LIMIT = 500 * 1024 * 1024
 KEY_COLUMNS = ("experiment", "arm", "seed", "run", "round", "agent")
@@ -132,6 +139,9 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
                    ("end_ts", _F), ("run_spec", _S)),
     "other": _schema(("type", _S), ("payload", _S)),
 }
+# discarded rounds (discarded.jsonl): the inference columns plus what the ledger was charged
+TABLE_SCHEMAS["discarded_inference"] = pa.schema(
+    [*TABLE_SCHEMAS["inference"], pa.field("charged_usd", _F)])
 FAMILIES = tuple(TABLE_SCHEMAS)
 
 _BASE_FIELDS = {"seq", "run", "round", "agent", "ts", "type"}
@@ -382,6 +392,37 @@ def build_tables(events: list[dict], meta: dict, blobs: _Blobs) -> dict[str, lis
             rows["other"].append({**key(ev), "type": t, "payload": _j(payload)})
     rows["turns"].extend(open_turn.values())  # a turn without turn_ended (should not happen)
     return rows
+
+
+def discarded_inference_rows(run_dir: Path | str, meta: dict,
+                             blobs: _Blobs | None = None) -> list[dict]:
+    """`discarded_inference` rows: the inference attempts/responses in `discarded.jsonl`.
+
+    `charged_usd` is what the ledger was charged for the call: 0 for a cache hit, the logged
+    `cost_usd` for a response, and the reservation (`reserved_usd`, the worst case) for an
+    attempt with no response (an in-flight call cancelled when the round was aborted)."""
+    run_dir = Path(run_dir)
+    blobs = blobs if blobs is not None else _Blobs(run_dir / "blobs")
+    events = list(read_events(run_dir / "discarded.jsonl"))
+    rows = build_tables(events, meta, blobs)["inference"]
+    for row in rows:
+        if row.get("response_seq") is None:
+            row["charged_usd"] = float(row.get("reserved_usd") or 0.0)
+        else:
+            row["charged_usd"] = 0.0 if row.get("cached") else float(row.get("cost_usd") or 0.0)
+    return rows
+
+
+def discarded_spend(run_dir: Path | str) -> float:
+    """USD charged for inference in discarded rounds (sum of `charged_usd`)."""
+    run_dir = Path(run_dir)
+    if not (run_dir / "discarded.jsonl").exists():
+        return 0.0
+    try:
+        meta = json.loads((run_dir / "run.json").read_text())
+    except (OSError, ValueError):
+        meta = {}
+    return sum(r["charged_usd"] for r in discarded_inference_rows(run_dir, meta))
 
 
 def write_table(rows: list[dict], family: str, path: Path) -> int:
@@ -780,6 +821,7 @@ def export_run(run_dir: Path | str, out: Path | str | None = None) -> Path:
     blobs = _Blobs(run_dir / "blobs")
     _clear(out)
     rows = build_tables(events, meta, blobs)
+    rows["discarded_inference"] = discarded_inference_rows(run_dir, meta, blobs)
     counts = {f: write_table(rows[f], f, out / "tables" / f"{f}.parquet") for f in FAMILIES}
     sessions = build_sessions(run_dir, events, meta, blobs)
     (out / "sessions").mkdir(parents=True, exist_ok=True)
@@ -799,6 +841,7 @@ def export_run(run_dir: Path | str, out: Path | str | None = None) -> Path:
         "end_reason": meta.get("end_reason"), "last_round": meta.get("last_round"),
         "score": meta.get("score"),
         "spend": {k: led.get(k, 0) for k in ("swarm", "measurement", "reserved", "calls")},
+        "spend_discarded_usd": sum(r["charged_usd"] for r in rows["discarded_inference"]),
         "budget": meta.get("budget") or spec.get("budget"),
         "metrics_final": _metric_finals(events),
         "agents": [{"agent": f"a{i:03d}", "type": p.get("type"),

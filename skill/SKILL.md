@@ -98,7 +98,8 @@ next item.
   the log with zero provider calls and exits 1 on any mismatch.
 - **Analyse from exports.** `swarmlab export RUN_DIR` writes `export/tables/<family>.parquet`
   (turns, tool_calls, posts, deliveries, reads, actions, inference, probes, metrics,
-  interventions, rounds, run, other; keys `experiment, arm, seed, run, round, agent`) and one pi
+  interventions, rounds, run, other, discarded_inference; keys `experiment, arm, seed, run, round,
+  agent`; `run.json` has `spend` from the ledger and `spend_discarded_usd`) and one pi
   session per agent in `export/sessions/` for reading a conversation turn by turn.
 - **Look at one run by eye** with `swarmlab view RUN_DIR` (writes `view.html`, no server).
 - **Restore a published run** with `swarmlab fetch-published OWNER/EXPERIMENT RUN_ID --out runs/`;

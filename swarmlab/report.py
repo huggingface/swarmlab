@@ -16,6 +16,10 @@ Decisions:
   logged), reading behaviour and tool-protocol health for every world; "where the swarm went"
   and "probe vs world belief" only when some run has committed `guess` actions (FlagGame-style
   worlds; truth and rival come from rebuilding the world, since `verify()` is not persisted).
+- The spend/run column is the ledger (discarded rounds included). When some summarised run
+  charged spend in discarded rounds (`export.discarded_spend`), a line under the summary gives
+  the ledger total and the discarded part, so it reconciles with exports; otherwise the report
+  is unchanged (the M2 reproduction stays byte-identical).
 """
 from __future__ import annotations
 
@@ -24,7 +28,9 @@ import statistics as st
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from .budget import ledger_total
 from .experiment import Experiment, Run
+from .export import discarded_spend
 from .rng import derive
 
 DEFAULT_TITLE = "swarmlab report"
@@ -116,6 +122,19 @@ def truth_info(run, agents):
     return v["truth"], v["rival"], v["truth"] == rec if rec is not None else None
 
 
+def spend_lines(runs) -> list[str]:
+    """Total ledger spend of the summarised runs, when some of it was charged in discarded rounds
+    (otherwise the spend/run column already adds up to the ledger)."""
+    discarded = sum(discarded_spend(r.dir) for r in runs)
+    if discarded <= 0:
+        return []
+    total = sum(ledger_total(r.spend) for r in runs)
+    line = (f"Total spend (ledger, swarm + measurement) over these {len(runs)} run(s): ${total:.3f}, "
+            f"of which ${discarded:.3f} was charged in discarded rounds (hard-ceiling aborts, not in "
+            "the logged rounds; `swarmlab export` puts them in `tables/discarded_inference`).")
+    return [line, ""]
+
+
 def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE) -> str:
     """The report for every ended run directly under `runs_dir`, as Markdown."""
     arms = defaultdict(list)
@@ -162,6 +181,7 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE) -> str:
     L += ["## Summary", ""] + table(["arm", "n", "final acc (mean ± sd)", "final consensus", "rounds to 0.9 cons. (median)",
                                     f"read_rate r2-{R[-1]}", "posts/agent/round", "spend/run (swarm + meas.)", "calls/run",
                                     "wall/run"], rows) + [""]
+    L += spend_lines([r for rs in arms.values() for r, _ in rs])
 
     # trajectories
     L += ["## Trajectories (mean over seeds)", ""]
