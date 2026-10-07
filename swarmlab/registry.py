@@ -18,6 +18,7 @@ GROUPS = (
     "swarmlab.policies",
     "swarmlab.participants",
     "swarmlab.metrics",
+    "swarmlab.claim_policies",
 )
 
 

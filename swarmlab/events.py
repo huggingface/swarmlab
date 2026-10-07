@@ -27,6 +27,9 @@ Decisions where the contract is silent:
 - M3a: new logical type `overflow` (`OverflowEvent`, LLM context limit), written into the agent's
   turn events after its tool events and before `turn_ended`.
 - M3a: new logical type `intervention` (`InterventionEvent`).
+- M3b: new logical types `registry` (`RegistryEvent`, one per committed registry write) and
+  `claim` (`ClaimEvent`, one per world action on a claimable resource when the registry is on);
+  see swarmlab/medium/registry.py.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
 """
@@ -240,6 +243,35 @@ class InterventionEvent(Event):
     error: str | None = None
 
 
+class RegistryEvent(Event):
+    """A committed registry write (M3b; logical). `version`, `owner` (live owner) and
+    `expires_round` describe the entry after the op; `value` is the written value (put/CAS)."""
+
+    type: Literal["registry"] = "registry"
+    op_id: str
+    op: str
+    key: str
+    ok: bool
+    version: int
+    owner: str | None = None
+    expires_round: int | None = None
+    value: Any = None
+    error: str | None = None
+
+
+class ClaimEvent(Event):
+    """The claim check of one world action on a claimable resource (M3b; logical)."""
+
+    type: Literal["claim"] = "claim"
+    action_id: str
+    key: str
+    owner: str | None = None
+    held: bool
+    violation: bool
+    rejected: bool
+    policy: str
+
+
 class RunEndedEvent(Event):
     type: Literal["run_ended"] = "run_ended"
     reason: Literal["terminal", "max_rounds", "soft_budget", "hard_ceiling", "error"]
@@ -250,7 +282,7 @@ _ALL = (
     InferenceAttemptEvent, InferenceResponseEvent, TurnEndedEvent, ReadEvent, PostEvent,
     DeliveryEvent, ActionCommittedEvent, WorldChangedEvent, MetricEvent, RoundCommittedEvent,
     SnapshotEvent, RunEndedEvent, BudgetEvent, BudgetChangedEvent, ProbeEvent,
-    OverflowEvent, InterventionEvent,
+    OverflowEvent, InterventionEvent, RegistryEvent, ClaimEvent,
 )
 EVENT_CLASSES: dict[str, type[Event]] = {c.model_fields["type"].default: c for c in _ALL}
 
@@ -259,7 +291,7 @@ AnyEvent = Annotated[
     | InferenceAttemptEvent | InferenceResponseEvent | TurnEndedEvent | ReadEvent | PostEvent
     | DeliveryEvent | ActionCommittedEvent | WorldChangedEvent | MetricEvent | RoundCommittedEvent
     | SnapshotEvent | RunEndedEvent | BudgetEvent | BudgetChangedEvent | ProbeEvent
-    | OverflowEvent | InterventionEvent,
+    | OverflowEvent | InterventionEvent | RegistryEvent | ClaimEvent,
     Field(discriminator="type"),
 ]
 _ADAPTER: TypeAdapter[Event] = TypeAdapter(AnyEvent)

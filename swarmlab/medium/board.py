@@ -49,6 +49,13 @@ Intervention overlays (M3a, docs/INTERFACE-M3a.md §1), owned by the runner's `O
 - `commit(..., recipients=...)`: an explicit recipient list bypasses the topology (used for
   injected posts whose author is not an agent); policies and overlays still apply.
 - All of this is in `snapshot()` (keys absent from pre-M3a snapshots restore as empty).
+
+Registry config (M3b, swarmlab/medium/registry.py): `registry: bool = False` and
+`claim_policy` (a name, `{type, params}` or `ClaimPolicy`; default "advisory") are medium
+settings carried by the board so that `MediumSpec` round-trips through `Board(**params)`. The
+board only stores them; the runner builds the `Registry` and the policy. `spec()` emits them only
+when they differ from the defaults, so existing specs and hashes are unchanged. A non-advisory
+claim policy without the registry is a `ValueError`.
 """
 from __future__ import annotations
 
@@ -158,6 +165,8 @@ class Board(Persistable, Plugin):
         policies: Sequence[Policy] = (),
         channels: Sequence[str] = ("main",),
         commit_mode: Literal["round_end", "immediate"] = "round_end",
+        registry: bool = False,
+        claim_policy: Any = "advisory",
     ) -> None:
         if delivery not in ("pull", "push"):
             raise ValueError(f"delivery must be 'pull' or 'push', got {delivery!r}")
@@ -171,6 +180,12 @@ class Board(Persistable, Plugin):
         self.policies: list[Policy] = [_policy(p) for p in policies]
         self.channels: list[str] = list(channels)
         self.commit_mode = commit_mode
+        from .registry import build_claim_policy
+
+        self.registry = bool(registry)
+        self.claim_policy = build_claim_policy(claim_policy)
+        if not self.registry and self.claim_policy.type_name() != "advisory":
+            raise ValueError("a claim policy other than 'advisory' needs `registry: true`")
         self._buffer: list[Post] = []
         self._inboxes: dict[AgentId, list[Delivery]] = {}
         self._post_channel: dict[PostId, str] = {}
@@ -193,6 +208,9 @@ class Board(Persistable, Plugin):
                 "push_limit": self.push_limit,
                 "policies": [p.spec() for p in self.policies],
                 "channels": list(self.channels),
+                **({"registry": True} if self.registry else {}),
+                **({"claim_policy": self.claim_policy.spec()}
+                   if self.claim_policy.spec() != {"type": "advisory", "params": {}} else {}),
             },
         }
 
