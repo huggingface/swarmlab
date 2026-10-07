@@ -22,10 +22,19 @@ call parsed: native tool calls without `bad_tool_args`, or the JSON protocol's b
 failure `error` (the provider's message, which carries the HTTP status and response text).
 A group fails when the request raises or no tool call parsed; `ok` is False when any group
 fails. Groups without a model (scripted participants) are listed with `skipped`.
+
+Image input (M5 §3): when the group's round-1 observation has image parts (FlagGame
+`modality="image"`), the user message is the agent's round-1 message (`round_message(view)`,
+images included) followed by a text part with `PROMPT`, so a text-only model meets the images
+it would get in the run. If that request raises and the error text mentions image, vision or
+content type (`IMAGE_ERROR_RE`, case-insensitive), the error reads
+`model rejects image input (image mode needs a vision model): <provider message>` and the row
+has `image_input_rejected: True`. Every row with images has `images` (the count sent).
 """
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from .experiment import Experiment, participant_model
@@ -33,8 +42,11 @@ from .participants.llm import ToolJsonError, parse_tool_json
 from .prompts_cmd import group_views
 from .providers.base import ChatMessage, ChatRequest
 from .runner import _run_coro
+from .view import Part
 
 PROMPT = "Preflight check: call one of your tools now (for example end_turn), once."
+IMAGE_ERROR_RE = re.compile(r"image|vision|content[ _-]?type", re.IGNORECASE)
+REJECTS_IMAGES = "model rejects image input (image mode needs a vision model)"
 
 
 class PreflightRefused(RuntimeError):
@@ -54,13 +66,21 @@ def plan(exp: Experiment, seed: int = 0) -> list[dict[str, Any]]:
             row["skipped"] = "no model (scripted participant)"
             out.append(row)
             continue
+        user: Any = PROMPT
+        images = sum(1 for part in view.observation.parts if part.type == "image")
+        round_message = getattr(p, "round_message", None)
+        if images and callable(round_message):
+            msg = round_message(view)
+            user = [*msg.content, Part(type="text", text=PROMPT)]
         req = ChatRequest(messages=[ChatMessage(role="system", content=render(view)),
-                                    ChatMessage(role="user", content=PROMPT)],
+                                    ChatMessage(role="user", content=user)],
                           tools=view.tools, tool_protocol=getattr(p, "tool_protocol", "native"),
                           **defaults())
         provider, _ = exp.provider_for(req.model)
         row.update(request=req, provider=provider, worst_case_usd=provider.max_cost(req),
                    extra=dict(req.extra), tools=[t.name for t in req.tools])
+        if images and not isinstance(user, str):
+            row["images"] = sum(1 for part in user if part.type == "image")
         out.append(row)
     return out
 
@@ -74,7 +94,11 @@ async def _send(row: dict[str, Any]) -> dict[str, Any]:
     try:
         resp = await row["provider"].complete(req)
     except Exception as e:  # noqa: BLE001 - report the provider's own message
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        message = f"{type(e).__name__}: {e}"
+        if row.get("images") and IMAGE_ERROR_RE.search(message):
+            return {"ok": False, "image_input_rejected": True,
+                    "error": f"{REJECTS_IMAGES}: {message}"}
+        return {"ok": False, "error": message}
     if req.tool_protocol == "native":
         names = [tc.name for tc in resp.tool_calls]
         parsed = bool(names) and resp.finish_reason != "bad_tool_args"
@@ -114,8 +138,9 @@ def run_preflight(rows: list[dict[str, Any]], max_usd: float) -> list[dict[str, 
         if "request" not in r:
             out.append({**base, "ok": True, "skipped": r.get("skipped")})
             continue
+        extra = {"images": r["images"]} if r.get("images") else {}
         out.append({**base, "extra": r["extra"], "tools": r["tools"],
-                    "worst_case_usd": r["worst_case_usd"], **next(results)})
+                    "worst_case_usd": r["worst_case_usd"], **extra, **next(results)})
     return out
 
 

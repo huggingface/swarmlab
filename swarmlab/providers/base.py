@@ -13,7 +13,9 @@ Decisions where the contract is silent:
   Tuples arriving as lists (from YAML or a spec round-trip) are normalised to tuples.
 - `estimate_prompt_tokens`: ceil(chars / 4) over every text part and string content, tool-call
   arguments (canonical JSON), tool-message content and the tool schemas (canonical JSON), plus
-  1000 per image part.
+  per image part `max(100, ceil(w * h / 750))` (Anthropic's image-token formula, M5 §3;
+  conservative for other providers), with `(w, h)` read from the PNG header; an image part
+  whose data is not a readable PNG counts 1000 (the M1b flat rate).
 - `max_cost = (est * p_in + (max_tokens + (thinking_budget or 0)) * p_out) / 1e6` (the thinking
   budget is added even where the provider ignores it: worst case).
 - `cost(request, usage) = ((prompt - cached) * p_in + cached * p_cached + completion * p_out) / 1e6`.
@@ -34,10 +36,13 @@ Decisions where the contract is silent:
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
 import random
+import struct
 from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel
@@ -137,6 +142,20 @@ def text_of(content: list[Part] | str) -> str:
     return "\n".join(p.text or "" for p in content if p.type == "text")
 
 
+UNREADABLE_IMAGE_TOKENS = 1000
+
+
+def image_tokens(png_b64: str | None) -> int:
+    """Prompt-token estimate of one image part: `max(100, ceil(w*h/750))`, 1000 if unreadable."""
+    from ..world.render import png_size
+
+    try:
+        w, h = png_size(base64.b64decode(png_b64 or "", validate=True))
+    except (ValueError, TypeError, struct.error, binascii.Error):
+        return UNREADABLE_IMAGE_TOKENS
+    return max(100, math.ceil(w * h / 750))
+
+
 def _normalise_pricing(pricing: dict | None) -> dict[str, PricingRow]:
     out: dict[str, PricingRow] = {}
     for k, v in (pricing or {}).items():
@@ -205,14 +224,14 @@ class Provider(Plugin):
             else:
                 for p in m.content:
                     if p.type == "image":
-                        images += 1
+                        images += image_tokens(p.image_png_b64)
                     else:
                         chars += len(p.text or "")
             for tc in m.tool_calls or []:
                 chars += len(tc.name) + len(canonical_json(tc.args))
         if request.tools:
             chars += len(canonical_json([t.model_dump(mode="json") for t in request.tools]))
-        return math.ceil(chars / 4) + 1000 * images
+        return math.ceil(chars / 4) + images
 
     def max_cost(self, request: ChatRequest) -> float:
         p_in, p_out, _ = self.model_pricing(model_id(request))

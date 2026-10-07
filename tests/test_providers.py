@@ -579,3 +579,58 @@ async def test_router_served_by_not_overridden_when_not_self_hosted():
     p = compat(handler)
     resp = await p.complete(req(model="hf:m"))
     assert resp.served_by is None
+
+
+# ---- M5 §3: image parts --------------------------------------------------------------------------
+def _flag_parts():
+    import base64
+
+    from swarmlab.world.render import grid_to_png
+    a = base64.b64encode(grid_to_png(["rrgg", "bbyy"], cell_px=12)).decode()   # 48x24
+    b = base64.b64encode(grid_to_png(["r" * 40] * 30, cell_px=12)).decode()   # 480x360
+    return a, b, [Part(type="text", text="Candidates A, B"), Part(type="image", image_png_b64=a),
+                  Part(type="image", image_png_b64=b), Part(type="text", text="Your crop:")]
+
+
+def test_image_token_estimate_uses_the_png_size():
+    from swarmlab.providers.base import image_tokens
+    a, b, parts = _flag_parts()
+    assert image_tokens(a) == 100                      # 48*24/750 < 100
+    assert image_tokens(b) == 231                      # ceil(480*360/750) = 231
+    assert image_tokens("AAAA") == image_tokens("not base64!") == image_tokens(None) == 1000
+    r = req(messages=[ChatMessage(role="user", content=parts)])
+    chars = len("Candidates A, B") + len("Your crop:")
+    import math
+    assert AnthropicProvider().estimate_prompt_tokens(r) == math.ceil(chars / 4) + 100 + 231
+
+
+async def test_anthropic_sends_image_blocks_in_order():
+    a, b, parts = _flag_parts()
+    p = stub_provider([anthropic_message()])
+    await p.complete(req(messages=[ChatMessage(role="system", content="s"),
+                                   ChatMessage(role="user", content=parts)]))
+    blocks = p._client.messages.kwargs[0]["messages"][0]["content"]
+    assert [x["type"] for x in blocks] == ["text", "image", "image", "text"]
+    assert blocks[1] == {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                                      "data": a}}
+    assert blocks[2]["source"]["data"] == b
+    import base64
+    assert base64.b64decode(blocks[1]["source"]["data"]).startswith(b"\x89PNG")
+
+
+async def test_openai_sends_image_url_parts_in_order(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "hf_test")
+    a, b, parts = _flag_parts()
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=completion({"content": "ok"}))
+
+    p = compat(handler)
+    await p.complete(req(model="hf:m", messages=[ChatMessage(role="user", content=parts)]))
+    content = seen["body"]["messages"][0]["content"]
+    assert [x["type"] for x in content] == ["text", "image_url", "image_url", "text"]
+    assert content[1]["image_url"]["url"] == f"data:image/png;base64,{a}"
+    assert content[2]["image_url"]["url"] == f"data:image/png;base64,{b}"
+    assert content[3] == {"type": "text", "text": "Your crop:"}
