@@ -37,7 +37,7 @@
 name: m6-flag-paper
 seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 options: { commit: round_end, max_rounds: 10 }
-budget: { soft_usd: 0, hard_usd: 0.5, measurement_usd: 0, total_usd: 10 }
+budget: { soft_usd: 0, hard_usd: 0.5, measurement_usd: 0, total_usd: 0 }
 # DeepInfra's HF-router price for Gemma 4 26B-A4B (2026-10-07 listing: $0.07 / $0.34 per million
 # prompt / completion tokens), pinned so validate/estimate/prompts work offline and the estimate
 # does not move under a listing change.
