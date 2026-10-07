@@ -33,6 +33,25 @@ Project-level copies work too: `.claude/skills/swarmlab/`, `.agents/skills/swarm
 
 ## First real run: the checklist
 
+Size it to the budget first. Put the user's total in the spec as `budget: {total_usd: T}` (top
+level): `swarmlab run` then never starts a run that could push the experiment past T.
+
+- **Total under $2: the short checklist.** A separate smoke run and a second-agent review would
+  eat a large share of the money, so:
+  1. `swarmlab doctor SPEC.yaml` and `swarmlab validate SPEC.yaml` (items 1-2 below).
+  2. Dry run with `fake:reader` (item 3; free).
+  3. Prompt review without a second agent: `swarmlab prompts SPEC.yaml --arm A > A.txt` for
+     every arm, then `diff A.txt B.txt` -> only the manipulated text differs, no correctness
+     hints, every needed tool named.
+  4. Smoke = the first real arm itself, at N <= 6 agents, with `hard_usd` <= 30% of the total
+     and `soft_usd` at least one round below it (`swarmlab run` warns when they are closer):
+     `swarmlab run SPEC.yaml --arm FIRST --seed S` -> `end=max_rounds`. That run is kept as
+     the arm's data, not repeated. A `hard_ceiling` end: `swarmlab resume RUN_DIR
+     --add-budget D` if the total allows, else cut rounds.
+  5. `swarmlab estimate SPEC.yaml` for the remaining arms, approval, `swarmlab run SPEC.yaml`
+     (the finished smoke run is skipped), then `swarmlab report runs/ --out report.md`.
+- **Total of $2 or more: the full checklist below**, all eleven items.
+
 Do these in order. Each item is done when its check holds; a failing check is fixed before the
 next item.
 
@@ -42,7 +61,8 @@ next item.
    from there); `swarmlab run` refuses to write `runs/` inside the checkout unless `--out` is
    given.
 2. **Spec.** `swarmlab validate SPEC.yaml` -> every arm resolves; its table shows each arm's
-   agents, models, soft/hard/measurement caps, probes and metrics, so check those match the plan. Model ids come from
+   agents, models, soft/hard/measurement caps, probes and metrics: check them against the plan.
+   Model ids come from
    `swarmlab models --tools --search QWEN` (prices are looked up, never typed). Every arm that
    calls a paid model has `budget: {hard_usd: X}`; `hard_usd: 0` means no ceiling.
 3. **Dry run with scripted agents.** Copy the arm into a dry-run arm whose participants are

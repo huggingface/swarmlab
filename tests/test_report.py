@@ -144,3 +144,12 @@ def test_report_sets_simulated_runs_apart_and_out_is_quiet(tmp_path):
     assert res.output.startswith(f"wrote {md}") and md.read_text() == text + "\n"
     res = cli.invoke(app, ["report", str(out), "--out", str(md), "--stdout", "--include-fake"])
     assert res.exit_code == 0 and "| llm (simulated) | 1 |" in res.output
+
+
+def test_skill_checklist_scales_to_the_budget():
+    text = (REPO / "skill" / "SKILL.md").read_text()
+    short = text.split("**Total under $2: the short checklist.**")[1].split("**Total of $2 or more")[0]
+    assert "N <= 6" in short and "30% of the total" in short
+    assert "swarmlab prompts SPEC.yaml --arm A" in short and "diff A.txt B.txt" in short
+    assert "second agent" not in short.replace("without a second agent", "")
+    assert "total_usd" in text and "all eleven items" in text
