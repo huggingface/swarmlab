@@ -71,7 +71,7 @@ def test_gap_warning_uses_a_finished_run_of_the_arm(tmp_path):
     spec = spec_file(tmp_path, soft_usd=0.3, hard_usd=0.3 + gap)
     res, _ = invoke("run", spec, "--seed", 1, "--out", out, "--yes")
     assert res.exit_code == 0, res.output
-    assert "less than twice one round's estimated worst case" in res.stdout
+    assert "less than half of one round's estimated worst case" in res.stdout
     # with a finished run of the arm, its measured round cost decides (far below the worst case)
     res, _ = invoke("run", spec, "--seed", 2, "--out", out, "--yes")
     assert res.exit_code == 0, res.output
