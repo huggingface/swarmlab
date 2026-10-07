@@ -151,6 +151,6 @@ class World(Persistable, Plugin):
         """Change `agent`'s private information; deliver it as new evidence in its next observation."""
         raise NotSupported(f"{type(self).__name__} does not support patch_private")
 
-    def intervene(self, name: str, **args: object) -> dict:
+    def intervene(self, name: str, /, **args: object) -> dict:
         """A world-specific change (e.g. FlagGame `set_truth`); returns a JSON-able result."""
         raise NotSupported(f"{type(self).__name__} does not support intervention {name!r}")

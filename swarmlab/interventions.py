@@ -330,7 +330,7 @@ class Ops:
         run._set_truth()
         self._log("patch_private", [agent], params={"data": data})
 
-    def world(self, name: str, **args: Any) -> dict | None:
+    def world(self, name: str, /, **args: Any) -> dict | None:
         run = self._runner
         params = {"name": name, "args": args}
         try:

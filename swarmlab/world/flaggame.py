@@ -321,10 +321,10 @@ class FlagGame(World):
         lines = [PREAMBLE]
         for name, grid in self.candidates.items():
             lines += ["", f"{name}:", *grid]
+        lines += ["", CROP_HEADER, *self.crop_rows(agent)]
         if agent in getattr(self, "crops_changed", ()):  # M3a patch_private: said once
             self.crops_changed = [a for a in self.crops_changed if a != agent]
             lines += ["", CROP_CHANGED]
-        lines += ["", CROP_HEADER, *self.crop_rows(agent)]
         y, x = self.crops[agent]
         return text_observation("\n".join(lines), crop_y=y, crop_x=x)
 
@@ -393,8 +393,8 @@ class FlagGame(World):
 
     # ---- interventions (M3a, docs/INTERFACE-M3a.md §1) --------------------------------------------
     def patch_private(self, agent: AgentId, data: dict) -> None:
-        """`{"crop": [y, x]}` moves the agent's crop; its next observation (only) carries a line
-        `Your crop has changed.` before the crop section."""
+        """`{"crop": [y, x]}` moves the agent's crop; its next observation (only) ends with a blank
+        line and the line `Your crop has changed.` after the crop rows (`parse_observation` skips it)."""
         if set(data) != {"crop"}:
             raise ValueError(f"FlagGame.patch_private takes {{'crop': [y, x]}}, got keys {sorted(data)}")
         if str(agent) not in self.crops:
@@ -406,7 +406,7 @@ class FlagGame(World):
         changed = getattr(self, "crops_changed", [])
         self.crops_changed = changed + ([str(agent)] if str(agent) not in changed else [])
 
-    def intervene(self, name: str, **args: Any) -> dict:
+    def intervene(self, name: str, /, **args: Any) -> dict:
         """`set_truth(name=...)` makes another candidate the hidden flag (the rival swaps with the
         truth when the new truth is the rival, else it is unchanged)."""
         if name != "set_truth":
