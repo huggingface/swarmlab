@@ -3,7 +3,7 @@
 `LLMAgent(model, system_prompt=None, memory="full", window_rounds=3, max_tokens=2048,
 temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker",
 extra=None, text_tool_fallback=False, context_limit_tokens=None, overflow="drop_oldest",
-summary_model=None, system_prompt_append=None)`, entry point `llm`.
+summary_model=None, system_prompt_append=None, memory_messages=8)`, entry point `llm`.
 
 **max_tokens** defaults to 2048 (was 1024). In the 2026-10-06 smoke, Qwen3.5-9B with thinking on
 spent the whole 1024-token budget reasoning (`finish_reason="length"`, empty text, no tool call)
@@ -85,6 +85,27 @@ round in `self.rounds: list[{"round", "messages"}]`, so the default `Persistable
 r, older rounds are dropped so that rounds r-window_rounds+1..r remain (the current observation is
 re-sent every round anyway). The system prompt is always kept.
 
+**memory="received"** (M6, docs/INTERFACE-M6.md §3; the Flag Game paper's pairwise memory). No
+conversation is kept across turns: each turn's request is the system prompt plus one user message
+built from state, and the turn's own tool traffic (if any) follows it during the turn only. The
+message is the current observation's parts (the crop is re-shown every call), then one text part
+`Transcript memory (oldest -> newest):` with a line `- <content>` per remembered item (or `[]`
+when there is none), then, when the agent has answered before, `Your previous answers (oldest ->
+newest): <JSON list>`. There is no `Round r.` line and
+no outcome lines (the paper's prompt has neither; under OneSpeaker the round number would leak
+the population's step count). Remembered items are delivered board items, ingested from
+`View.pushed` at turn start, from `read_board` results during a turn (pull works too) and from
+the runner's `prepare_probe` hook before probes; an item is added only when its
+`(eligible_round, delivery_id)` is newer than every item ingested so far (so re-pushed items are
+not duplicated), and only the last `memory_messages` are kept. Author ids are not shown (pushed
+items carry none). Own answers are the accepted `guess` arguments, the last `max(1, memory_messages)` kept. State
+(`received`, `received_upto`, `own_answers`, `last_observation`) is plain data in the snapshot.
+Pair it with `delivery: push`, `push_consume: true` (swarmlab/medium/board.py) so each item is
+pushed once and the newest win. `prepare_probe(view_for)` ingests pending items and, for an agent
+that has not acted yet, stores its observation and renders its system prompt. `probe_context()`
+is `[system, <the message above>]` (`[system]` or `[]` before any
+observation). `memory_messages` is in `params` only when `memory="received"` or non-default.
+
 **Probing.** `probe_context()` returns `[system] + memory` as fresh `ChatMessage` objects (callers
 cannot mutate the agent's memory through them); `model_request_defaults()` returns `model,
 temperature, max_tokens, thinking_budget, extra`.
@@ -155,6 +176,10 @@ log = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 DEFAULT_SYSTEM_TEMPLATE = PROMPTS_DIR / "default_system.j2"
+MEMORY_MODES = ("full", "window", "received")
+TRANSCRIPT_HEADER = "Transcript memory (oldest -> newest):"
+OWN_ANSWERS_HEADER = "Your previous answers (oldest -> newest):"
+
 RESULTS_PREFIX = "[tool results]"
 
 JSON_PROTOCOL_TEXT = (
@@ -170,21 +195,23 @@ _ENV = jinja2.Environment(trim_blocks=True, lstrip_blocks=True, undefined=jinja2
 
 
 def render_system_prompt(template: str | None, *, agent: str, role: str, description: str,
-                         tools: list[ToolSchema], append: str | None = None) -> str:
+                         tools: list[ToolSchema], append: str | None = None,
+                         default: Path = DEFAULT_SYSTEM_TEMPLATE, **variables: Any) -> str:
     """Render `template` (text, `file:<path>`, or None for the default) with the agent's context.
 
     `append` (`system_prompt_append`) is the template variable `system_prompt_append`; the
     default template puts it after the task section, before the tool list. A custom template
     that does not use the variable gets it appended at the end."""
     if template is None:
-        text = DEFAULT_SYSTEM_TEMPLATE.read_text()
+        text = default.read_text()
     elif template.startswith("file:"):
         text = Path(template[len("file:"):]).read_text()
     else:
         text = template
     extra = (append or "").strip()
     out = _ENV.from_string(text).render(agent=agent, role=role, description=description,
-                                        tools=tools, system_prompt_append=extra).strip()
+                                        tools=tools, system_prompt_append=extra,
+                                        **variables).strip()
     if extra and "system_prompt_append" not in text:
         out += "\n\n" + extra
     return out
@@ -367,7 +394,7 @@ class LLMAgent(Participant):
         self,
         model: str,
         system_prompt: str | None = None,
-        memory: Literal["full", "window"] = "full",
+        memory: Literal["full", "window", "received"] = "full",
         window_rounds: int = 3,
         max_tokens: int = 2048,
         temperature: float | None = None,
@@ -381,9 +408,12 @@ class LLMAgent(Participant):
         overflow: Literal["drop_oldest", "summarize", "fail_turn"] = "drop_oldest",
         summary_model: str | None = None,
         system_prompt_append: str | None = None,
+        memory_messages: int = 8,
     ) -> None:
-        if memory not in ("full", "window"):
-            raise ValueError(f"memory must be 'full' or 'window', got {memory!r}")
+        if memory not in MEMORY_MODES:
+            raise ValueError(f"memory must be one of {MEMORY_MODES}, got {memory!r}")
+        if isinstance(memory_messages, bool) or not isinstance(memory_messages, int) or memory_messages < 0:
+            raise ValueError("memory_messages must be an integer >= 0")
         if tool_protocol not in ("native", "json"):
             raise ValueError(f"tool_protocol must be 'native' or 'json', got {tool_protocol!r}")
         if window_rounds < 1:
@@ -422,14 +452,98 @@ class LLMAgent(Participant):
         if system_prompt_append is None:  # in params (and the spec hash) only when set
             params.pop("system_prompt_append", None)
         self.system_prompt_append = system_prompt_append
+        # ---- M6 §3-§4: params only when set, so existing spec hashes stay ----
+        if memory_messages == 8 and memory != "received":
+            params.pop("memory_messages", None)
+        self.memory_messages = memory_messages
         # conversation state (plain data, snapshotted by Persistable)
         self.system: str | None = None
         self.rounds: list[dict] = []
+        # memory="received" state (M6 §3): the last `memory_messages` delivered items, the
+        # newest delivery key ingested, the agent's own accepted answers, its last observation
+        self.received: list[dict] = []
+        self.received_upto: list | None = None
+        self.own_answers: list[str] = []
+        self.last_observation: list[dict] | None = None
 
     # ---- probing support ---------------------------------------------------------------------
     def probe_context(self) -> list[ChatMessage]:
         msgs = [ChatMessage(role="system", content=self.system)] if self.system else []
+        if self.memory == "received":  # M6 §3: the same construction, without the schema line
+            if self.last_observation is None:
+                return msgs
+            return msgs + [self._received_message(schema=False)]
         return msgs + [ChatMessage.model_validate(m) for r in self.rounds for m in r["messages"]]
+
+    # ---- memory="received" (M6 §3) -------------------------------------------------------------
+    @property
+    def calls_per_turn_cap(self) -> int | None:
+        """Most model calls a turn can make (for `swarmlab estimate`): `max_calls`."""
+        return self.max_calls
+
+    def ingest(self, items: list[dict]) -> int:
+        """Add delivered board items (`{delivery_id, post_id, eligible_round, content}`) to the
+        received memory: only items newer (by `(eligible_round, delivery_id)`) than every item
+        ingested so far, oldest first, keeping the last `memory_messages`. Returns how many were
+        added."""
+        def key(it: dict) -> list:
+            return [int(it.get("eligible_round") or 0), str(it.get("delivery_id") or "")]
+
+        added = 0
+        for it in sorted(items, key=key):
+            k = key(it)
+            if self.received_upto is not None and k <= list(self.received_upto):
+                continue
+            content = it.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content, sort_keys=True)
+            self.received.append({"delivery_id": it.get("delivery_id"), "post_id": it.get("post_id"),
+                                  "content": content})
+            self.received_upto = k
+            added += 1
+        if self.memory_messages == 0:
+            self.received = []
+        else:
+            self.received = self.received[-self.memory_messages:]
+        return added
+
+    def _received_message(self, schema: bool = True) -> ChatMessage:
+        """Observation parts, the transcript block, the own-answers line, the schema line."""
+        parts = [Part.model_validate(p) for p in self.last_observation or []]
+        if self.received:
+            block = "\n".join([TRANSCRIPT_HEADER] + [f"- {it['content']}" for it in self.received])
+        else:
+            block = f"{TRANSCRIPT_HEADER} []"
+        parts.append(Part(type="text", text=block))
+        if self.own_answers:
+            parts.append(Part(type="text", text=f"{OWN_ANSWERS_HEADER} "
+                              + json.dumps(self.own_answers, ensure_ascii=False)))
+        return ChatMessage(role="user", content=parts)
+
+    def _note_answer(self, name: str, args: dict, ok: bool) -> None:
+        if name == "guess" and ok and args:
+            value = next(iter(args.values()))
+            self.own_answers = (self.own_answers + [str(value)])[-max(1, self.memory_messages):]
+
+    def _note_read(self, name: str, result: Any) -> None:
+        if self.memory == "received" and name == "read_board" and isinstance(result, dict):
+            items = result.get("items")
+            if isinstance(items, list):
+                self.ingest([i for i in items if isinstance(i, dict)])
+
+    def prepare_probe(self, view_for: Any) -> None:
+        """Runner hook before a probe (M6 §3): under `memory="received"`, ingest the items
+        delivered since the last turn and, when the agent has not had a turn yet, store its
+        observation, so `probe_context()` shows the crop and the memory. `view_for(observe)`
+        builds the agent's View (with the world observation only when `observe`)."""
+        if self.memory != "received":
+            return
+        view = view_for(self.last_observation is None)
+        if self.system is None:
+            self.system = self._render_system(view)
+        if self.last_observation is None:
+            self.last_observation = [p.model_dump(mode="json") for p in view.observation.parts]
+        self.ingest(list(view.pushed))
 
     def reconfigure(self, **kw: Any) -> None:
         """M3a `Ops.reconfigure`: change `model`, `system_prompt` (re-rendered at the next turn),
@@ -439,8 +553,8 @@ class LLMAgent(Participant):
         unknown = set(kw) - allowed
         if unknown:
             raise ValueError(f"LLMAgent.reconfigure: unknown settings {sorted(unknown)}; allowed {sorted(allowed)}")
-        if kw.get("memory", self.memory) not in ("full", "window"):
-            raise ValueError(f"memory must be 'full' or 'window', got {kw['memory']!r}")
+        if kw.get("memory", self.memory) not in MEMORY_MODES:
+            raise ValueError(f"memory must be one of {MEMORY_MODES}, got {kw['memory']!r}")
         if kw.get("window_rounds", self.window_rounds) < 1:
             raise ValueError("window_rounds must be >= 1")
         for k, v in kw.items():
@@ -579,13 +693,19 @@ class LLMAgent(Participant):
             self.system = self._render_system(view)
         if self.memory == "window":
             self.rounds = self.rounds[-(self.window_rounds - 1):] if self.window_rounds > 1 else []
-        self.rounds.append({"round": view.round, "messages": []})
-        self._append(self.round_message(view))
+        if self.memory == "received":  # M6 §3: no history across turns, one constructed message
+            self.ingest(list(view.pushed))
+            self.last_observation = [p.model_dump(mode="json") for p in view.observation.parts]
+            self.rounds = [{"round": view.round, "messages": []}]
+            self._append(self._received_message())
+        else:
+            self.rounds.append({"round": view.round, "messages": []})
+            self._append(self.round_message(view))
+        usage = LLMTurnUsage()
+        self._overflow_events = []
         executed = 0
         model_calls = 0
         retried = False
-        usage = LLMTurnUsage()
-        self._overflow_events = []
         while self.max_calls is None or model_calls < self.max_calls:
             await self._enforce_context_limit(view.tools, tools)  # M3a §3 context limit
             resp = await tools.infer(self._request(view.tools))
@@ -641,7 +761,10 @@ class LLMAgent(Participant):
                     payload = {"ok": False, "result": {},
                                "error": "arguments are not a JSON object; nothing was executed"}
                 else:
-                    payload = _result_payload(await tools.call(tc.name, tc.args))
+                    res = await tools.call(tc.name, tc.args)
+                    payload = _result_payload(res)
+                    self._note_answer(tc.name, tc.args, res.ok)
+                    self._note_read(tc.name, res.result)
                     ended = ended or tc.name == "end_turn"
                 self._append(ChatMessage(role="tool", content=json.dumps(payload, sort_keys=True),
                                          tool_call_id=tc.call_id))
@@ -658,6 +781,8 @@ class LLMAgent(Participant):
         try:
             for name, args in calls:
                 res = await tools.call(name, args)
+                self._note_answer(name, args, res.ok)
+                self._note_read(name, res.result)
                 results.append({"name": name, **_result_payload(res)})
                 ended = ended or name == "end_turn"
         finally:

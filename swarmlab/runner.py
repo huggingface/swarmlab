@@ -12,7 +12,13 @@ one deep copy of each participant prototype per agent (agent i is `agent_id(i)`)
 the world is reset with `derive(seed, "world")`, metrics that `needs_truth()` get
 `set_truth(world.verify())`. The scheduler is `options.scheduler` (M6, swarmlab/scheduler.py;
 `SeededShuffle` when unset). Probes ask every live agent, also those a scheduler left out of the
-round's order (OneSpeaker): the order first, then the rest in agent order. A scheduler with
+round's order (OneSpeaker): the order first, then the rest in agent order. Before a probe, a
+participant with `prepare_probe(view_for)` gets a callable `view_for(observe: bool) -> View`
+(the world observation only when `observe`, push items not marked read), so a memory that is
+built from deliveries (LLMAgent `memory="received"`) is current and an agent that has not had a
+turn yet still has its observation (`world.observe` runs then, once). With
+`board.push_consume` (M6) a turn's pushed items are the newest `push_limit` unread ones and all
+unread items are marked read before the turn. A scheduler with
 `listeners` (OneSpeaker) and a `gossip` topology must agree (`k == listeners`), else ValueError.
 
 Round `r` (phase-commit, `commit == "round_end"`):
@@ -240,7 +246,7 @@ from .spec import (
     unbilled_spec,
 )
 from .tools import AgentTools, TurnCapReached
-from .view import View, describe
+from .view import Observation, View, describe
 
 if TYPE_CHECKING:
     from .experiment import Experiment
@@ -1012,6 +1018,10 @@ class Runner:
                 targets.append(a)
             if not targets:
                 continue
+            for a in targets:  # M6: e.g. LLMAgent(memory="received") refreshes its probe context
+                prep = getattr(self.participants[a], "prepare_probe", None)
+                if callable(prep):
+                    prep(lambda observe, a=a: self._probe_view(a, r, ex, observe))
             results = await asyncio.gather(*(self._probe_one(probe, a, r, ex) for a in targets))
             for a, fields in zip(targets, results, strict=True):
                 self._append(ProbeEvent, r, a, **fields)
@@ -1114,13 +1124,7 @@ class Runner:
         obs = self.world.observe(agent)
         ex.begin_turn(agent, _jsonable(obs.private))
         obs = obs.model_copy(update={"private": {}})  # private never reaches the participant
-        pushed: list[dict] = []
-        if self.board.delivery == "push":
-            pushed = [
-                {"delivery_id": d.delivery_id, "post_id": d.post_id,
-                 "eligible_round": d.eligible_round, "content": self.board.content(d, self.blobs)}
-                for d in ex.pushable(agent, self.board.push_limit)  # M3c: role channel filter
-            ]
+        pushed = self._pushed(agent, ex, round, consume=True)
         view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
                     tools=ex.schemas(agent), description=describe(self.world, agent))
@@ -1151,6 +1155,31 @@ class Runner:
             if rejected * 2 > answered:
                 usage = {**usage, "notes": [*usage.get("notes", []), f"cap:{rejected}"]}
         ex.end_turn_event(agent, kind, usage, error)
+
+    def _pushed(self, agent: AgentId, ex: RoundExecutor, round: int, consume: bool) -> list[dict]:
+        """Push-delivery items for a View (`[]` under pull). With `board.push_consume` (M6): the
+        newest `push_limit` unread items, and (when `consume`) every unread item marked read."""
+        if self.board.delivery != "push":
+            return []
+        if getattr(self.board, "push_consume", False):
+            items = ex.pushable(agent, 1 << 30)  # M3c: role channel filter
+            if consume:
+                self.board.mark_read(agent, [d.delivery_id for d in items], round)
+            items = items[-self.board.push_limit:] if self.board.push_limit > 0 else []
+        else:
+            items = ex.pushable(agent, self.board.push_limit)
+        return [{"delivery_id": d.delivery_id, "post_id": d.post_id,
+                 "eligible_round": d.eligible_round, "content": self.board.content(d, self.blobs)}
+                for d in items]
+
+    def _probe_view(self, agent: AgentId, r: int, ex: RoundExecutor, observe: bool) -> View:
+        """M6 `prepare_probe`: the agent's View after round r (observation only when asked;
+        pushed items are not marked read)."""
+        obs = (self.world.observe(agent).model_copy(update={"private": {}}) if observe
+               else Observation(parts=[]))
+        return View(round=r, agent=agent, observation=obs, outcomes=[],
+                    pushed=self._pushed(agent, ex, r, consume=False), tools=ex.schemas(agent),
+                    description=describe(self.world, agent))
 
     async def _round(self, r: int) -> None:
         seed = self.options.seed

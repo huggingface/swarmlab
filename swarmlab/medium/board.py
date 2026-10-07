@@ -50,6 +50,14 @@ Intervention overlays (M3a, docs/INTERFACE-M3a.md §1), owned by the runner's `O
   injected posts whose author is not an agent); policies and overlays still apply.
 - All of this is in `snapshot()` (keys absent from pre-M3a snapshots restore as empty).
 
+Push consume (M6, docs/INTERFACE-M6.md §3): `push_consume: bool = False`. With `delivery: push`
+and `push_consume: true` a turn is shown the *newest* `push_limit` eligible unread items (oldest
+first among them) and every eligible unread item is then marked read (the runner calls
+`mark_read`; no `read` event is logged), so each item is pushed once and a backlog larger than the
+limit keeps its newest part. Without it, pushing marks nothing read (an agent sees the oldest
+`push_limit` unread items every turn, the M1a behaviour). It is a medium setting (`MediumSpec`)
+emitted by `spec()` only when true, so existing specs and hashes are unchanged.
+
 Registry config (M3b, swarmlab/medium/registry.py): `registry: bool = False` and
 `claim_policy` (a name, `{type, params}` or `ClaimPolicy`; default "advisory") are medium
 settings carried by the board so that `MediumSpec` round-trips through `Board(**params)`. The
@@ -167,6 +175,7 @@ class Board(Persistable, Plugin):
         commit_mode: Literal["round_end", "immediate"] = "round_end",
         registry: bool = False,
         claim_policy: Any = "advisory",
+        push_consume: bool = False,
     ) -> None:
         if delivery not in ("pull", "push"):
             raise ValueError(f"delivery must be 'pull' or 'push', got {delivery!r}")
@@ -183,6 +192,7 @@ class Board(Persistable, Plugin):
         from .registry import build_claim_policy
 
         self.registry = bool(registry)
+        self.push_consume = bool(push_consume)  # M6
         self.claim_policy = build_claim_policy(claim_policy)
         if not self.registry and self.claim_policy.type_name() != "advisory":
             raise ValueError("a claim policy other than 'advisory' needs `registry: true`")
@@ -209,6 +219,7 @@ class Board(Persistable, Plugin):
                 "policies": [p.spec() for p in self.policies],
                 "channels": list(self.channels),
                 **({"registry": True} if self.registry else {}),
+                **({"push_consume": True} if getattr(self, "push_consume", False) else {}),
                 **({"claim_policy": self.claim_policy.spec()}
                    if self.claim_policy.spec() != {"type": "advisory", "params": {}} else {}),
             },
@@ -354,6 +365,14 @@ class Board(Persistable, Plugin):
     def pushable(self, agent: AgentId, round: int, limit: int) -> list[Delivery]:
         """What `read` would return (any channel), without marking anything read."""
         return [d.model_copy() for d in self._select(agent, round, None, limit)]
+
+    def mark_read(self, agent: AgentId, delivery_ids: Sequence[str], round: int) -> None:
+        """M6 `push_consume`: mark these deliveries of `agent` read in `round` (unknown ids and
+        already-read items are left alone)."""
+        ids = set(delivery_ids)
+        for d in self._inboxes.get(agent, []):
+            if d.delivery_id in ids and d.read_round is None:
+                d.read_round = round
 
     def content(self, delivery: Delivery, blobs: BlobStoreLike) -> str:
         return blobs.get(delivery.content_hash).decode()

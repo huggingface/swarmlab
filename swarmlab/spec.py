@@ -136,6 +136,7 @@ class MediumSpec(BaseModel):
     channels: list[str] = ["main"]
     registry: bool = False  # M3b
     claim_policy: PluginSpec = PluginSpec(type="advisory")  # M3b
+    push_consume: bool = False  # M6: push each item once, newest push_limit first (board.py)
 
     @field_validator("topology", "claim_policy", mode="before")
     @classmethod
@@ -148,6 +149,8 @@ class MediumSpec(BaseModel):
         if isinstance(data, dict):
             if data.get("registry") is False:
                 data.pop("registry")
+            if data.get("push_consume") is False:
+                data.pop("push_consume")
             if data.get("claim_policy") in ({"type": "advisory", "params": {}},
                                             PluginSpec(type="advisory")):
                 data.pop("claim_policy")

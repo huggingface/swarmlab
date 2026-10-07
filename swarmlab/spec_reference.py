@@ -96,6 +96,8 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
                     "`{type: gossip, params: {k: 2}}`",
         "delivery": "`pull` (agents call `read_board`) or `push` (deliveries come with the turn)",
         "push_limit": "most items pushed per turn under `delivery: push`",
+        "push_consume": "with `delivery: push`: show the newest `push_limit` unread items and mark "
+                        "every pushed-up-to item read, so each item is pushed once",
         "policies": "visibility policies applied in order, e.g. `[{type: delay, params: "
                     "{rounds: 1}}]`",
         "channels": "board channels",
