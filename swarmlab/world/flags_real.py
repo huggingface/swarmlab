@@ -33,8 +33,10 @@ Simplifications
 - Triangle apexes: Czechia 1/2 of the length; Sudan and Palestine 1/3; Cuba, Philippines
   (equilateral on a 1:2 flag) 0.433; Bahamas 0.4 (approximation).
 - Left out on purpose: Monaco (same layout as Indonesia), Chad (as Romania), Luxembourg (as the
-  Netherlands up to a blue shade), Jordan (as Palestine once its star is dropped), and flags whose
-  triangles or emblems do not survive a 24x16 grid (Guyana, Eritrea, East Timor, Vanuatu).
+  Netherlands up to a blue shade), Jordan (as Palestine once its star is dropped), flags whose
+  triangles or emblems do not survive a 24x16 grid (Guyana, Eritrea, East Timor, Vanuatu), and
+  Sierra Leone, Gabon, Guinea and Armenia (plain tribands, dropped to make room for six triangle
+  flags, which the paper's pool also has).
 """
 from __future__ import annotations
 
