@@ -61,7 +61,10 @@ world action commits at once inside the executor. The resulting `post*`, `delive
 `action_committed*` events are logged after the turn events in application order, so the log has
 the same shape in both modes.
 
-Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else
+Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else (M6)
+`options.stop_when` held at `consecutive` evaluations in a row (probe rounds when the run has
+probes, else every round; the streak is re-derived from the logged metric events on resume) ->
+`run_ended(stop_condition)`, else
 `r == max_rounds` -> `run_ended(max_rounds)`, else (M1b) `soft_usd > 0` and
 `ledger.spent["swarm"] >= soft_usd` -> `run_ended(soft_budget)`, else `budget.total_usd > 0` and
 the experiment's spend (`<out>/<experiment>.ledger.jsonl` over every other run instance, plus this
@@ -932,6 +935,9 @@ class Runner:
             self._set_truth()
         log = EventLog(self.log_path)
         by_name = {m.name: m for m in self.metrics}
+        for m in self.metrics:  # M6: every output name of a multi-output metric
+            for name in (m.output_names() if callable(getattr(m, "output_names", None)) else ()):
+                by_name.setdefault(name, m)
         last_committed = 0
         checked = 0
         for ev in log:
@@ -948,7 +954,8 @@ class Runner:
                 for m in self.metrics:
                     m.update(ev)
             elif ev.type == "metric" and ev.name in by_name:
-                value, denom = by_name[ev.name].value()
+                outs = {n: (v, d) for n, v, d, _ in by_name[ev.name].outputs()}
+                value, denom = outs.get(ev.name, (None, 0))
                 if (value, denom) != (ev.value, ev.denominator):
                     raise ReplayMismatch(
                         f"round {ev.round} metric {ev.name}: log has ({ev.value}, {ev.denominator}), "
@@ -982,6 +989,13 @@ class Runner:
             if e.type == "probe" and (e.parsed or {}).get("skipped") == "no_context"
         }
         self.turns = TurnTally.of(logged)  # resume / fork: the turns already in the log count
+        self._stop_streak, self._stop_hit = 0, False  # M6: re-derived from the logged metrics
+        values: dict[int, dict[str, float | None]] = {}
+        for e in logged:
+            if e.type == "metric":
+                values.setdefault(e.round, {})[e.name] = e.value
+        for rr in sorted(values):
+            self._check_stop(rr, values[rr])
         r = start
         while True:
             reason = self._end_reason(r - 1)
@@ -1068,6 +1082,23 @@ class Runner:
         return {"probe": probe.name, "question_hash": q_hash, "raw_hash": self.blobs.put_text(raw),
                 "parsed": _jsonable(parsed), "ok": ok, "cost_usd": cost}
 
+    def _stop_evaluated(self, r: int) -> bool:
+        """M6: stop_when is evaluated at probe rounds when the run has probes, else every round."""
+        if not self.probes:
+            return True
+        return any(r % max(1, p.every) == 0 for p in self.probes)
+
+    def _check_stop(self, r: int, values: dict[str, float | None]) -> None:
+        """M6 `options.stop_when`: count consecutive evaluations where the metric holds."""
+        cond = self.options.stop_when
+        if cond is None or not self._stop_evaluated(r):
+            return
+        if cond.holds(values.get(cond.metric)):
+            self._stop_streak = getattr(self, "_stop_streak", 0) + 1
+        else:
+            self._stop_streak = 0
+        self._stop_hit = self._stop_streak >= cond.consecutive
+
     def _end_reason(self, committed: int) -> str | None:
         """The reason to end before round `committed + 1`, checked at each round boundary.
 
@@ -1079,6 +1110,8 @@ class Runner:
         """
         if committed >= 1 and self.world.terminal():
             return "terminal"
+        if committed >= 1 and getattr(self, "_stop_hit", False):  # M6 options.stop_when
+            return "stop_condition"
         if committed >= self.options.max_rounds:
             return "max_rounds"
         soft = self.budget.soft_usd
@@ -1267,9 +1300,12 @@ class Runner:
         for m in self.metrics:
             for ev in fed:
                 m.update(ev)
+        logged: dict[str, float | None] = {}
         for m in self.metrics:
-            value, denom = m.value()
-            self._append(MetricEvent, r, name=m.name, value=value, denominator=denom)
+            for name, value, denom, label in m.outputs():  # M6: a metric may log several series
+                self._append(MetricEvent, r, name=name, value=value, denominator=denom, label=label)
+                logged[name] = value
+        self._check_stop(r, logged)
         led = self.ledger.spent
         self._append(BudgetEvent, r, spent_swarm=led["swarm"], spent_measurement=led["measurement"],
                      reserved=self.ledger.reserved, calls=self.ledger.calls)

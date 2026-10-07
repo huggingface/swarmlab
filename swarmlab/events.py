@@ -31,6 +31,7 @@ Decisions where the contract is silent:
   `claim` (`ClaimEvent`, one per world action on a claimable resource when the registry is on);
   see swarmlab/medium/registry.py.
 - M3c: `turn_started` gained `role` (the agent's role name, None without one).
+- M6: `metric` gained `label` (a string, e.g. `belief.state`'s class), omitted when None.
 - M6: `round_started` gained `live` (the live agents), written only when the scheduler's `order`
   is not a permutation of them (OneSpeaker); absent, `order` is the live list as before.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
@@ -182,6 +183,14 @@ class MetricEvent(Event):
     name: str
     value: float | None
     denominator: int
+    label: str | None = None  # M6: a categorical metric's value (belief.state); omitted when None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_label(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("label", 0) is None:
+            data.pop("label")
+        return data
 
 
 class RoundCommittedEvent(Event):
@@ -293,7 +302,7 @@ class ClaimEvent(Event):
 class RunEndedEvent(Event):
     type: Literal["run_ended"] = "run_ended"
     reason: Literal["terminal", "max_rounds", "soft_budget", "hard_ceiling", "hard_ceiling_probes",
-                    "total_budget", "error"]
+                    "total_budget", "error", "stop_condition"]
 
 
 _ALL = (

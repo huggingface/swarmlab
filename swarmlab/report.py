@@ -22,6 +22,14 @@ Decisions:
   a run's world is a FlagGame (or subclass) or some run has committed `guess` actions (truth and
   rival come from rebuilding the world, since `verify()` is not persisted); "Coloring (final
   grid)" (the recorded `score()` per run) only when a run's world is a ColoringGrid.
+- M6 "Terminal states (Flag Game paper)" (FlagGame-style runs, after "where the swarm went"):
+  per arm, the share of runs whose endpoint is correct consensus / wrong consensus / polarized /
+  fragmented (`metrics.belief.classify_state`, thresholds 0.85 / 0.25) and the mean terminal
+  truth mass. The endpoint is the manager's final decision when a blind agent guessed (manager
+  protocol: correct or wrong consensus of one), else the last belief-probe round's answers of the
+  sighted agents (pairwise: the paper's probes), else their final committed guesses. Runs with an
+  empty endpoint are left out (`runs` counts the classified ones). Guesses are read by their
+  canonical name (`feedback["candidate"]` when the world gives one).
 - Protocol health (per arm, any world; the first thing to check after a paid run): turn end
   kinds, turns errored with the first error (for a traceback: the first line of its final
   exception), finish reasons of all inference responses, responses and cache hits, retries
@@ -166,7 +174,9 @@ def scan(run):
         elif t == "action_committed":
             act = ev.action if isinstance(ev.action, dict) else dict(ev.action)
             if act.get("name") == "guess" and ev.accepted:
-                cur[str(a)] = act["args"]["candidate"]
+                fb = ev.feedback if isinstance(ev.feedback, dict) else {}
+                canonical = fb.get("candidate")  # M6: the world's canonical name (real flags)
+                cur[str(a)] = canonical if isinstance(canonical, str) else act["args"]["candidate"]
             d["committed"] += 1
             if not ev.accepted:
                 fb = ev.feedback if isinstance(ev.feedback, dict) else {}
@@ -291,15 +301,74 @@ def coloring_section(arms) -> list[str]:
     return ["## Coloring (final grid)", ""] + table(["run", "rounds", *COLORING_KEYS], rows) + [""]
 
 
-def truth_info(run, agents):
+def world_verify(run, agents):
     """verify() is not persisted: rebuild the world exactly as the runner does."""
     seed = run.spec.options.seed
     exp = Experiment.from_spec(run.spec)
     ag = [p.agent for p in exp.participants if getattr(p, "agent", None)] or sorted(agents)
     exp.world.reset(derive(seed, "world"), ag)
-    v = exp.world.verify()
+    return exp.world.verify()
+
+
+def truth_info(run, agents):
+    v = world_verify(run, agents)
     rec = run.score.get("truth")
     return v["truth"], v["rival"], v["truth"] == rec if rec is not None else None
+
+
+def terminal_distribution(run, d, verify) -> tuple[Counter, str]:
+    """M6: the run's endpoint distribution and its kind: the blind agents' final guesses
+    (`manager`) when a blind agent guessed, else the last belief-probe round's answers
+    (`probes`), else the final committed guesses of the sighted agents (`guesses`)."""
+    final = d["guess_by_round"].get(d["last_round"], {})
+    blind = set(verify.get("blind") or [])
+    if blind and any(a in final for a in blind):
+        return Counter(v for a, v in final.items() if a in blind), "manager"
+    try:
+        pr = run.probes.get("belief", [])
+    except Exception:  # noqa: BLE001 - a broken run is reported as missing data
+        pr = []
+    answered = [(r, ag, parsed) for r, ag, parsed, ok in pr
+                if ok and isinstance(parsed, dict) and isinstance(parsed.get("candidate"), str)]
+    if answered:
+        last = max(r for r, _, _ in answered)
+        return Counter(p["candidate"] for r, ag, p in answered if r == last and ag not in blind), "probes"
+    return Counter(v for a, v in final.items() if a not in blind), "guesses"
+
+
+def terminal_section(arms) -> list[str]:
+    """M6 §5: the paper's terminal-state shares per arm across seeds, and terminal truth mass."""
+    from .metrics.belief import STATES, classify_state
+
+    rows = []
+    for arm, rs in sorted(arms.items()):
+        states: Counter = Counter()
+        mass, kinds, n = [], Counter(), 0
+        for run, d in rs:
+            try:
+                v = world_verify(run, d["agents"])
+            except Exception:  # noqa: BLE001, S112 - no verifiable truth: not classified
+                continue
+            dist, kind = terminal_distribution(run, d, v)
+            label = classify_state(dist, v.get("truth"))
+            if label is None:
+                continue
+            n += 1
+            states[label] += 1
+            kinds[kind] += 1
+            mass.append(dist.get(v.get("truth"), 0) / sum(dist.values()))
+        if not n:
+            rows.append([arm, 0] + [NA] * (len(STATES) + 2))
+            continue
+        rows.append([arm, n] + [f(states[s] / n, 2) for s in STATES]
+                    + [f(mean(mass), 3), ", ".join(f"{k} {c}" for k, c in sorted(kinds.items()))])
+    head = ["arm", "runs", "correct consensus", "wrong consensus", "polarized", "fragmented",
+            "terminal truth mass", "endpoint"]
+    note = ("Share of runs per class of the endpoint distribution (s1 >= 0.85 consensus, camps "
+            ">= 0.25); terminal truth mass is the mean share of the endpoint on the truth. "
+            "Endpoint: the manager's final decision when a blind agent guessed, else the last "
+            "belief-probe round, else the final committed guesses.")
+    return ["## Terminal states (Flag Game paper)", "", note, ""] + table(head, rows) + [""]
 
 
 def is_simulated(meta: dict) -> bool:
@@ -435,6 +504,8 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
                 rows.append([run.id, truth or NA, rival or NA, {True: "yes", False: "NO", None: NA}[match],
                              dist, sh(rival), sh(truth), other])
         L += table(["run", "truth", "rival", "matches score", "guess counts", "on rival", "on truth", "elsewhere"], rows) + [""]
+
+        L += terminal_section(arms)  # M6
 
         # probes
         L += ["## Probe vs world belief", ""]

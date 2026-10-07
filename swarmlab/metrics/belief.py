@@ -32,6 +32,22 @@ standing and an agent that never answered counted as `"none"`. The metric's `nam
 side; the runner requires unique names, not unique entry points. Same denominator rules, less
 the skipped agents.
 `source="world"` is left out of `params`, so M1a specs and their hashes are unchanged.
+
+M6 (docs/INTERFACE-M6.md §5): a guess's belief is the world's canonical name when the
+`action_committed` feedback carries one (`feedback["candidate"]`, FlagGame with real flags, where
+guesses match country names case-insensitively), else `args["candidate"]` as before. The live list
+for replay comes from `round_started.live` when logged (OneSpeaker), else `order`.
+
+`belief.state(consensus=0.85, camp=0.25, source="world")` is the Flag Game paper's terminal
+classification, computed every round over the live (non-blind) agents **that hold a guess**
+(`"none"` and skipped agents are out of numerator and denominator): `s1` = the top candidate's
+share, `correct_consensus` if `s1 >= consensus` (with 1e-9 slack) on the truth, `wrong_consensus`
+if on another candidate, `polarized` if `s1 < consensus` and at least two candidates each hold
+`>= camp`, else `fragmented` (`classify_state`). It emits (`outputs()`) the event `belief.state`
+with `label` = the class and `value` = its index in `STATES` (0..3; None and no label when nobody
+holds a guess), plus one 0/1 series per class, `belief.state.<class>` (all None when nobody holds
+a guess), each with the same denominator. With a probe source every name gains `@probe:<name>`.
+`consensus`/`camp` are in `params` only when not at their defaults.
 """
 from __future__ import annotations
 
@@ -83,7 +99,9 @@ class _BeliefMetric(Metric):
         action = event.action or {}
         if action.get("name") != "guess":
             return
-        candidate = (action.get("args") or {}).get("candidate")
+        candidate = (getattr(event, "feedback", None) or {}).get("candidate")  # M6: canonical name
+        if not isinstance(candidate, str):
+            candidate = (action.get("args") or {}).get("candidate")
         if isinstance(candidate, str) and event.agent is not None:
             self.beliefs[event.agent] = candidate
 
@@ -170,3 +188,67 @@ class Entropy(_BeliefMetric):
     def _value(self, counts: Counter[str], none: int, n: int) -> float:
         parts = [*counts.values(), none]
         return -sum((c / n) * math.log2(c / n) for c in parts if c)
+
+
+STATES = ("correct_consensus", "wrong_consensus", "polarized", "fragmented")
+
+
+def classify_state(counts: Counter[str] | dict[str, int], truth: str | None,
+                   consensus: float = 0.85, camp: float = 0.25) -> str | None:
+    """The paper's class of a belief distribution (counts per candidate, no "none"); None if
+    empty. Ties for the top share only matter below `consensus` (two candidates cannot both
+    reach a consensus threshold above 0.5)."""
+    n = sum(counts.values())
+    if n == 0:
+        return None
+    eps = 1e-9
+    top_name, top = max(sorted(counts.items()), key=lambda kv: kv[1])
+    if top / n >= consensus - eps:
+        return "correct_consensus" if top_name == truth else "wrong_consensus"
+    if sum(1 for c in counts.values() if c / n >= camp - eps) >= 2:
+        return "polarized"
+    return "fragmented"
+
+
+class State(_BeliefMetric):
+    entry_point: ClassVar[str | None] = "belief.state"
+    name = "belief.state"
+    description = ("Flag Game paper class of the guess distribution: correct/wrong consensus, "
+                   "polarized, fragmented (label, plus one-hot belief.state.<class> series)")
+
+    def __init__(self, consensus: float = 0.85, camp: float = 0.25, source: str = "world") -> None:
+        if not (0 < camp <= consensus <= 1):
+            raise ValueError("belief.state needs 0 < camp <= consensus <= 1")
+        self._init(source)
+        self.consensus, self.camp = float(consensus), float(camp)
+        if isinstance(getattr(self, "params", None), dict):
+            for k, default in (("consensus", 0.85), ("camp", 0.25)):
+                if self.params.get(k) == default:
+                    self.params.pop(k)
+        self.truth: str | None = None
+
+    def needs_truth(self) -> bool:
+        return True
+
+    def set_truth(self, truth: dict) -> None:
+        self.truth = truth.get("truth")
+
+    def label(self) -> tuple[str | None, int]:
+        counts, _ = self._distribution()
+        return classify_state(counts, self.truth, self.consensus, self.camp), sum(counts.values())
+
+    def value(self) -> tuple[float | None, int]:
+        label, n = self.label()
+        return (None if label is None else float(STATES.index(label))), n
+
+    def output_names(self) -> list[str]:
+        suffix = self.name[len("belief.state"):]  # "" or "@probe:<name>"
+        return [self.name] + [f"belief.state.{s}{suffix}" for s in STATES]
+
+    def outputs(self) -> list[tuple[str, float | None, int, str | None]]:
+        label, n = self.label()
+        names = self.output_names()
+        out = [(names[0], None if label is None else float(STATES.index(label)), n, label)]
+        out += [(nm, None if label is None else float(label == s), n, None)
+                for nm, s in zip(names[1:], STATES, strict=True)]
+        return out

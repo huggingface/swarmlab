@@ -9,6 +9,10 @@ Additions after M1a:
   run, so a metric whose meaning changed (rev 2: `comm.posts_per_round` per agent instead of
   swarm-wide, probe-sourced belief metrics leaving skipped agents out of the denominator) folds
   old logs the way they were written and `replay` still matches. The default is a no-op.
+- M6: `outputs()` lists the metric events one metric emits per round as `(name, value,
+  denominator, label)`; the default is the single `(self.name, *self.value(), None)`. A metric
+  with several outputs (`belief.state`: its state code with a string `label`, plus four one-hot
+  series) overrides it; the runner logs one `metric` event per output and replay checks each.
 """
 from __future__ import annotations
 
@@ -33,6 +37,11 @@ class Metric(Persistable, Plugin):
 
     def value(self) -> tuple[float | None, int]:
         raise NotImplementedError
+
+    def outputs(self) -> list[tuple[str, float | None, int, str | None]]:
+        """M6: the metric events of this round, `(name, value, denominator, label)`."""
+        value, denom = self.value()
+        return [(self.name, value, denom, None)]
 
     def needs_truth(self) -> bool:
         return False

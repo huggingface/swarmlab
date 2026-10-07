@@ -40,7 +40,7 @@ def since_m2(text: str) -> str:
     out, drop_blank, health, traj, dropped = [], False, False, False, False
     for line in text.splitlines(keepends=True):
         if line.startswith("## "):  # sections added later: protocol health, coloring
-            dropped = line.startswith(("## Protocol health", "## Coloring"))
+            dropped = line.startswith(("## Protocol health", "## Coloring", "## Terminal states"))
             traj = line.startswith("## Trajectories")
         if dropped:
             continue

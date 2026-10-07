@@ -145,7 +145,8 @@ Real flags and name-only candidates (M6, docs/INTERFACE-M6.md §1)
   `cell_px` defaults to 25 for real flags (a 6x4 crop is 150x100 px) and 12 otherwise.
   `verify()` adds `country` (the truth's name) and `layout` (its layout id, e.g. `h3+tri`).
   `guess` accepts a country name case-insensitively (exact match after `normalise_name`:
-  whitespace collapsed, casefolded) and records the canonical name.
+  whitespace collapsed, casefolded) and records the canonical name, which it also returns as
+  `feedback["candidate"]` (belief metrics and the report prefer it over the raw argument).
 - `candidates="names"` (requires `flags="real"`, a ValueError otherwise: synthetic flags have no
   names to recognise): no candidate grids or images. The observation is the text part
   `Allowed countries: <JSON list>` followed by the crop: in image mode a text part `Your crop:`
@@ -721,6 +722,8 @@ class FlagGame(World):
             candidate = match_country(candidate, list(self.candidates)) or candidate
         self.guesses[agent] = candidate
         self.guesses_made[agent] = self.guesses_made.get(agent, 0) + 1
+        if self.real:  # the canonical name, read by belief metrics and the report
+            return Outcome(accepted=True, feedback={"recorded": True, "candidate": candidate})
         return Outcome(accepted=True, feedback={"recorded": True})
 
     def validate(self, agent: AgentId, action: Action, pending: Sequence[Action] = ()) -> Ack:
