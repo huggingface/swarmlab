@@ -494,9 +494,11 @@ def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_r
                                       f"{m['measured']['run_id']}")
         else:
             per_round = float(ests[a].get("usd_per_round") or 0)
-            limit, what = 2 * per_round, (f"twice one round's estimated worst case "
-                                          f"(2 x ${per_round:.4f}; no finished run of this arm "
-                                          "to measure)")
+            # The flat worst case runs 4-6x above measured spend, so warn only when the gap is
+            # below half of it; a finished run of the arm replaces this with the measured figure.
+            limit, what = 0.5 * per_round, (f"half of one round's estimated worst case "
+                                            f"(0.5 x ${per_round:.4f}; no finished run of this "
+                                            "arm to measure)")
         if gap < limit:
             lines.append(
                 f"warning: arm={a}: hard_usd - soft_usd = ${gap:.4f} is less than {what}. "
