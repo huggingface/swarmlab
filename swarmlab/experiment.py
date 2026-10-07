@@ -71,9 +71,12 @@ Decisions where the contract is silent:
   `usd_flat / max_rounds` (the CLI compares it with the gap between `soft_usd` and `hard_usd`).
   `calls_per_turn_used` lists the distinct calls per turn actually priced (`calls_per_turn`
   capped by each model-backed participant's `max_calls`).
-- `run_all` honours `budget.total_usd` (experiment-wide; see `budget.total_cap_refusal`): before
-  each run it would start, the spend of the runs already returned plus this arm's `hard_usd` must
-  fit, else it stops and warns (`TotalBudgetWarning`, naming the skipped seeds).
+- `run_all` honours `budget.total_usd` (experiment-wide): before each run it would start,
+  `admit(seed, out)` checks the experiment ledger `<out>/<name>.ledger.jsonl` (spend of every
+  run of the experiment under `out`, from any process or invocation, plus the headroom of runs
+  still in flight, plus this arm's `hard_usd` must fit; `budget.ExperimentLedger`), else it stops
+  and warns (`TotalBudgetWarning`, naming the skipped seeds). Run dirs it finds are backfilled
+  into the ledger when they have no row (written before the ledger existed).
 - `Run.summary()` is the CLI's run summary: run_dir, run_id, arm, seed, spec_hash, status,
   end_reason, last_round, score, metrics (last value per name), spend, `probes_skipped`
   (`{reason: count}`, only when the spec has probes; `Run.probes_skipped()`) (+ parent_run/fork_round
@@ -97,7 +100,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from ._io import atomic_write_bytes
-from .budget import TotalBudgetWarning, ledger_total, total_cap_refusal
+from .budget import ExperimentLedger, TotalBudgetWarning
 from .events import Event, EventLog, logical_view
 from .ids import run_id as make_run_id
 from .interventions import build_intervention, check_names
@@ -326,6 +329,20 @@ class Experiment(BaseModel):
         same = run.meta.get("spec_hash") == self.spec_hash(seed, max_rounds, **run_options)
         return ("same" if same else "different"), run
 
+    def experiment_ledger(self, out: Path | str = "runs") -> ExperimentLedger:
+        """`<out>/<name>.ledger.jsonl`: spend of every run of this experiment under `out`."""
+        return ExperimentLedger(out, self.name)
+
+    def admit(self, seed: int, out: Path | str = "runs") -> tuple[str | None, float]:
+        """The `budget.total_usd` start check for the run of `seed` under `out` (see
+        `ExperimentLedger.admit`): (refusal or None, spend + reserved it was checked against)."""
+        total = self.budget.total_usd
+        if total <= 0:
+            return None, 0.0
+        led = self.experiment_ledger(out)
+        led.backfill_dir(out)  # run dirs from before the ledger existed
+        return led.admit(self.run_id(seed), self.budget.hard_usd, total)
+
     @staticmethod
     def rerun_dir(out: Path | str, run_id: str) -> Path:
         n = 2
@@ -337,25 +354,29 @@ class Experiment(BaseModel):
                 skip_existing: bool = True, rerun: bool = False, **run_options: Any) -> list[Run]:
         """Run this arm once per seed, in order; returns the runs (skipped ones included)."""
         runs: list[Run] = []
+        led = self.experiment_ledger(out)
         for i, seed in enumerate(seeds):
             state, found = self.existing(seed, max_rounds, out, **run_options)
-            why = total_cap_refusal(sum(ledger_total(r.spend) for r in runs), self.budget.hard_usd,
-                                    self.budget.total_usd)
-            if why and (rerun or state != "same" or not skip_existing):
-                warnings.warn(TotalBudgetWarning(f"total cap: {why}; skipped seeds {seeds[i:]}"),
-                              stacklevel=2)
-                break
-            if rerun and state != "new":
-                runs.append(self.run(seed, max_rounds, out=out, **run_options,
-                                     run_dir=self.rerun_dir(out, self.run_id(seed))))
-            elif state == "same" and skip_existing and found is not None:
+            if found is not None:
+                led.backfill(found.meta)
+            if state == "same" and skip_existing and not rerun and found is not None:
                 runs.append(found)
-            elif state == "different" and found is not None:
+                continue
+            if state == "different" and not rerun and found is not None:
                 raise FileExistsError(
                     f"{found.dir} holds a run with a different spec_hash; pass rerun=True "
                     "(CLI: --rerun) or another out dir")
-            else:
-                runs.append(self.run(seed, max_rounds, out=out, **run_options))
+            why, _ = self.admit(seed, out)
+            if why:
+                warnings.warn(TotalBudgetWarning(f"total cap: {why}; skipped seeds {seeds[i:]}"),
+                              stacklevel=2)
+                break
+            target = self.rerun_dir(out, self.run_id(seed)) if rerun and state != "new" else None
+            try:
+                runs.append(self.run(seed, max_rounds, out=out, run_dir=target, **run_options))
+            except BaseException:
+                led.record(self.run_id(seed), f"{self.run_id(seed)}@admit", 0.0, "failed")
+                raise
         return runs
 
     @classmethod

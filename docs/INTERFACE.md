@@ -128,7 +128,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 | `metric` | `name, value, denominator` | after fold, per metric |
 | `round_committed` | `n_posts, n_actions, n_deliveries` | last logical event of the round |
 | `snapshot` | `manifest_path` | after `round_committed`, every `snapshot_every` |
-| `run_ended` | `reason: "terminal"|"max_rounds"|"soft_budget"|"hard_ceiling"|"hard_ceiling_probes"|"error"` (`hard_ceiling_probes`: the ceiling was reached by post-commit probes; that round is kept) | once |
+| `run_ended` | `reason: "terminal"|"max_rounds"|"soft_budget"|"hard_ceiling"|"hard_ceiling_probes"|"total_budget"|"error"` (`hard_ceiling_probes`: the ceiling was reached by post-commit probes; that round is kept; `total_budget`: the experiment-wide `budget.total_usd` was reached at a round boundary, swarmlab/budget.py `ExperimentLedger`) | once |
 
 **Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them and also drops `seq`, because operational events are appended as they happen and shift later sequence numbers. Acceptance tests compare logical views.
 

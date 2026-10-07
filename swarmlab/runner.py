@@ -54,7 +54,16 @@ the same shape in both modes.
 
 Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else
 `r == max_rounds` -> `run_ended(max_rounds)`, else (M1b) `soft_usd > 0` and
-`ledger.spent["swarm"] >= soft_usd` -> `run_ended(soft_budget)`, all checked at the round boundary.
+`ledger.spent["swarm"] >= soft_usd` -> `run_ended(soft_budget)`, else `budget.total_usd > 0` and
+the experiment's spend (`<out>/<experiment>.ledger.jsonl` over every other run instance, plus this
+run's ledger) >= `total_usd` -> `run_ended(total_budget)`, all checked at the round boundary
+(also before round 1). `total_budget` is resumable like `soft_budget`.
+
+Experiment ledger (swarmlab/budget.py `ExperimentLedger`): every `run.json` write also appends a
+row (run id, instance key `<run_id>@<started_at>`, spec hash, spend so far, status, hard_usd,
+pid, host, time) to `<run dir's parent>/<experiment>.ledger.jsonl`; a live/resume call that
+leaves without ending appends a final `interrupted` row. `run.json["started_at"]` is set when
+the run first starts and kept by resume.
 
 Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
 
@@ -156,6 +165,7 @@ import copy
 import json
 import random
 import shutil
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -164,7 +174,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._io import atomic_write_bytes
 from .blobs import BlobStore
-from .budget import Gate, HardCeilingReached, Ledger, MeasurementBudgetReached
+from .budget import ExperimentLedger, Gate, HardCeilingReached, Ledger, MeasurementBudgetReached
 from .events import (
     OPERATIONAL_TYPES,
     ActionCommittedEvent,
@@ -227,7 +237,7 @@ if TYPE_CHECKING:
 NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "run_ended", "budget",
                      "budget_changed"})
 # run_ended reasons that resume() continues from
-BUDGET_REASONS = ("soft_budget", "hard_ceiling", "hard_ceiling_probes")
+BUDGET_REASONS = ("soft_budget", "hard_ceiling", "hard_ceiling_probes", "total_budget")
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -388,6 +398,10 @@ class Runner:
         # the spec YAML's dir, for module:Class plugins next to it (registry.add_import_dir)
         self.import_dir: str | None = (getattr(experiment, "_import_dir", None)
                                        or (meta or {}).get("import_dir"))
+        # one run instance in the experiment ledger (swarmlab/budget.py ExperimentLedger)
+        # (run dirs from before the ledger existed are the instance "legacy")
+        self.started_at: str = (f"{time.time():.6f}" if meta is None
+                                else meta.get("started_at") or "legacy")
         self._aborted_score: Any = None
         self.status = "running"
         self.end_reason: str | None = None
@@ -437,8 +451,28 @@ class Runner:
         }
         if self.import_dir:
             data["import_dir"] = self.import_dir
+        data["started_at"] = self.started_at
         text = json.dumps(data, indent=2, sort_keys=True) + "\n"
         atomic_write_bytes(self.dir / "run.json", text.encode())
+        self._ledger_row(self.status, data["spec_hash"])
+
+    @property
+    def experiment_ledger(self) -> ExperimentLedger:
+        return ExperimentLedger(self.dir.parent, self.spec.experiment)
+
+    def _ledger_row(self, status: str, spec_hash_: str | None = None) -> None:
+        """Append this run's spend so far to `<out>/<experiment>.ledger.jsonl`."""
+        self.experiment_ledger.record(
+            self.run_id, f"{self.run_id}@{self.started_at}", self.ledger.spent_total, status,
+            hard=self.budget.hard_usd, spec_hash=spec_hash_ or spec_hash(self.spec))
+
+    def _ledger_interrupted(self) -> None:
+        """A live/resume that leaves without ending (an exception, Ctrl-C): stop reserving."""
+        if self.status != "ended" and getattr(self, "ledger", None) is not None:
+            try:
+                self._ledger_row("interrupted")
+            except OSError:
+                pass
 
     def _write_artifacts(self) -> None:
         art = self.dir / "artifacts"
@@ -624,6 +658,7 @@ class Runner:
             _run_coro(self._loop(start))
         finally:
             self.log.close()
+            self._ledger_interrupted()
         return self
 
     def resume(self, budget: Budget | None = None) -> Runner:
@@ -661,6 +696,7 @@ class Runner:
             _run_coro(self._loop(start))
         finally:
             self.log.close()
+            self._ledger_interrupted()
         return self
 
     def recover(self, events: list[Event] | None = None, meta: dict | None = None) -> int:
@@ -1005,6 +1041,11 @@ class Runner:
         soft = self.budget.soft_usd
         if soft > 0 and self.ledger.spent["swarm"] >= soft:
             return "soft_budget"
+        total = self.budget.total_usd
+        if total > 0:  # experiment-wide: every run in <out>/<experiment>.ledger.jsonl
+            others = self.experiment_ledger.spent(exclude=f"{self.run_id}@{self.started_at}")
+            if others + self.ledger.spent_total >= total:
+                return "total_budget"
         return None
 
     def _abort_round(self, r: int) -> None:

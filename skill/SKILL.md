@@ -34,7 +34,9 @@ Project-level copies work too: `.claude/skills/swarmlab/`, `.agents/skills/swarm
 ## First real run: the checklist
 
 Size it to the budget first. Put the user's total in the spec as `budget: {total_usd: T}` (top
-level): `swarmlab run` then never starts a run that could push the experiment past T.
+level): `swarmlab run` then never starts a run that could push the experiment past T. The
+spend is shared through `runs/<experiment>.ledger.jsonl`, so separate invocations, parallel
+shells and `swarmlab run --parallel N` all count against the same T (same `--out`).
 
 - **Total under $2: the short checklist.** A separate smoke run and a second-agent review would
   eat a large share of the money, and one round's worst-case estimate can be a fifth of the

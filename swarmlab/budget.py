@@ -24,13 +24,36 @@ Decisions where the contract is silent:
   next_hard, total)` is the check `swarmlab run` and `Experiment.run_all` make before starting
   each run (spent = ledger swarm + measurement of the runs already done or found on disk). A
   refusal stops the sequence; `run_all` reports it as a `TotalBudgetWarning`.
+- Experiment spend across processes (field notes item 3): `ExperimentLedger(out, experiment)` is
+  the append-only file `<out>/<experiment>.ledger.jsonl`. Every run appends a row each time it
+  writes `run.json` (each commit, its start and its end): `{ts, pid, host, run_id, key,
+  spec_hash, spend_usd, status, hard_usd}` where `spend_usd` is the run's ledger total so far
+  and `key` identifies one run instance (`<run_id>@<started_at>`: a resume keeps it, a run dir
+  deleted and run again gets a new one, so spend already paid is never forgotten). The
+  experiment's spend is the sum over keys of each key's latest `spend_usd`, over every process
+  and invocation that wrote rows. Rows are appended under an exclusive `fcntl.flock` on the
+  file. `admit(run_id, ...)` is the start check, under the same lock: spent + the headroom of
+  runs in flight (`hard_usd - spend_usd` of rows whose latest status is `running`, or an
+  `admitted` row not yet followed by a row of that run id, written by a live pid; a row from
+  another host counts as live) + this run's `hard_usd` must fit under `total_usd`
+  (`total_cap_refusal`), and when it does an `admitted` row is appended at once, so concurrent
+  starts (`swarmlab run --parallel`, or two shells) cannot both take the same headroom. A run
+  whose process died keeps its spend but no longer reserves headroom. The runner ends a run
+  with `total_budget` at a round boundary when the ledger's spend (its own included) reaches
+  `total_usd` (swarmlab/runner.py). Delete the file to forget past spend.
 """
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
-from typing import Literal
+import fcntl
+import json
+import os
+import socket
+import time
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
+from pathlib import Path
+from typing import Any, Literal
 
 from .base import Persistable
 from .providers import resolve
@@ -87,6 +110,157 @@ def ledger_total(spend: Mapping | None) -> float:
     """Swarm + measurement spend of a run's ledger dict (`Run.spend`, `run.json["ledger"]`)."""
     spend = spend or {}
     return float(spend.get("swarm") or 0) + float(spend.get("measurement") or 0)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class ExperimentLedger:
+    """`<out>/<experiment>.ledger.jsonl`: the experiment's spend over every run (module doc)."""
+
+    def __init__(self, out: Path | str, experiment: str) -> None:
+        self.path = Path(out) / f"{experiment}.ledger.jsonl"
+
+    @contextmanager
+    def lock(self) -> Iterator[Any]:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a+b") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield f
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _append(f: Any, line: str) -> None:
+        """Append one row; a torn last line (a killed writer) is closed off first."""
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                line = "\n" + line
+        f.write(line.encode("utf-8"))
+        f.flush()
+
+    def rows(self) -> list[dict]:
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in text.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:  # a torn last line from a killed process
+                continue
+            if isinstance(row, dict) and "key" in row:
+                out.append(row)
+        return out
+
+    @staticmethod
+    def _state(rows: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
+        """(latest row per key, pending `admitted` row per run id)."""
+        latest: dict[str, dict] = {}
+        pending: dict[str, dict] = {}
+        for row in rows:
+            if row.get("status") == "admitted":
+                pending[row["run_id"]] = row
+                continue
+            pending.pop(row.get("run_id"), None)
+            latest[row["key"]] = row
+        return latest, pending
+
+    @staticmethod
+    def _live(row: dict) -> bool:
+        if row.get("host") != socket.gethostname():
+            return True
+        return _pid_alive(int(row.get("pid") or 0))
+
+    def totals(self, exclude: str | None = None, rows: list[dict] | None = None
+               ) -> tuple[float, float]:
+        """(spend, headroom reserved by runs in flight), leaving out key or run id `exclude`."""
+        latest, pending = self._state(self.rows() if rows is None else rows)
+        spent = 0
+        reserved = 0
+        for key, row in latest.items():
+            if exclude in (key, row.get("run_id")):
+                continue
+            spent += to_nano(float(row.get("spend_usd") or 0))
+            if row.get("status") == "running" and self._live(row):
+                reserved += max(0, to_nano(float(row.get("hard_usd") or 0))
+                                - to_nano(float(row.get("spend_usd") or 0)))
+        for run_id, row in pending.items():
+            if exclude != run_id and self._live(row):
+                reserved += to_nano(float(row.get("hard_usd") or 0))
+        return spent / NANO, reserved / NANO
+
+    def spent(self, exclude: str | None = None) -> float:
+        return self.totals(exclude)[0]
+
+    def run_ids(self) -> set[str]:
+        return {r["run_id"] for r in self.rows()}
+
+    def _row(self, run_id: str, key: str, spend: float, status: str, hard: float,
+             spec_hash: str | None, **extra: Any) -> str:
+        row = {"ts": time.time(), "pid": os.getpid(), "host": socket.gethostname(),
+               "run_id": run_id, "key": key, "spec_hash": spec_hash, "spend_usd": spend,
+               "status": status, "hard_usd": hard, **extra}
+        return json.dumps(row, sort_keys=True) + "\n"
+
+    def record(self, run_id: str, key: str, spend: float, status: str, hard: float = 0.0,
+               spec_hash: str | None = None, **extra: Any) -> None:
+        line = self._row(run_id, key, spend, status, hard, spec_hash, **extra)
+        with self.lock() as f:
+            self._append(f, line)
+
+    def backfill(self, meta: Mapping) -> bool:
+        """Add a row for a run dir's `run.json` when the ledger has none for that run instance
+        (run dirs written before the ledger existed, or copied in); True if one was added."""
+        key = f"{meta['run_id']}@{meta.get('started_at') or 'legacy'}"
+        if any(r["key"] == key for r in self.rows()):
+            return False
+        self.record(meta["run_id"], key, ledger_total(meta.get("ledger")),
+                    str(meta.get("status") or "ended"),
+                    hard=float((meta.get("budget") or {}).get("hard_usd") or 0),
+                    spec_hash=meta.get("spec_hash"), backfilled=True)
+        return True
+
+    def backfill_dir(self, out: Path | str) -> int:
+        """`backfill` every run dir directly under `out` whose `run.json` names this
+        experiment; returns how many rows were added."""
+        name = self.path.name.removesuffix(".ledger.jsonl")
+        added = 0
+        for d in sorted(Path(out).glob("*/run.json")):
+            try:
+                meta = json.loads(d.read_text())
+            except (OSError, ValueError):
+                continue
+            if meta.get("experiment") == name and "run_id" in meta:
+                added += self.backfill(meta)
+        return added
+
+    def admit(self, run_id: str, hard: float, total: float, spec_hash: str | None = None
+              ) -> tuple[str | None, float]:
+        """The start check (module doc): (refusal or None, spend + reserved it was checked
+        against). An admitted run gets an `admitted` row in the same locked step."""
+        with self.lock() as f:
+            spent, reserved = self.totals()
+            why = total_cap_refusal(spent + reserved, hard, total)
+            if why and reserved > 0:
+                why += f" (${reserved:.4f} of it reserved by runs still in flight)"
+            if why is None:
+                self._append(f, self._row(run_id, f"{run_id}@admit", 0.0, "admitted", hard,
+                                          spec_hash))
+            return why, spent + reserved
 
 
 class Ledger(Persistable):

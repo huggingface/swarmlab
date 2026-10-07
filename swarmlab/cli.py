@@ -59,6 +59,17 @@ Decisions where the contract is silent:
 - `preflight SPEC [--arm A] [--max-usd 0.05]` (swarmlab/preflight.py): one real request per LLM
   participant group with the arm's exact model settings and tools; prints the worst-case cost
   first and refuses above `--max-usd`; exit 1 on any failure.
+- Total cap across processes and `--parallel` (field notes item 3): the spend that counts is the
+  experiment ledger `<out>/<experiment>.ledger.jsonl` (`budget.ExperimentLedger`), written by
+  every run at each commit, so two `swarmlab run` invocations (sequential or concurrent, same
+  `--out`) share one `total_usd`. Each run is started only after `Experiment.admit(seed, out)`:
+  ledger spend + headroom reserved by runs in flight + its `hard_usd` <= total (it then gets an
+  `admitted` row in the same locked step); found run dirs without a ledger row are backfilled.
+  The runner also stops a run with `total_budget` at a round boundary once the ledger spend
+  reaches the total. `run --parallel N` runs up to N runs at once as threads of this process
+  (each thread builds its own `Experiment` from the YAML, so providers and plugin prototypes are
+  not shared, and runs its own asyncio loop); the rows come back in plan order. After the first
+  refusal no further run starts (outcome `capped`), as in the sequential case.
 - Total cap (`budget.total_usd`, top level): `run` prints the per-run caps of every arm and the
   total cap before anything runs, plus one `existing:` line per run dir that already exists with
   its actual ledger spend (resumed spend included), rounds and per-round cost (not the spec's
@@ -88,13 +99,15 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 
-from .budget import ledger_total, total_cap_refusal
+from .budget import ExperimentLedger, ledger_total
 from .experiment import Experiment, Run, participant_model
 from .spec import Budget, RunOptions, SpecError, experiment_seeds, load_experiment_yaml
 
@@ -396,7 +409,8 @@ def _existing_runs(exps: dict[str, Experiment], seeds: list[int], max_rounds: in
 
 def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_runs: int,
                n_seeds: int, total_cap: float,
-               existing: dict[str, list[tuple[int, str, Run]]] | None = None) -> list[str]:
+               existing: dict[str, list[tuple[int, str, Run]]] | None = None,
+               out: Path | None = None) -> list[str]:
     """The planned per-run caps, the actual spend of runs that already exist, the experiment's
     total cap, and soft/hard gap warnings."""
     def money(v: float) -> str:
@@ -430,6 +444,14 @@ def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_r
             line += (f"; hard ceilings sum to ${hard_sum:g}, so later runs may be skipped if "
                      "earlier ones spend near their ceilings")
         lines.append(line)
+        if out is not None:
+            led = ExperimentLedger(out, next(iter(exps.values())).name)
+            spent, reserved = led.totals()
+            if led.path.exists():
+                lines.append(f"caps: experiment ledger {led.path}: ${spent:.4f} spent so far by "
+                             "every run of this experiment under this --out (all invocations "
+                             "and processes)" + (f", ${reserved:.4f} reserved by runs in flight"
+                                                 if reserved > 0 else ""))
     else:
         lines.append("caps: no total cap (budget.total_usd: 0)"
                      + (f"; hard ceilings sum to ${hard_sum:g}" if hard_sum > 0 else ""))
@@ -469,6 +491,9 @@ def run(
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask before spending.")] = False,
     rerun: Annotated[bool, typer.Option(
         "--rerun", help="Run again into runs/<id>__r<N> even if runs/<id> exists.")] = False,
+    parallel: Annotated[int, typer.Option(
+        "--parallel", min=1,
+        help="Run up to N runs at once (threads in this process), under the shared total cap.")] = 1,
     as_json: JsonOpt = False,
 ) -> None:
     """Run an experiment: every arm x every seed of the YAML, or the arm/seed you pick."""
@@ -513,50 +538,83 @@ def run(
             _say("  (fake: models only: prices are nominal, nothing is billed)", as_json)
     if budgeted:
         existing = _existing_runs(exps, seeds, max_rounds, out) if not rerun else {}
-        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap, existing):
+        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap, existing, out):
             _say(line, as_json)
     if budgeted and not yes:
         _confirm(f"Start {n_runs} run(s), worst case ${total:.4f}?")
 
-    rows: list[dict[str, Any]] = []
-    capped: dict[str, Any] | None = None
-    for a, sd in [(a, sd) for a in arms for sd in seeds]:
-        exp = exps[a]
+    plan = [(a, sd) for a in arms for sd in seeds]
+    state_lock = threading.Lock()
+    capped_box: dict[str, Any] = {}
+
+    def attempt(a: str, sd: int, exp: Experiment) -> dict[str, Any]:
+        """One run of the plan: skip, cap, fail or run it (thread-safe: `--parallel`)."""
         rid = exp.run_id(sd)
-        if capped is not None:
-            capped["skipped"].append(rid)
-            rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"})
-            continue
+        with state_lock:
+            if capped_box:
+                capped_box["skipped"].append(rid)
+                return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
+        admitted = False
+        led = exp.experiment_ledger(out)
         try:
             state, found = exp.existing(sd, max_rounds, out)
+            if found is not None:
+                led.backfill(found.meta)
             if state == "same" and not rerun and found is not None:
                 _say(f"{rid}: exists, skipping ({found.dir})", as_json)
-                rows.append({**summary(found), "outcome": "skipped"})
-                continue
-            spent = sum(ledger_total(r.get("spend")) for r in rows)
-            why = total_cap_refusal(spent, exp.budget.hard_usd, total_cap)
-            if why:
-                capped = {"reason": why, "total_usd": total_cap, "spent": spent,
-                          "skipped": [rid]}
-                _say(f"total cap: not starting {rid}: {why}", as_json)
-                rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"})
-                continue
+                data = summary(found)
+                _warn_health(data)
+                return {**data, "outcome": "skipped"}
             if state == "different" and not rerun:
                 raise FileExistsError(
-                    f"{out / rid} holds a run of a different configuration (spec_hash "
-                    "differs); pass --rerun or another --out")
+                    f"{out / rid} holds a run of a different configuration (existing spec_hash "
+                    f"{found.meta.get('spec_hash') if found else '?'}, this spec's "
+                    f"{exp.spec_hash(sd, max_rounds)}); pass --rerun (writes {rid}__r<N>) or "
+                    "another --out")
+            with state_lock:  # the admission and the capped flag move together
+                if capped_box:
+                    capped_box["skipped"].append(rid)
+                    return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
+                why, spent = exp.admit(sd, out)
+                if why:
+                    capped_box.update(reason=why, total_usd=total_cap, spent=spent,
+                                      skipped=[rid])
+                    _say(f"total cap: not starting {rid}: {why}", as_json)
+                    return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
+                admitted = total_cap > 0
             target = Experiment.rerun_dir(out, rid) if state != "new" else None
             if not single:
                 _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
             r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
             data = summary(r)
             _warn_health(data)
-            rows.append({**data, "outcome": "errored" if health_warning(data) else "ran"})
+            return {**data, "outcome": "errored" if health_warning(data) else "ran"}
         except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
+            if admitted:  # stop reserving its headroom
+                led.record(rid, f"{rid}@admit", 0.0, "failed")
             msg = f"{type(e).__name__}: {e}"
             print(f"error: {rid}: {msg}", file=sys.stderr)
-            rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "failed",
-                         "error": msg, "spec_error": isinstance(e, SpecError)})
+            return {"run_id": rid, "arm": a, "seed": sd, "outcome": "failed",
+                    "error": msg, "spec_error": isinstance(e, SpecError)}
+
+    if parallel <= 1:
+        rows = [attempt(a, sd, exps[a]) for a, sd in plan]
+    else:
+        def task(item: tuple[str, int]) -> dict[str, Any]:
+            a, sd = item
+            try:
+                exp = _build(spec, a)  # own providers and plugin prototypes per thread
+            except Exception as e:  # noqa: BLE001
+                return {"run_id": exps[a].run_id(sd), "arm": a, "seed": sd, "outcome": "failed",
+                        "error": f"{type(e).__name__}: {e}", "spec_error": isinstance(e, SpecError)}
+            return attempt(a, sd, exp)
+
+        with ThreadPoolExecutor(max_workers=parallel, thread_name_prefix="swarmlab-run") as pool:
+            rows = list(pool.map(task, plan))  # plan order
+    capped: dict[str, Any] | None = None
+    if capped_box:
+        order = {exps[a].run_id(sd): i for i, (a, sd) in enumerate(plan)}
+        capped = {**capped_box, "skipped": sorted(capped_box["skipped"], key=order.get)}
     failed = [r for r in rows if r["outcome"] == "failed"]
     code = 0 if not failed else (2 if all(r["spec_error"] for r in failed) else 1)
     if any(r["outcome"] == "errored" for r in rows):
