@@ -79,7 +79,9 @@ Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
 `run.json` (rewritten atomically after every commit): run_id, experiment, arm, spec, spec_hash,
 git_commit, dirty, parent_run, fork_round, restored (what a fork restored), status
 ("running" | "ended"), end_reason, last_round (last committed round), score (`world.score()`
-after the last commit).
+after the last commit), metrics_rev (the metric-semantics revision the run logs with,
+`swarmlab.metrics.base.METRICS_REV` for new runs; absent in older run.json files, which are
+revision 1: replay, resume and report then fold with `Metric.use_rev(1)`).
 
 Recovery (`resume(budget=None)`): if the log has `run_ended` with a reason other than
 `soft_budget`/`hard_ceiling`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
@@ -187,7 +189,7 @@ from .interventions import (
     replay_world_op,
 )
 from .medium.registry import Registry, commit_world
-from .metrics.base import Metric
+from .metrics.base import METRICS_REV, Metric
 from .metrics.base import get as get_metric
 from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
 from .providers.base import ChatMessage, ChatRequest, ProviderError
@@ -313,6 +315,8 @@ class Runner:
             self.budget = Budget.model_validate(meta.get("budget") or meta["spec"]["budget"])
         else:
             self.budget = experiment.budget
+        # semantics revision of the metrics this run logs (swarmlab/metrics/base.py)
+        self.metrics_rev = int((meta or {}).get("metrics_rev", 1)) if meta is not None else METRICS_REV
         self._aborted_score: Any = None
         self.status = "running"
         self.end_reason: str | None = None
@@ -356,6 +360,7 @@ class Runner:
             "budget": self.budget.model_dump(mode="json"),
             "ledger": self.ledger.to_dict(),
             "ledger_seq": self.log.next_seq - 1 if getattr(self, "log", None) is not None else -1,
+            "metrics_rev": self.metrics_rev,
         }
         text = json.dumps(data, indent=2, sort_keys=True) + "\n"
         atomic_write_bytes(self.dir / "run.json", text.encode())
@@ -376,6 +381,8 @@ class Runner:
         self.board.commit_mode = self.options.commit
         self.scheduler = SeededShuffle()
         self.metrics: list[Metric] = [build_metric(m) for m in exp.metrics]
+        for m in self.metrics:
+            m.use_rev(self.metrics_rev)
         names = [m.name for m in self.metrics]
         if len(set(names)) != len(names):
             raise ValueError(f"metric names must be unique, got {names}")

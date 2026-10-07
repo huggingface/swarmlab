@@ -2,7 +2,8 @@
 
 Generalised from `tools/m2_report.py` (the M2 phase-1 Flag Game report); on the archived M2 runs
 with `--title "M2 phase-1 Flag Game report"` it reproduces
-`docs/notes/m2-phase1-report-2026-10-06.md` byte for byte. Read-only over the runs dir.
+`docs/notes/m2-phase1-report-2026-10-06.md` byte for byte apart from the rows and lines added
+since (`post_rate` trajectory rows, "probes skipped" lines, the tool-health `max_tokens` column). Read-only over the runs dir.
 
 Decisions:
 
@@ -12,8 +13,9 @@ Decisions:
   arm, else `?`).
 - Per-round columns span rounds 1..max(last committed round) over the runs (10 for M2), and the
   summary's read rate averages rounds 2..that maximum.
-- Sections: summary, trajectories (belief and read-rate metrics; `n/a` where a metric is not
-  logged), reading behaviour and tool-protocol health for every world; "where the swarm went"
+- Sections: summary, trajectories (belief and read-rate metrics, `n/a` where a metric is not
+  logged; plus `post_rate`, the share of the round's turns that posted, computed from the
+  events so it is there whether or not `comm.post_rate` was logged), reading behaviour and tool-protocol health for every world; "where the swarm went"
   and "probe vs world belief" only when some run has committed `guess` actions (FlagGame-style
   worlds; truth and rival come from rebuilding the world, since `verify()` is not persisted).
 - The spend/run column is the ledger (discarded rounds included). When some summarised run
@@ -74,7 +76,7 @@ def scan(run):
     d = {"guess_by_round": {}, "turns": Counter(), "reads": Counter(), "read_deliv": Counter(),
          "read_turns": Counter(), "agents_read": set(), "agents": set(), "yields": Counter(),
          "finish": Counter(), "err": 0, "cached": 0, "nresp": 0, "posts": Counter(), "t0": None,
-         "t1": None, "turn_n": Counter(), "length": 0}
+         "t1": None, "turn_n": Counter(), "length": 0, "posters": defaultdict(set)}
     cur = {}
     last_round = 0
     for ev in run.events_all:
@@ -97,6 +99,7 @@ def scan(run):
             d["agents_read"].add(a)
         elif t == "post":
             d["posts"][r] += 1
+            d["posters"][r].add(a)
         elif t == "inference_response":
             d["nresp"] += 1
             d["cached"] += bool(getattr(ev, "cached", False))
@@ -225,6 +228,8 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
                        ("entropy", "belief.entropy"), ("read_rate", "comm.read_rate")]:
             ss = [mseries(r, n) for r, _ in rs]
             rows.append([lab] + [f(mean([s.get(k) for s in ss]), 2) for k in R])
+        rows.append(["post_rate"] + [f(mean([len(d["posters"][k]) / d["turns"][k]
+                                              for _, d in rs if d["turns"][k]]), 2) for k in R])
         L += [f"**{arm}**", ""] + table(["metric"] + [f"r{k}" for k in R], rows) + [""]
 
     probe_ctx = {}

@@ -1,4 +1,15 @@
-"""Metric base class and registry (docs/INTERFACE.md §14)."""
+"""Metric base class and registry (docs/INTERFACE.md §14).
+
+Additions after M1a:
+
+- `description` (class attribute): one line shown by `swarmlab metrics` (`catalog()`).
+- `METRICS_REV` and `Metric.use_rev(rev)`: the revision of metric semantics a run was recorded
+  with. New runs record `metrics_rev: METRICS_REV` in `run.json`; a run without it is revision 1
+  and the runner calls `use_rev(1)` on every metric when it replays, resumes or reports on such a
+  run, so a metric whose meaning changed (rev 2: `comm.posts_per_round` per agent instead of
+  swarm-wide, probe-sourced belief metrics leaving skipped agents out of the denominator) folds
+  old logs the way they were written and `replay` still matches. The default is a no-op.
+"""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -7,9 +18,15 @@ from typing import Any
 
 from ..base import Persistable, Plugin
 
+METRICS_REV = 2
+
 
 class Metric(Persistable, Plugin):
     name: str = "metric"
+    description: str = ""
+
+    def use_rev(self, rev: int) -> None:
+        """Fold with the semantics of metrics revision `rev` (see the module doc). No-op default."""
 
     def update(self, event: Any) -> None:
         raise NotImplementedError
@@ -45,6 +62,18 @@ class Metric(Persistable, Plugin):
 
         _FnMetric.__qualname__ = f"FnMetric[{name}]"
         return _FnMetric()
+
+
+def catalog() -> list[tuple[str, str]]:
+    """(entry-point name, description) of every registered metric, sorted by name."""
+    out = []
+    for ep in entry_points(group="swarmlab.metrics"):
+        try:
+            desc = getattr(ep.load(), "description", "") or ""
+        except Exception as e:  # noqa: BLE001 - a broken plugin is listed, not fatal
+            desc = f"(cannot load: {type(e).__name__}: {e})"
+        out.append((ep.name, desc))
+    return sorted(out)
 
 
 def get(name: str, **params: Any) -> Metric:

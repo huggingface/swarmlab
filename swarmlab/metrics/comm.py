@@ -1,10 +1,17 @@
 """Communication metrics (docs/INTERFACE.md §14, DESIGN.md §10).
 
-`read_rate` and `posts_per_round` are per-round folds: counters reset on `round_started`.
+`read_rate`, `post_rate`, `posts_per_round` and `posts_total` are per-round folds: counters
+reset on `round_started`.
 
 - `comm.read_rate`: share of this round's turns that issued at least one `read` (a `read_board`
   call, even one returning nothing). None when there were no turns.
-- `comm.posts_per_round`: number of `post` events committed this round, as a float.
+- `comm.post_rate`: share of this round's turns whose agent committed at least one `post`. None
+  when there were no turns.
+- `comm.posts_per_round`: `post` events committed this round per turn (i.e. per agent that had
+  a turn), so it compares across swarm sizes. None when there were no turns. Before metrics
+  revision 2 (`swarmlab.metrics.base.METRICS_REV`) it was the swarm-wide count; runs recorded
+  then are replayed with that meaning (`use_rev(1)`).
+- `comm.posts_total`: number of `post` events committed this round, swarm-wide, as a float.
 - `comm.hops`: propagation depth, cumulative over the run (review A6). A post's hop count is
   1 + the maximum hop count of the posts its author had read *before making it* (1 if none):
   a read counts only if it happened earlier than the post call, i.e. in an earlier round or
@@ -19,7 +26,7 @@
   far (None before the first post). Denominator: the number of posts read at least once so far
   (not turns: the value is cumulative, so a per-round turn count would be meaningless).
 
-The other two metrics' denominator is the number of turns (`turn_started` events) in the round.
+The per-round metrics' denominator is the number of turns (`turn_started` events) in the round.
 """
 from __future__ import annotations
 
@@ -51,6 +58,7 @@ class _PerRound(Metric):
 class ReadRate(_PerRound):
     entry_point: ClassVar[str | None] = "comm.read_rate"
     name = "comm.read_rate"
+    description = "share of the round's turns that read the board at least once"
 
     def __init__(self) -> None:
         super().__init__()
@@ -69,9 +77,32 @@ class ReadRate(_PerRound):
         return len(self.readers) / self.turns, self.turns
 
 
-class PostsPerRound(_PerRound):
-    entry_point: ClassVar[str | None] = "comm.posts_per_round"
-    name = "comm.posts_per_round"
+class PostRate(_PerRound):
+    entry_point: ClassVar[str | None] = "comm.post_rate"
+    name = "comm.post_rate"
+    description = "share of the round's turns that posted at least once"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.posters: list[str] = []
+
+    def _reset_round(self) -> None:
+        self.posters = []
+
+    def _update(self, t: str | None, event: Any) -> None:
+        if t == "post" and event.agent not in self.posters:
+            self.posters.append(event.agent)
+
+    def value(self) -> tuple[float | None, int]:
+        if self.turns == 0:
+            return None, 0
+        return len(self.posters) / self.turns, self.turns
+
+
+class PostsTotal(_PerRound):
+    entry_point: ClassVar[str | None] = "comm.posts_total"
+    name = "comm.posts_total"
+    description = "posts committed in the round, swarm-wide (grows with the swarm size)"
 
     def __init__(self) -> None:
         super().__init__()
@@ -88,9 +119,30 @@ class PostsPerRound(_PerRound):
         return float(self.posts), self.turns
 
 
+class PostsPerRound(PostsTotal):
+    entry_point: ClassVar[str | None] = "comm.posts_per_round"
+    name = "comm.posts_per_round"
+    description = "posts committed in the round per agent that had a turn"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._swarm_wide = False
+
+    def use_rev(self, rev: int) -> None:
+        self._swarm_wide = rev < 2  # revision 1 logged the swarm-wide count
+
+    def value(self) -> tuple[float | None, int]:
+        if self._swarm_wide:
+            return float(self.posts), self.turns
+        if self.turns == 0:
+            return None, 0
+        return self.posts / self.turns, self.turns
+
+
 class Hops(_PerRound):
     entry_point: ClassVar[str | None] = "comm.hops"
     name = "comm.hops"
+    description = "deepest relay chain so far: hops a post is from an original post (cumulative)"
 
     def __init__(self) -> None:
         super().__init__()

@@ -63,6 +63,8 @@ Decisions where the contract is silent:
 - `validate` prints a per-arm table (agents, models with counts, soft/hard/measurement caps,
   rounds, probes, metrics) and the total cap; `--json` has the same per arm (`models`,
   `budget`, `probes`, ...) plus `total_usd`.
+- `metrics` lists every registered metric (`swarmlab.metrics` entry points) with its class's
+  `description`.
 - `spec-reference` prints README.md's "Spec reference" section (every YAML key, its shape and
   default; swarmlab/spec_reference.py); `--readme README.md` rewrites that section in place.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
@@ -1061,6 +1063,24 @@ def prompts_cmd(
         if as_json:
             return {"ok": True, "arm": exp.arm, "seed": s, "groups": rows}
         return {"text": prompts_text(rows, exp.arm, s)}
+
+    _execute(go, as_json)
+
+
+@app.command("metrics")
+def metrics_cmd(as_json: JsonOpt = False) -> None:
+    """List every registered metric (entry points) with a one-line description."""
+    from .metrics.base import catalog
+
+    def go() -> dict[str, Any]:
+        rows = catalog()
+        if as_json:
+            return {"ok": True, "metrics": [{"name": n, "description": d} for n, d in rows]}
+        width = max(len(n) for n, _ in rows)
+        lines = [f"{n:<{width}}  {d}" for n, d in rows]
+        lines.append('belief.* metrics read world guesses by default; add params {source: '
+                     '"probe:belief"} to read the belief probe (metric name gets "@probe:belief").')
+        return {"text": "\n".join(lines)}
 
     _execute(go, as_json)
 

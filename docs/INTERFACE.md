@@ -282,7 +282,7 @@ class Metric(Persistable, Plugin):
     def set_truth(self, truth: dict) -> None: ...
 registry: get(name) -> Metric via entry points; Metric.from_fn(name, fn) for one-liners
 ```
-M1a metrics: `belief.accuracy` (needs truth), `belief.consensus`, `belief.polarization(threshold=0.2)`, `belief.entropy`, `comm.read_rate`, `comm.posts_per_round`, `comm.hops`. Denominators: **all live agents** for belief metrics, with agents that have no committed guess counted as an explicit `none` category (so `belief.accuracy` equals the world's `score()["accuracy"]`, and agents that never guess lower consensus rather than raise it); turns for comm metrics.
+M1a metrics: `belief.accuracy` (needs truth), `belief.consensus`, `belief.polarization(threshold=0.2)`, `belief.entropy`, `comm.read_rate`, `comm.posts_per_round`, `comm.hops` (later additions: `comm.post_rate`, `comm.posts_total`; since metrics revision 2 `comm.posts_per_round` is per agent, see swarmlab/metrics/base.py). Denominators: **all live agents** for belief metrics, with agents that have no committed guess counted as an explicit `none` category (so `belief.accuracy` equals the world's `score()["accuracy"]`, and agents that never guess lower consensus rather than raise it); turns for comm metrics.
 
 ## 15. Run directory
 

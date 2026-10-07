@@ -32,7 +32,13 @@ def test_report_reproduces_the_m2_report(tmp_path):
     res = cli.invoke(app, ["report", str(M2_RUNS), "--out", str(out),
                            "--title", "M2 phase-1 Flag Game report"])
     assert res.exit_code == 0, res.output
-    assert out.read_text() == M2_NOTE.read_text()
+    assert since_m2(out.read_text()) == M2_NOTE.read_text()
+
+
+def since_m2(text: str) -> str:
+    """The report without the rows added after the M2 note was written."""
+    return "".join(line for line in text.splitlines(keepends=True)
+                   if not line.startswith("| post_rate |"))
 
 
 @pytest.fixture(scope="module")
@@ -56,6 +62,7 @@ def test_report_sections_and_round_span(runs_dir):
     assert "| broadcast | 2 |" in text and "| gossip | 1 |" in text
     assert "read_rate r2-6" in text and "| r6 |" in text and "| r7 |" not in text
     assert "flaggame-m1a__broadcast__s2" in text
+    assert "| post_rate |" in text
 
 
 def test_report_cli_json(runs_dir):

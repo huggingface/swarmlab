@@ -83,6 +83,7 @@ class _GridFold(Metric):
 class Coverage(_GridFold):
     entry_point: ClassVar[str | None] = "coloring.coverage"
     name = "coloring.coverage"
+    description = "share of grid cells matching the target"
 
     def value(self) -> tuple[float | None, int]:
         cells = self._cells()
@@ -92,6 +93,7 @@ class Coverage(_GridFold):
 class DuplicatePaints(_GridFold):
     entry_point: ClassVar[str | None] = "coloring.duplicate_paints"
     name = "coloring.duplicate_paints"
+    description = "cumulative paints of a cell that already had the right colour"
 
     def value(self) -> tuple[float | None, int]:
         return float(self.duplicates), self.paints
@@ -100,6 +102,7 @@ class DuplicatePaints(_GridFold):
 class WrongPaints(_GridFold):
     entry_point: ClassVar[str | None] = "coloring.wrong_paints"
     name = "coloring.wrong_paints"
+    description = "cumulative paints with a colour the target does not have there"
 
     def value(self) -> tuple[float | None, int]:
         return float(self.wrong), self.paints
@@ -108,6 +111,7 @@ class WrongPaints(_GridFold):
 class ParallelEfficiency(_GridFold):
     entry_point: ClassVar[str | None] = "coloring.parallel_efficiency"
     name = "coloring.parallel_efficiency"
+    description = "correct cells per agent-round relative to the single-agent ideal"
 
     def value(self) -> tuple[float | None, int]:
         if not self.agent_rounds:
@@ -119,6 +123,7 @@ class ParallelEfficiency(_GridFold):
 class ClaimViolations(Metric):
     entry_point: ClassVar[str | None] = "claims.violations"
     name = "claims.violations"
+    description = "cumulative world actions on a key another live agent had claimed"
 
     def __init__(self) -> None:
         self.violations = 0
@@ -136,6 +141,7 @@ class ClaimViolations(Metric):
 class ClaimsHeld(Metric):
     entry_point: ClassVar[str | None] = "claims.held"
     name = "claims.held"
+    description = "live registry claims after the round's commit"
 
     def __init__(self) -> None:
         self.claims: dict[str, int] = {}  # key -> expires_round of its live claim

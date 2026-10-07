@@ -105,6 +105,7 @@ class _BeliefMetric(Metric):
 class Accuracy(_BeliefMetric):
     entry_point: ClassVar[str | None] = "belief.accuracy"
     name = "belief.accuracy"
+    description = "share of live agents whose belief is the truth (world guesses or probes)"
 
     def __init__(self, source: str = "world") -> None:
         self._init(source)
@@ -123,6 +124,7 @@ class Accuracy(_BeliefMetric):
 class Consensus(_BeliefMetric):
     entry_point: ClassVar[str | None] = "belief.consensus"
     name = "belief.consensus"
+    description = "largest share of live agents holding one candidate (world guesses or probes)"
 
     def _value(self, counts: Counter[str], none: int, n: int) -> float:
         return max(counts.values(), default=0) / n
@@ -131,6 +133,7 @@ class Consensus(_BeliefMetric):
 class Polarization(_BeliefMetric):
     entry_point: ClassVar[str | None] = "belief.polarization"
     name = "belief.polarization"
+    description = "number of candidates held by at least `threshold` (0.2) of live agents"
 
     def __init__(self, threshold: float = 0.2, source: str = "world") -> None:
         self._init(source)
@@ -143,6 +146,7 @@ class Polarization(_BeliefMetric):
 class Entropy(_BeliefMetric):
     entry_point: ClassVar[str | None] = "belief.entropy"
     name = "belief.entropy"
+    description = "Shannon entropy (bits) of the live agents' beliefs, 'none' included"
 
     def _value(self, counts: Counter[str], none: int, n: int) -> float:
         parts = [*counts.values(), none]

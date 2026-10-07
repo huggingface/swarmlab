@@ -33,7 +33,7 @@ demo__gossip__s1     ran      max_rounds  accuracy=0.875, n_guessed=8, truth=G  
 - **Providers** (model id prefix): `anthropic`, `hf` (HF router), `openai`, `vllm` (self-hosted, normally via `job run`), `fake` (`fake:reader`, `fake:painter`: deterministic, no network).
 - **Probes**: `belief` (each agent's own model answers "which candidate?" every round, out of band, billed to `measurement_usd`).
 - **Interventions** (`interventions:` in a spec, triggered by `at_round`, `every` or a metric `when`): `inject_post`, `delay_delivery`, `mute`, `kill_agents`, `patch_private`, `reconfigure`. **Paired runs** from round 0: `Experiment.pair(...)` with unchanged-pair controls.
-- **Metrics**: `belief.consensus`, `belief.accuracy`, `belief.polarization`, `belief.entropy` (from world guesses, or from probes with `params: {source: "probe:belief"}`); `comm.read_rate`, `comm.posts_per_round`, `comm.hops`; `coloring.coverage`, `coloring.duplicate_paints`, `coloring.wrong_paints`, `coloring.parallel_efficiency`; `claims.violations`, `claims.held`.
+- **Metrics**: `belief.consensus`, `belief.accuracy`, `belief.polarization`, `belief.entropy` (from world guesses, or from probes with `params: {source: "probe:belief"}`); `comm.read_rate`, `comm.post_rate` (share of turns with a post), `comm.posts_per_round` (posts per agent per round), `comm.posts_total` (swarm-wide posts per round), `comm.hops`; `coloring.coverage`, `coloring.duplicate_paints`, `coloring.wrong_paints`, `coloring.parallel_efficiency`; `claims.violations`, `claims.held`. `swarmlab metrics` lists them all with one-line descriptions.
 - **Roles** (`roles:` plus `role:` per participant group): built-ins `worker`, `coordinator`, `reviewer`, `skeptic`, `scribe`; each can restrict tools, channels, registry access and world actions, add prompt text, or override the model.
 - **Run control**: replay (checks metrics and score from the log), resume, fork at a round (optionally with an edited spec), budgets (soft, hard, measurement, experiment total), per-call timeout and retry.
 - **Export and publish**: Parquet tables, pi-format sessions and raw logs; private Hub dataset per experiment; static `view.html`; `fetch-published` restores a run.
@@ -223,7 +223,7 @@ Note that the default prompt already lists every tool the world and board offer 
 
 ```
 swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S] [--refresh]
-swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC    swarmlab spec-reference
+swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC    swarmlab spec-reference    swarmlab metrics
 swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [--rerun]
 swarmlab estimate SPEC [--arm A] [--seed N] [--max-rounds R] [--prompt-growth G] [--calls-per-turn C]
 swarmlab replay RUN_DIR
@@ -270,7 +270,7 @@ Run ids are `<experiment>__s<seed>` from Python, `<experiment>__<arm>__s<seed>` 
 
 ## Known issues
 
-`docs/notes/known-issues.md` lists open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `comm.posts_per_round` being swarm-wide, `validate` rejecting `vllm:` specs, role and paired-run gaps, and no grid panel in the viewer.
+`docs/notes/known-issues.md` lists open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `validate` rejecting `vllm:` specs, role and paired-run gaps, and no grid panel in the viewer.
 
 ## Docs
 

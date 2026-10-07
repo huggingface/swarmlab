@@ -21,10 +21,6 @@ Last checked against main on 2026-10-07. Items fixed since the first version (pe
 - `swarmlab validate` rejects specs that use `vllm:` models ("provider 'vllm' needs a base_url") because the base_url is injected only by `swarmlab job run`. Use `job run` (without `--launch`) as the validator for them, or give `providers: {vllm: {type: openai_compat, params: {name: vllm, base_url: ...}}}`.
 - The job wall-time estimate (30 + 2N s per round) is 3-4x pessimistic for self-hosted vLLM (measured: N=64 about 40 s/round). Pass `--per-round` or `--timeout` from a measured run.
 
-## Metrics
-
-- `comm.posts_per_round` is swarm-wide (all posts committed in the round), not per agent, despite the name; see `docs/notes/m3-scale-2026-10-07.md`. Divide by the agent count or rename the metric before comparing across N.
-
 ## Roles, paired runs, registry, viewer
 
 - Roles: a role's `model` override is ignored by `Experiment.estimate`; a fork keeps the parent's participant settings (role overrides in an edited spec do not re-bind them); `reconfigure` interventions do not change roles. `Role` and `Tree` are not re-exported at top level (import from `swarmlab.roles` and `swarmlab.medium.topology`).

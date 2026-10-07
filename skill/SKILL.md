@@ -65,6 +65,8 @@ next item.
    `swarmlab spec-reference` lists every YAML key and its shape (e.g. `medium: {topology:
    {type: gossip, params: {k: 1}}}`, per-arm `budget:`); a shape error names the key and the
    shape expected there.
+   `swarmlab metrics` lists every metric name with what it measures (e.g. `comm.post_rate`,
+   `comm.posts_per_round` per agent).
    Model ids come from
    `swarmlab models --tools --search QWEN` (prices are looked up, never typed). Every arm that
    calls a paid model has `budget: {hard_usd: X}`; `hard_usd: 0` means no ceiling.

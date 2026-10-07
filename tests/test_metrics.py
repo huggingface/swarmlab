@@ -14,7 +14,7 @@ from swarmlab.events import (
 )
 from swarmlab.metrics.base import get
 from swarmlab.metrics.belief import Accuracy, Consensus, Entropy, Polarization
-from swarmlab.metrics.comm import Hops, PostsPerRound, ReadRate
+from swarmlab.metrics.comm import Hops, PostRate, PostsPerRound, PostsTotal, ReadRate
 
 
 def guess(agent, cand, accepted=True, round=1):
@@ -33,6 +33,7 @@ def test_registry_resolves_entry_points():
     for name, cls in [("belief.accuracy", Accuracy), ("belief.consensus", Consensus),
                       ("belief.polarization", Polarization), ("belief.entropy", Entropy),
                       ("comm.read_rate", ReadRate), ("comm.posts_per_round", PostsPerRound),
+                      ("comm.post_rate", PostRate), ("comm.posts_total", PostsTotal),
                       ("comm.hops", Hops)]:
         m = get(name)
         assert isinstance(m, cls) and m.name == name and m.spec()["type"] == name
@@ -124,11 +125,38 @@ def test_read_rate_and_posts_per_round_are_per_round():
           post(1, "a001", "p1")]
     rr, ppr = ReadRate(), PostsPerRound()
     assert feed(rr, r1) == (0.5, 2)
-    assert feed(ppr, r1) == (1.0, 2)
+    assert feed(ppr, r1) == (0.5, 2)  # one post over two turns: per agent, not swarm-wide
     r2 = [rs(2), ts(2, "a000"), ts(2, "a001")]
     assert feed(rr, r2) == (0.0, 2)
     assert feed(ppr, r2) == (0.0, 2)
     assert ReadRate().value() == (None, 0)
+    assert PostsPerRound().value() == (None, 0)
+
+
+def test_post_rate_and_posts_total():
+    r1 = [rs(1), ts(1, "a000"), ts(1, "a001"), ts(1, "a002"), ts(1, "a003"),
+          post(1, "a001", "p1"), post(1, "a001", "p2"), post(1, "a002", "p3")]
+    pr, tot, ppr = PostRate(), PostsTotal(), PostsPerRound()
+    assert feed(pr, r1) == (0.5, 4)     # two of four turns posted
+    assert feed(tot, r1) == (3.0, 4)    # three posts swarm-wide
+    assert feed(ppr, r1) == (0.75, 4)   # three posts over four agents
+    assert feed(pr, [rs(2), ts(2, "a000")]) == (0.0, 1)
+    assert PostRate().value() == (None, 0)
+
+
+def test_posts_per_round_revision_1_is_swarm_wide():
+    ppr = PostsPerRound()
+    ppr.use_rev(1)
+    assert feed(ppr, [rs(1), ts(1, "a000"), ts(1, "a001"), post(1, "a001", "p1"),
+                      post(1, "a000", "p2")]) == (2.0, 2)
+
+
+def test_every_registered_metric_has_a_description():
+    from swarmlab.metrics.base import catalog
+
+    rows = dict(catalog())
+    assert {"comm.post_rate", "comm.posts_total", "comm.posts_per_round"} <= set(rows)
+    assert all(rows.values()), [n for n, d in rows.items() if not d]
 
 
 def test_hops_chain():
@@ -226,3 +254,39 @@ def test_hops_read_then_post_round_end(tmp_path):
 
     got = _hops(tmp_path, ReadThenPost(), "round_end", "rtp")
     assert [v for v, _ in got] == [1.0, 2.0, 3.0, 4.0, 5.0]
+
+
+def test_runs_recorded_before_revision_2_replay_with_the_old_meaning(tmp_path):
+    """run.json without `metrics_rev` is revision 1: comm.posts_per_round folds swarm-wide."""
+    import json
+
+    from swarmlab import Board, Experiment
+    from swarmlab.experiment import Run
+    from swarmlab.metrics.base import METRICS_REV
+    from swarmlab.runner import ReplayMismatch
+    from swarmlab.world.flaggame import FlagGame
+
+    from .helpers import Chatter
+
+    exp = Experiment(name="rev", world=FlagGame(), participants=[Chatter()] * 3,
+                     medium=Board(topology="broadcast"), metrics=["comm.posts_per_round"])
+    run = exp.run(seed=1, max_rounds=2, out=tmp_path)
+    assert run.meta["metrics_rev"] == METRICS_REV
+    assert [v for _, v, _ in run.metrics["comm.posts_per_round"]] == [1.0, 1.0]
+    Run.load(run.dir)
+    # rewrite it as an old run: swarm-wide values, no metrics_rev
+    log = run.dir / "events.jsonl"
+    lines = []
+    for line in log.read_text().splitlines():
+        ev = json.loads(line)
+        if ev["type"] == "metric" and ev["name"] == "comm.posts_per_round":
+            ev["value"] = ev["value"] * ev["denominator"]
+        lines.append(json.dumps(ev, separators=(",", ":")))
+    log.write_text("\n".join(lines) + "\n")
+    with pytest.raises(ReplayMismatch):
+        Run.load(run.dir)
+    meta = json.loads((run.dir / "run.json").read_text())
+    meta.pop("metrics_rev")
+    (run.dir / "run.json").write_text(json.dumps(meta))
+    old = Run.load(run.dir)
+    assert [v for _, v, _ in old.metrics["comm.posts_per_round"]] == [3.0, 3.0]
