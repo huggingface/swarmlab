@@ -95,6 +95,7 @@ from .providers import catalog_priced, ensure_pricing
 from .providers import resolve as resolve_provider
 from .providers.base import Provider, split_model
 from .registry import build
+from .roles import Role, assign, role_name, roles_from_spec, spec_roles
 from .runner import Runner
 from .spec import (
     Budget,
@@ -126,6 +127,7 @@ class Experiment(BaseModel):
     arm: str | None = None
     options: dict = {}
     providers: dict[str, Provider] | None = None
+    roles: dict[str, Role] = {}  # M3c: swarmlab/roles.py (assign agents with roles.assign)
     _resolved: dict[str, Provider] = PrivateAttr(default_factory=dict)
 
     def __init__(self, **data: Any) -> None:
@@ -139,6 +141,7 @@ class Experiment(BaseModel):
         # after validation, so UnknownModelPricing propagates as itself (not a ValidationError)
         models = [participant_model(p) for p in self.participants]
         models += [p.coder_model() for p in self.probes]
+        models += [r.model for r in self.roles.values()]  # M3c: role model overrides
         for model in models:
             if model is not None:
                 provider, mid = self.provider_for(model)
@@ -340,6 +343,7 @@ class Experiment(BaseModel):
         metrics = [
             PluginSpec(type=m) if isinstance(m, str) else PluginSpec(**m.spec()) for m in self.metrics
         ]
+        roles, participant_roles = spec_roles(self.roles, [role_name(p) for p in self.participants])
         return RunSpec(
             experiment=self.name,
             arm=self.arm,
@@ -352,6 +356,8 @@ class Experiment(BaseModel):
             providers={k: PluginSpec(**p.spec()) for k, p in (self.providers or {}).items()},
             probes=[PluginSpec(**p.spec()) for p in self.probes],
             interventions=[PluginSpec(**i.spec()) for i in self.interventions],
+            roles=roles,
+            participant_roles=participant_roles,
         )
 
     @classmethod
@@ -361,7 +367,10 @@ class Experiment(BaseModel):
             name=spec.experiment,
             arm=spec.arm,
             world=build(spec.world, "swarmlab.worlds"),
-            participants=[build(p, "swarmlab.participants") for p in spec.participants],
+            participants=[assign(build(p, "swarmlab.participants"), r) for p, r in
+                          zip(spec.participants, [*spec.participant_roles, *[None] * len(spec.participants)],
+                              strict=False)],
+            roles=roles_from_spec(spec.roles),
             medium=Board(**medium),
             metrics=[build(m, "swarmlab.metrics") for m in spec.metrics],
             budget=spec.budget,

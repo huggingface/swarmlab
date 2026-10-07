@@ -30,6 +30,7 @@ Decisions where the contract is silent:
 - M3b: new logical types `registry` (`RegistryEvent`, one per committed registry write) and
   `claim` (`ClaimEvent`, one per world action on a claimable resource when the registry is on);
   see swarmlab/medium/registry.py.
+- M3c: `turn_started` gained `role` (the agent's role name, None without one).
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
 """
@@ -76,6 +77,7 @@ class RoundStartedEvent(Event):
 class TurnStartedEvent(Event):
     type: Literal["turn_started"] = "turn_started"
     private: dict = {}  # the observation's evaluator-only data, stripped from the agent's view
+    role: str | None = None  # M3c: the agent's role name (None without a role)
 
 
 class ToolCalledEvent(Event):

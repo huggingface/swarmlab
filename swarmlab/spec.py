@@ -41,6 +41,14 @@ Decisions where the contract is silent:
   `MediumSpec.claim_policy` (default `advisory`; `enforced`; bare strings allowed) links it to
   the world (swarmlab/medium/registry.py). `MediumSpec` serialises without either field while it
   is at its default, so earlier run specs, documents and hashes are unchanged.
+- M3c (docs/INTERFACE-M3c.md, swarmlab/roles.py): `roles: {name: {Role fields}}` on the
+  experiment and/or an arm (field-merged per name, arm over experiment, both over the built-in
+  of that name if there is one) and `participants[].role: <name>`. A group role that is not
+  declared but names a built-in uses the built-in. `RunSpec.roles` (resolved full `Role` dumps)
+  and `RunSpec.participant_roles` (one name or None per agent) are left out of the serialised
+  spec (hence `spec_hash`, `run.json`, `artifacts/spec.yaml`) when empty, and empty `roles` / null `role` are left out of the normalised document, so earlier
+  specs, documents and hashes are unchanged. `runspec_to_doc` writes the resolved roles at the
+  top level and keeps `role` in the participant groups (groups split where the role changes).
 """
 from __future__ import annotations
 
@@ -154,6 +162,18 @@ class RunSpec(BaseModel):
     providers: dict[str, PluginSpec] = {}  # M1b: provider overrides by model prefix
     probes: list[PluginSpec] = []  # M1b: probes run after each commit (swarmlab/probes.py)
     interventions: list[PluginSpec] = []  # M3a: swarmlab/interventions.py
+    roles: dict[str, dict] = {}  # M3c: resolved Role dumps by name (swarmlab/roles.py)
+    participant_roles: list[str | None] = []  # M3c: role name per agent, [] without roles
+
+    @model_serializer(mode="wrap")
+    def _drop_m3c_defaults(self, handler: Any) -> Any:
+        """Serialise without the M3c fields while empty (earlier specs and dumps unchanged)."""
+        data = handler(self)
+        if isinstance(data, dict):
+            for key in ("roles", "participant_roles"):
+                if not data.get(key, True):
+                    data.pop(key)
+        return data
 
 
 def canonical_json(data: Any) -> str:
@@ -178,6 +198,7 @@ class ParticipantGroup(BaseModel):
     type: str
     count: int = Field(default=1, ge=1)
     params: dict = {}
+    role: str | None = None  # M3c
 
 
 class ArmDoc(BaseModel):
@@ -190,6 +211,7 @@ class ArmDoc(BaseModel):
     interventions: list[PluginSpec] = []
     options: dict = {}
     budget: dict = {}
+    roles: dict[str, dict] = {}  # M3c
 
     @field_validator("world", mode="before")
     @classmethod
@@ -216,6 +238,7 @@ class ExperimentDoc(BaseModel):
     providers: dict[str, PluginSpec] = {}
     seeds: list[int] = []
     interventions: list[PluginSpec] = []
+    roles: dict[str, dict] = {}  # M3c
 
     @field_validator("interventions", mode="before")
     @classmethod
@@ -260,7 +283,36 @@ def validate_experiment_doc(doc: dict) -> dict:
     for arm in out["arms"].values():
         if not arm["interventions"]:
             arm.pop("interventions")
+    _check_roles(out)
     return out
+
+
+def _arm_roles(norm: dict, arm: dict) -> tuple[dict[str, dict], list[str | None]]:
+    """M3c: (`RunSpec.roles`, `RunSpec.participant_roles`) for one normalised arm."""
+    from .roles import merge_role_docs, spec_roles
+
+    names = [g.get("role") for g in arm["participants"] for _ in range(g["count"])]
+    declared = merge_role_docs(norm.get("roles", {}), arm.get("roles", {}))
+    try:
+        return spec_roles(declared, names)
+    except (KeyError, ValueError) as e:
+        raise SpecError(f"roles: {e}") from e
+
+
+def _check_roles(out: dict) -> None:
+    """Validate roles and drop the M3c keys while empty (normalised documents stay as before)."""
+    for arm_name, arm in out["arms"].items():
+        try:
+            _arm_roles(out, arm)
+        except SpecError as e:
+            raise SpecError(f"arms.{arm_name}.{e}") from e
+        if not arm["roles"]:
+            arm.pop("roles")
+        for g in arm["participants"]:
+            if g.get("role") is None:
+                g.pop("role", None)
+    if not out["roles"]:
+        out.pop("roles")
 
 
 def experiment_seeds(doc: dict) -> list[int]:
@@ -306,6 +358,7 @@ def arm_to_runspec(doc: dict, arm: str, seed: int, **option_overrides: Any) -> R
         for g in a["participants"]
         for _ in range(g["count"])
     ]
+    roles, participant_roles = _arm_roles(norm, a)
     try:
         return RunSpec(
             experiment=norm["name"],
@@ -319,6 +372,8 @@ def arm_to_runspec(doc: dict, arm: str, seed: int, **option_overrides: Any) -> R
             budget=Budget(**{**norm["budget"], **a["budget"]}),
             options=RunOptions(**options),
             providers={k: PluginSpec(**v) for k, v in norm["providers"].items()},
+            roles=roles,
+            participant_roles=participant_roles,
         )
     except ValidationError as e:
         raise SpecError(str(e)) from e
@@ -331,11 +386,15 @@ def runspec_to_doc(run_spec: RunSpec, arm: str | None = None) -> dict:
     seed is dropped from `options` (it is supplied at run time).
     """
     groups: list[dict] = []
-    for p in run_spec.participants:
-        if groups and groups[-1]["type"] == p.type and groups[-1]["params"] == p.params:
+    roles = list(run_spec.participant_roles) + [None] * (len(run_spec.participants)
+                                                          - len(run_spec.participant_roles))
+    for p, role in zip(run_spec.participants, roles, strict=False):
+        if (groups and groups[-1]["type"] == p.type and groups[-1]["params"] == p.params
+                and groups[-1].get("role") == role):
             groups[-1]["count"] += 1
         else:
-            groups.append({"type": p.type, "count": 1, "params": p.params})
+            groups.append({"type": p.type, "count": 1, "params": p.params,
+                           **({"role": role} if role else {})})
     options = run_spec.options.model_dump(mode="json")
     options.pop("seed")
     arm_name = arm or run_spec.arm or "default"
@@ -345,6 +404,7 @@ def runspec_to_doc(run_spec: RunSpec, arm: str | None = None) -> dict:
             "budget": run_spec.budget.model_dump(mode="json"),
             "options": options,
             "providers": {k: v.model_dump(mode="json") for k, v in run_spec.providers.items()},
+            "roles": {k: {f: v for f, v in r.items() if f != "name"} for k, r in run_spec.roles.items()},
             "arms": {
                 arm_name: {
                     "world": run_spec.world.model_dump(mode="json"),
