@@ -41,7 +41,7 @@ Intervention overlays (M3a, docs/INTERFACE-M3a.md §1), owned by the runner's `O
 
 - `set_delay(agents, rounds, until=None)`: deliveries to these recipients of posts committed in
   rounds <= `until` (forever when None) get `rounds` added to their eligible round, after the
-  policies. Setting replaces an agent's previous delay; `rounds == 0` clears it.
+  policies (counting from `round + 1` in immediate mode too, like `DelayPolicy`). Setting replaces an agent's previous delay; `rounds == 0` clears it.
 - `mute(agents, until)`: posts by these authors committed in rounds <= `until` are returned by
   `commit` (and logged) but fanned out to nobody. A later mute extends, never shortens.
 - `set_policies(policies)` / `set_topology(topology)` replace the configured plugins and record the
@@ -261,7 +261,9 @@ class Board(Persistable, Plugin):
                 if resolved is None:
                     continue
                 eligible, content = resolved
-                eligible += self._delay_for(reader, round)
+                extra = self._delay_for(reader, round)
+                if extra:  # like DelayPolicy, an explicit delay counts from round + 1 in both modes
+                    eligible = max(eligible, round + 1) + extra
                 n, self._delivery_seq = self._next(self._delivery_seq, round)
                 delivery = Delivery(
                     delivery_id=DeliveryId(f"d{round:04d}-{n:05d}"),
