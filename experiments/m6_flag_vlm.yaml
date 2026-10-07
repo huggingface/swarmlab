@@ -1,0 +1,138 @@
+# M6: the three communication protocols of the Flag Game paper
+# (physicsintelligence.org/research/flag-game) on a vision model, image mode. NOT LAUNCHED:
+# needs the user's approval of the estimate first (`swarmlab estimate experiments/m6_flag_vlm.yaml`).
+#
+# Protocols (docs/handoff/WP16.md):
+#   bc-N       broadcast: every post reaches every other agent each round.
+#   gossip-N   pairwise (gossip, k=1): each agent's posts reach one partner per round, redrawn
+#              every round (one speaker, one listener).
+#   manager-N  a blind manager: a000 has no crop (FlagGame blind_agents: 1), may not guess, and
+#              holds the `manager` role; the `star` topology sends every member's post to a000
+#              only and a000's posts to every member. N counts all agents: 1 manager + N-1
+#              members. The manager is left out of accuracy and of every belief.* denominator.
+# N in {4, 16, 128}; same world per seed in every arm (candidates, truth and the members' crops;
+# in manager arms a000's crop is drawn and then withheld, so a001.. see the crops they see in the
+# bc/gossip arms).
+#
+# Every arm turns off `collective_status` (status_tools: [my_status]): it reports swarm-wide guess
+# counts to every agent, a global channel that would bypass the gossip and manager topologies.
+#
+# Memory: window of 3 rounds (the x-memory anchor). For full memory set
+#   x-memory: &memory { memory: full }
+# and raise the budgets (the per-arm hard ceilings below assume window memory).
+#
+# Budgets: soft 0 (no soft stop), hard = 2x the per-run estimate for window memory
+# (N=4 $0.15 -> $0.30, N=16 $0.60 -> $1.20, N=128 $8 -> $16). total_usd 30 caps the experiment:
+# a run starts only if spend so far + its hard_usd <= 30, so if the estimates hold the third
+# N=128 arm is refused (spend ~$18.25 + $16 > $30); run it on its own or raise total_usd to 35.
+#
+# Before launch: `tools/real_smoke.py --arms gemma-image,gemma-manager` (each <= $0.50),
+# `swarmlab preflight experiments/m6_flag_vlm.yaml --arm manager-4`, and the `swarmlab prompts`
+# review of bc-4 and manager-4.
+name: m6-flag-vlm
+seeds: [1]
+options: { max_rounds: 10, commit: round_end }
+budget: { soft_usd: 0, hard_usd: 0.30, measurement_usd: 0, total_usd: 30 }
+
+x-memory: &memory { memory: window, window_rounds: 3 }
+x-llm: &llm
+  model: "hf:google/gemma-4-26B-A4B-it:deepinfra"
+  max_tokens: 1024
+  max_calls: 5
+  <<: *memory
+x-world: &world { type: flaggame, params: { n_candidates: 8, modality: image, status_tools: [my_status] } }
+x-manager-world: &manager_world
+  type: flaggame
+  params: { n_candidates: 8, modality: image, status_tools: [my_status], blind_agents: 1 }
+x-probes: &probes [ { type: belief, params: { every: 1 } } ]
+x-metrics: &metrics
+  - belief.accuracy
+  - belief.consensus
+  - belief.polarization
+  - belief.entropy
+  - { type: belief.accuracy, params: { source: "probe:belief" } }
+  - { type: belief.consensus, params: { source: "probe:belief" } }
+  - { type: belief.polarization, params: { source: "probe:belief" } }
+  - { type: belief.entropy, params: { source: "probe:belief" } }
+  - comm.read_rate
+  - comm.post_rate
+x-bc: &bc { topology: { type: broadcast } }
+x-gossip: &gossip { topology: { type: gossip, params: { k: 1 } } }
+x-star: &star { topology: { type: star, params: { center: a000 } } }
+x-b4: &b4 { hard_usd: 0.30 }
+x-b16: &b16 { hard_usd: 1.20 }
+x-b128: &b128 { hard_usd: 16.0 }
+
+roles:
+  manager: {}   # the built-in (swarmlab/roles.py): may_act false, posts one summary per round
+
+arms:
+  bc-4:
+    world: *world
+    medium: *bc
+    participants: [ { type: llm, count: 4, params: *llm } ]
+    probes: *probes
+    metrics: *metrics
+    budget: *b4
+  gossip-4:
+    world: *world
+    medium: *gossip
+    participants: [ { type: llm, count: 4, params: *llm } ]
+    probes: *probes
+    metrics: *metrics
+    budget: *b4
+  manager-4:
+    world: *manager_world
+    medium: *star
+    participants:
+      - { type: llm, role: manager, params: *llm }
+      - { type: llm, count: 3, params: *llm }
+    probes: *probes
+    metrics: *metrics
+    budget: *b4
+  bc-16:
+    world: *world
+    medium: *bc
+    participants: [ { type: llm, count: 16, params: *llm } ]
+    probes: *probes
+    metrics: *metrics
+    budget: *b16
+  gossip-16:
+    world: *world
+    medium: *gossip
+    participants: [ { type: llm, count: 16, params: *llm } ]
+    probes: *probes
+    metrics: *metrics
+    budget: *b16
+  manager-16:
+    world: *manager_world
+    medium: *star
+    participants:
+      - { type: llm, role: manager, params: *llm }
+      - { type: llm, count: 15, params: *llm }
+    probes: *probes
+    metrics: *metrics
+    budget: *b16
+  bc-128:
+    world: *world
+    medium: *bc
+    participants: [ { type: llm, count: 128, params: *llm } ]
+    probes: *probes
+    metrics: *metrics
+    budget: *b128
+  gossip-128:
+    world: *world
+    medium: *gossip
+    participants: [ { type: llm, count: 128, params: *llm } ]
+    probes: *probes
+    metrics: *metrics
+    budget: *b128
+  manager-128:
+    world: *manager_world
+    medium: *star
+    participants:
+      - { type: llm, role: manager, params: *llm }
+      - { type: llm, count: 127, params: *llm }
+    probes: *probes
+    metrics: *metrics
+    budget: *b128
