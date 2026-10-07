@@ -76,6 +76,10 @@ Decisions where the contract is silent
 - `my_status` for an agent with no state (including before `reset`) returns
   `{"current_guess": None, "guesses_made": 0}` when enabled.
 - `score()["accuracy"]` divides by all agents given to `reset` (0.0 when there are none).
+- `crop_overrides={agent: [y, x]}` (M3a §2, paired runs) replaces those agents' crop positions
+  after the normal reset draws, so every other draw (candidates, truth, other crops) is unchanged.
+  Positions are validated against the flag at construction, agent ids at `reset`. The param is
+  part of `spec()` only when given, so runs without it keep their spec hash.
 - Snapshots carry game state only. Constructor config (the kwargs) is skipped, so a restored or
   forked world keeps the config it was constructed with (e.g. a fork may change `guess_limit`).
 """
@@ -226,8 +230,23 @@ def _names(kind: str, n: int) -> list[str]:
 # ---- world ------------------------------------------------------------------------------------
 _CONFIG = (
     "height", "width", "palette", "n_candidates", "rival_edits", "crop_h", "crop_w",
-    "candidate_names", "status_tools", "guess_limit",
+    "candidate_names", "status_tools", "guess_limit", "crop_overrides",
 )
+
+
+def _check_overrides(overrides: dict[str, list[int]] | None, max_y: int,
+                     max_x: int) -> dict[str, tuple[int, int]]:
+    """Validate `crop_overrides` ({agent: [y, x]}, top-left inside the flag) into tuples."""
+    out: dict[str, tuple[int, int]] = {}
+    for agent, pos in (overrides or {}).items():
+        if (not isinstance(pos, (list, tuple)) or len(pos) != 2
+                or not all(isinstance(v, int) and not isinstance(v, bool) for v in pos)):
+            raise ValueError(f"crop_overrides[{agent!r}] must be [y, x], got {pos!r}")
+        y, x = pos
+        if not (0 <= y <= max_y and 0 <= x <= max_x):
+            raise ValueError(f"crop_overrides[{agent!r}] = {[y, x]} is outside 0..{max_y} x 0..{max_x}")
+        out[str(agent)] = (y, x)
+    return out
 
 
 class FlagGame(World):
@@ -247,6 +266,7 @@ class FlagGame(World):
         candidate_names: str = "letters",
         status_tools: tuple[str, ...] | list[str] = ("my_status", "collective_status"),
         guess_limit: int | None = None,
+        crop_overrides: dict[str, list[int]] | None = None,
     ) -> None:
         if not 3 <= palette <= len(COLOURS):
             raise ValueError(f"palette must be in 3..{len(COLOURS)}")
@@ -268,6 +288,10 @@ class FlagGame(World):
         self.candidate_names = candidate_names
         self.status_tools = tuple(status_tools)
         self.guess_limit = guess_limit
+        self.crop_overrides = _check_overrides(crop_overrides, height - crop_h, width - crop_w)
+        if crop_overrides is None and isinstance(getattr(self, "params", None), dict):
+            # absent from spec() when unset, so runs without overrides keep their spec hash
+            self.params.pop("crop_overrides", None)
         # game state (plain Python data only)
         self.agents: list[str] = []
         self.candidates: dict[str, list[str]] = {}
@@ -309,6 +333,11 @@ class FlagGame(World):
         for agent, s in zip(self.agents, seeds, strict=True):
             r = derive(s, "private", agent)
             self.crops[agent] = (r.randint(0, h - self.crop_h), r.randint(0, w - self.crop_w))
+        unknown = sorted(set(self.crop_overrides) - set(self.agents))
+        if unknown:
+            raise ValueError(f"crop_overrides names agents not in the game: {unknown}")
+        for agent, (y, x) in self.crop_overrides.items():
+            self.crops[agent] = (y, x)
         self.guesses = {}
         self.guesses_made = {}
 

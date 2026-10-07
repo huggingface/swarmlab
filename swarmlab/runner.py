@@ -120,12 +120,28 @@ board's claim policy, and hands both to each round's executor. Each round starts
 Commit order under phase-commit: posts, then registry writes (in `order`, each agent's in call
 order; `registry*` events), then world actions through the claim check (`claim*` events, then
 `action_committed*`). Registry outcomes join `View.outcomes` after the world-action outcomes.
+
+Fork at round 0 (M3a §2): no round-0 snapshot is ever written (the first is after round 1), so
+`fork(0, experiment)` copies nothing from the parent: the child re-resets the world with the
+parent's seed under the (possibly edited) experiment, binds fresh participants, and runs from
+round 1 with the same schedule/topology streams. Its log starts with its own
+`run_started(round=0, parent_run, fork_round=0)`; `run.json["restored"]` is
+`{"world": False, "participants": [], "metrics": [], "reset": True}`. With the same experiment it
+reproduces the parent's logical view (apart from `run` and `run_started`).
+
+Paired-run repeats (M3a §2): `RunOptions.repeat` (default 0, omitted from the spec when 0) selects
+the agent streams. Repeat 0 is a plain run. Repeat i > 0 binds agent `a` with
+`derive(seed, "repeat", i, "agent", a)` and gives every inference request that has no `seed` one
+derived from `derive(seed, "repeat", i, "agent", a, call_id)` (`RepeatSeeded`), so the sampling of
+seeded providers, the fake provider and the request cache differ per repeat. World, schedule and
+topology streams never depend on the repeat.
 """
 from __future__ import annotations
 
 import asyncio
 import copy
 import json
+import random
 import shutil
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -236,6 +252,37 @@ def build_metric(m: str | Metric) -> Metric:
 
 def metric_spec(m: Metric) -> PluginSpec:
     return PluginSpec(**m.spec())
+
+
+def agent_stream(seed: int, agent: str, repeat: int = 0) -> random.Random:
+    """Agent `agent`'s stream: `derive(seed, "agent", agent)`, and for paired-run repeat i > 0
+    `derive(seed, "repeat", i, "agent", agent)` (M3a §2); repeat 0 is exactly a plain run."""
+    if repeat == 0:
+        return derive(seed, "agent", agent)
+    return derive(seed, "repeat", repeat, "agent", agent)
+
+
+class RepeatSeeded:
+    """Inference wrapper for repeat i > 0: a request without a `seed` gets one drawn from
+    `derive(seed, "repeat", i, "agent", agent, call_id)`. Sampling is thereby re-derived per
+    repeat (seeded providers and the fake provider answer differently; the request hash and so
+    the cache key differ) while staying a pure function of the run, so resume hits the cache."""
+
+    def __init__(self, inner: Inference, seed: int, repeat: int) -> None:
+        self.inner = inner
+        self.seed = seed
+        self.repeat = repeat
+
+    async def infer(self, *, agent: str | None, round: int, call_id: str, request: ChatRequest,
+                    category: str = "swarm") -> Any:
+        if request.seed is None:
+            s = derive(self.seed, "repeat", self.repeat, "agent", agent or "", call_id).getrandbits(31)
+            request = request.model_copy(update={"seed": s})
+        return await self.inner.infer(agent=agent, round=round, call_id=call_id, request=request,
+                                      category=category)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
 
 
 class Runner:
@@ -353,11 +400,13 @@ class Runner:
         self.cache = InferenceCache(self.dir / "blobs")
         self.inference = Inference(run_id=self.run_id, gate=self.gate, blobs=self.blobs,
                                    cache=self.cache, log_operational=self.log_operational)
+        if self.options.repeat:
+            self.inference = RepeatSeeded(self.inference, self.options.seed, self.options.repeat)
 
     def _init_fresh(self) -> None:
         seed = self.options.seed
         for a, p in self.participants.items():
-            p.bind(a, derive(seed, "agent", a))
+            p.bind(a, agent_stream(seed, a, self.options.repeat))
         self.world.reset(derive(seed, "world"), list(self.agents))
         self._set_truth()
         self._set_agents()
@@ -475,6 +524,9 @@ class Runner:
         try:
             self._init_fresh()
             if self.parent is None:
+                start = 1
+            elif self.parent.at_round == 0:  # M3a §2: a fork at round 0 is a fresh reset
+                self.restored = {"world": False, "participants": [], "metrics": [], "reset": True}
                 start = 1
             else:
                 manifest = self.snapshots.read(self.parent.at_round)
@@ -622,6 +674,8 @@ class Runner:
             raise ValueError(f"{self.dir} is not a run directory")
         parent_spec = RunSpec.model_validate(meta["spec"])
         parent_id = meta["run_id"]
+        if at_round == 0:
+            return self._fork_at_zero(parent_spec, parent_id, experiment, out, max_rounds)
         raw = self.log_path.read_bytes()
         lines = raw.splitlines(keepends=True)
         end = None
@@ -639,12 +693,7 @@ class Runner:
         src_snaps = SnapshotStore(self.dir)
         if at_round not in src_snaps.list_rounds():
             raise ValueError(f"no snapshot for round {at_round} in {self.dir}")
-        out_dir = Path(out) if out is not None else self.dir.parent
-        n = 1
-        while (out_dir / fork_run_id(parent_id, at_round, n)).exists():
-            n += 1
-        child_id = fork_run_id(parent_id, at_round, n)
-        child_dir = out_dir / child_id
+        child_id, child_dir = self._fork_dir(parent_id, at_round, out)
         child_dir.mkdir(parents=True)
         prefix = lines[:end]
         (child_dir / "events.jsonl").write_bytes(b"".join(prefix))
@@ -674,6 +723,33 @@ class Runner:
             experiment = self.experiment
         child = Runner(child_dir, experiment, options,
                        parent=ForkOrigin(parent_id, at_round, parent_spec), run_id=child_id)
+        return child.live()
+
+    def _fork_dir(self, parent_id: str, at_round: int, out: Path | str | None) -> tuple[str, Path]:
+        out_dir = Path(out) if out is not None else self.dir.parent
+        n = 1
+        while (out_dir / fork_run_id(parent_id, at_round, n)).exists():
+            n += 1
+        child_id = fork_run_id(parent_id, at_round, n)
+        return child_id, out_dir / child_id
+
+    def _fork_at_zero(self, parent_spec: RunSpec, parent_id: str, experiment: Experiment | None,
+                      out: Path | str | None, max_rounds: int | None) -> Runner:
+        """Fork at round 0 (M3a §2). Runs never write a round-0 snapshot, so nothing is copied:
+        the child re-resets the world with the parent's seed (and repeat) under `experiment`
+        (possibly edited), binds fresh participants, uses the same schedule and topology streams,
+        and its log starts with its own `run_started(round=0, parent_run, fork_round=0)`."""
+        if experiment is None:
+            experiment = self.experiment
+        if len(experiment.participants) != len(parent_spec.participants):
+            raise ValueError("a fork cannot change the number of participants")
+        child_id, child_dir = self._fork_dir(parent_id, 0, out)
+        child_dir.mkdir(parents=True)
+        options = parent_spec.options
+        if max_rounds is not None:
+            options = options.model_copy(update={"max_rounds": max_rounds})
+        child = Runner(child_dir, experiment, options,
+                       parent=ForkOrigin(parent_id, 0, parent_spec), run_id=child_id)
         return child.live()
 
     def replay(self) -> dict:
