@@ -127,3 +127,32 @@ def test_run_denominators_and_replay(tmp_path):
               and e["result"].get("error") == "not_allowed"]
     assert called  # the scripted aggregator tried to guess and was refused
     run.replay()
+
+
+def test_blind_task_description():
+    world = reset(FlagGame(blind_agents=1))
+    text = world.description_for("a000")
+    assert "You have no crop of your own" in text and "do not record guesses" in text
+    assert "`guess`" not in text
+    assert world.description_for("a001") == world.description()
+    may = reset(FlagGame(modality="image", blind_agents=1, blind_may_guess=True))
+    assert "`guess` tool" in may.description_for("a000") and "image" in may.description_for("a000")
+    plain = reset(FlagGame())
+    assert all(plain.description_for(a) == plain.description() for a in AGENTS)
+
+
+def test_prompts_show_blind_description():
+    from swarmlab import Experiment
+    from swarmlab.participants import LLMAgent
+    from swarmlab.prompts_cmd import render_prompts
+    from swarmlab.roles import assign
+
+    parts = [LLMAgent(model="fake:reader") for _ in range(3)]
+    assign(parts[0], "manager")
+    exp = Experiment(name="m", world=FlagGame(blind_agents=1), participants=parts,
+                     medium=Board(topology="star"))
+    rows = render_prompts(exp, seed=1)
+    assert "You have no crop of your own: you rely" in rows[0]["system"]
+    assert "guess" not in rows[0]["tools"] and "guess" in rows[1]["tools"]
+    assert rows[0]["user"].rstrip().endswith(BLIND_NOTE)
+    assert "You privately see" in rows[1]["system"]

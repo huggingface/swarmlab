@@ -178,6 +178,11 @@ class World(Persistable, Plugin):
         Default: every world tool is offered to every agent."""
         return True
 
+    def description_for(self, agent: AgentId) -> str:
+        """The task description shown to `agent` (what the runner puts in `View.description`).
+        Default: `description()` for everyone; override when agents' tasks differ."""
+        return self.description()
+
     def excluded_from_belief(self) -> list[AgentId]:
         """Agents left out of belief metrics' populations (numerator and denominator), e.g. agents
         with no private evidence of their own. The runner removes them from the live list it

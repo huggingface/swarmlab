@@ -121,7 +121,8 @@ Decisions where the contract is silent
   `accuracy`'s denominator, and `n_guessed`; `n_blind` is added) and named by
   `excluded_from_belief()`, so belief metrics leave them out too; `verify()["crops"]` omits them
   and `verify()["blind"]` lists them. `description()` gains one sentence saying that some agents
-  have no crop. `patch_private` and `crop_overrides` on a blind agent are a `ValueError`; an int
+  have no crop, and `description_for(agent)` gives blind agents their own task text (no crop of
+  their own; "You do not record guesses yourself." unless `blind_may_guess`). `patch_private` and `crop_overrides` on a blind agent are a `ValueError`; an int
   or list naming every agent (nobody sighted) or an unknown agent is a `ValueError` at `reset`.
   Both params are left out of `spec()` when unset (empty / 0 / False), so spec hashes are
   unchanged.
@@ -629,6 +630,25 @@ class FlagGame(World):
             "more than one candidate may contain your crop. Record which candidate you believe is "
             "the hidden flag with the `guess` tool; only your latest guess counts and you may "
             f"change it in any round.{limit} You are never told whether a guess is right."
+        )
+
+    def description_for(self, agent: AgentId) -> str:
+        """Blind agents (WP16) get their own task text; everyone else gets `description()`."""
+        if not self.is_blind(agent):
+            return self.description()
+        image = getattr(self, "modality", "text") == "image"
+        shown = "shown as an image of coloured cells" if image else "a grid of colour letters"
+        if self.blind_may_guess:
+            act = ("Record which candidate you believe is the hidden flag with the `guess` tool; "
+                   "only your latest guess counts and you may change it in any round.")
+        else:
+            act = "You do not record guesses yourself."
+        return (
+            f"There are {self.n_candidates} candidate flags, each {shown}, and exactly one of "
+            "them is the hidden flag. Other agents each privately see a "
+            f"{self.crop_h}x{self.crop_w} crop of the hidden flag at an undisclosed position, and "
+            "more than one candidate may contain any one crop. You have no crop of your own: you "
+            f"rely on what the others report. {act} Nobody is ever told whether a guess is right."
         )
 
     # ---- M5: participants that read the text grids ------------------------------------------------

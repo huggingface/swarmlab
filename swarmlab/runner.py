@@ -236,7 +236,7 @@ from .spec import (
     unbilled_spec,
 )
 from .tools import AgentTools, TurnCapReached
-from .view import View
+from .view import View, describe
 
 if TYPE_CHECKING:
     from .experiment import Experiment
@@ -1112,7 +1112,7 @@ class Runner:
             ]
         view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
-                    tools=ex.schemas(agent), description=self.world.description())
+                    tools=ex.schemas(agent), description=describe(self.world, agent))
         usage: dict = {}
         error = None
         try:
