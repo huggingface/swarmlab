@@ -52,6 +52,9 @@ Decisions where the contract is silent:
   spec (hence `spec_hash`, `run.json`, `artifacts/spec.yaml`) when empty, and empty `roles` / null `role` are left out of the normalised document, so earlier
   specs, documents and hashes are unchanged. `runspec_to_doc` writes the resolved roles at the
   top level and keeps `role` in the participant groups (groups split where the role changes).
+- WP16: top-level keys starting with `x-` (e.g. `x-memory: &memory {memory: window}`) are
+  ignored, as in Docker Compose: a place for YAML anchors shared by several arms. They are
+  dropped before validation, so they never reach a `RunSpec` or the normalised document.
 - `budget.total_usd` (top level only; an arm-level one is a `SpecError`) caps the experiment's
   total spend: `swarmlab run` / `Experiment.run_all` refuse to start a run when the spend of the
   runs already done plus the next run's `hard_usd` would exceed it. It is never part of
@@ -281,6 +284,7 @@ def validate_experiment_doc(doc: dict) -> dict:
     """Validate and normalise an experiment document (already parsed from YAML)."""
     if not isinstance(doc, dict):
         raise SpecError(f"experiment document must be a mapping, got {type(doc).__name__}")
+    doc = {k: v for k, v in doc.items() if not (isinstance(k, str) and k.startswith("x-"))}
     try:
         parsed = ExperimentDoc.model_validate(doc)
     except ValidationError as e:

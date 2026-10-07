@@ -236,7 +236,7 @@ from .spec import (
     unbilled_spec,
 )
 from .tools import AgentTools, TurnCapReached
-from .view import View
+from .view import View, describe
 
 if TYPE_CHECKING:
     from .experiment import Experiment
@@ -548,10 +548,15 @@ class Runner:
         self._set_agents()
 
     def _set_agents(self) -> None:
-        """Tell metrics the live agent list (at reset, restore, and whenever it changes)."""
+        """Tell metrics the live agent list (at reset, restore, and whenever it changes); belief
+        metrics (`belief_population`) get it without `world.excluded_from_belief()`."""
         self._metric_agents = list(self.live_agents)
+        hook = getattr(self.world, "excluded_from_belief", None)  # WP16: blind agents
+        excluded = {str(a) for a in hook()} if callable(hook) else set()
+        believers = [a for a in self.live_agents if str(a) not in excluded]
         for m in self.metrics:
-            m.set_agents(list(self.live_agents))
+            m.set_agents(list(believers if getattr(m, "belief_population", False)
+                              else self.live_agents))
 
     def _set_truth(self) -> None:
         if any(m.needs_truth() for m in self.metrics):
@@ -1107,7 +1112,7 @@ class Runner:
             ]
         view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
-                    tools=ex.schemas(agent), description=self.world.description())
+                    tools=ex.schemas(agent), description=describe(self.world, agent))
         usage: dict = {}
         error = None
         try:

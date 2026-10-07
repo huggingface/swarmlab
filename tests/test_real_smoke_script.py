@@ -18,7 +18,8 @@ def smoke():
 
 
 def test_arms(smoke):
-    assert list(smoke.ARMS) == ["haiku", "qwen", "haiku-json", "haiku-image"]
+    assert list(smoke.ARMS) == ["haiku", "qwen", "haiku-json", "haiku-image", "gemma-image",
+                                "gemma-manager"]
     assert smoke.DEFAULT_ARMS == ("haiku", "qwen", "haiku-json")
     qwen = smoke.experiment("qwen")
     assert all(p.extra == {"chat_template_kwargs": {"enable_thinking": False}} for p in qwen.participants)
@@ -76,3 +77,48 @@ def test_visual_mentions(smoke):
         "The left half is Green",
     ])
     assert vm == {"posts": 4, "colour_words": 2, "layout_words": 2, "letter_rows": 1, "visual": 2}
+
+
+def test_gemma_arms(smoke):
+    from swarmlab.medium.topology import Broadcast, Star
+    from swarmlab.roles import role_name
+
+    for arm in ("gemma-image", "gemma-manager"):
+        exp = smoke.experiment(arm)
+        assert exp.world.modality == "image" and len(exp.participants) == 4
+        assert smoke.ARMS[arm]["rounds"] == 3 and exp.budget.hard_usd == 0.50
+        assert all(p.model == "hf:google/gemma-4-26B-A4B-it:deepinfra" and p.max_calls == 5
+                   for p in exp.participants)
+        assert exp.providers["hf"].pricing[smoke.GEMMA_ID] == smoke.GEMMA_PRICING
+        assert smoke.estimate(arm, exp)["usd"] <= 0.50
+    image, mgr = smoke.experiment("gemma-image"), smoke.experiment("gemma-manager")
+    assert isinstance(image.medium.topology, Broadcast) and not image.world.blind_agents
+    assert isinstance(mgr.medium.topology, Star) and mgr.medium.topology.center == "a000"
+    assert mgr.world.blind_agents == 1
+    assert [role_name(p) for p in mgr.participants] == ["manager", None, None, None]
+    assert "gemma-image" not in smoke.DEFAULT_ARMS and "gemma-manager" not in smoke.DEFAULT_ARMS
+
+
+def test_dry_run_gemma_arms(smoke, monkeypatch, capsys):
+    monkeypatch.delenv("SWARMLAB_REAL", raising=False)
+    monkeypatch.setattr(sys, "argv", ["real_smoke.py", "--arms", "gemma-image,gemma-manager"])
+    assert smoke.main() == 0
+    out = capsys.readouterr().out
+    assert "estimate gemma-manager: worst-case" in out and "not calling any provider" in out
+
+
+def test_manager_report_on_a_fake_run(smoke, tmp_path, capsys):
+    """The gemma-manager report runs on a finished run (fake reader stands in for the model)."""
+    from swarmlab.participants import LLMAgent
+    from swarmlab.roles import assign
+    from swarmlab.worlds import FlagGame
+
+    exp = smoke.experiment("gemma-manager")
+    exp.world = FlagGame(n_candidates=8, modality="image", image_text_hint=True, blind_agents=1)
+    exp.participants = [LLMAgent(model="fake:reader", max_calls=5) for _ in range(4)]
+    assign(exp.participants[0], "manager")
+    exp.providers = None
+    run = exp.run(seed=1, max_rounds=2, out=tmp_path)
+    smoke.report("gemma-manager", run)
+    out = capsys.readouterr().out
+    assert "manager " in out and "member posts delivered to it" in out

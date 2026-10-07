@@ -3,7 +3,7 @@
 Runs only when SWARMLAB_REAL=1; otherwise it prints the worst-case estimate and exits.
 
     SWARMLAB_REAL=1 uv run python tools/real_smoke.py [--out runs/real_smoke] [--seed 1]
-        [--arms haiku,qwen,haiku-json | --arms haiku-image]
+        [--arms haiku,qwen,haiku-json | --arms haiku-image | --arms gemma-image,gemma-manager]
 
 Three arms of LLMAgents on the Flag Game, broadcast board, a BeliefProbe every round, every agent
 at `max_tokens=1024, max_calls=6`. `haiku` and `qwen` keep `Budget(soft_usd=0.40, hard_usd=0.50,
@@ -35,6 +35,20 @@ or the summed worst-case estimate reaches $1.00.
   mention visual features (colour words, layout words such as stripe/band/top/left) and whether
   they transcribe the image into colour-letter rows.
 
+- `gemma-image` (WP16): N=4, 3 rounds, `hf:google/gemma-4-26B-A4B-it:deepinfra` (HF_TOKEN) on
+  `FlagGame(modality="image")`, broadcast, `max_calls=5`, `Budget(soft_usd=0.40, hard_usd=0.50,
+  measurement_usd=0.10)`. The model of `experiments/m6_flag_vlm.yaml`. Pricing is the router's
+  listed DeepInfra price on 2026-10-07, input 0.07 / output 0.34 USD per M tokens (listing
+  `input_modalities: [text, image]`, `supports_tools: true`), cached priced at the input price:
+  (0.07, 0.34, 0.07).
+- `gemma-manager` (WP16): the same model, N=4, 3 rounds, image mode, the Flag Game paper's
+  manager protocol: `FlagGame(blind_agents=1)` (a000 has no crop and no `guess` tool), the
+  `star` topology (members' posts reach only a000, a000's reach everyone) and a000 assigned the
+  built-in `manager` role; same budget. Its report adds the manager's posts (count and the
+  first two), whether the manager tried to guess (it should not; `not_allowed` if it did), and
+  how many member posts reached the manager.
+  Neither gemma arm is in the default `--arms`; run them with `--arms gemma-image,gemma-manager`.
+
 `--arms` (comma list, default `haiku,qwen,haiku-json`) selects the arms; the total cap applies to
 the selected arms.
 
@@ -60,6 +74,7 @@ from swarmlab.metrics.belief import Accuracy, Consensus
 from swarmlab.participants import LLMAgent
 from swarmlab.probes import BeliefProbe
 from swarmlab.providers.openai_compat import OpenAICompatProvider
+from swarmlab.roles import assign
 from swarmlab.worlds import FlagGame
 
 BUDGET = Budget(soft_usd=0.40, hard_usd=0.50, measurement_usd=0.10)
@@ -68,6 +83,8 @@ TOTAL_CAP_USD = 1.00  # worst case over all arms must stay under this
 QWEN_ID = "Qwen/Qwen3.5-9B:deepinfra"
 QWEN_PRICING = (0.10, 0.15, 0.10)  # router-listed DeepInfra price (input, output, cached=input)
 HAIKU = "anthropic:claude-haiku-4-5"
+GEMMA_ID = "google/gemma-4-26B-A4B-it:deepinfra"
+GEMMA_PRICING = (0.07, 0.34, 0.07)  # router-listed DeepInfra price 2026-10-07 (cached=input)
 AGENT = {"max_tokens": 1024, "max_calls": 6}
 NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
 DEFAULT_ARMS = ("haiku", "qwen", "haiku-json")
@@ -78,6 +95,11 @@ ARMS: dict[str, dict] = {
                    "budget": SMALL_BUDGET},
     "haiku-image": {"model": HAIKU, "n": 4, "rounds": 3, "agent": {"max_calls": 5},
                     "world": {"modality": "image"}},
+    "gemma-image": {"model": f"hf:{GEMMA_ID}", "n": 4, "rounds": 3, "agent": {"max_calls": 5},
+                    "world": {"modality": "image"}},
+    "gemma-manager": {"model": f"hf:{GEMMA_ID}", "n": 4, "rounds": 3, "agent": {"max_calls": 5},
+                      "world": {"modality": "image", "blind_agents": 1}, "topology": "star",
+                      "manager": True},
 }
 BASE_PROMPT_TOKENS = 3000  # Experiment.estimate's planning default
 COLOUR_WORDS = ("red", "green", "blue", "yellow", "black", "white", "orange", "purple", "cyan",
@@ -89,32 +111,39 @@ _LETTER_ROW = re.compile(r"(?m)^\s*[rgbykwopcmnt]{3,}\s*$")
 
 def experiment(arm: str) -> Experiment:
     cfg = ARMS[arm]
+    participants = [LLMAgent(model=cfg["model"], **{**AGENT, **cfg["agent"]})
+                    for _ in range(cfg["n"])]
+    if cfg.get("manager"):  # WP16: a000 is the blind manager at the centre of the star
+        assign(participants[0], "manager")
     return Experiment(
         name="real-smoke",
         arm=arm,
         world=FlagGame(n_candidates=8, **cfg.get("world", {})),
-        participants=[LLMAgent(model=cfg["model"], **{**AGENT, **cfg["agent"]})] * cfg["n"],
-        medium=Board(topology="broadcast"),
+        participants=participants,
+        medium=Board(topology=cfg.get("topology", "broadcast")),
         metrics=["belief.accuracy", "belief.consensus",
                  Accuracy(source="probe:belief"), Consensus(source="probe:belief")],
         probes=[BeliefProbe()],
         budget=cfg.get("budget", BUDGET),
-        providers={"hf": OpenAICompatProvider("hf", pricing={QWEN_ID: QWEN_PRICING})},
+        providers={"hf": OpenAICompatProvider("hf", pricing={QWEN_ID: QWEN_PRICING,
+                                                             GEMMA_ID: GEMMA_PRICING})},
     )
 
 
 def image_overhead_tokens(exp: Experiment) -> int:
-    """Estimated prompt tokens the image round-1 message adds over the text-mode one."""
+    """Estimated prompt tokens the image round-1 message adds over the text-mode one (for the
+    last participant group: a member with a crop, never the blind manager)."""
     from swarmlab.prompts_cmd import group_views
     from swarmlab.providers.base import ChatRequest
 
     def round_tokens(e: Experiment) -> int:
-        _, _, _, agent, view = group_views(e, 1)[0]
+        _, _, _, agent, view = group_views(e, 1)[-1]
         req = ChatRequest(model=agent.model, messages=[agent.round_message(view)])
         return e.provider_for(agent.model)[0].estimate_prompt_tokens(req)
 
     text = copy.deepcopy(exp)
-    text.world = FlagGame(n_candidates=exp.world.n_candidates)
+    text.world = FlagGame(n_candidates=exp.world.n_candidates,
+                          blind_agents=getattr(exp.world, "blind_agents", None) or None)
     return max(0, round_tokens(exp) - round_tokens(text))
 
 
@@ -180,6 +209,18 @@ def report(arm: str, run) -> None:
               f"colour-letter rows {vm['letter_rows']})")
         for t in posts[:2]:
             print(f"    e.g. {t[:160]!r}")
+    if cfg.get("manager"):
+        mgr_posts = [str((e.get("args") or {}).get("text", "")) for e in called
+                     if e["tool"] == "post" and e["agent"] == "a000"]
+        mgr_guess = [e for e in returned if e["agent"] == "a000"
+                     and (e["result"] or {}).get("error") == "not_allowed"]
+        post_author = {e["post_id"]: e["agent"] for e in events if e["type"] == "post"}
+        to_mgr = sum(1 for e in events if e["type"] == "delivery" and e["recipient"] == "a000"
+                     and post_author.get(e["post_id"]) != "a000")
+        print(f"  manager        {len(mgr_posts)} posts, {len(mgr_guess)} not_allowed calls, "
+              f"{to_mgr} member posts delivered to it")
+        for t in mgr_posts[:2]:
+            print(f"    e.g. {t[:200]!r}")
     errs = [e for e in turns if e.get("error")]
     if errs:
         print(f"  first turn error: {errs[0]['error'][-400:]}")

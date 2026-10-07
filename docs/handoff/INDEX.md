@@ -19,4 +19,5 @@ One line per work package. Contracts are in `docs/INTERFACE*.md`; run notes in `
 | [WP13](WP13.md) | M3b | Registry with claim policies (advisory, enforced), ColoringGrid world, coloring and claim metrics, Coloring S0 example |
 | [WP14](WP14.md) | M3c | Roles (built-ins plus overrides), executor role enforcement, Tree topology, hierarchy examples |
 | [WP15](WP15.md) | M5 | FlagGame image modality: PNG renderer and shared palette, image observations, image token estimate, preflight image rejection, exports, `haiku-image` smoke arm |
+| [WP16](WP16.md) | M6 prep | Flag Game protocols: blind agents (`blind_agents`), `star` topology, `manager` role, `x-` spec keys, `m6_flag_vlm` experiment (broadcast/gossip/manager x N=4,16,128 on Gemma 4 image), `gemma-image`/`gemma-manager` smoke arms |
 | [field-notes-report](field-notes-report.md) | field notes | Report protocol health for any world, export/publish robustness and `--no-raw`, session round-marker fix, analysis docs, `World.render_state` viewer panel |

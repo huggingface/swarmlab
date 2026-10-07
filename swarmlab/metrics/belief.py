@@ -6,7 +6,9 @@ Each metric tracks the latest accepted `guess` per agent from `action_committed`
 Denominator (review B2): **all live agents**, which the runner supplies through
 `set_agents(agents)` at reset and whenever the live list changes (replay derives it from each
 `round_started.order`). A live agent with no committed guess is an explicit `"none"` belief.
-Guesses by agents that are not live are ignored. With no live agents the value is None (denominator
+Guesses by agents that are not live are ignored. Agents the world names in
+`World.excluded_from_belief()` (FlagGame's blind agents, WP16) are not in the list the runner
+passes, so they count in neither numerator nor denominator. With no live agents the value is None (denominator
 0). Standalone use without `set_agents` falls back to the agents that have guessed.
 
 - `belief.accuracy`: share of live agents whose guess equals `truth["truth"]` (needs truth). This
@@ -49,6 +51,8 @@ def _check_source(source: str) -> str:
 
 
 class _BeliefMetric(Metric):
+    belief_population: ClassVar[bool] = True  # WP16: the runner leaves out excluded_from_belief()
+
     def __init__(self, source: str = "world") -> None:
         self._init(source)
 

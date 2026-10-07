@@ -28,5 +28,11 @@ class View(BaseModel):
     description: str = ""  # M1b: World.description(), the task text for prompt templates
 
 
+def describe(world: Any, agent: str) -> str:
+    """`world.description_for(agent)` when the world has it (WP16), else `world.description()`."""
+    per_agent = getattr(world, "description_for", None)
+    return per_agent(agent) if callable(per_agent) else world.description()
+
+
 def text_observation(text: str, **private: Any) -> Observation:
     return Observation(parts=[Part(type="text", text=text)], private=dict(private))

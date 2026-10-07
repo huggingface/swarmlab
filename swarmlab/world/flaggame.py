@@ -108,6 +108,24 @@ Decisions where the contract is silent
   after the normal reset draws, so every other draw (candidates, truth, other crops) is unchanged.
   Positions are validated against the flag at construction, agent ids at `reset`. The param is
   part of `spec()` only when given, so runs without it keep their spec hash.
+- Blind agents (WP16, the Flag Game paper's manager protocol): `blind_agents` is a list of agent
+  ids or an int n (the first n agents of the `reset` list, i.e. by index). Crops are still drawn
+  for every agent (so the other agents' crops, the candidates and the truth are what they would be
+  without blind agents) and then dropped for the blind ones. A blind agent's observation lists
+  the candidates exactly as usual and, in place of the crop section, the line `BLIND_NOTE`
+  ("You have no crop of your own; rely on what others report."); in image mode the framing line
+  drops "your crop follows" (`IMAGE_INTRO_BLIND`) and `BLIND_NOTE` is the last text part.
+  `private` is `{}`. Unless `blind_may_guess=True`, `allows_tool(agent, "guess")` is False for
+  them (the executor neither offers nor runs `guess`) and `guess`/`validate` reject their guesses
+  ("blind agents may not guess"). Blind agents are left out of `score()` (numerator and
+  `accuracy`'s denominator, and `n_guessed`; `n_blind` is added) and named by
+  `excluded_from_belief()`, so belief metrics leave them out too; `verify()["crops"]` omits them
+  and `verify()["blind"]` lists them. `description()` gains one sentence saying that some agents
+  have no crop, and `description_for(agent)` gives blind agents their own task text (no crop of
+  their own; "You do not record guesses yourself." unless `blind_may_guess`). `patch_private` and `crop_overrides` on a blind agent are a `ValueError`; an int
+  or list naming every agent (nobody sighted) or an unknown agent is a `ValueError` at `reset`.
+  Both params are left out of `spec()` when unset (empty / 0 / False), so spec hashes are
+  unchanged.
 - Snapshots carry game state only. Constructor config (the kwargs) is skipped, so a restored or
   forked world keeps the config it was constructed with (e.g. a fork may change `guess_limit`).
 """
@@ -130,9 +148,13 @@ COLOURS = "rgbykwopcmnt"
 PREAMBLE = "Candidate flags:"
 CROP_HEADER = "Your crop:"
 CROP_CHANGED = "Your crop has changed."
+BLIND_NOTE = "You have no crop of your own; rely on what others report."
 IMAGE_INTRO = ("Candidates {names} are shown as images in that order (no label is drawn inside an "
                "image: the order is the labelling); your crop follows. Each colour cell is "
                "{cell_px}x{cell_px} pixels in every image.")
+IMAGE_INTRO_BLIND = ("Candidates {names} are shown as images in that order (no label is drawn inside "
+                     "an image: the order is the labelling). Each colour cell is "
+                     "{cell_px}x{cell_px} pixels in every image.")
 _IMAGE_INTRO_RE = re.compile(r"^Candidates (.+?) are shown as images in that order")
 MODALITIES = ("text", "image")
 _LAYOUTS = ("h_stripes", "v_stripes", "blocks_2x2", "blocks_2x3")
@@ -152,7 +174,7 @@ def parse_observation(text: str) -> tuple[dict[str, list[str]], list[str]]:
     current: list[str] | None = None
     for raw in text.split("\n"):
         line = raw.strip()
-        if not line or line in (PREAMBLE, CROP_CHANGED):
+        if not line or line in (PREAMBLE, CROP_CHANGED, BLIND_NOTE):
             continue
         if line == CROP_HEADER:
             current = crop
@@ -286,7 +308,7 @@ def _names(kind: str, n: int) -> list[str]:
 _CONFIG = (
     "height", "width", "palette", "n_candidates", "rival_edits", "crop_h", "crop_w",
     "candidate_names", "status_tools", "guess_limit", "crop_overrides",
-    "modality", "cell_px", "image_text_hint",
+    "modality", "cell_px", "image_text_hint", "blind_agents", "blind_may_guess",
 )
 _M5_DEFAULTS = {"modality": "text", "cell_px": 12, "image_text_hint": False}
 
@@ -304,6 +326,21 @@ def _check_overrides(overrides: dict[str, list[int]] | None, max_y: int,
             raise ValueError(f"crop_overrides[{agent!r}] = {[y, x]} is outside 0..{max_y} x 0..{max_x}")
         out[str(agent)] = (y, x)
     return out
+
+
+def _check_blind(blind: list[str] | int | None) -> list[str] | int:
+    """Validate `blind_agents`: None/[] -> [], an int >= 0, or a list of distinct agent ids."""
+    if blind is None:
+        return []
+    if isinstance(blind, int) and not isinstance(blind, bool):
+        if blind < 0:
+            raise ValueError(f"blind_agents must be >= 0, got {blind}")
+        return blind
+    if not isinstance(blind, (list, tuple)) or not all(isinstance(a, str) for a in blind):
+        raise ValueError(f"blind_agents must be a list of agent ids or an int, got {blind!r}")
+    if len(set(blind)) != len(blind):
+        raise ValueError(f"blind_agents lists an agent twice: {list(blind)}")
+    return [str(a) for a in blind]
 
 
 class FlagGame(World):
@@ -327,6 +364,8 @@ class FlagGame(World):
         modality: str = "text",
         cell_px: int = 12,
         image_text_hint: bool = False,
+        blind_agents: list[str] | int | None = None,
+        blind_may_guess: bool = False,
     ) -> None:
         if not 3 <= palette <= len(COLOURS):
             raise ValueError(f"palette must be in 3..{len(COLOURS)}")
@@ -347,6 +386,8 @@ class FlagGame(World):
         if not isinstance(cell_px, int) or isinstance(cell_px, bool) or cell_px < 1:
             raise ValueError("cell_px must be an integer >= 1")
         self.modality, self.cell_px, self.image_text_hint = modality, cell_px, bool(image_text_hint)
+        self.blind_agents = _check_blind(blind_agents)
+        self.blind_may_guess = bool(blind_may_guess)
         self.height, self.width, self.palette = height, width, palette
         self.n_candidates, self.rival_edits = n_candidates, rival_edits
         self.crop_h, self.crop_w = crop_h, crop_w
@@ -358,6 +399,12 @@ class FlagGame(World):
             # absent from spec() when unset, so runs without overrides keep their spec hash
             self.params.pop("crop_overrides", None)
         if isinstance(getattr(self, "params", None), dict):
+            # WP16: absent from spec() when unset, so runs without blind agents keep their hash
+            if not self.blind_agents:
+                self.params.pop("blind_agents", None)
+            if not self.blind_may_guess:
+                self.params.pop("blind_may_guess", None)
+        if isinstance(getattr(self, "params", None), dict):
             # M5: absent from spec() at their defaults, so text-mode spec hashes are unchanged
             for k, default in _M5_DEFAULTS.items():
                 if k in self.params and self.params[k] == default and type(self.params[k]) is type(default):
@@ -368,6 +415,7 @@ class FlagGame(World):
         self.truth: str | None = None
         self.rival: str | None = None
         self.crops: dict[str, tuple[int, int]] = {}
+        self.blind: list[str] = []
         self.guesses: dict[str, str] = {}
         self.guesses_made: dict[str, int] = {}
 
@@ -408,8 +456,41 @@ class FlagGame(World):
             raise ValueError(f"crop_overrides names agents not in the game: {unknown}")
         for agent, (y, x) in self.crop_overrides.items():
             self.crops[agent] = (y, x)
+        self.blind = self._resolve_blind(self.agents)
+        bad = sorted(set(self.crop_overrides) & set(self.blind))
+        if bad:
+            raise ValueError(f"crop_overrides names blind agents: {bad}")
+        for agent in self.blind:
+            del self.crops[agent]
         self.guesses = {}
         self.guesses_made = {}
+
+    def _resolve_blind(self, agents: list[str]) -> list[str]:
+        spec = getattr(self, "blind_agents", [])
+        if isinstance(spec, int):
+            if spec >= len(agents) and spec:
+                raise ValueError(f"blind_agents={spec} leaves no agent with a crop "
+                                 f"({len(agents)} agents)")
+            return list(agents[:spec])
+        unknown = sorted(set(spec) - set(agents))
+        if unknown:
+            raise ValueError(f"blind_agents names agents not in the game: {unknown}")
+        if agents and set(agents) <= set(spec):
+            raise ValueError("blind_agents names every agent: nobody has a crop")
+        return [a for a in agents if a in spec]
+
+    def is_blind(self, agent: AgentId) -> bool:
+        return str(agent) in getattr(self, "blind", ())
+
+    def sighted(self) -> list[str]:
+        """The agents with a crop, in reset order."""
+        return [a for a in self.agents if not self.is_blind(a)]
+
+    def allows_tool(self, agent: AgentId, name: str) -> bool:
+        return not (name == "guess" and self.is_blind(agent) and not self.blind_may_guess)
+
+    def excluded_from_belief(self) -> list[AgentId]:
+        return [AgentId(a) for a in getattr(self, "blind", ())]
 
     def crop_rows(self, agent: AgentId) -> list[str]:
         y, x = self.crops[agent]
@@ -425,12 +506,17 @@ class FlagGame(World):
 
     def _observe_image(self, agent: AgentId) -> Observation:
         names = ", ".join(self.candidates)
+        blind = self.is_blind(agent)
+        intro = IMAGE_INTRO_BLIND if blind else IMAGE_INTRO
         parts = [Part(type="text", text=PREAMBLE + "\n"
-                      + IMAGE_INTRO.format(names=names, cell_px=self.cell_px))]
+                      + intro.format(names=names, cell_px=self.cell_px))]
         for name, grid in self.candidates.items():
             parts.append(Part(type="image", image_png_b64=self._png_b64(grid)))
             if self.image_text_hint:
                 parts.append(Part(type="text", text="\n".join([f"{name}:", *grid])))
+        if blind:
+            parts.append(Part(type="text", text=BLIND_NOTE))
+            return Observation(parts=parts, private={})
         crop = self.crop_rows(agent)
         parts += [Part(type="text", text=CROP_HEADER), Part(type="image", image_png_b64=self._png_b64(crop))]
         if self.image_text_hint:
@@ -447,6 +533,8 @@ class FlagGame(World):
         lines = [PREAMBLE]
         for name, grid in self.candidates.items():
             lines += ["", f"{name}:", *grid]
+        if self.is_blind(agent):
+            return text_observation("\n".join([*lines, "", BLIND_NOTE]))
         lines += ["", CROP_HEADER, *self.crop_rows(agent)]
         if agent in getattr(self, "crops_changed", ()):  # M3a patch_private: said once
             self.crops_changed = [a for a in self.crops_changed if a != agent]
@@ -455,16 +543,23 @@ class FlagGame(World):
         return text_observation("\n".join(lines), crop_y=y, crop_x=x)
 
     def score(self) -> dict:
-        right = sum(1 for a in self.agents if self.guesses.get(a) == self.truth)
-        return {
-            "accuracy": right / len(self.agents) if self.agents else 0.0,
-            "n_guessed": sum(1 for a in self.agents if a in self.guesses),
+        agents = self.sighted()  # blind agents are not scored (WP16)
+        right = sum(1 for a in agents if self.guesses.get(a) == self.truth)
+        out = {
+            "accuracy": right / len(agents) if agents else 0.0,
+            "n_guessed": sum(1 for a in agents if a in self.guesses),
             "truth": self.truth,
         }
+        if getattr(self, "blind", None):
+            out["n_blind"] = len(self.blind)
+        return out
 
     # ---- actions ------------------------------------------------------------------------------
     def _guess_error(self, agent: AgentId, candidate: Any) -> str | None:
-        if agent not in self.crops:
+        if self.is_blind(agent):
+            if not self.blind_may_guess:
+                return "blind agents may not guess"
+        elif agent not in self.crops:
             return "unknown agent"
         if not isinstance(candidate, str) or candidate not in self.candidates:
             return f"unknown candidate {candidate!r}"
@@ -513,6 +608,9 @@ class FlagGame(World):
     def description(self) -> str:
         limit = (f" You may record at most {self.guess_limit} guesses."
                  if self.guess_limit is not None else "")
+        if getattr(self, "blind_agents", None):
+            limit += (" Some agents have no crop of their own (their observation says so) and "
+                      "rely on what others report.")
         if getattr(self, "modality", "text") == "image":
             hint = (" Each image is also written out as a grid of colour letters."
                     if self.image_text_hint else "")
@@ -534,6 +632,25 @@ class FlagGame(World):
             f"change it in any round.{limit} You are never told whether a guess is right."
         )
 
+    def description_for(self, agent: AgentId) -> str:
+        """Blind agents (WP16) get their own task text; everyone else gets `description()`."""
+        if not self.is_blind(agent):
+            return self.description()
+        image = getattr(self, "modality", "text") == "image"
+        shown = "shown as an image of coloured cells" if image else "a grid of colour letters"
+        if self.blind_may_guess:
+            act = ("Record which candidate you believe is the hidden flag with the `guess` tool; "
+                   "only your latest guess counts and you may change it in any round.")
+        else:
+            act = "You do not record guesses yourself."
+        return (
+            f"There are {self.n_candidates} candidate flags, each {shown}, and exactly one of "
+            "them is the hidden flag. Other agents each privately see a "
+            f"{self.crop_h}x{self.crop_w} crop of the hidden flag at an undisclosed position, and "
+            "more than one candidate may contain any one crop. You have no crop of your own: you "
+            f"rely on what the others report. {act} Nobody is ever told whether a guess is right."
+        )
+
     # ---- M5: participants that read the text grids ------------------------------------------------
     def check_participants(self, participants: dict, experiment: Any = None) -> None:
         """Image mode without `image_text_hint`: refuse participants that read the text grids."""
@@ -552,6 +669,8 @@ class FlagGame(World):
         line and the line `Your crop has changed.` after the crop rows (`parse_observation` skips it)."""
         if set(data) != {"crop"}:
             raise ValueError(f"FlagGame.patch_private takes {{'crop': [y, x]}}, got keys {sorted(data)}")
+        if self.is_blind(agent):
+            raise ValueError(f"{agent} is blind (has no crop to move)")
         if str(agent) not in self.crops:
             raise ValueError(f"unknown agent {agent!r}")
         y, x = (int(v) for v in data["crop"])
@@ -576,12 +695,15 @@ class FlagGame(World):
 
     # ---- evaluator-only -----------------------------------------------------------------------
     def verify(self) -> dict:
-        return {
+        out = {
             "truth": self.truth,
             "rival": self.rival,
             "candidates": {n: list(g) for n, g in self.candidates.items()},
             "crops": {a: [y, x] for a, (y, x) in self.crops.items()},
         }
+        if getattr(self, "blind", None):
+            out["blind"] = list(self.blind)
+        return out
 
 
 def reads_text_grids(participant: Any, experiment: Any = None) -> bool:
