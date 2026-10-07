@@ -15,6 +15,10 @@ Decisions where the contract is silent:
 - `from_spec` resolves plugins through entry points (`swarmlab.worlds`, `swarmlab.participants`,
   `swarmlab.metrics`) or `module:Class`; the medium is rebuilt with `Board(**MediumSpec)` (the
   board resolves its own topology and policies). Metrics come back as `Metric` objects.
+- `from_yaml` puts the YAML's directory at the front of `sys.path` before resolving plugins
+  (`registry.add_import_dir`), so `module:Class` plugins in files next to the spec work without
+  `PYTHONPATH`; the directory is kept on the experiment and recorded by the runner in
+  `run.json["import_dir"]`, which `Run.experiment` puts on `sys.path` before `from_spec`.
 - `to_yaml(path)` writes a one-arm experiment document (arm name = `arm` or "default") whose
   top-level `options` are exactly `self.options`; `from_yaml(path, arm)` reads it back.
 - `Run` reads everything from the run directory. `Run.events` is `logical_view(...)` (plain dicts
@@ -103,7 +107,7 @@ from .probes import Probe, build_probe
 from .providers import catalog_priced, ensure_pricing
 from .providers import resolve as resolve_provider
 from .providers.base import Provider, split_model
-from .registry import build
+from .registry import add_import_dir, build
 from .roles import Role, assign, role_name, roles_from_spec, spec_roles
 from .runner import Runner
 from .spec import (
@@ -138,6 +142,7 @@ class Experiment(BaseModel):
     providers: dict[str, Provider] | None = None
     roles: dict[str, Role] = {}  # M3c: swarmlab/roles.py (assign agents with roles.assign)
     _resolved: dict[str, Provider] = PrivateAttr(default_factory=dict)
+    _import_dir: str | None = PrivateAttr(default=None)  # the YAML's dir (registry.add_import_dir)
 
     def __init__(self, **data: Any) -> None:
         super().__init__(**data)
@@ -406,8 +411,10 @@ class Experiment(BaseModel):
         options = {**doc["options"], **doc["arms"][arm]["options"]}
         options.pop("seed", None)
         spec = arm_to_runspec(doc, arm, seed=0, max_rounds=options.get("max_rounds", 1))
+        import_dir = add_import_dir(Path(path).resolve().parent)  # module:Class next to the YAML
         exp = cls.from_spec(spec)
         exp.options = options
+        exp._import_dir = import_dir
         return exp
 
     def to_yaml(self, path: Path | str) -> None:
@@ -535,7 +542,10 @@ class Run:
     @property
     def experiment(self) -> Experiment:
         if self._experiment is None:
+            if self._meta.get("import_dir"):  # the spec's dir: module:Class plugins next to it
+                add_import_dir(self._meta["import_dir"])
             self._experiment = Experiment.from_spec(self.spec)
+            self._experiment._import_dir = self._meta.get("import_dir")
         return self._experiment
 
     # ---- events ------------------------------------------------------------------------------

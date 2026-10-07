@@ -98,6 +98,7 @@ class Counter(World):
     def score(self):
         return {"total": self.total}
 ```
+To use it from YAML, save it as `myworld.py` next to the spec and write `world: {type: "myworld:Counter"}` (participants, metrics and probes take `module:Class` the same way). Every command that loads a spec (and `Experiment.from_yaml`) puts the spec's directory at the front of `sys.path` first, so no `PYTHONPATH` is needed; `run.json` records that directory, so `replay`, `resume`, `fork` and `view` of the run dir find the module from any working directory.
 
 **4. LLM agents with a belief probe** (`examples/04_llm_flaggame.py`): `LLMAgent(model="fake:reader")` on the Flag Game with `BeliefProbe()`; set `MODEL = "anthropic:claude-haiku-4-5"` for a real run.
 

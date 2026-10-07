@@ -86,7 +86,8 @@ git_commit, dirty, parent_run, fork_round, restored (what a fork restored), stat
 ("running" | "ended"), end_reason, last_round (last committed round), score (`world.score()`
 after the last commit), metrics_rev (the metric-semantics revision the run logs with,
 `swarmlab.metrics.base.METRICS_REV` for new runs; absent in older run.json files, which are
-revision 1: replay, resume and report then fold with `Metric.use_rev(1)`).
+revision 1: replay, resume and report then fold with `Metric.use_rev(1)`), import_dir (only
+when the experiment came from a YAML: its directory, put on `sys.path` by `Run.experiment`).
 
 Recovery (`resume(budget=None)`): if the log has `run_ended` with a reason other than
 `soft_budget`/`hard_ceiling`/`hard_ceiling_probes`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
@@ -323,6 +324,9 @@ class Runner:
             self.budget = experiment.budget
         # semantics revision of the metrics this run logs (swarmlab/metrics/base.py)
         self.metrics_rev = int((meta or {}).get("metrics_rev", 1)) if meta is not None else METRICS_REV
+        # the spec YAML's dir, for module:Class plugins next to it (registry.add_import_dir)
+        self.import_dir: str | None = (getattr(experiment, "_import_dir", None)
+                                       or (meta or {}).get("import_dir"))
         self._aborted_score: Any = None
         self.status = "running"
         self.end_reason: str | None = None
@@ -368,6 +372,8 @@ class Runner:
             "ledger_seq": self.log.next_seq - 1 if getattr(self, "log", None) is not None else -1,
             "metrics_rev": self.metrics_rev,
         }
+        if self.import_dir:
+            data["import_dir"] = self.import_dir
         text = json.dumps(data, indent=2, sort_keys=True) + "\n"
         atomic_write_bytes(self.dir / "run.json", text.encode())
 
