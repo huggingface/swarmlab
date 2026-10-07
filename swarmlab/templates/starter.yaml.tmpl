@@ -2,8 +2,10 @@
 #
 # The Flag Game: every agent sees crops of a hidden flag and the group must agree on which of 8
 # candidates it is. Two arms compare a broadcast board (everyone reads every post) with a gossip
-# board (each post reaches a few neighbours). 8 LLM agents per arm run on the deterministic fake
-# model `fake:reader`: no network, no keys, no spend.
+# board (each agent's posts reach one random partner per round by default (k=1); more with
+# `medium: {topology: {type: gossip, params: {k: 3}}}`). 8 LLM agents per arm run on the
+# deterministic fake model `fake:reader`: no network, no keys, no spend.
+# `swarmlab spec-reference` lists every key of this file; `swarmlab metrics` every metric.
 #
 #   swarmlab validate __NAME__.yaml        # check the file and build every arm
 #   swarmlab run __NAME__.yaml             # every arm x every seed below, into runs/<run id>
@@ -41,7 +43,7 @@ arms:
     world: {type: flaggame, params: {n_candidates: 8}}
     participants:
       - {type: llm, count: 8, params: {model: "fake:reader", max_tokens: 512, max_calls: 6}}
-    medium: {topology: gossip}
+    medium: {topology: gossip}           # = {type: gossip, params: {k: 1}}: one random partner per round
     probes: [belief]
     metrics:
       - belief.consensus

@@ -94,9 +94,10 @@ next item.
    `options: {max_rounds: 3}`, `budget: {hard_usd: 0.50, measurement_usd: 0.10}`.
    `swarmlab run SPEC.yaml --arm smoke --seed 0` -> `end=max_rounds` (not `hard_ceiling`), then
    `swarmlab report RUNS_DIR` -> tool protocol health shows no errored turns and few `length`
-   finishes. A `hard_ceiling` end (the round in flight was discarded) or `hard_ceiling_probes`
-   (the last round was kept, some of its probes were skipped) means raise the budget or cut rounds; `swarmlab resume RUN_DIR
-   --add-budget D` continues the same run with D more dollars (`--budget-hard X` sets the run's
+   / `max_tokens` finishes (truncated replies). A `hard_ceiling` end (the round in flight was
+   discarded) or `hard_ceiling_probes` (the last round was kept, some of its probes were
+   skipped) means raise the budget or cut rounds; `swarmlab resume RUN_DIR --add-budget D`
+   continues the same run with D more dollars (`--budget-hard X` sets the run's
    total, spend so far and discarded rounds included).
 6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS --calls-per-turn C` -> total
    for every arm x seed. Take the growth and calls per turn from the smoke run's `inference` table
@@ -150,4 +151,4 @@ next item.
   critical path; keep it to fast providers or small N (`swarmlab estimate` does not model this).
 - **Reasoning models need room**: set `max_tokens: 2048` or turn thinking off through
   `params: {extra: {chat_template_kwargs: {enable_thinking: false}}}`; `swarmlab report` counts
-  `length` finishes.
+  `length` and `max_tokens` finishes (truncated replies).

@@ -37,8 +37,13 @@ def test_report_reproduces_the_m2_report(tmp_path):
 
 def since_m2(text: str) -> str:
     """The report without the rows added after the M2 note was written."""
-    out, drop_blank = [], False
+    out, drop_blank, health = [], False, False
     for line in text.splitlines(keepends=True):
+        health = health or line.startswith("## Tool protocol health")
+        if health and line.startswith("|---"):  # the max_tokens column was appended later
+            line = line.replace("---|", "", 1)
+        elif health and line.startswith("|"):
+            line = line.rstrip("\n").rstrip(" |").rsplit(" | ", 1)[0] + " |\n"
         if line.startswith(("| post_rate |", "Probes skipped:")):
             drop_blank = line.startswith("Probes skipped:")
             continue
@@ -170,3 +175,27 @@ def test_skill_checklist_scales_to_the_budget():
     assert "swarmlab prompts SPEC.yaml --arm A" in short and "diff A.txt B.txt" in short
     assert "second agent" not in short.replace("without a second agent", "")
     assert "total_usd" in text and "all eleven items" in text
+
+
+def test_tool_health_counts_length_and_max_tokens_finishes(runs_dir):
+    from types import SimpleNamespace
+
+    from swarmlab.report import scan
+
+    def resp(fr):
+        return SimpleNamespace(type="inference_response", round=1, agent="a000", cached=False,
+                               finish_reason=fr)
+
+    d = scan(SimpleNamespace(events_all=[resp("length"), resp("max_tokens"), resp("max_tokens"),
+                                         resp("tool_use")]))
+    assert (d["length"], d["max_tokens"], d["nresp"]) == (1, 2, 4)
+    text = build_report(runs_dir, "demo")
+    assert "| length (responses) | errored turns | cache hits/responses | max_tokens (responses) |" in text
+
+
+def test_init_starter_describes_gossip_as_one_partner(tmp_path):
+    res = cli.invoke(app, ["init", "demo", "--dir", str(tmp_path)])
+    assert res.exit_code == 0, res.output
+    text = (tmp_path / "demo.yaml").read_text()
+    assert "one random partner per round by default (k=1)" in text
+    assert "a few neighbours" not in text

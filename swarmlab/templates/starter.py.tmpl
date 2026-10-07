@@ -26,7 +26,7 @@ def arm(topology: str) -> Experiment:
         arm=topology,  # run ids are __NAME____<arm>__s<seed>, as from the YAML
         world=FlagGame(n_candidates=8),
         participants=[LLMAgent(model=MODEL, max_tokens=512, max_calls=6)] * 8,
-        medium=Board(topology=topology),
+        medium=Board(topology=topology),  # gossip: one random partner per round by default (k=1)
         probes=[BeliefProbe()],
         metrics=["belief.consensus", "belief.accuracy",
                  Consensus(source="probe:belief"), Accuracy(source="probe:belief"),

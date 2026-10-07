@@ -21,6 +21,9 @@ Decisions:
 - Probe vs world belief: a skipped probe (`parsed.skipped`: no probe context, a budget, a
   provider error) is left out of that round's probe columns rather than counted as no answer,
   and each arm's table is followed by a `Probes skipped:` line with the counts by reason.
+- Tool protocol health counts truncated responses (`inference_response.finish_reason`) in two
+  columns: `length` (OpenAI-compatible providers) and `max_tokens` (Anthropic); both mean the
+  reply hit `max_tokens`. (`max_tokens` is the last column so the M2 table keeps its layout.)
 - The spend/run column is the ledger (discarded rounds included). When some summarised run
   charged spend in discarded rounds (`export.discarded_spend`), a line under the summary gives
   the ledger total and the discarded part, so it reconciles with exports; otherwise the report
@@ -79,7 +82,7 @@ def scan(run):
     d = {"guess_by_round": {}, "turns": Counter(), "reads": Counter(), "read_deliv": Counter(),
          "read_turns": Counter(), "agents_read": set(), "agents": set(), "yields": Counter(),
          "finish": Counter(), "err": 0, "cached": 0, "nresp": 0, "posts": Counter(), "t0": None,
-         "t1": None, "turn_n": Counter(), "length": 0, "posters": defaultdict(set)}
+         "t1": None, "turn_n": Counter(), "length": 0, "max_tokens": 0, "posters": defaultdict(set)}
     cur = {}
     last_round = 0
     for ev in run.events_all:
@@ -107,8 +110,10 @@ def scan(run):
             d["nresp"] += 1
             d["cached"] += bool(getattr(ev, "cached", False))
             fr = getattr(ev, "finish_reason", None)
-            if fr == "length":
+            if fr == "length":  # OpenAI-compatible providers
                 d["length"] += 1
+            elif fr == "max_tokens":  # Anthropic
+                d["max_tokens"] += 1
         elif t == "action_committed":
             act = ev.action if isinstance(ev.action, dict) else dict(ev.action)
             if act.get("name") == "guess" and ev.accepted:
@@ -322,9 +327,10 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
             fr.update(d["finish"])
         rows.append([arm, dict(y) or NA, dict(fr) or NA, sum(d["length"] for _, d in rs),
                      sum(d["err"] for _, d in rs),
-                     f"{sum(d['cached'] for _, d in rs)}/{sum(d['nresp'] for _, d in rs)}"])
+                     f"{sum(d['cached'] for _, d in rs)}/{sum(d['nresp'] for _, d in rs)}",
+                     sum(d["max_tokens"] for _, d in rs)])
     L += table(["arm", "yield kinds", "finish reasons (turn usage)", "length (responses)", "errored turns",
-                "cache hits/responses"], rows) + [""]
+                "cache hits/responses", "max_tokens (responses)"], rows) + [""]
     return "\n".join(L)
 
 
