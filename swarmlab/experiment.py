@@ -65,6 +65,8 @@ Decisions where the contract is silent:
   tokens; `usd_flat` is the same estimate with growth 0 (equal to `usd` when growth is 0), and
   `total_usd_flat` accompanies `total_usd` when `seeds` is given. `usd_per_round` is
   `usd_flat / max_rounds` (the CLI compares it with the gap between `soft_usd` and `hard_usd`).
+  `calls_per_turn_used` lists the distinct calls per turn actually priced (`calls_per_turn`
+  capped by each model-backed participant's `max_calls`).
 - `run_all` honours `budget.total_usd` (experiment-wide; see `budget.total_cap_refusal`): before
   each run it would start, the spend of the runs already returned plus this arm's `hard_usd` must
   fit, else it stops and warns (`TotalBudgetWarning`, naming the skipped seeds).
@@ -179,6 +181,7 @@ class Experiment(BaseModel):
         probe_calls = 0
         measurement = 0.0
         measurement_flat = 0.0
+        cpts: set[int] = set()
         for p in self.participants:
             model = participant_model(p)
             if model is None:
@@ -188,6 +191,7 @@ class Experiment(BaseModel):
             p_in, p_out, _ = provider.model_pricing(mid)
             own = getattr(p, "max_calls", None)
             cpt = min(calls_per_turn, own) if isinstance(own, int) and own > 0 else calls_per_turn
+            cpts.add(cpt)
             calls += cpt * max_rounds
             out_usd = completion_tokens * p_out * max_rounds
             by_model[model] = by_model.get(model, 0.0) + cpt * (grown_tokens * p_in + out_usd) / 1e6
@@ -212,6 +216,7 @@ class Experiment(BaseModel):
             "usd_flat": sum(by_model_flat.values()) + measurement_flat,
         }
         out["usd_per_round"] = out["usd_flat"] / max(1, max_rounds)  # one round, no growth
+        out["calls_per_turn_used"] = sorted(cpts)  # after each participant's own max_calls
         if seeds is not None:
             out["runs"] = len(seeds)
             out["total_usd"] = out["usd"] * len(seeds)

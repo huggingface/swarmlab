@@ -56,9 +56,10 @@ next item.
    `swarmlab report RUNS_DIR` -> tool protocol health shows no errored turns and few `length`
    finishes. A `hard_ceiling` end means raise the budget or cut rounds; `swarmlab resume RUN_DIR
    --budget-hard X` continues the same run.
-6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS` -> total for every arm x
-   seed. Take the growth and calls per turn from the smoke run's `inference` table
-   (`swarmlab export RUN_DIR`); the flat estimate overstates real spend 4-6x. The user approves
+6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS --calls-per-turn C` -> total
+   for every arm x seed. Take the growth and calls per turn from the smoke run's `inference` table
+   (`swarmlab export RUN_DIR`); without them the worst case (each group's `max_calls`, else the
+   runner cap) overstates real spend 4-6x. The user approves
    the total before launch.
 7. **Launch.** Local: `swarmlab run SPEC.yaml` (every arm x seed; asks before spending; already
    finished runs are skipped). Self-hosted model on HF Jobs (spec models `vllm:<model>`):

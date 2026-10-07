@@ -21,8 +21,11 @@ Decisions where the contract is silent:
 - M1b (WP7): `run` prints `Experiment.estimate(seed, max_rounds, calls_per_turn=...)` before
   running whenever any budget field is non-zero: one line `estimate: arm=... worst-case $X ...`
   on stdout, or on stderr under `--json` (stdout keeps exactly one JSON object). The estimate uses
-  `calls_per_turn = options.max_calls_per_turn` (every turn hitting the runner's cap: the worst
-  case), plus one call per probed agent per probed round. `swarmlab estimate SPEC [--arm A]
+  `calls_per_turn = --calls-per-turn` if given, else `options.max_calls_per_turn` (every turn
+  hitting the runner's cap: the worst case), capped per participant by its own `max_calls`, plus
+  one call per probed agent per probed round. The result's `calls_per_turn` is the value(s)
+  actually priced (an int, or the distinct values when groups differ) and
+  `calls_per_turn_source` says where it came from; the printed line and table show both. `swarmlab estimate SPEC [--arm A]
   [--seed N] [--max-rounds R] [--calls-per-turn C]` prints the same dict (default
   calls_per_turn: the worst case as above). `resume` takes `--budget-soft/--budget-hard/
   --budget-measurement`; given any of them, the effective budget (`run.json["budget"]`) is
@@ -150,12 +153,23 @@ def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
     rounds = max_rounds if max_rounds is not None else exp.options.get("max_rounds")
     if rounds is None:
         raise SpecError("no max_rounds in options; pass --max-rounds")
-    if calls_per_turn is None:
-        calls_per_turn = int(exp.options.get("max_calls_per_turn",
-                                             RunOptions.model_fields["max_calls_per_turn"].default))
-    return {**exp.estimate(seed, int(rounds), calls_per_turn=calls_per_turn,
-                           prompt_growth=prompt_growth),
-            "calls_per_turn": calls_per_turn}
+    cap = int(exp.options.get("max_calls_per_turn",
+                              RunOptions.model_fields["max_calls_per_turn"].default))
+    requested = calls_per_turn if calls_per_turn is not None else cap
+    est = exp.estimate(seed, int(rounds), calls_per_turn=requested, prompt_growth=prompt_growth)
+    used = est["calls_per_turn_used"] or [requested]
+    source = (f"--calls-per-turn {calls_per_turn}" if calls_per_turn is not None
+              else f"options.max_calls_per_turn {cap}")
+    if used != [requested]:
+        source = f"participant max_calls, under {source}"
+    return {**est, "calls_per_turn": used[0] if len(used) == 1 else used,
+            "calls_per_turn_source": source}
+
+
+def _cpt_text(est: dict[str, Any]) -> str:
+    cpt = est["calls_per_turn"]
+    n = f"{min(cpt)}-{max(cpt)}" if isinstance(cpt, list) else str(cpt)
+    return f"{n} calls/turn ({est.get('calls_per_turn_source', '')})"
 
 
 def _budget_text(budget: dict[str, float]) -> str:
@@ -175,7 +189,7 @@ def _estimate_line(est: dict[str, Any], seeds: int | None = None) -> str:
         per += f" per run x {seeds} seed(s) = ${est['usd'] * seeds:.4f}"
     return (f"estimate: arm={est['arm']} {per} "
             f"({est['llm_agents']} model agents x {est['rounds']} rounds x "
-            f"{est['calls_per_turn']} calls/turn, {est['probe_calls']} probe calls; {by_model}); "
+            f"{_cpt_text(est)}, {est['probe_calls']} probe calls; {by_model}); "
             f"{_budget_text(est['budget'])}")
 
 
@@ -412,12 +426,15 @@ def run(
 
 
 def _estimate_table(ests: dict[str, dict[str, Any]], n_seeds: int, growth: bool) -> str:
-    head = ["arm", "model agents", "rounds", "calls/run", "probe calls", "per run", "seeds", "total"]
+    head = ["arm", "model agents", "rounds", "calls/turn", "calls/run", "probe calls", "per run",
+            "seeds", "total"]
     if growth:
         head += ["per run +growth", "total +growth"]
     body = []
     for a, e in ests.items():
-        row = [a, str(e["llm_agents"]), str(e["rounds"]), str(e["calls"]), str(e["probe_calls"]),
+        cpt = e["calls_per_turn"]
+        cpt = f"{min(cpt)}-{max(cpt)}" if isinstance(cpt, list) else str(cpt)
+        row = [a, str(e["llm_agents"]), str(e["rounds"]), cpt, str(e["calls"]), str(e["probe_calls"]),
                _usd(e["usd_flat"]), str(n_seeds), _usd(e["usd_flat"] * n_seeds)]
         if growth:
             row += [_usd(e["usd"]), _usd(e["usd"] * n_seeds)]
@@ -436,7 +453,9 @@ def estimate(
         "--seed", help="Estimate only this seed (default: every seed in the YAML's `seeds:`).")] = None,
     max_rounds: Annotated[int | None, typer.Option("--max-rounds", help="Override options.max_rounds.")] = None,
     calls_per_turn: Annotated[int | None, typer.Option(
-        "--calls-per-turn", help="Model calls per turn (default: options.max_calls_per_turn).")] = None,
+        "--calls-per-turn",
+        help="Model calls per turn to assume (default: options.max_calls_per_turn); a "
+             "participant's own max_calls still caps it.")] = None,
     prompt_growth: Annotated[int, typer.Option(
         "--prompt-growth", metavar="TOKENS_PER_ROUND",
         help="Prompt tokens added per round (full-memory context growth); round r is priced at "
@@ -473,7 +492,9 @@ def estimate(
                                 "total_usd_flat": total_flat}
         if as_json:
             return data
+        sources = sorted({e["calls_per_turn_source"] for e in ests.values()})
         lines = [_estimate_table(ests, len(seeds), prompt_growth > 0),
+                 f"calls/turn from: {'; '.join(sources)}",
                  f"estimate total: ${total_flat:.4f} worst case over {n_runs} run(s)"]
         if prompt_growth > 0:
             lines.append(f"with prompt growth {prompt_growth} tokens/round: ${total:.4f} worst case")
