@@ -53,8 +53,9 @@ Budget: `MeasurementBudgetReached` -> `ok=False, parsed={"skipped": "measurement
 agent, and probing stops for the rest of this runner's life (a resume with a larger budget probes
 again). `HardCeilingReached` during a probe -> `ok=False, parsed={"skipped": "hard_ceiling"}`; the
 round is still committed (its turns are complete and its world commit already happened), then
-the run ends with `run_ended(hard_ceiling)` at round r. Resume continues from r + 1; the skipped
-probes of round r are not retried.
+the run ends with `run_ended(hard_ceiling_probes)` at round r (round r is kept; plain
+`hard_ceiling` is the mid-round abort that discards the round). Resume continues from r + 1; the
+skipped probes of round r are not retried.
 
 Context: `probe_messages` flattens tool traffic into text (an assistant tool call becomes a text
 line `[tool call] name {args}`, a tool message becomes a user text `[tool result] ...`) because

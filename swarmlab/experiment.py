@@ -71,7 +71,8 @@ Decisions where the contract is silent:
   each run it would start, the spend of the runs already returned plus this arm's `hard_usd` must
   fit, else it stops and warns (`TotalBudgetWarning`, naming the skipped seeds).
 - `Run.summary()` is the CLI's run summary: run_dir, run_id, arm, seed, spec_hash, status,
-  end_reason, last_round, score, metrics (last value per name), spend (+ parent_run/fork_round
+  end_reason, last_round, score, metrics (last value per name), spend, `probes_skipped`
+  (`{reason: count}`, only when the spec has probes; `Run.probes_skipped()`) (+ parent_run/fork_round
   for a fork; + `self_hosted`: the model prefixes served self-hosted, e.g. `["vllm"]`, only when
   there are any, so a $0 spend reads as compute time, not free). `Run.load(dir, run_id=None)` accepts a run dir, or a parent dir plus run id.
 - M3a §2: `run(..., repeat=None, run_id=None)`: `repeat` is `RunOptions.repeat` (paired-run
@@ -564,6 +565,16 @@ class Run:
                 out.setdefault(ev.probe, []).append((ev.round, str(ev.agent), dict(ev.parsed), ev.ok))
         return out
 
+    def probes_skipped(self) -> dict[str, int]:
+        """Skipped probe events by reason (`parsed["skipped"]`: `no_context`,
+        `measurement_budget`, `hard_ceiling`, `provider_error`) in the log."""
+        out: dict[str, int] = {}
+        for ev in self.events_all:
+            if ev.type == "probe" and "skipped" in (ev.parsed or {}):
+                why = str(ev.parsed["skipped"])
+                out[why] = out.get(why, 0) + 1
+        return dict(sorted(out.items()))
+
     # ---- operations --------------------------------------------------------------------------
     def view(self) -> Path:
         from .viewer.build import build as build_view
@@ -608,6 +619,8 @@ class Run:
             "metrics": metrics,
             "spend": self.spend,
         }
+        if (meta.get("spec") or {}).get("probes"):
+            out["probes_skipped"] = self.probes_skipped()
         hosted = self_hosted_prefixes((meta.get("spec") or {}).get("providers") or {})
         if hosted:
             out["self_hosted"] = hosted

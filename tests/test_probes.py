@@ -86,7 +86,12 @@ def test_acceptance_5_measurement_cap_stops_probes_not_the_swarm(tmp_path):
     assert run.spend["measurement"] <= 0.05
     # the swarm kept going after the cap
     assert {t["round"] for t in run.events if t["type"] == "turn_ended"} == set(range(1, 6))
-    assert run.metrics["belief.consensus@probe:belief"][-1][2] == 4
+    # skipped agents leave the probe metrics' denominator (they were not asked)
+    series = run.metrics["belief.consensus@probe:belief"]
+    assert all(den == 4 for r, _, den in series if r < stop)
+    n_skipped_at_stop = len([e for e in skipped if e["round"] == stop])
+    assert [den for r, _, den in series if r == stop] == [4 - n_skipped_at_stop]
+    assert series[-1][2] == 4 - n_skipped_at_stop
 
 
 def test_scripted_agents_skipped_once_per_run(tmp_path):
@@ -107,8 +112,8 @@ def test_scripted_agents_skipped_once_per_run(tmp_path):
     child = run.fork(at_round=1).run(out=tmp_path / "forks")
     child_skips = [e for e in probe_events(child) if e["parsed"].get("skipped")]
     assert len(child_skips) == 2  # the copied prefix's, none new
-    # scripted agents count as "none" in probe metrics, guessers in world metrics
-    assert run.metrics["belief.accuracy@probe:belief"][-1][2] == 4
+    # scripted agents (never asked) are left out of the probe metrics' denominator
+    assert run.metrics["belief.accuracy@probe:belief"][-1][2] == 2
 
 
 def test_probe_hard_ceiling_commits_the_round_then_ends(tmp_path, monkeypatch):
@@ -122,14 +127,46 @@ def test_probe_hard_ceiling_commits_the_round_then_ends(tmp_path, monkeypatch):
     monkeypatch.setattr(RoundExecutor, "infer", ceiling)
     exp = llm_agent_experiment(3, probes=[BeliefProbe()], metrics=PROBE_METRICS)
     run = exp.run(seed=1, max_rounds=4, out=tmp_path)
-    assert run.end_reason == "hard_ceiling" and run.meta["last_round"] == 2
+    # the round is kept and the end reason says the ceiling was reached by the probes
+    assert run.end_reason == "hard_ceiling_probes" and run.meta["last_round"] == 2
     r2 = [e for e in run.events if e["round"] == 2]
     assert "round_committed" in [e["type"] for e in r2]
     assert {e["parsed"].get("skipped") for e in r2 if e["type"] == "probe"} == {"hard_ceiling"}
+    assert run.summary()["probes_skipped"] == {"hard_ceiling": 3}
+    # every agent skipped in round 2: no probe answers, no denominator (not three "none"s)
+    assert run.metrics["belief.consensus@probe:belief"][1] == (2, None, 0)
+    assert run.metrics["belief.consensus@probe:belief"][0][2] == 3
     monkeypatch.setattr(RoundExecutor, "infer", original)
     resumed = Run(run.dir, experiment=exp).resume(budget=Budget(hard_usd=10.0))
     assert resumed.end_reason == "max_rounds" and resumed.meta["last_round"] == 4
     assert {e["round"] for e in probe_events(resumed) if e["ok"]} == {1, 3, 4}
+
+
+def test_probe_skips_in_report_and_status_line(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from swarmlab.cli import app
+    from swarmlab.report import build_report
+
+    original = RoundExecutor.infer
+
+    async def ceiling(self, agent, request, category="swarm"):
+        if category == "measurement" and self.round == 2:
+            raise HardCeilingReached("test ceiling")
+        return await original(self, agent, request, category)
+
+    monkeypatch.setattr(RoundExecutor, "infer", ceiling)
+    exp = llm_agent_experiment(3, probes=[BeliefProbe()], metrics=PROBE_METRICS)
+    run = exp.run(seed=1, max_rounds=4, out=tmp_path)
+    text = build_report(tmp_path, include_fake=True)
+    assert "Probes skipped: 3 over 1 run(s) (hard_ceiling 3)" in text
+    # round 2's probe columns have no answers (skipped agents are not counted as "no answer")
+    probe_rows = [line for line in text.splitlines() if line.startswith("| probe consensus |")]
+    assert probe_rows and probe_rows[0].rstrip(" |").split(" | ")[2] == "n/a"
+    res = CliRunner().invoke(app, ["replay", str(run.dir)])
+    assert res.exit_code == 0, res.output
+    assert "end=hard_ceiling_probes" in res.output
+    assert "probes_skipped=3 (hard_ceiling 3)" in res.output
 
 
 def test_coder_model_extracts_free_text(tmp_path):
@@ -202,11 +239,22 @@ def test_probe_metric_source_rules():
     m.update(ev("a1", {"error": "no JSON object"}, False))  # failed parse -> none
     assert m.value() == (0.5, 2)
     m.update(ev("a1", {"candidate": "A"}, True))
-    m.update(ev("a1", {"skipped": "measurement_budget"}, False))  # skipped: last answer stands
+    m.update(ev("a1", {"skipped": "measurement_budget"}, False))  # skipped: not in the denominator
     m.update(ev("a1", {"candidate": "B"}, True, probe="other"))  # another probe: ignored
     m.update(SimpleNamespace(type="action_committed", agent="a1", accepted=True,
                              action={"name": "guess", "args": {"candidate": "B"}}))
-    assert m.value() == (1.0, 2)
+    assert m.value() == (1.0, 1)
+    m.update(ev("a0", {"skipped": "hard_ceiling"}, False))
+    assert m.value() == (None, 0)
+    m.update(ev("a1", {"candidate": "B"}, True))  # answered again: back in
+    assert m.value() == (1.0, 1)
+    old = Consensus(source="probe:belief")  # metrics revision 1: a skip left the last answer
+    old.use_rev(1)
+    old.set_agents(["a0", "a1"])
+    for x in (ev("a0", {"candidate": "A"}, True), ev("a1", {"candidate": "A"}, True),
+              ev("a1", {"skipped": "measurement_budget"}, False)):
+        old.update(x)
+    assert old.value() == (1.0, 2)
     with pytest.raises(ValueError):
         Consensus(source="probe:")
     with pytest.raises(ValueError):

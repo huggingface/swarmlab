@@ -37,8 +37,16 @@ def test_report_reproduces_the_m2_report(tmp_path):
 
 def since_m2(text: str) -> str:
     """The report without the rows added after the M2 note was written."""
-    return "".join(line for line in text.splitlines(keepends=True)
-                   if not line.startswith("| post_rate |"))
+    out, drop_blank = [], False
+    for line in text.splitlines(keepends=True):
+        if line.startswith(("| post_rate |", "Probes skipped:")):
+            drop_blank = line.startswith("Probes skipped:")
+            continue
+        if drop_blank and line == "\n":
+            drop_blank = False
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 @pytest.fixture(scope="module")

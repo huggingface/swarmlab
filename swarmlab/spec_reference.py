@@ -101,8 +101,9 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
     },
     Budget: {
         "soft_usd": "end the run at the next round boundary once agent spend reaches this (0: off)",
-        "hard_usd": "absolute ceiling on agent + probe spend for the run; the round in flight is "
-                    "discarded (0: off)",
+        "hard_usd": "absolute ceiling on agent + probe spend for the run: reached mid-round, the "
+                    "round is discarded (end `hard_ceiling`); reached by the probes after the "
+                    "commit, the round is kept (end `hard_ceiling_probes`) (0: off)",
         "measurement_usd": "cap on probe spend (0: off)",
         "total_usd": "top level only: cap on the whole experiment's spend (all arms x seeds, "
                      "finished and resumed runs included) (0: off)",

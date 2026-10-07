@@ -20,10 +20,15 @@ Guesses by agents that are not live are ignored. With no live agents the value i
 M1b `source` param (docs/INTERFACE-M1b.md §6), on every belief metric: `"world"` (default, the
 committed guesses above) or `"probe:<name>"`, which reads `probe` events of that probe instead:
 `ok` with a string `parsed["candidate"]` sets the agent's belief, any other answer (a failed
-parse) resets it to `"none"`, and skipped probes (`parsed["skipped"]`: scripted agents, an
-exhausted measurement budget) leave it unchanged. The metric's `name` gains the suffix
+parse) resets it to `"none"`. A skipped probe (`parsed["skipped"]`: a scripted agent without a
+probe context, an exhausted measurement budget, the hard ceiling, a provider error) takes the
+agent out of the denominator (and the numerator) until its next answered probe: nobody asked
+it, so it is neither `"none"` nor its older answer. Before metrics revision 2 (runs whose
+`run.json` has no `metrics_rev`, replayed with `use_rev(1)`) a skip left the last answer
+standing and an agent that never answered counted as `"none"`. The metric's `name` gains the suffix
 `@probe:<name>` (`belief.consensus@probe:belief`), so the same entry point can run twice side by
-side; the runner requires unique names, not unique entry points. Same denominator rules.
+side; the runner requires unique names, not unique entry points. Same denominator rules, less
+the skipped agents.
 `source="world"` is left out of `params`, so M1a specs and their hashes are unchanged.
 """
 from __future__ import annotations
@@ -56,6 +61,11 @@ class _BeliefMetric(Metric):
         self.name = base if self.probe is None else f"{base}@{source}"
         self.beliefs: dict[str, str] = {}
         self.agents: list[str] | None = None
+        self.skipped: set[str] = set()  # probe source: agents whose latest probe was skipped
+        self._rev1 = False
+
+    def use_rev(self, rev: int) -> None:
+        self._rev1 = rev < 2
 
     def set_agents(self, agents: list[Any]) -> None:
         self.agents = sorted(str(a) for a in agents)
@@ -77,8 +87,11 @@ class _BeliefMetric(Metric):
         if getattr(event, "type", None) != "probe" or event.probe != self.probe or event.agent is None:
             return
         parsed = event.parsed or {}
-        if "skipped" in parsed:  # not asked (scripted agent, budget): the last answer stands
+        if "skipped" in parsed:  # not asked (scripted agent, budget, error)
+            if not self._rev1:  # revision 1: the last answer stands
+                self.skipped.add(event.agent)
             return
+        self.skipped.discard(event.agent)
         candidate = parsed.get("candidate")
         if event.ok and isinstance(candidate, str):
             self.beliefs[event.agent] = candidate
@@ -88,6 +101,8 @@ class _BeliefMetric(Metric):
     def _distribution(self) -> tuple[Counter[str], int]:
         """(counts of candidate beliefs among live agents, number of live agents without one)."""
         agents = self.agents if self.agents is not None else sorted(self.beliefs)
+        if self.skipped:
+            agents = [a for a in agents if a not in self.skipped]
         counts: Counter[str] = Counter(self.beliefs[a] for a in agents if a in self.beliefs)
         return counts, len(agents) - sum(counts.values())
 

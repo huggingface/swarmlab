@@ -32,8 +32,10 @@ Round `r` (phase-commit, `commit == "round_end"`):
    fed to metrics (probe-sourced belief metrics see round r's answers in round r), covered by
    the round's `budget` event, and dropped with the round on a crash (resume re-asks them; the
    cache answers the ones already paid). See swarmlab/probes.py for the request, skip and budget
-   rules. A `HardCeilingReached` from a probe does not abort the round: the round commits and
-   the run then ends with `run_ended(hard_ceiling)` at round r.
+   rules. A `HardCeilingReached` from a probe does not abort the round: the round is kept (its
+   turns and world commit are complete; the probes not yet answered are logged as skipped) and
+   the run then ends with `run_ended(hard_ceiling_probes)` at round r, so the end reason says
+   the last round was committed, unlike `hard_ceiling`, which discards the round in flight.
 6. Metrics are folded over this round's logical events (every event from `round_started`
    through the last `action_committed`, parsed back from JSON so live and replay feed identical
    objects); log `metric*`.
@@ -84,7 +86,7 @@ after the last commit), metrics_rev (the metric-semantics revision the run logs 
 revision 1: replay, resume and report then fold with `Metric.use_rev(1)`).
 
 Recovery (`resume(budget=None)`): if the log has `run_ended` with a reason other than
-`soft_budget`/`hard_ceiling`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
+`soft_budget`/`hard_ceiling`/`hard_ceiling_probes`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
 `round_committed` (round c); keep the log through it plus a directly following `snapshot` /
 `run_started` event; move every dropped event (logical and operational) to `discarded.jsonl`;
 restore all plugins, `outcomes_prev` and `live` from snapshot c; re-append the `snapshot` event if
@@ -215,7 +217,8 @@ if TYPE_CHECKING:
 # events metrics are fed (every logical event of a round up to the commit bookkeeping)
 NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "run_ended", "budget",
                      "budget_changed"})
-BUDGET_REASONS = ("soft_budget", "hard_ceiling")  # run_ended reasons that resume() continues from
+# run_ended reasons that resume() continues from
+BUDGET_REASONS = ("soft_budget", "hard_ceiling", "hard_ceiling_probes")
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -552,7 +555,7 @@ class Runner:
     def resume(self, budget: Budget | None = None) -> Runner:
         """Recover after a crash (§12 `recover()`) and continue live.
 
-        A run that ended with `soft_budget` or `hard_ceiling` is resumable too: its `run_ended`
+        A run that ended with `soft_budget`, `hard_ceiling` or `hard_ceiling_probes` is resumable too: its `run_ended`
         (and, after a hard ceiling, the aborted round's events) go to `discarded.jsonl` like a
         crashed round's. `budget`, when given, replaces the effective budget (stored as
         `run.json["budget"]`; the archived spec and its hash are unchanged) and is logged as a
@@ -842,7 +845,7 @@ class Runner:
                 self._abort_round(r)
                 return
             if self._probe_hard_ceiling:  # a probe hit the ceiling after round r was committed
-                self._end(r, "hard_ceiling")
+                self._end(r, "hard_ceiling_probes")
                 return
             r += 1
 
@@ -911,6 +914,14 @@ class Runner:
                 "parsed": _jsonable(parsed), "ok": ok, "cost_usd": cost}
 
     def _end_reason(self, committed: int) -> str | None:
+        """The reason to end before round `committed + 1`, checked at each round boundary.
+
+        `terminal`, `max_rounds` and `soft_budget` end the run at the boundary; every round up
+        to `committed` is kept. The two ceiling reasons are not decided here: `hard_ceiling`
+        (`_abort_round`) means the round in flight was discarded and the run ends at r - 1;
+        `hard_ceiling_probes` (set in `_loop`) means the ceiling was reached by the probes after
+        round r had committed, so round r is kept and the run ends at r.
+        """
         if committed >= 1 and self.world.terminal():
             return "terminal"
         if committed >= self.options.max_rounds:

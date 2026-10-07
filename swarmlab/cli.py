@@ -34,7 +34,8 @@ Decisions where the contract is silent:
   soft = swarm spend + X and hard = swarm + measurement spend + X (only the enforced ones).
   `resume` prints the spend so far and the budget it resumes with (stderr under --json).
 - Run summaries (status line of `run`, `resume`, `replay`, `fork`, ...) carry
-  `spend=$x.xxx (swarm $a + measurement $b)` from the ledger; the JSON adds `spend_usd`, and
+  `spend=$x.xxx (swarm $a + measurement $b)` from the ledger, and for runs with probes
+  `probes_skipped=N (reason n, ...)` (`Run.probes_skipped()`); the JSON adds `spend_usd`, and
   `resume --json` adds the `budget` it resumed with.
 - Setup UX: `run SPEC` without `--arm`/`--seed` runs every arm (document order) x every seed in
   the YAML's `seeds:` (default `[0]`); `--arm`/`--seed` narrow it. With one arm and a `--seed`
@@ -128,6 +129,15 @@ def _spend_text(spend: dict | None) -> str:
     return f"spend=${swarm + meas:.3f} (swarm ${swarm:.3f} + measurement ${meas:.3f})"
 
 
+def _skips_text(skipped: dict[str, int] | None) -> str:
+    """`  probes_skipped=N (reason n, ...)` for runs with probes, else empty."""
+    if skipped is None:
+        return ""
+    n = sum(skipped.values())
+    return f"  probes_skipped={n}" + (
+        " (" + ", ".join(f"{k} {v}" for k, v in skipped.items()) + ")" if n else "")
+
+
 def _fmt(v: Any) -> str:
     return f"{v:.3g}" if isinstance(v, float) else str(v)
 
@@ -139,7 +149,8 @@ def _human(data: dict[str, Any]) -> str:
         return "\n".join(f"{k}: {v}" for k, v in data.items())
     lines = [
         (f"run {data['run_id']}  status={data['status']}  end={data['end_reason']}  "
-         f"rounds={data['last_round']}  {_spend_text(data.get('spend'))}"),
+         f"rounds={data['last_round']}  {_spend_text(data.get('spend'))}"
+         + _skips_text(data.get("probes_skipped"))),
         f"  dir    {data['run_dir']}",
         f"  spec   {str(data['spec_hash'])[:16]}",
         "  score  " + ", ".join(f"{k}={_fmt(v)}" for k, v in (data["score"] or {}).items()),

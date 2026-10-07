@@ -18,6 +18,9 @@ Decisions:
   events so it is there whether or not `comm.post_rate` was logged), reading behaviour and tool-protocol health for every world; "where the swarm went"
   and "probe vs world belief" only when some run has committed `guess` actions (FlagGame-style
   worlds; truth and rival come from rebuilding the world, since `verify()` is not persisted).
+- Probe vs world belief: a skipped probe (`parsed.skipped`: no probe context, a budget, a
+  provider error) is left out of that round's probe columns rather than counted as no answer,
+  and each arm's table is followed by a `Probes skipped:` line with the counts by reason.
 - The spend/run column is the ledger (discarded rounds included). When some summarised run
   charged spend in discarded rounds (`export.discarded_spend`), a line under the summary gives
   the ledger total and the discarded part, so it reconciles with exports; otherwise the report
@@ -262,6 +265,7 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
         L += ["## Probe vs world belief", ""]
         for arm, rs in sorted(arms.items()):
             pc, pa, wc, wa, dis = defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list)
+            skips: Counter = Counter()
             for run, d in rs:
                 try:
                     pr = run.probes.get("belief", [])
@@ -270,6 +274,9 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
                 truth = probe_ctx.get(run.id, (None, None))[0]
                 byr = defaultdict(dict)
                 for r, ag, parsed, ok in pr:
+                    if isinstance(parsed, dict) and "skipped" in parsed:  # not asked: not counted
+                        skips[str(parsed["skipped"])] += 1
+                        continue
                     byr[r][ag] = parsed.get("candidate") if ok and isinstance(parsed, dict) else None
                 for r, ans in byr.items():
                     cnt = Counter(ans.values())
@@ -288,6 +295,12 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
                     [("probe consensus", pc), ("world consensus", wc), ("probe accuracy", pa),
                      ("world accuracy", wa), ("disagreement (probe != guess)", dis)]]
             L += [f"**{arm}**", ""] + table(["metric"] + [f"r{k}" for k in R], rows) + [""]
+            if skips:
+                why = ", ".join(f"{k} {v}" for k, v in sorted(skips.items()))
+                L += [(f"Probes skipped: {sum(skips.values())} over {len(rs)} run(s) ({why}); "
+                       "skipped agents are left out of that round's probe columns."), ""]
+            else:
+                L += ["Probes skipped: none.", ""]
 
     # reading
     L += ["## Reading behaviour", ""]
