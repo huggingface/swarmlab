@@ -68,15 +68,22 @@ Decisions where the contract is silent:
   end_reason, last_round, score, metrics (last value per name), spend (+ parent_run/fork_round
   for a fork; + `self_hosted`: the model prefixes served self-hosted, e.g. `["vllm"]`, only when
   there are any, so a $0 spend reads as compute time, not free). `Run.load(dir, run_id=None)` accepts a run dir, or a parent dir plus run id.
+- M3a §2: `run(..., repeat=None, run_id=None)`: `repeat` is `RunOptions.repeat` (paired-run
+  sampling repeat, see swarmlab/runner.py); `run_id` overrides the derived run id (and, without
+  `run_dir`, the directory name). `pair(seed, max_rounds, *, patch, repeats=1, control=True,
+  out="runs", **run_options) -> PairedResult`: see `pair` and `PairedResult`. A `Run.fork(0, exp)`
+  re-resets the world under `exp` with the parent's seed (swarmlab/runner.py).
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from ._io import atomic_write_bytes
 from .events import Event, EventLog, logical_view
 from .ids import run_id as make_run_id
 from .medium.board import Board
@@ -229,13 +236,53 @@ class Experiment(BaseModel):
         out: Path | str = "runs",
         concurrency: int | None = None,
         run_dir: Path | str | None = None,
+        repeat: int | None = None,
+        run_id: str | None = None,
     ) -> Run:
         """Run one seed into `out/<run_id>` (or exactly `run_dir` when given)."""
         options = self._options(seed, max_rounds, commit=commit, max_calls_per_turn=max_calls_per_turn,
-                                snapshot_every=snapshot_every, concurrency=concurrency)
-        target = Path(run_dir) if run_dir is not None else Path(out) / self.run_id(seed)
-        Runner(target, self, options).live()
+                                snapshot_every=snapshot_every, concurrency=concurrency, repeat=repeat)
+        rid = run_id or self.run_id(seed)
+        target = Path(run_dir) if run_dir is not None else Path(out) / rid
+        Runner(target, self, options, run_id=run_id).live()
         return Run(target, experiment=self)
+
+    def pair(self, seed: int, max_rounds: int | None = None, *, patch: Experiment | None,
+             repeats: int = 1, control: bool = True, out: Path | str = "runs",
+             **run_options: Any) -> PairedResult:
+        """Paired runs from round 0 (M3a §2): per repeat i, the base run, the `patch` run and
+        (with `control`) an unchanged re-run of the base, all with the same seed and repeat i.
+
+        Layout: `<out>/<run_id(seed)>__pair/` holds `pair.json` and one run dir per run, named
+        (and with run id) `<run_id(seed)>__{base,patched,control}_r<i>`. Repeat 0 of the base is
+        exactly `run(seed)` (only the run id differs). `patch=None` pairs the base with itself.
+        """
+        if repeats < 1:
+            raise ValueError("repeats must be >= 1")
+        patched_exp = self if patch is None else patch
+        if len(patched_exp.participants) != len(self.participants):
+            raise ValueError("a paired run cannot change the number of participants")
+        base_id = self.run_id(seed)
+        root = Path(out) / f"{base_id}__pair"
+        if (root / "pair.json").exists():
+            raise FileExistsError(f"{root} already holds a paired run; use another out dir")
+        root.mkdir(parents=True, exist_ok=True)
+        roles: list[tuple[str, Experiment]] = [("base", self), ("patched", patched_exp)]
+        if control:
+            roles.append(("control", self))
+        runs: dict[str, list[Run]] = {"base": [], "patched": [], "control": []}
+        for i in range(repeats):
+            for role, exp in roles:
+                rid = f"{base_id}__{role}_r{i}"
+                runs[role].append(exp.run(seed, max_rounds, run_dir=root / rid, run_id=rid,
+                                          repeat=i, **run_options))
+        result = PairedResult(root, runs["base"], runs["patched"], runs["control"])
+        doc = {"seed": seed, "repeats": repeats, "control": control,
+               "base_spec_hash": runs["base"][0].meta["spec_hash"],
+               "patched_spec_hash": runs["patched"][0].meta["spec_hash"],
+               "runs": {k: [r.dir.name for r in v] for k, v in result.runs.items()}}
+        atomic_write_bytes(root / "pair.json", (json.dumps(doc, indent=2) + "\n").encode())
+        return result
 
     def run_id(self, seed: int) -> str:
         return make_run_id(self.name, self.arm, seed)
@@ -335,6 +382,62 @@ class Experiment(BaseModel):
         doc = runspec_to_doc(spec, self.arm or "default")
         doc["options"] = {k: v for k, v in self.options.items() if k != "seed"}
         dump_experiment_yaml(doc, path)
+
+
+class PairedResult:
+    """The runs of `Experiment.pair` and their paired metric differences.
+
+    `runs` is `{"base": [...], "patched": [...], "controls": [...]}` (one `Run` per repeat;
+    `controls` is empty without `control`). `effect(metric, round=-1)` compares the metric at
+    `round` (-1: each run's last logged value) per repeat: `diff` is the mean of patched - base,
+    `control_spread` is the root-mean-square of the control diffs (control - base), i.e. their
+    spread around the zero they should have; it is defined for a single control pair (= its
+    absolute diff) and is None without controls. Repeats whose value is None on either side are
+    left out (`n` / `n_control` count the pairs used).
+    """
+
+    def __init__(self, dir: Path, base: list[Run], patched: list[Run], controls: list[Run]) -> None:
+        self.dir = dir
+        self.base = base
+        self.patched = patched
+        self.controls = controls
+
+    @property
+    def runs(self) -> dict[str, list[Run]]:
+        return {"base": self.base, "patched": self.patched, "controls": self.controls}
+
+    @staticmethod
+    def value(run: Run, metric: str, round: int = -1) -> float | None:
+        series = run.metrics.get(metric)
+        if not series:
+            raise KeyError(f"{run.id} logged no metric {metric!r}")
+        if round == -1:
+            return series[-1][1]
+        for r, v, _ in series:
+            if r == round:
+                return v
+        raise KeyError(f"{run.id} has no {metric!r} value at round {round}")
+
+    def _diffs(self, others: list[Run], metric: str, round: int) -> list[float]:
+        out = []
+        for b, o in zip(self.base, others, strict=False):
+            vb, vo = self.value(b, metric, round), self.value(o, metric, round)
+            if vb is not None and vo is not None:
+                out.append(vo - vb)
+        return out
+
+    def effect(self, metric: str, round: int = -1) -> dict[str, Any]:
+        diffs = self._diffs(self.patched, metric, round)
+        cdiffs = self._diffs(self.controls, metric, round)
+        return {
+            "metric": metric, "round": round,
+            "diff": sum(diffs) / len(diffs) if diffs else None,
+            "control_spread": (sum(d * d for d in cdiffs) / len(cdiffs)) ** 0.5 if cdiffs else None,
+            "diffs": diffs, "control_diffs": cdiffs, "n": len(diffs), "n_control": len(cdiffs),
+        }
+
+    def __repr__(self) -> str:
+        return f"PairedResult({str(self.dir)!r}, repeats={len(self.base)}, controls={len(self.controls)})"
 
 
 class ForkHandle:
