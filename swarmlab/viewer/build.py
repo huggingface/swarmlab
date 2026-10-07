@@ -21,6 +21,12 @@ Decisions where the contract is silent:
   shows a committed-actions table instead of the flag panel.
 - `truth` comes from `run.json` `score["truth"]` if present, else from the restored world's
   `verify()`; the page hides it until "reveal truth" is ticked.
+- `world_states` (`{"<round>": state}` or None): `World.render_state()` of a fresh world built
+  from the run spec and restored from each committed round's snapshot (the state after that
+  round's commit), for the page's "World state" panel; rounds without a snapshot or whose
+  state is None are left out, and a world that returns None for every round (FlagGame, which
+  has its own panel; any world without the hook), cannot be imported, or fails to restore gives
+  None and no panel. States are passed through `json` (non-JSON values become strings).
 """
 from __future__ import annotations
 
@@ -122,6 +128,35 @@ def _world(run_dir: Path, meta: dict, blobs: BlobStore) -> tuple[dict | None, st
     return data, world.verify().get("truth")
 
 
+def _world_states(run_dir: Path, meta: dict, blobs: BlobStore, last: int) -> dict | None:
+    from ..world.base import World
+
+    spec = meta.get("spec", {}).get("world") or {}
+    try:
+        if type(build_plugin(spec, "swarmlab.worlds")).render_state is World.render_state:
+            return None  # no hook: skip restoring every round
+    except Exception:  # noqa: BLE001 - inline script worlds may not be importable here
+        return None
+    snaps = SnapshotStore(run_dir, blobs)
+    out: dict[str, Any] = {}
+    for r in snaps.list_rounds():
+        if not 1 <= r <= last:
+            continue
+        try:
+            manifest = snaps.read(r)
+            if "world" not in manifest.plugins:
+                continue
+            world = build_plugin(spec, "swarmlab.worlds")
+            world.restore(blobs.get(manifest.plugins["world"]))
+            state = world.render_state()
+        except Exception:  # noqa: BLE001 - a world we cannot rebuild here just has no panel
+            return None
+        if state is None:
+            continue
+        out[str(r)] = json.loads(json.dumps(state, default=str))
+    return out or None
+
+
 def collect(run_dir: Path | str) -> dict:
     """The data blob the page embeds (see module docstring)."""
     run_dir = Path(run_dir)
@@ -152,6 +187,7 @@ def collect(run_dir: Path | str) -> dict:
         },
         "agents": agents,
         "world": world,
+        "world_states": _world_states(run_dir, meta, blobs, last),
         "truth": truth if isinstance(truth, str) else None,
         "events": events,
     }

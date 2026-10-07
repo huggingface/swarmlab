@@ -101,6 +101,14 @@ class Counter(World):
 
 **4. LLM agents with a belief probe** (`examples/04_llm_flaggame.py`): `LLMAgent(model="fake:reader")` on the Flag Game with `BeliefProbe()`; set `MODEL = "anthropic:claude-haiku-4-5"` for a real run.
 
+## Writing a world
+
+- Required: `reset(rng, agents)`, `observe(agent)`, `score()` and at least one `@tool` action returning an `Outcome` (example 3). A world in your own module is used from YAML as `world: {type: "mymodule:MyWorld", params: {...}}`.
+- State in ordinary attributes is snapshotted every round (a pickle of the instance's attributes minus `params` and `_`-prefixed ones), so resume, replay and fork need no world code.
+- Optional hooks (defaults in `swarmlab/world/base.py`): `description()` (task text for prompts), `validate` and `commit` (refusals and conflict rules), `begin_round(round)`, `terminal()`, `my_status`/`collective_status`, `verify()` (evaluator-only truth for metrics, see [Analysis patterns](#analysis-patterns)), `claim_key`, `killed_at`, and `render_state()`.
+- `Outcome.feedback` reaches the agent and the `actions` table: put there what you will analyse per decision, never correctness.
+- `render_state() -> dict | None` fills the "World state" panel of `view.html`: the builder restores a fresh world from each round's snapshot and shows what it returns. A `grid` (list of equal-length rows) is drawn as coloured cells with `palette` (cell value -> CSS colour; other 2-D lists are drawn too when `palette` is given), a list of flat dicts as a table, other values as key/value rows. `coloring` returns its current and target grids; FlagGame returns None (it has its own panel).
+
 ## Switching to real models
 
 - **Model ids** are `provider:model[:served_by]`: `anthropic:claude-haiku-4-5`, `hf:Qwen/Qwen3.5-9B:deepinfra` (the HF router, pinned to DeepInfra; without `:served_by` the router picks), `openai:<model>`, `vllm:<model>` (with a `providers:` base url). Put it in `model:` of each `llm` participant group.
@@ -302,7 +310,7 @@ Run ids are `<experiment>__s<seed>` from Python, `<experiment>__<arm>__s<seed>` 
 
 ## Known issues
 
-`docs/notes/known-issues.md` lists open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `validate` rejecting `vllm:` specs, role and paired-run gaps, and no grid panel in the viewer.
+`docs/notes/known-issues.md` lists open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `validate` rejecting `vllm:` specs, and role and paired-run gaps.
 
 ## Docs
 

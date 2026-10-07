@@ -25,5 +25,5 @@ Last checked against main on 2026-10-07. Items fixed since the first version (pe
 
 - Roles: a role's `model` override is ignored by `Experiment.estimate`; a fork keeps the parent's participant settings (role overrides in an edited spec do not re-bind them); `reconfigure` interventions do not change roles. `Role` and `Tree` are not re-exported at top level (import from `swarmlab.roles` and `swarmlab.medium.topology`).
 - Paired runs: `PairedResult` is not re-exported from `swarmlab` (import from `swarmlab.experiment`).
-- Registry: the viewer shows registry state as lists and has no grid panel for `ColoringGrid`.
+- Registry: the viewer shows registry state as lists (tool results and actions); the `ColoringGrid` panel (`World.render_state`) draws the grids but not who holds which claim.
 - `LLMAgent` `summary_model` (context-limit summaries) is not priced by `Experiment.estimate`.

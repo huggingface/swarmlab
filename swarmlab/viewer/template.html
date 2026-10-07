@@ -70,6 +70,11 @@ pre { margin: 2px 0 0; white-space: pre-wrap; word-break: break-word; }
 select { font: inherit; background: var(--chip); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
 .empty { color: var(--muted); font-style: italic; }
 .scroll { max-height: 420px; overflow: auto; }
+.wgrids { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 8px; }
+.wgrid { display: flex; flex-direction: column; gap: 3px; }
+.wgrid .lbl { color: var(--muted); font-size: 12px; }
+.grid.big i { width: 16px; height: 16px; outline: 1px solid var(--cell-border); outline-offset: -1px; }
+.kv td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
 </style>
 </head>
 <body>
@@ -90,6 +95,10 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
     <section id="flagPanel">
       <h2>Flag Game <span class="hint">candidates; bar = share of agents guessing it</span></h2>
       <div class="flags" id="flags"></div>
+    </section>
+    <section id="statePanel">
+      <h2>World state <span class="hint" id="stateHint">after this round's commit</span></h2>
+      <div id="worldState"></div>
     </section>
     <section id="guessPanel">
       <h2>Guesses <span class="hint">committed, as of this round</span></h2>
@@ -153,16 +162,16 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
     }).join(", ");
     return s.length > 90 ? s.slice(0, 89) + "…" : s;
   }
-  function gridHtml(rows, small) {
+  function gridHtml(rows, small, palette, cls) {
     if (!rows || !rows.length) return "";
     var w = rows[0].length, cells = "";
     rows.forEach(function (row) {
       for (var i = 0; i < row.length; i++) {
-        var c = COLOURS[row[i]] || "#999";
-        cells += '<i style="background:' + c + '" title="' + esc(row[i]) + '"></i>';
+        var v = row[i], c = (palette && palette[v]) || COLOURS[v] || "#999";
+        cells += '<i style="background:' + esc(c) + '" title="' + esc(v) + '"></i>';
       }
     });
-    return '<div class="grid' + (small ? " small" : "") + '" style="grid-template-columns:repeat(' + w + ',max-content)">' + cells + "</div>";
+    return '<div class="grid' + (small ? " small" : "") + (cls ? " " + cls : "") + '" style="grid-template-columns:repeat(' + w + ',max-content)">' + cells + "</div>";
   }
 
   // ---- folding -------------------------------------------------------------------------------
@@ -204,6 +213,52 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
       else if (e.type === "turn_ended") { q.yield = e.yield_kind; q.error = e.error; }
     });
     return { order: order, per: per };
+  }
+
+  // ---- world state panel (World.render_state) ---------------------------------------------------
+  var WS = D.world_states || null;
+  function isScalar(v) { return v === null || typeof v !== "object"; }
+  function isGrid(v) {
+    return Array.isArray(v) && v.length > 0 && v.every(function (r) {
+      return Array.isArray(r) && r.length === v[0].length && r.every(isScalar);
+    });
+  }
+  function isFlat(o) { return o && typeof o === "object" && !Array.isArray(o) && Object.keys(o).every(function (k) { return isScalar(o[k]); }); }
+  function smallTable(rows) {
+    var cols = [];
+    rows.forEach(function (r) { Object.keys(r).forEach(function (k) { if (cols.indexOf(k) < 0) cols.push(k); }); });
+    return "<table><tr>" + cols.map(function (c) { return "<th>" + esc(c) + "</th>"; }).join("") + "</tr>" +
+      rows.map(function (r) { return "<tr>" + cols.map(function (c) { return "<td class=mono>" + esc(fmt(r[c])) + "</td>"; }).join("") + "</tr>"; }).join("") + "</table>";
+  }
+  function stateAt(r) {
+    if (!WS) return null;
+    for (var k = r; k >= 1; k--) if (WS[k]) return { round: k, state: WS[k] };
+    return null;
+  }
+  function renderWorldState(r) {
+    var hit = stateAt(r);
+    $("stateHint").textContent = hit ? (hit.round === r ? "after round " + r + "'s commit" : "as of round " + hit.round + " (no snapshot for round " + r + ")") : "";
+    if (!hit) { $("worldState").innerHTML = '<div class="empty">no state for this round</div>'; return; }
+    var st = hit.state, palette = st.palette || st.colors || null;
+    var keys = Object.keys(st).filter(function (k) { return k !== "palette" && k !== "colors"; });
+    var gridKeys = keys.filter(function (k) { return isGrid(st[k]) && (k === "grid" || palette); });
+    gridKeys.sort(function (a, b) { return (a === "grid" ? 0 : 1) - (b === "grid" ? 0 : 1); });
+    var grids = gridKeys.map(function (k) {
+      return '<div class="wgrid"><span class="lbl">' + esc(k) + "</span>" + gridHtml(st[k], false, palette, "big") + "</div>";
+    }).join("");
+    var kv = [], blocks = [];
+    keys.forEach(function (k) {
+      if (gridKeys.indexOf(k) >= 0) return;
+      var v = st[k];
+      if (isScalar(v)) kv.push([k, esc(fmt(v))]);
+      else if (isFlat(v)) kv.push([k, Object.keys(v).map(function (j) { return '<span class="chip">' + esc(j) + " " + esc(fmt(v[j])) + "</span>"; }).join("")]);
+      else if (Array.isArray(v) && v.length && v.every(isFlat)) blocks.push("<div class=muted>" + esc(k) + '</div><div class="scroll">' + smallTable(v) + "</div>");
+      else if (Array.isArray(v) && v.every(isScalar)) kv.push([k, esc(v.map(fmt).join(", "))]);
+      else blocks.push("<div class=muted>" + esc(k) + "</div><pre>" + esc(JSON.stringify(v, null, 1)) + "</pre>");
+    });
+    $("worldState").innerHTML = (grids ? '<div class="wgrids">' + grids + "</div>" : "") +
+      (kv.length ? '<table class="kv">' + kv.map(function (p) { return "<tr><td>" + esc(p[0]) + "</td><td>" + p[1] + "</td></tr>"; }).join("") + "</table>" : "") +
+      blocks.join("");
   }
 
   // ---- rendering -----------------------------------------------------------------------------
@@ -306,6 +361,7 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
     $("agentSel").value = state.agent || "";
     renderHeader(); renderMetrics(r);
     if (isFlag) renderFlag(r);
+    if (WS) renderWorldState(r);
     renderActions(r); renderPosts(r); renderInbox(r); renderQueue(r);
   }
   function go(r) { state.round = Math.min(Math.max(1, r), Math.max(1, LAST)); render(); }
@@ -315,6 +371,7 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
   $("flagPanel").hidden = !isFlag; $("guessPanel").hidden = !isFlag;
   $("truthWrap").hidden = !(isFlag && D.truth);
   $("actionsPanel").hidden = isFlag;
+  $("statePanel").hidden = !WS;
   $("agentSel").innerHTML = D.agents.map(function (a) { return '<option value="' + esc(a) + '">' + esc(a) + "</option>"; }).join("");
   $("slider").addEventListener("input", function (e) { go(parseInt(e.target.value, 10)); });
   $("prev").addEventListener("click", function () { go(state.round - 1); });

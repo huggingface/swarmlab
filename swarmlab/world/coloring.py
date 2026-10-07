@@ -85,6 +85,9 @@ round. `score()` -> coverage, correct (matching cells), wrong (painted, not matc
 paints, useful_paints, duplicate_paints, wrong_paints, overwritten_paints, wasted_paints.
 `verify()` -> target (as of now), initial_target, target_changes, colours, sizes, zones.
 
+`render_state()` (the replay page's world panel) -> `grid` (current), `target`, `palette` (colour
+letter -> CSS colour, "." transparent), coverage, cells_matching, cells, round and paint counts.
+
 Snapshots carry game state only (grid, target, painters, counters, round); constructor config is
 kept on restore, as in FlagGame.
 """
@@ -99,6 +102,9 @@ from ..view import Observation, text_observation
 from .base import Ack, Action, Outcome, World, tool
 
 COLOURS = "rgbykwopcmnt"
+PALETTE_CSS = {"r": "#d62728", "g": "#2ca02c", "b": "#1f77b4", "y": "#f2c80f", "k": "#111111",
+               "w": "#ffffff", "o": "#ff7f0e", "p": "#7b4fa0", "c": "#17becf", "m": "#e377c2",
+               "n": "#8c564b", "t": "#0f766e"}  # the replay page's colours for COLOURS
 UNPAINTED = "."
 TARGET_HEADER = "Target grid"
 CURRENT_HEADER = 'Current grid ("." = unpainted):'
@@ -361,6 +367,18 @@ class ColoringGrid(World):
                 "target_changes": [[r, [list(c) for c in cells]] for r, cells in self.target_changes],
                 "colours": list(self.colours), "height": self.height, "width": self.width,
                 "zones": self.zones, "paints_per_round": self.paints_per_round}
+
+    def render_state(self) -> dict | None:
+        """Target and current grid for the replay page (see `World.render_state`)."""
+        if not self.grid:
+            return None
+        cells = self.height * self.width
+        return {"grid": [list(r) for r in self.grid], "target": [list(r) for r in self.target],
+                "palette": {**{c: PALETTE_CSS[c] for c in self.colours}, UNPAINTED: "transparent"},
+                "coverage": round(self._matching() / cells, 4), "cells_matching": self._matching(),
+                "cells": cells, "round": self.round, "paints": self.stats["paints"],
+                "wrong_paints": self.stats["wrong_paints"],
+                "duplicate_paints": self.stats["duplicate_paints"]}
 
 
 # ---- fake LLM script (entry point `painter` in swarmlab.fake_scripts; model "fake:painter") -----

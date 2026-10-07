@@ -156,6 +156,22 @@ class World(Persistable, Plugin):
     def verify(self) -> dict:
         return {}
 
+    def render_state(self) -> dict | None:
+        """The world's state for the replay page's "World state" panel, or None (no panel).
+
+        Evaluator-side (agents never see it, so it may show the truth). Called by the viewer
+        builder on a fresh instance restored from each round's snapshot (the state after that
+        round's commit), so it must depend on snapshotted state and constructor config only.
+        Return JSON-able data; the page renders, per key:
+
+        - `grid`, and any other key holding a list of equal-length lists of scalars when the dict
+          has `palette` (or `colors`), a mapping from cell value to CSS colour: a coloured grid
+          (unknown cell values in grey; FlagGame/ColoringGrid letters have default colours);
+        - a list of flat dicts: a small table; a flat dict: key/value rows;
+        - a scalar: a key/value row; anything else: JSON text.
+        """
+        return None
+
     # ---- round, claim and failure hooks (M3b; swarmlab/medium/registry.py) ----------------------
     def begin_round(self, round: int) -> None:
         """Called by the runner at the start of every round, before any observation (no-op)."""
