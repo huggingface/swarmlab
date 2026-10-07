@@ -9,3 +9,5 @@
 - A fork's `Run.spend` includes the parent's prefix spend (correct for the ledger, confusing in tables); show "inherited" and "new" separately.
 - Probe-sourced metrics must be declared with `params: {source: "probe:<name>"}`; a string shorthand `belief.consensus@probe:belief` in the metrics list would be friendlier. M2 phase 1 computed them offline (`tools/m2_report.py`) because the spec omitted them.
 - `Experiment.estimate` assumes the per-turn call cap every turn and overstates real spend 4-6x; add a mode seeded from a measured run (calls/turn and tokens/round).
+- `swarmlab validate` rejects specs that use `vllm:` models ("provider 'vllm' needs a base_url") because the base_url is injected only by `swarmlab job run`. Validate should accept vllm specs with a placeholder, or `job run` should be documented as the validator for them.
+- The job wall-time estimate (30 + 2N s per round) is 3-4x pessimistic for self-hosted vLLM (measured: N=64 ≈ 40 s/round). Seed it from a measured run.
