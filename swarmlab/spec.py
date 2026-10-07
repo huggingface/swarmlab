@@ -49,6 +49,10 @@ Decisions where the contract is silent:
   spec (hence `spec_hash`, `run.json`, `artifacts/spec.yaml`) when empty, and empty `roles` / null `role` are left out of the normalised document, so earlier
   specs, documents and hashes are unchanged. `runspec_to_doc` writes the resolved roles at the
   top level and keeps `role` in the participant groups (groups split where the role changes).
+- `budget.total_usd` (top level only; an arm-level one is a `SpecError`) caps the experiment's
+  total spend: `swarmlab run` / `Experiment.run_all` refuse to start a run when the spend of the
+  runs already done plus the next run's `hard_usd` would exceed it. It is never part of
+  `spec_hash`, so changing the total cap does not make finished runs look different.
 """
 from __future__ import annotations
 
@@ -78,12 +82,24 @@ class SpecError(ValueError):
 
 
 class Budget(BaseModel):
-    """Enforced from M1b (swarmlab/budget.py); a field <= 0 is not enforced."""
+    """Enforced from M1b (swarmlab/budget.py); a field <= 0 is not enforced.
+
+    `total_usd` is experiment-wide (all arms x seeds of one `swarmlab run` / `run_all`), not a
+    per-run limit: it is enforced before each run starts, never by the gate, and it is left out of
+    `spec_hash`, and from serialised budgets when 0."""
 
     model_config = ConfigDict(extra="forbid")
     soft_usd: float = 0.0
     hard_usd: float = 0.0
     measurement_usd: float = 0.0
+    total_usd: float = 0.0
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_total(self, handler: Any) -> dict:
+        data = handler(self)
+        if not data.get("total_usd"):  # absent when off, so earlier documents stay unchanged
+            data.pop("total_usd", None)
+        return data
 
 
 class PluginSpec(BaseModel):
@@ -187,6 +203,7 @@ def spec_hash(run_spec: RunSpec) -> str:
         data.pop("probes", None)
     if not data.get("interventions"):  # M3a, likewise
         data.pop("interventions", None)
+    (data.get("budget") or {}).pop("total_usd", None)  # experiment-wide, not part of a run
     return hashlib.sha256(canonical_json(data).encode()).hexdigest()
 
 
@@ -273,6 +290,10 @@ def validate_experiment_doc(doc: dict) -> dict:
         unknown = set(mapping) - allowed
         if unknown:
             raise SpecError(f"{label}: unknown keys {sorted(unknown)}; allowed {sorted(allowed)}")
+    for arm_name, arm in parsed.arms.items():
+        if "total_usd" in arm.budget:
+            raise SpecError(f"arms.{arm_name}.budget.total_usd: total_usd caps the whole "
+                            "experiment; set it in the top-level budget")
     if len(set(parsed.seeds)) != len(parsed.seeds):
         raise SpecError(f"seeds: duplicates in {parsed.seeds}")
     out = parsed.model_dump(mode="json")

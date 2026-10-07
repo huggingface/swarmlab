@@ -22,6 +22,10 @@ def _events(run_dir: Path) -> list[dict]:
     return [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
 
 
+def _events_of(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
 def _expected_rows(evs: list[dict]) -> dict[str, int]:
     c = Counter(e["type"] for e in evs)
     covered = {"turn_started", "turn_ended", "tool_called", "tool_returned", "post", "delivery",
@@ -53,6 +57,8 @@ def _check_export(run_dir: Path, out: Path) -> dict:
     doc = json.loads((out / "run.json").read_text())
     assert doc["export_schema"] == export.EXPORT_SCHEMA
     expected = _expected_rows(evs)
+    expected["discarded_inference"] = sum(
+        1 for e in _events_of(run_dir / "discarded.jsonl") if e["type"] == "inference_attempt")
     for fam in export.FAMILIES:
         table = pq.read_table(out / "tables" / f"{fam}.parquet")
         assert table.column_names[:6] == list(export.KEY_COLUMNS), fam
@@ -211,3 +217,44 @@ def test_cli_export(llm_run, tmp_path):
     assert data["export"] == str(tmp_path / "e")
     assert data["tables"]["turns"] == 12
     assert data["sessions"] == 4
+
+
+def test_discarded_rounds_are_exported_with_their_spend(tmp_path):
+    """A hard-ceiling abort discards the round in flight; its calls and spend stay visible."""
+    from swarmlab.spec import Budget
+
+    exp = llm_agent_experiment(4, name="exp-disc", pricing={"*": (10.0, 50.0, 1.0)},
+                               agent_kw={"max_tokens": 64, "max_calls": 2},
+                               budget=Budget(hard_usd=0.06))
+    run = exp.run(seed=1, max_rounds=3, out=tmp_path / "runs")
+    assert run.end_reason == "hard_ceiling"
+    run = run.resume(budget=Budget(hard_usd=5.0))  # moves the aborted round to discarded.jsonl
+    assert run.end_reason == "max_rounds"
+    out = run.export()
+    doc = _check_export(run.dir, out)
+    disc = pq.read_table(out / "tables" / "discarded_inference.parquet").to_pylist()
+    assert disc and doc["tables"]["discarded_inference"]["rows"] == len(disc)
+    assert len({r["round"] for r in disc}) == 1
+    assert doc["spend_discarded_usd"] == pytest.approx(sum(r["charged_usd"] for r in disc))
+    assert doc["spend_discarded_usd"] > 0
+    assert doc["spend_discarded_usd"] == pytest.approx(export.discarded_spend(run.dir))
+    # the ledger = what the kept log charged + what the discarded round charged
+    kept = sum(r["cost_usd"] or 0 for r in pq.read_table(out / "tables" / "inference.parquet")
+               .to_pylist() if not r["cached"])
+    ledger = doc["spend"]["swarm"] + doc["spend"]["measurement"]
+    assert kept + doc["spend_discarded_usd"] == pytest.approx(ledger)
+
+
+def test_report_reconciles_spend_with_the_ledger(tmp_path):
+    from swarmlab.report import build_report, spend_lines
+    from swarmlab.spec import Budget
+
+    exp = llm_agent_experiment(4, name="exp-disc", pricing={"*": (10.0, 50.0, 1.0)},
+                               agent_kw={"max_tokens": 64, "max_calls": 2},
+                               budget=Budget(hard_usd=0.06))
+    run = exp.run(seed=1, max_rounds=3, out=tmp_path / "runs").resume(budget=Budget(hard_usd=5.0))
+    total = run.spend["swarm"] + run.spend["measurement"]
+    line = spend_lines([run])[0]  # what the report prints for real (non-fake) runs
+    assert f"${total:.3f}" in line and f"${export.discarded_spend(run.dir):.3f}" in line
+    # these runs use fake: models, so the report sets them apart and counts none of their spend
+    assert "over the 0 real run(s): $0.000; 1 simulated" in build_report(tmp_path / "runs")

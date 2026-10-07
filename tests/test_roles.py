@@ -249,7 +249,7 @@ def test_prompt_append_combines_with_system_prompt_append():
     view = View(round=1, agent="a000", observation=Observation(parts=[]), outcomes=[], pushed=[],
                 tools=[], description="d")
     text = agent._render_system(view)
-    assert text.endswith("ARM-TEXT\n\nROLE-TEXT")
+    assert "ARM-TEXT\n\nTools:" in text and text.endswith("ROLE-TEXT")
 
 
 def test_acceptance_4_model_override_changes_provider(tmp_path):

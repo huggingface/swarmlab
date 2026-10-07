@@ -9,6 +9,6 @@
 
 # Running experiments
 
-- When the task is to design, smoke, launch, analyse, report on or publish an experiment, follow `skill/SKILL.md`: its first-real-run checklist (doctor, validate, scripted dry run, `swarmlab prompts` review by a second agent, N=4 smoke with a hard ceiling, estimate, launch, fetch, report, publish) is the tested workflow, and every rule in it names a command.
+- When the task is to design, smoke, launch, analyse, report on or publish an experiment, follow `skill/SKILL.md`: its first-real-run checklist (doctor, validate, scripted dry run, `swarmlab prompts` review by a second agent, N=4 smoke with a hard ceiling, estimate, launch, fetch, report, publish; under a $2 total, the short version: `prompts` + `diff` and the first arm at N<=6 as the smoke) is the tested workflow, and every rule in it names a command.
 - Spending steps need the user's approval of the estimate first; publishing stays private unless the user asks for `--public`.
 - Read finished runs through `swarmlab export` tables and sessions or `swarmlab report`, not by parsing `events.jsonl` by hand.

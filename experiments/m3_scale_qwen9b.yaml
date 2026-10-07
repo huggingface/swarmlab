@@ -1,5 +1,10 @@
-# Scale check: N=256 on self-hosted Qwen3.5-9B. Two arms: default prompt (agents are not told about the board)
-# and a variant whose only change is one sentence stating that a board exists (window memory to bound context).
+# Scale check: N=256 on self-hosted Qwen3.5-9B. Three arms:
+# - bc-9b-256: default prompt (it lists read_board/post among the tools but says nothing else about the board),
+#   full memory.
+# - bc-9b-256-board: one extra sentence stating that a board exists AND window memory (window_rounds: 3) to
+#   bound context. Two changes, so a difference from bc-9b-256 is not attributable to the sentence alone.
+# - bc-9b-256-board-full: the same sentence via system_prompt_append, full memory: the one-sentence
+#   comparison against bc-9b-256 (`swarmlab prompts` + diff shows the sentence as the only change).
 name: m3-scale-qwen9b
 seeds: [1]
 options: { max_rounds: 10, commit: round_end }
@@ -47,6 +52,27 @@ arms:
             {% for t in tools %}
             - {{ t.name }}: {{ t.description }}
             {% endfor %}
+    probes: [ { type: belief } ]
+    metrics:
+      - belief.accuracy
+      - belief.consensus
+      - belief.entropy
+      - comm.read_rate
+      - comm.posts_per_round
+      - comm.hops
+      - { type: belief.consensus, params: { source: "probe:belief" } }
+      - { type: belief.accuracy, params: { source: "probe:belief" } }
+  bc-9b-256-board-full:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - type: llm
+        count: 256
+        params:
+          model: "vllm:Qwen/Qwen3.5-9B"
+          max_tokens: 2048
+          extra: { chat_template_kwargs: { enable_thinking: false } }
+          system_prompt_append: "A shared message board exists: `read_board` shows what other agents have posted, and `post` writes a message that other agents can read next round."
     probes: [ { type: belief } ]
     metrics:
       - belief.accuracy

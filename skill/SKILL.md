@@ -33,12 +33,36 @@ Project-level copies work too: `.claude/skills/swarmlab/`, `.agents/skills/swarm
 
 ## First real run: the checklist
 
+Size it to the budget first. Put the user's total in the spec as `budget: {total_usd: T}` (top
+level): `swarmlab run` then never starts a run that could push the experiment past T.
+
+- **Total under $2: the short checklist.** A separate smoke run and a second-agent review would
+  eat a large share of the money, so:
+  1. `swarmlab doctor SPEC.yaml` and `swarmlab validate SPEC.yaml` (items 1-2 below).
+  2. Dry run with `fake:reader` (item 3; free).
+  3. Prompt review without a second agent: `swarmlab prompts SPEC.yaml --arm A > A.txt` for
+     every arm, then `diff A.txt B.txt` -> only the manipulated text differs, no correctness
+     hints, every needed tool named.
+  4. Smoke = the first real arm itself, at N <= 6 agents, with `hard_usd` <= 30% of the total
+     and `soft_usd` at least one round below it (`swarmlab run` warns when they are closer):
+     `swarmlab run SPEC.yaml --arm FIRST --seed S` -> `end=max_rounds`. That run is kept as
+     the arm's data, not repeated. A `hard_ceiling` end: `swarmlab resume RUN_DIR
+     --add-budget D` if the total allows, else cut rounds.
+  5. `swarmlab estimate SPEC.yaml` for the remaining arms, approval, `swarmlab run SPEC.yaml`
+     (the finished smoke run is skipped), then `swarmlab report runs/ --out report.md`.
+- **Total of $2 or more: the full checklist below**, all eleven items.
+
 Do these in order. Each item is done when its check holds; a failing check is fixed before the
 next item.
 
 1. **Environment.** `swarmlab doctor SPEC.yaml` -> exit 0 (keys, extras, provider reachability,
-   clean git). A new experiment starts from `swarmlab init NAME` (writes `NAME.yaml`, `NAME.py`).
-2. **Spec.** `swarmlab validate SPEC.yaml` -> every arm resolves. Model ids come from
+   clean git). A new experiment starts from `swarmlab init NAME` (writes `NAME.yaml`, `NAME.py`)
+   in a project directory outside the swarmlab checkout (`uv run --project <repo> swarmlab ...`
+   from there); `swarmlab run` refuses to write `runs/` inside the checkout unless `--out` is
+   given.
+2. **Spec.** `swarmlab validate SPEC.yaml` -> every arm resolves; its table shows each arm's
+   agents, models, soft/hard/measurement caps, probes and metrics: check them against the plan.
+   Model ids come from
    `swarmlab models --tools --search QWEN` (prices are looked up, never typed). Every arm that
    calls a paid model has `budget: {hard_usd: X}`; `hard_usd: 0` means no ceiling.
 3. **Dry run with scripted agents.** Copy the arm into a dry-run arm whose participants are
@@ -55,10 +79,12 @@ next item.
    `swarmlab run SPEC.yaml --arm smoke --seed 0` -> `end=max_rounds` (not `hard_ceiling`), then
    `swarmlab report RUNS_DIR` -> tool protocol health shows no errored turns and few `length`
    finishes. A `hard_ceiling` end means raise the budget or cut rounds; `swarmlab resume RUN_DIR
-   --budget-hard X` continues the same run.
-6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS` -> total for every arm x
-   seed. Take the growth and calls per turn from the smoke run's `inference` table
-   (`swarmlab export RUN_DIR`); the flat estimate overstates real spend 4-6x. The user approves
+   --add-budget D` continues the same run with D more dollars (`--budget-hard X` sets the run's
+   total, spend so far and discarded rounds included).
+6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS --calls-per-turn C` -> total
+   for every arm x seed. Take the growth and calls per turn from the smoke run's `inference` table
+   (`swarmlab export RUN_DIR`); without them the worst case (each group's `max_calls`, else the
+   runner cap) overstates real spend 4-6x. The user approves
    the total before launch.
 7. **Launch.** Local: `swarmlab run SPEC.yaml` (every arm x seed; asks before spending; already
    finished runs are skipped). Self-hosted model on HF Jobs (spec models `vllm:<model>`):
@@ -68,7 +94,8 @@ next item.
    `swarmlab job logs JOB_ID --follow`.
 9. **Fetch** (jobs): `swarmlab job fetch RUN_ID --out runs/` for each run id the log names ->
    `swarmlab replay runs/RUN_ID` exits 0.
-10. **Report.** `swarmlab report runs/ --out report.md` -> one row per arm; read it before
+10. **Report.** `swarmlab report runs/ --out report.md` -> one row per arm (dry runs on `fake:`
+    models are listed as simulated and kept out of the tables and spend); read it before
     claiming any effect, and say how many seeds stand behind each number.
 11. **Publish.** `swarmlab publish runs/ --repo OWNER/EXPERIMENT` -> private dataset repo with
     tables, sessions, raw logs and a card. `swarmlab view RUN_DIR --publish OWNER/EXPERIMENT`
@@ -79,8 +106,15 @@ next item.
 
 - **Change the spec, never the code, to change the hypothesis.** One arm per condition; arms of
   one experiment differ only in the manipulated variable. `swarmlab prompts` shows what differs.
+- **Change prompts through params, then diff.** An `llm` group's `system_prompt_append: "..."`
+  adds text after the default prompt's task section (before the tool list); `system_prompt`
+  replaces the whole Jinja2 template (variables `agent`, `role`, `description`, `tools`,
+  `system_prompt_append`; `file:<path>` works). Prefer the append: copying the template invites
+  accidental differences. `swarmlab prompts SPEC.yaml --arm A > A.txt` per arm, then `diff`, must
+  show only the manipulated text. The default prompt already lists every tool (`read_board`,
+  `post`), so a "mention the board" arm is a nudge, not awareness.
 - **Resume or fork instead of rerunning.** A crashed or budget-ended run continues with
-  `swarmlab resume RUN_DIR [--budget-hard X]`; a counterfactual from round R is
+  `swarmlab resume RUN_DIR [--add-budget D]`; a counterfactual from round R is
   `swarmlab fork RUN_DIR --at R --spec edited.yaml`. Both reuse the inference cache, so the
   shared prefix costs nothing.
 - **Re-running a finished run is a skip.** `swarmlab run` skips run dirs with the same spec hash;
@@ -89,7 +123,8 @@ next item.
   the log with zero provider calls and exits 1 on any mismatch.
 - **Analyse from exports.** `swarmlab export RUN_DIR` writes `export/tables/<family>.parquet`
   (turns, tool_calls, posts, deliveries, reads, actions, inference, probes, metrics,
-  interventions, rounds, run, other; keys `experiment, arm, seed, run, round, agent`) and one pi
+  interventions, rounds, run, other, discarded_inference; keys `experiment, arm, seed, run, round,
+  agent`; `run.json` has `spend` from the ledger and `spend_discarded_usd`) and one pi
   session per agent in `export/sessions/` for reading a conversation turn by turn.
 - **Look at one run by eye** with `swarmlab view RUN_DIR` (writes `view.html`, no server).
 - **Restore a published run** with `swarmlab fetch-published OWNER/EXPERIMENT RUN_ID --out runs/`;

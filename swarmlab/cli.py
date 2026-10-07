@@ -21,12 +21,21 @@ Decisions where the contract is silent:
 - M1b (WP7): `run` prints `Experiment.estimate(seed, max_rounds, calls_per_turn=...)` before
   running whenever any budget field is non-zero: one line `estimate: arm=... worst-case $X ...`
   on stdout, or on stderr under `--json` (stdout keeps exactly one JSON object). The estimate uses
-  `calls_per_turn = options.max_calls_per_turn` (every turn hitting the runner's cap: the worst
-  case), plus one call per probed agent per probed round. `swarmlab estimate SPEC [--arm A]
+  `calls_per_turn = --calls-per-turn` if given, else `options.max_calls_per_turn` (every turn
+  hitting the runner's cap: the worst case), capped per participant by its own `max_calls`, plus
+  one call per probed agent per probed round. The result's `calls_per_turn` is the value(s)
+  actually priced (an int, or the distinct values when groups differ) and
+  `calls_per_turn_source` says where it came from; the printed line and table show both. `swarmlab estimate SPEC [--arm A]
   [--seed N] [--max-rounds R] [--calls-per-turn C]` prints the same dict (default
   calls_per_turn: the worst case as above). `resume` takes `--budget-soft/--budget-hard/
   --budget-measurement`; given any of them, the effective budget (`run.json["budget"]`) is
-  updated with those fields and passed to `Run.resume(budget=...)`.
+  updated with those fields and passed to `Run.resume(budget=...)`. The values are run totals
+  (the ledger, discarded rounds included, counts against them). `--add-budget X` sets
+  soft = swarm spend + X and hard = swarm + measurement spend + X (only the enforced ones).
+  `resume` prints the spend so far and the budget it resumes with (stderr under --json).
+- Run summaries (status line of `run`, `resume`, `replay`, `fork`, ...) carry
+  `spend=$x.xxx (swarm $a + measurement $b)` from the ledger; the JSON adds `spend_usd`, and
+  `resume --json` adds the `budget` it resumed with.
 - Setup UX: `run SPEC` without `--arm`/`--seed` runs every arm (document order) x every seed in
   the YAML's `seeds:` (default `[0]`); `--arm`/`--seed` narrow it. With one arm and a `--seed`
   (the M1a form) the output is the single run summary as before; otherwise it is
@@ -39,8 +48,21 @@ Decisions where the contract is silent:
   command asks for confirmation on stderr unless `--yes`; declining (or no TTY to answer)
   exits 1 before anything runs. A failed run does not stop the others; the exit code is then 1
   (2 if every failure was a SpecError).
+- Total cap (`budget.total_usd`, top level): `run` prints the per-run caps of every arm and the
+  total cap before anything runs, and warns per arm when `hard_usd - soft_usd` is less than one
+  round of the estimate (`usd_per_round`). Before starting each run it checks
+  `budget.total_cap_refusal(spend of the runs ran or found so far, the arm's hard_usd, total)`;
+  on a refusal that run and every later one get outcome `capped`, the JSON gets
+  `capped: {reason, total_usd, spent, skipped: [run ids]}` and the exit code is 1.
 - `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server) are documented in
   `swarmlab/jobs/` and docs/handoff/WP8.md. `job run` only prints unless `--launch`.
+- Working directory: `run` without `--out` refuses (exit 2) when the current directory is the
+  swarmlab checkout itself (`is_swarmlab_checkout`: a pyproject.toml with `name = "swarmlab"`),
+  so runs never land in the repo by accident; `init` says to work from a project directory
+  outside the checkout and warns when it is run inside one.
+- `validate` prints a per-arm table (agents, models with counts, soft/hard/measurement caps,
+  rounds, probes, metrics) and the total cap; `--json` has the same per arm (`models`,
+  `budget`, `probes`, ...) plus `total_usd`.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
   `doctor.py`) and in `init`'s help.
 """
@@ -54,7 +76,8 @@ from typing import Annotated, Any
 
 import typer
 
-from .experiment import Experiment, Run
+from .budget import ledger_total, total_cap_refusal
+from .experiment import Experiment, Run, participant_model
 from .spec import Budget, RunOptions, SpecError, experiment_seeds, load_experiment_yaml
 
 app = typer.Typer(
@@ -89,7 +112,16 @@ def _build(spec: Path, arm: str | None) -> Experiment:
 
 
 def summary(run: Run) -> dict[str, Any]:
-    return run.summary()
+    """`Run.summary()` plus `spend_usd` (ledger swarm + measurement, discarded rounds included)."""
+    data = run.summary()
+    data["spend_usd"] = ledger_total(data.get("spend"))
+    return data
+
+
+def _spend_text(spend: dict | None) -> str:
+    spend = spend or {}
+    swarm, meas = float(spend.get("swarm") or 0), float(spend.get("measurement") or 0)
+    return f"spend=${swarm + meas:.3f} (swarm ${swarm:.3f} + measurement ${meas:.3f})"
 
 
 def _fmt(v: Any) -> str:
@@ -103,7 +135,7 @@ def _human(data: dict[str, Any]) -> str:
         return "\n".join(f"{k}: {v}" for k, v in data.items())
     lines = [
         (f"run {data['run_id']}  status={data['status']}  end={data['end_reason']}  "
-         f"rounds={data['last_round']}"),
+         f"rounds={data['last_round']}  {_spend_text(data.get('spend'))}"),
         f"  dir    {data['run_dir']}",
         f"  spec   {str(data['spec_hash'])[:16]}",
         "  score  " + ", ".join(f"{k}={_fmt(v)}" for k, v in (data["score"] or {}).items()),
@@ -115,6 +147,8 @@ def _human(data: dict[str, Any]) -> str:
                 "published"):
         if key in data:
             lines.append(f"  {key} {data[key]}")
+    if isinstance(data.get("budget"), dict):
+        lines.append("  " + _budget_text(data["budget"]))
     return "\n".join(lines)
 
 
@@ -143,12 +177,23 @@ def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
     rounds = max_rounds if max_rounds is not None else exp.options.get("max_rounds")
     if rounds is None:
         raise SpecError("no max_rounds in options; pass --max-rounds")
-    if calls_per_turn is None:
-        calls_per_turn = int(exp.options.get("max_calls_per_turn",
-                                             RunOptions.model_fields["max_calls_per_turn"].default))
-    return {**exp.estimate(seed, int(rounds), calls_per_turn=calls_per_turn,
-                           prompt_growth=prompt_growth),
-            "calls_per_turn": calls_per_turn}
+    cap = int(exp.options.get("max_calls_per_turn",
+                              RunOptions.model_fields["max_calls_per_turn"].default))
+    requested = calls_per_turn if calls_per_turn is not None else cap
+    est = exp.estimate(seed, int(rounds), calls_per_turn=requested, prompt_growth=prompt_growth)
+    used = est["calls_per_turn_used"] or [requested]
+    source = (f"--calls-per-turn {calls_per_turn}" if calls_per_turn is not None
+              else f"options.max_calls_per_turn {cap}")
+    if used != [requested]:
+        source = f"participant max_calls, under {source}"
+    return {**est, "calls_per_turn": used[0] if len(used) == 1 else used,
+            "calls_per_turn_source": source}
+
+
+def _cpt_text(est: dict[str, Any]) -> str:
+    cpt = est["calls_per_turn"]
+    n = f"{min(cpt)}-{max(cpt)}" if isinstance(cpt, list) else str(cpt)
+    return f"{n} calls/turn ({est.get('calls_per_turn_source', '')})"
 
 
 def _budget_text(budget: dict[str, float]) -> str:
@@ -168,7 +213,7 @@ def _estimate_line(est: dict[str, Any], seeds: int | None = None) -> str:
         per += f" per run x {seeds} seed(s) = ${est['usd'] * seeds:.4f}"
     return (f"estimate: arm={est['arm']} {per} "
             f"({est['llm_agents']} model agents x {est['rounds']} rounds x "
-            f"{est['calls_per_turn']} calls/turn, {est['probe_calls']} probe calls; {by_model}); "
+            f"{_cpt_text(est)}, {est['probe_calls']} probe calls; {by_model}); "
             f"{_budget_text(est['budget'])}")
 
 
@@ -185,16 +230,62 @@ def validate(
         arms = {}
         for arm in doc["arms"]:
             exp = _build(spec, arm)
+            models: dict[str, int] = {}
+            for p in exp.participants:
+                key = participant_model(p) or f"{p.spec()['type']} (scripted)"
+                models[key] = models.get(key, 0) + 1
             arms[arm] = {
                 "world": exp.world.spec()["type"],
                 "n_agents": len(exp.participants),
+                "models": models,
                 "topology": exp.medium.spec()["params"]["topology"],
+                "budget": exp.budget.model_dump(mode="json"),
+                "probes": [p.name for p in exp.probes],
                 "metrics": [m if isinstance(m, str) else m.name for m in exp.metrics],
                 "max_rounds": exp.options.get("max_rounds"),
             }
-        return {"ok": True, "spec": str(spec), "name": doc["name"], "arms": arms}
+        data = {"ok": True, "spec": str(spec), "name": doc["name"], "arms": arms,
+                "total_usd": float(doc["budget"].get("total_usd") or 0)}
+        if as_json:
+            return data
+        return {"text": _validate_text(data)}
 
     _execute(go, as_json)
+
+
+def _validate_text(data: dict[str, Any]) -> str:
+    """`validate`'s per-arm table: agents, models, caps, probes, metrics."""
+    def money(v: float) -> str:
+        return f"${v:g}" if v > 0 else "-"
+
+    head = ("arm", "agents", "model(s)", "soft", "hard", "meas.", "rounds", "probes", "metrics")
+    body = []
+    for arm, a in data["arms"].items():
+        b = a["budget"]
+        body.append((arm, str(a["n_agents"]),
+                     ", ".join(f"{m} x{n}" for m, n in a["models"].items()),
+                     money(b["soft_usd"]), money(b["hard_usd"]), money(b["measurement_usd"]),
+                     str(a["max_rounds"] or "-"), ", ".join(a["probes"]) or "-",
+                     ", ".join(a["metrics"]) or "-"))
+    widths = [max(len(h), *(len(r[i]) for r in body)) for i, h in enumerate(head)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    total = data["total_usd"]
+    lines = [f"ok: {data['spec']} ({data['name']}): {len(body)} arm(s) resolve",
+             fmt.format(*head).rstrip(), *(fmt.format(*r).rstrip() for r in body),
+             "caps are per run (0 / - = not enforced); total cap: "
+             + (f"${total:g} for the whole experiment" if total > 0 else "none")]
+    return "\n".join(lines)
+
+
+def is_swarmlab_checkout(path: Path) -> bool:
+    """True when `path` holds swarmlab's own pyproject.toml (`[project] name = "swarmlab"`)."""
+    import tomllib
+
+    try:
+        data = tomllib.loads((path / "pyproject.toml").read_text())
+    except (OSError, ValueError):
+        return False
+    return (data.get("project") or {}).get("name") == "swarmlab"
 
 
 def _say(line: str, as_json: bool) -> None:
@@ -234,6 +325,40 @@ def _table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_runs: int,
+               n_seeds: int, total_cap: float) -> list[str]:
+    """The planned per-run caps, the experiment's total cap, and soft/hard gap warnings."""
+    def money(v: float) -> str:
+        return f"${v:g}" if v > 0 else "off"
+
+    lines = []
+    for a, exp in exps.items():
+        b = exp.budget
+        lines.append(f"caps: arm={a} per run soft={money(b.soft_usd)} hard={money(b.hard_usd)} "
+                     f"measurement={money(b.measurement_usd)} x {n_seeds} seed(s)")
+    hard_sum = sum(e.budget.hard_usd for e in exps.values()) * n_seeds
+    if total_cap > 0:
+        line = (f"caps: total ${total_cap:g} for the {n_runs} run(s) (budget.total_usd); a run "
+                "starts only if spend so far + its hard_usd fits")
+        if hard_sum > total_cap:
+            line += (f"; hard ceilings sum to ${hard_sum:g}, so later runs may be skipped if "
+                     "earlier ones spend near their ceilings")
+        lines.append(line)
+    else:
+        lines.append("caps: no total cap (budget.total_usd: 0)"
+                     + (f"; hard ceilings sum to ${hard_sum:g}" if hard_sum > 0 else ""))
+    for a, exp in exps.items():
+        b, per_round = exp.budget, float(ests[a].get("usd_per_round") or 0)
+        if b.soft_usd > 0 and b.hard_usd > 0 and b.hard_usd - b.soft_usd < per_round:
+            lines.append(
+                f"warning: arm={a}: hard_usd - soft_usd = ${b.hard_usd - b.soft_usd:.4f} is less "
+                f"than one round's estimated worst case ${per_round:.4f}. soft_usd is checked "
+                "only between rounds, so a round can start below soft_usd, reach hard_usd "
+                "mid-round and be discarded (its spend still counts). Leave at least one round "
+                "between them (hard_usd >= soft_usd + one round).")
+    return lines
+
+
 def _confirm(prompt: str) -> None:
     try:
         ok = typer.confirm(prompt, default=False, err=True)
@@ -252,13 +377,22 @@ def run(
     arm: Annotated[str | None, typer.Option(
         "--arm", help="Run only this arm (default: every arm).")] = None,
     max_rounds: Annotated[int | None, typer.Option("--max-rounds", help="Override options.max_rounds.")] = None,
-    out: Annotated[Path, typer.Option("--out", help="Parent directory for run dirs.")] = Path("runs"),
+    out: Annotated[Path | None, typer.Option(
+        "--out", help="Parent directory for run dirs (default: runs/ under the current directory; "
+                      "required inside the swarmlab repo checkout).")] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask before spending.")] = False,
     rerun: Annotated[bool, typer.Option(
         "--rerun", help="Run again into runs/<id>__r<N> even if runs/<id> exists.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
     """Run an experiment: every arm x every seed of the YAML, or the arm/seed you pick."""
+    if out is None:
+        if is_swarmlab_checkout(Path.cwd()):
+            _fail(SpecError(
+                "the current directory is the swarmlab repo checkout; run experiments from a "
+                "project directory outside it (`cd ~/my-exp && uv run --project "
+                f"{Path.cwd()} swarmlab run SPEC`) or pass --out DIR"), 2, as_json)
+        out = Path("runs")
     try:
         doc = load_experiment_yaml(spec)
         arms = [arm] if arm is not None else list(doc["arms"])
@@ -268,6 +402,12 @@ def run(
             if max_rounds is None and "max_rounds" not in exp.options:
                 raise SpecError(f"{spec}: arm {a!r}: no max_rounds in options; pass --max-rounds")
         ests = {a: _estimate(exp, seeds[0], max_rounds) for a, exp in exps.items()}
+        total_cap = float(doc["budget"].get("total_usd") or 0)
+        if total_cap > 0:
+            unbounded = [a for a, e in exps.items() if e.budget.hard_usd <= 0]
+            if unbounded:
+                raise SpecError(f"{spec}: budget.total_usd ${total_cap:g} needs hard_usd > 0 on "
+                                f"every arm that runs; arms without one: {unbounded}")
     except SpecError as e:
         _fail(e, 2, as_json)
     except Exception as e:  # noqa: BLE001
@@ -285,38 +425,62 @@ def run(
                  + (f"; hard ceilings sum to ${ceiling:.2f}" if ceiling > 0 else ""), as_json)
         if _only_fake(ests.values()):
             _say("  (fake: models only: prices are nominal, nothing is billed)", as_json)
+    if budgeted:
+        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap):
+            _say(line, as_json)
     if budgeted and not yes:
         _confirm(f"Start {n_runs} run(s), worst case ${total:.4f}?")
 
     rows: list[dict[str, Any]] = []
-    for a in arms:
+    capped: dict[str, Any] | None = None
+    for a, sd in [(a, sd) for a in arms for sd in seeds]:
         exp = exps[a]
-        for sd in seeds:
-            rid = exp.run_id(sd)
-            try:
-                state, found = exp.existing(sd, max_rounds, out)
-                if state == "same" and not rerun and found is not None:
-                    _say(f"{rid}: exists, skipping ({found.dir})", as_json)
-                    rows.append({**found.summary(), "outcome": "skipped"})
-                    continue
-                if state == "different" and not rerun:
-                    raise FileExistsError(
-                        f"{out / rid} holds a run of a different configuration (spec_hash "
-                        "differs); pass --rerun or another --out")
-                target = Experiment.rerun_dir(out, rid) if state != "new" else None
-                if not single:
-                    _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
-                r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
-                rows.append({**r.summary(), "outcome": "ran"})
-            except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
-                msg = f"{type(e).__name__}: {e}"
-                print(f"error: {rid}: {msg}", file=sys.stderr)
-                rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "failed",
-                             "error": msg, "spec_error": isinstance(e, SpecError)})
+        rid = exp.run_id(sd)
+        if capped is not None:
+            capped["skipped"].append(rid)
+            rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"})
+            continue
+        try:
+            state, found = exp.existing(sd, max_rounds, out)
+            if state == "same" and not rerun and found is not None:
+                _say(f"{rid}: exists, skipping ({found.dir})", as_json)
+                rows.append({**summary(found), "outcome": "skipped"})
+                continue
+            spent = sum(ledger_total(r.get("spend")) for r in rows)
+            why = total_cap_refusal(spent, exp.budget.hard_usd, total_cap)
+            if why:
+                capped = {"reason": why, "total_usd": total_cap, "spent": spent,
+                          "skipped": [rid]}
+                _say(f"total cap: not starting {rid}: {why}", as_json)
+                rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"})
+                continue
+            if state == "different" and not rerun:
+                raise FileExistsError(
+                    f"{out / rid} holds a run of a different configuration (spec_hash "
+                    "differs); pass --rerun or another --out")
+            target = Experiment.rerun_dir(out, rid) if state != "new" else None
+            if not single:
+                _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
+            r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
+            rows.append({**summary(r), "outcome": "ran"})
+        except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
+            msg = f"{type(e).__name__}: {e}"
+            print(f"error: {rid}: {msg}", file=sys.stderr)
+            rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "failed",
+                         "error": msg, "spec_error": isinstance(e, SpecError)})
     failed = [r for r in rows if r["outcome"] == "failed"]
     code = 0 if not failed else (2 if all(r["spec_error"] for r in failed) else 1)
+    if capped is not None:
+        code = code or 1
+        print(f"error: total cap ${total_cap:g} reached; skipped {len(capped['skipped'])} "
+              f"run(s): {', '.join(capped['skipped'])} ({capped['reason']})", file=sys.stderr)
     if single:
         r = rows[0]
+        if r["outcome"] == "capped":
+            if as_json:
+                typer.echo(json.dumps({"ok": False, "error": f"total cap: {capped['reason']}",
+                                       "exit_code": code, "capped": capped}))
+            raise typer.Exit(code)
         if failed:
             if as_json:
                 typer.echo(json.dumps({"ok": False, "error": r["error"], "exit_code": code}))
@@ -329,8 +493,10 @@ def run(
     for r in rows:
         r.pop("spec_error", None)
     if as_json:
-        typer.echo(json.dumps({"ok": not failed, "exit_code": code, "runs": rows,
-                               "estimate": {"arms": ests, "total_usd": total, "runs": n_runs}},
+        typer.echo(json.dumps({"ok": not failed and capped is None, "exit_code": code,
+                               "runs": rows, "capped": capped,
+                               "estimate": {"arms": ests, "total_usd": total, "runs": n_runs,
+                                            "total_cap_usd": total_cap}},
                               default=str))
     else:
         typer.echo(_table(rows))
@@ -339,12 +505,15 @@ def run(
 
 
 def _estimate_table(ests: dict[str, dict[str, Any]], n_seeds: int, growth: bool) -> str:
-    head = ["arm", "model agents", "rounds", "calls/run", "probe calls", "per run", "seeds", "total"]
+    head = ["arm", "model agents", "rounds", "calls/turn", "calls/run", "probe calls", "per run",
+            "seeds", "total"]
     if growth:
         head += ["per run +growth", "total +growth"]
     body = []
     for a, e in ests.items():
-        row = [a, str(e["llm_agents"]), str(e["rounds"]), str(e["calls"]), str(e["probe_calls"]),
+        cpt = e["calls_per_turn"]
+        cpt = f"{min(cpt)}-{max(cpt)}" if isinstance(cpt, list) else str(cpt)
+        row = [a, str(e["llm_agents"]), str(e["rounds"]), cpt, str(e["calls"]), str(e["probe_calls"]),
                _usd(e["usd_flat"]), str(n_seeds), _usd(e["usd_flat"] * n_seeds)]
         if growth:
             row += [_usd(e["usd"]), _usd(e["usd"] * n_seeds)]
@@ -363,7 +532,9 @@ def estimate(
         "--seed", help="Estimate only this seed (default: every seed in the YAML's `seeds:`).")] = None,
     max_rounds: Annotated[int | None, typer.Option("--max-rounds", help="Override options.max_rounds.")] = None,
     calls_per_turn: Annotated[int | None, typer.Option(
-        "--calls-per-turn", help="Model calls per turn (default: options.max_calls_per_turn).")] = None,
+        "--calls-per-turn",
+        help="Model calls per turn to assume (default: options.max_calls_per_turn); a "
+             "participant's own max_calls still caps it.")] = None,
     prompt_growth: Annotated[int, typer.Option(
         "--prompt-growth", metavar="TOKENS_PER_ROUND",
         help="Prompt tokens added per round (full-memory context growth); round r is priced at "
@@ -400,7 +571,9 @@ def estimate(
                                 "total_usd_flat": total_flat}
         if as_json:
             return data
+        sources = sorted({e["calls_per_turn_source"] for e in ests.values()})
         lines = [_estimate_table(ests, len(seeds), prompt_growth > 0),
+                 f"calls/turn from: {'; '.join(sources)}",
                  f"estimate total: ${total_flat:.4f} worst case over {n_runs} run(s)"]
         if prompt_growth > 0:
             lines.append(f"with prompt growth {prompt_growth} tokens/round: ${total:.4f} worst case")
@@ -426,23 +599,51 @@ def replay(
 @app.command()
 def resume(
     run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
-    budget_soft: Annotated[float | None, typer.Option("--budget-soft", help="New soft budget (USD).")] = None,
-    budget_hard: Annotated[float | None, typer.Option("--budget-hard", help="New hard ceiling (USD).")] = None,
+    budget_soft: Annotated[float | None, typer.Option(
+        "--budget-soft", help="New soft budget (USD) for the run's swarm spend in total, including "
+                              "spend already recorded (discarded rounds included), not an "
+                              "amount to add.")] = None,
+    budget_hard: Annotated[float | None, typer.Option(
+        "--budget-hard", help="New hard ceiling (USD) for the run's total spend, including spend "
+                              "already recorded (discarded rounds included), not an amount to "
+                              "add.")] = None,
     budget_measurement: Annotated[float | None, typer.Option(
-        "--budget-measurement", help="New measurement budget (USD).")] = None,
+        "--budget-measurement", help="New measurement budget (USD) for the run's total probe "
+                                     "spend, including spend already recorded.")] = None,
+    add_budget: Annotated[float | None, typer.Option(
+        "--add-budget", help="Allow this many more USD from now: soft = swarm spend so far + X, "
+                             "hard = total spend so far + X (each only if enforced).")] = None,
     as_json: JsonOpt = False,
 ) -> None:
-    """Resume an interrupted (or budget-ended) run from its last committed round."""
+    """Resume an interrupted (or budget-ended) run from its last committed round.
+
+    The budget values are totals for the whole run; the current spend is printed before
+    resuming (stderr under --json)."""
 
     def go() -> dict[str, Any]:
         r = Run(run_dir)
         changes = {k: v for k, v in (("soft_usd", budget_soft), ("hard_usd", budget_hard),
                                      ("measurement_usd", budget_measurement)) if v is not None}
-        budget = None
-        if changes:
-            current = r.meta.get("budget") or r.meta["spec"]["budget"]
-            budget = Budget(**{**current, **changes})
-        return summary(r.resume(budget=budget))
+        current = dict(r.meta.get("budget") or r.meta["spec"]["budget"])
+        spend = r.spend
+        if add_budget is not None:
+            if add_budget <= 0:
+                raise SpecError("--add-budget must be > 0")
+            if {"soft_usd", "hard_usd"} & set(changes):
+                raise SpecError("--add-budget cannot be combined with --budget-soft/--budget-hard")
+            if not (current.get("soft_usd", 0) > 0 or current.get("hard_usd", 0) > 0):
+                raise SpecError("--add-budget: the run has no soft or hard budget to raise; pass "
+                                "--budget-hard X (the run's total)")
+            if current.get("soft_usd", 0) > 0:
+                changes["soft_usd"] = round(float(spend["swarm"]) + add_budget, 9)
+            if current.get("hard_usd", 0) > 0:
+                changes["hard_usd"] = round(ledger_total(spend) + add_budget, 9)
+        _say(f"resume {r.id}: {_spend_text(spend)} so far; " + _budget_text(
+            {k: v for k, v in {**current, **changes}.items() if k != "total_usd"}), as_json)
+        budget = Budget(**{**current, **changes}) if changes else None
+        data = summary(r.resume(budget=budget))
+        data["budget"] = (budget or Budget(**current)).model_dump(mode="json")
+        return data
 
     _execute(go, as_json)
 
@@ -584,9 +785,17 @@ def init(
             text = (files("swarmlab") / "templates" / template).read_text()
             target.write_text(text.replace("__NAME__", name))
         yaml_path = directory / f"{name}.yaml"
+        text = (f"wrote {yaml_path} and {directory / f'{name}.py'}\n"
+                f"next: swarmlab run {yaml_path}   (writes runs/ under the current directory)")
+        inside = is_swarmlab_checkout(Path.cwd()) or is_swarmlab_checkout(directory)
+        if inside:
+            text += ("\nnote: this is the swarmlab repo checkout. Keep experiments in a project "
+                     "directory outside it, e.g. `mkdir ~/my-exp && cd ~/my-exp && uv run "
+                     f"--project {Path.cwd().resolve()} swarmlab init {name}` (or `pip install -e "
+                     "<repo>` into that project's environment); `swarmlab run` refuses to write "
+                     "runs/ here without --out.")
         return {"ok": True, "yaml": str(yaml_path), "python": str(directory / f"{name}.py"),
-                "text": (f"wrote {yaml_path} and {directory / f'{name}.py'}\n"
-                         f"next: swarmlab run {yaml_path}")}
+                "inside_checkout": inside, "text": text}
 
     _execute(go, as_json)
 
@@ -803,19 +1012,29 @@ def fetch_published_cmd(
 @app.command("report")
 def report_cmd(
     runs_dir: Annotated[Path, typer.Argument(help="Directory of run directories.")],
-    out: Annotated[Path | None, typer.Option("--out", help="Also write the Markdown here.")] = None,
+    out: Annotated[Path | None, typer.Option(
+        "--out", help="Write the Markdown here (prints one confirmation line).")] = None,
+    stdout: Annotated[bool, typer.Option("--stdout", help="With --out, also print the report.")] = False,
+    include_fake: Annotated[bool, typer.Option(
+        "--include-fake", help="Include simulated runs (only fake: models) in the tables, "
+                               "labelled '(simulated)'.")] = False,
     title: Annotated[str, typer.Option("--title", help="Report title.")] = "swarmlab report",
     as_json: JsonOpt = False,
 ) -> None:
-    """Markdown report over the finished runs in RUNS_DIR (accuracy, consensus, reading, health)."""
+    """Markdown report over the finished runs in RUNS_DIR (accuracy, consensus, reading, health).
+
+    Simulated runs (only fake: models) are listed but left out of the tables and the spend
+    total unless --include-fake."""
     from .report import write_report
 
     def go() -> dict[str, Any]:
         if not runs_dir.is_dir():
             raise SpecError(f"{runs_dir} is not a directory")
-        text = write_report(runs_dir, out, title)
+        text = write_report(runs_dir, out, title, include_fake=include_fake)
         if as_json:
             return {"ok": True, "report": text, "out": str(out) if out else None}
+        if out is not None and not stdout:
+            return {"text": f"wrote {out} ({len(text.splitlines())} lines)"}
         return {"text": text}
 
     _execute(go, as_json)
