@@ -106,7 +106,95 @@ class Counter(World):
 - **Prices** are never typed by hand. `swarmlab models [--provider hf|anthropic] [--tools] [--search qwen]` lists models, who serves them, tool support and USD per million tokens. `hf` prices come from the router listing (cached 24 h in `~/.cache/swarmlab/catalog.json`); a bare `hf:Org/Model` is priced at its most expensive listed provider. The price used is written into the run spec. To override, or for a model the catalog does not price, add `providers: {hf: {type: openai_compat, params: {name: hf, pricing: {"Org/Model:prov": [in, out, cached]}}}}`.
 - **Timeouts**: each provider call attempt is cut off after `timeout_s` (default 90 s) and timeouts, connection errors, 429 and 5xx are retried up to `max_retries` times (default 2) with jittered 1/2/4 s backoff; the budget reservation is held across retries. A phase-commit round waits for its slowest call, so tighten these for slow-tailed routers: `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 60, max_retries: 3}}}` (`type: anthropic` takes the same two params).
 - Each `inference_response` event records `attempts`; a call that still fails after its retries raises `ProviderError`.
-- **Budgets** (USD, per run): `soft_usd` ends the run at the next round boundary once agent spend reaches it; `hard_usd` is an absolute ceiling on agent + probe spend (the round in flight is discarded, its spend still counts, and `swarmlab resume RUN --budget-hard X` continues: X is the run's new total including everything already spent, or `--add-budget D` allows D more from the current spend; `resume` prints the spend so far); `measurement_usd` caps probes. 0 means "not enforced", so set `hard_usd` before using a paid model. These caps are per run; `total_usd` (top-level `budget:` only) caps the whole experiment: `swarmlab run` (and `Experiment.run_all`) starts a run only if the spend of the runs before it plus its `hard_usd` fits under `total_usd`, otherwise it stops and lists the skipped runs. `run` prints every arm's caps and the total cap before starting, and warns when `hard_usd - soft_usd` is less than one round's estimated cost (the soft budget is checked between rounds, so a round can start under it, hit the hard ceiling and be discarded). When any budget is non-zero `run` asks before starting (`--yes` skips the question); `swarmlab estimate spec.yaml` prints the estimate alone (every arm x seed; `--arm`/`--seed` narrow it, `--prompt-growth TOKENS` models a context that grows each round under full memory; calls per turn default to the runner cap `max_calls_per_turn`, capped by each group's own `max_calls`, `--calls-per-turn C` assumes C instead, and the output states the value used).
+- **Budgets** (USD, per run): `soft_usd` ends the run at the next round boundary once agent spend reaches it; `hard_usd` is an absolute ceiling on agent + probe spend (the round in flight is discarded, its spend still counts, and `swarmlab resume RUN --budget-hard X` continues: X is the run's new total including everything already spent, or `--add-budget D` allows D more from the current spend; `resume` prints the spend so far); `measurement_usd` caps probes. 0 means "not enforced", so set `hard_usd` before using a paid model. These caps are per run and can be set in the top-level `budget:` and per arm (`arms.A.budget: {hard_usd: 0.5}`, merged over the top-level one, so arms can get different caps); `total_usd` (top-level `budget:` only) caps the whole experiment: `swarmlab run` (and `Experiment.run_all`) starts a run only if the spend of the runs before it plus its `hard_usd` fits under `total_usd`, otherwise it stops and lists the skipped runs. `run` prints every arm's caps and the total cap before starting, and warns when `hard_usd - soft_usd` is less than one round's estimated cost (the soft budget is checked between rounds, so a round can start under it, hit the hard ceiling and be discarded). When any budget is non-zero `run` asks before starting (`--yes` skips the question); `swarmlab estimate spec.yaml` prints the estimate alone (every arm x seed; `--arm`/`--seed` narrow it, `--prompt-growth TOKENS` models a context that grows each round under full memory; calls per turn default to the runner cap `max_calls_per_turn`, capped by each group's own `max_calls`, `--calls-per-turn C` assumes C instead, and the output states the value used).
+
+## Spec reference
+
+<!-- spec-reference:start -->
+Every key of an experiment YAML, generated from the pydantic models (`swarmlab spec-reference` prints this list). Unknown keys are errors. Wherever the shape is `{type: NAME, params: {...}}` the value is a plugin: `{type: NAME, params: {...}}`, or the bare string `NAME` for `{type: NAME, params: {}}`.
+
+- `name`: `str` (required): experiment name; run ids are `<name>__<arm>__s<seed>`
+- `arms`: `{NAME: {world, participants, medium, metrics, probes, interventions, options, budget, roles}}` (required): the conditions, by arm name; each arm is a full setup (see `arms.<arm>`)
+  - `arms.NAME.world`: `{type: NAME, params: {...}}` (required): the task, e.g. `{type: flaggame, params: {n_candidates: 8}}` or `flaggame`
+  - `arms.NAME.participants`: `[{type, count, params, role}, ...]` (required): participant groups, in agent order
+    - `arms.NAME.participants[].type`: `str` (required): participant type: `llm`, `evidence_aggregator`, `enumerator`, `silent`, ...
+    - `arms.NAME.participants[].count`: `int` (default `1`): number of agents in this group (>= 1)
+    - `arms.NAME.participants[].params`: `{...}` (optional): constructor params, e.g. `{model: "anthropic:claude-haiku-4-5", max_tokens: 1024}` for `llm`
+    - `arms.NAME.participants[].role`: `str | null` (optional): role name (declared in `roles`, or a built-in: worker, coordinator, reviewer, skeptic, scribe)
+  - `arms.NAME.medium`: `{topology, delivery, push_limit, policies, channels, registry, claim_policy}` (default: see keys): the message board: topology, policies, registry
+    - `arms.NAME.medium.topology`: `{type: NAME, params: {...}}` (default `broadcast`): who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per agent per round), `groups`, `tree`; e.g. `{type: gossip, params: {k: 2}}`
+    - `arms.NAME.medium.delivery`: `pull | push` (default `pull`): `pull` (agents call `read_board`) or `push` (deliveries come with the turn)
+    - `arms.NAME.medium.push_limit`: `int` (default `20`): most items pushed per turn under `delivery: push`
+    - `arms.NAME.medium.policies`: `[{type: NAME, params: {...}}, ...]` (optional): visibility policies applied in order, e.g. `[{type: delay, params: {rounds: 1}}]`
+    - `arms.NAME.medium.channels`: `[str, ...]` (default `[main]`): board channels
+    - `arms.NAME.medium.registry`: `bool` (default `false`): turn on the claim registry tools
+    - `arms.NAME.medium.claim_policy`: `{type: NAME, params: {...}}` (default `advisory`): `advisory` or `enforced` (registry claims checked against world actions)
+  - `arms.NAME.metrics`: `[{type: NAME, params: {...}}, ...]` (optional): metrics logged every round (`swarmlab metrics` lists them)
+  - `arms.NAME.probes`: `[{type: NAME, params: {...}}, ...]` (optional): probes asked after every commit, e.g. `[belief]`
+  - `arms.NAME.interventions`: `[{type: NAME, params: {...}}, ...]` (optional): interventions (`inject_post`, `mute`, ...) for this arm
+  - `arms.NAME.options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat}` (optional): run options for this arm, merged over the top-level `options`
+    - `arms.NAME.options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
+    - `arms.NAME.options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
+    - `arms.NAME.options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
+    - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
+    - `arms.NAME.options.concurrency`: `int` (default `32`): concurrent turns
+    - `arms.NAME.options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
+  - `arms.NAME.budget`: `{soft_usd, hard_usd, measurement_usd}` (optional): per-run caps for this arm, merged over the top-level `budget` (no `total_usd`)
+    - `arms.NAME.budget.soft_usd`: `float` (default `0.0`): end the run at the next round boundary once agent spend reaches this (0: off)
+    - `arms.NAME.budget.hard_usd`: `float` (default `0.0`): absolute ceiling on agent + probe spend for the run; the round in flight is discarded (0: off)
+    - `arms.NAME.budget.measurement_usd`: `float` (default `0.0`): cap on probe spend (0: off)
+  - `arms.NAME.roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations for this arm, merged over the top-level `roles`
+    - `arms.NAME.roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
+    - `arms.NAME.roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
+    - `arms.NAME.roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
+    - `arms.NAME.roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
+    - `arms.NAME.roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
+    - `arms.NAME.roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`
+    - `arms.NAME.roles.NAME.may_act`: `bool` (default `true`): may use the world's action tools
+    - `arms.NAME.roles.NAME.model`: `str | null` (optional): overrides the participant's model (`prefix:id`)
+    - `arms.NAME.roles.NAME.budget`: `{...} | null` (optional): per-turn overrides: `{max_calls, max_tokens}`
+    - `arms.NAME.roles.NAME.post_fields`: `{...} | null` (optional): allowed post fields and values: `{field: [values]}`
+- `budget`: `{soft_usd, hard_usd, measurement_usd, total_usd}` (default: see keys): per-run caps in USD (each arm's `budget` is merged over it) plus `total_usd`, the cap for the whole experiment
+  - `budget.soft_usd`: `float` (default `0.0`): end the run at the next round boundary once agent spend reaches this (0: off)
+  - `budget.hard_usd`: `float` (default `0.0`): absolute ceiling on agent + probe spend for the run; the round in flight is discarded (0: off)
+  - `budget.measurement_usd`: `float` (default `0.0`): cap on probe spend (0: off)
+  - `budget.total_usd`: `float` (default `0.0`): top level only: cap on the whole experiment's spend (all arms x seeds, finished and resumed runs included) (0: off)
+- `options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat}` (optional): run options for every arm (each arm's `options` is merged over them)
+  - `options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
+  - `options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
+  - `options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
+  - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
+  - `options.concurrency`: `int` (default `32`): concurrent turns
+  - `options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
+- `providers`: `{NAME: {type: NAME, params: {...}}}` (optional): provider overrides by model prefix, e.g. `hf: {type: openai_compat, params: {name: hf, timeout_s: 60}}`
+- `seeds`: `[int, ...]` (optional): seeds `swarmlab run` runs per arm (empty: `[0]`)
+- `interventions`: `[{type: NAME, params: {...}}, ...]` (optional): interventions for every arm (an arm's own list is appended)
+- `roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations by name, for every arm (an arm's `roles` is merged per name)
+  - `roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
+  - `roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
+  - `roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
+  - `roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
+  - `roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
+  - `roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`
+  - `roles.NAME.may_act`: `bool` (default `true`): may use the world's action tools
+  - `roles.NAME.model`: `str | null` (optional): overrides the participant's model (`prefix:id`)
+  - `roles.NAME.budget`: `{...} | null` (optional): per-turn overrides: `{max_calls, max_tokens}`
+  - `roles.NAME.post_fields`: `{...} | null` (optional): allowed post fields and values: `{field: [values]}`
+
+Example: a gossip arm where each agent reaches one partner per round, with its own caps:
+
+```yaml
+arms:
+  gossip:
+    world: flaggame
+    participants:
+      - {type: llm, count: 6, params: {model: "anthropic:claude-haiku-4-5"}}
+    medium: {topology: {type: gossip, params: {k: 1}}}
+    budget: {soft_usd: 0, hard_usd: 0.5}
+```
+<!-- spec-reference:end -->
+
+A key in the wrong place or with the wrong shape is an error that names the key path and the shape expected there, e.g. `arms.gossip.medium.topology_params: unknown key 'topology_params'; arms.gossip.medium expects a mapping with keys topology, ...; topology is {type: NAME, params: {...}}, e.g. medium: {topology: {type: gossip, params: {k: 1}}}`.
 
 ## Changing what agents are told
 
@@ -135,7 +223,7 @@ Note that the default prompt already lists every tool the world and board offer 
 
 ```
 swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S] [--refresh]
-swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC
+swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC    swarmlab spec-reference
 swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [--rerun]
 swarmlab estimate SPEC [--arm A] [--seed N] [--max-rounds R] [--prompt-growth G] [--calls-per-turn C]
 swarmlab replay RUN_DIR

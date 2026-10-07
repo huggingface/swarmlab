@@ -62,6 +62,9 @@ next item.
    given.
 2. **Spec.** `swarmlab validate SPEC.yaml` -> every arm resolves; its table shows each arm's
    agents, models, soft/hard/measurement caps, probes and metrics: check them against the plan.
+   `swarmlab spec-reference` lists every YAML key and its shape (e.g. `medium: {topology:
+   {type: gossip, params: {k: 1}}}`, per-arm `budget:`); a shape error names the key and the
+   shape expected there.
    Model ids come from
    `swarmlab models --tools --search QWEN` (prices are looked up, never typed). Every arm that
    calls a paid model has `budget: {hard_usd: X}`; `hard_usd: 0` means no ceiling.

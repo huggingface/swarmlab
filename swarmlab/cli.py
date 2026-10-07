@@ -63,6 +63,8 @@ Decisions where the contract is silent:
 - `validate` prints a per-arm table (agents, models with counts, soft/hard/measurement caps,
   rounds, probes, metrics) and the total cap; `--json` has the same per arm (`models`,
   `budget`, `probes`, ...) plus `total_usd`.
+- `spec-reference` prints README.md's "Spec reference" section (every YAML key, its shape and
+  default; swarmlab/spec_reference.py); `--readme README.md` rewrites that section in place.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
   `doctor.py`) and in `init`'s help.
 """
@@ -1061,6 +1063,22 @@ def prompts_cmd(
         return {"text": prompts_text(rows, exp.arm, s)}
 
     _execute(go, as_json)
+
+
+@app.command("spec-reference")
+def spec_reference_cmd(
+    readme: Annotated[Path | None, typer.Option(
+        "--readme", help="Rewrite the generated block of this README in place instead of "
+                         "printing.")] = None,
+) -> None:
+    """Print every experiment YAML key with its shape and default (generated from the models)."""
+    from .spec_reference import replace_readme_section, spec_reference
+
+    if readme is None:
+        typer.echo(spec_reference())
+        return
+    readme.write_text(replace_readme_section(readme.read_text()))
+    typer.echo(f"updated the spec reference in {readme}")
 
 
 def main() -> None:  # pragma: no cover - `python -m swarmlab.cli`

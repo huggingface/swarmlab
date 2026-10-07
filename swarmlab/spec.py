@@ -25,6 +25,9 @@ Decisions where the contract is silent:
 
   Anywhere a plugin is expected, a bare string `"x"` means `{type: "x", params: {}}`.
   Per-arm `options`/`budget` exist so commit policy can be an arm (DESIGN.md M2).
+  `swarmlab spec-reference` (swarmlab/spec_reference.py) prints every key with its shape; a
+  shape error names the key path and the shape expected there (no `topology_params`-style
+  shorthands are accepted).
 - `load_experiment_yaml` returns the *normalised* document as plain data (strings expanded to
   `{type, params}`, defaults filled), so `arm_to_runspec` and `dump_experiment_yaml` accept it.
 - `git_identity` treats untracked files as clean (`git status --porcelain --untracked-files=no`),
@@ -279,7 +282,9 @@ def validate_experiment_doc(doc: dict) -> dict:
     try:
         parsed = ExperimentDoc.model_validate(doc)
     except ValidationError as e:
-        raise SpecError(str(e)) from e
+        from .spec_reference import explain_validation_error
+
+        raise SpecError(f"{explain_validation_error(e)}\n(see `swarmlab spec-reference`)\n{e}") from e
     where = [("options", parsed.options, _OPTION_FIELDS)]
     for arm_name, arm in parsed.arms.items():
         where += [
