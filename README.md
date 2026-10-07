@@ -5,13 +5,16 @@ A scientific testbed for finding the primitives that make heterogeneous groups o
 ## Quickstart
 
 ```
+git clone https://github.com/cmpatino/swarmlab && cd swarmlab
 uv sync --extra dev --extra anthropic     # or: pip install -e .[anthropic]
 uv run swarmlab doctor                    # Python, extras, API keys, provider reachability, git
-uv run swarmlab init demo                 # writes demo.yaml and demo.py
-uv run swarmlab run demo.yaml             # every arm x every seed -> runs/<run_id>/
-uv run swarmlab view runs/demo__gossip__s1   # writes the replay page view.html
+
+mkdir ~/demo-exp && cd ~/demo-exp         # experiments live outside the repo checkout
+uv run --project ~/swarmlab swarmlab init demo      # writes demo.yaml and demo.py
+uv run --project ~/swarmlab swarmlab run demo.yaml  # every arm x every seed -> ./runs/<run_id>/
+uv run --project ~/swarmlab swarmlab view runs/demo__gossip__s1   # writes the replay page view.html
 ```
-(Inside an activated venv, or after `pip install`, drop the `uv run`.) The starter compares a broadcast board with a gossip board on the Flag Game, with 8 LLM agents per arm on the deterministic fake model `fake:reader`: no keys, no network, nothing billed. `run` prints the worst-case estimate per arm and in total, runs each arm with each seed in `seeds:`, skips runs whose directory already holds the same spec (`--rerun` writes `runs/<run_id>__r2`), and ends with a table:
+(`~/swarmlab` is wherever you cloned the repo. Alternatively `pip install -e ~/swarmlab[anthropic]` into the project's own environment and call `swarmlab` directly.) Work from a project directory outside the checkout: `run` writes `runs/` under the current directory, and inside the swarmlab checkout it refuses unless you pass `--out`, so runs never end up in the repo. `swarmlab validate demo.yaml` prints each arm's agents, models, caps, probes and metrics. The starter compares a broadcast board with a gossip board on the Flag Game, with 8 LLM agents per arm on the deterministic fake model `fake:reader`: no keys, no network, nothing billed. `run` prints the worst-case estimate per arm and in total, runs each arm with each seed in `seeds:`, skips runs whose directory already holds the same spec (`--rerun` writes `runs/<run_id>__r2`), and ends with a table:
 
 ```
 run                  outcome  end         score                                 spend
@@ -117,7 +120,7 @@ Note that the default prompt already lists every tool the world and board offer 
 
 ```
 swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S]
-swarmlab init [NAME]                     swarmlab validate SPEC
+swarmlab init [NAME] [--dir D]            swarmlab validate SPEC
 swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [--rerun]
 swarmlab estimate SPEC [--arm A] [--seed N] [--prompt-growth G] [--calls-per-turn C]
 swarmlab replay RUN_DIR

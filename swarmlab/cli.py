@@ -56,6 +56,13 @@ Decisions where the contract is silent:
   `capped: {reason, total_usd, spent, skipped: [run ids]}` and the exit code is 1.
 - `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server) are documented in
   `swarmlab/jobs/` and docs/handoff/WP8.md. `job run` only prints unless `--launch`.
+- Working directory: `run` without `--out` refuses (exit 2) when the current directory is the
+  swarmlab checkout itself (`is_swarmlab_checkout`: a pyproject.toml with `name = "swarmlab"`),
+  so runs never land in the repo by accident; `init` says to work from a project directory
+  outside the checkout and warns when it is run inside one.
+- `validate` prints a per-arm table (agents, models with counts, soft/hard/measurement caps,
+  rounds, probes, metrics) and the total cap; `--json` has the same per arm (`models`,
+  `budget`, `probes`, ...) plus `total_usd`.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
   `doctor.py`) and in `init`'s help.
 """
@@ -70,7 +77,7 @@ from typing import Annotated, Any
 import typer
 
 from .budget import ledger_total, total_cap_refusal
-from .experiment import Experiment, Run
+from .experiment import Experiment, Run, participant_model
 from .spec import Budget, RunOptions, SpecError, experiment_seeds, load_experiment_yaml
 
 app = typer.Typer(
@@ -223,16 +230,62 @@ def validate(
         arms = {}
         for arm in doc["arms"]:
             exp = _build(spec, arm)
+            models: dict[str, int] = {}
+            for p in exp.participants:
+                key = participant_model(p) or f"{p.spec()['type']} (scripted)"
+                models[key] = models.get(key, 0) + 1
             arms[arm] = {
                 "world": exp.world.spec()["type"],
                 "n_agents": len(exp.participants),
+                "models": models,
                 "topology": exp.medium.spec()["params"]["topology"],
+                "budget": exp.budget.model_dump(mode="json"),
+                "probes": [p.name for p in exp.probes],
                 "metrics": [m if isinstance(m, str) else m.name for m in exp.metrics],
                 "max_rounds": exp.options.get("max_rounds"),
             }
-        return {"ok": True, "spec": str(spec), "name": doc["name"], "arms": arms}
+        data = {"ok": True, "spec": str(spec), "name": doc["name"], "arms": arms,
+                "total_usd": float(doc["budget"].get("total_usd") or 0)}
+        if as_json:
+            return data
+        return {"text": _validate_text(data)}
 
     _execute(go, as_json)
+
+
+def _validate_text(data: dict[str, Any]) -> str:
+    """`validate`'s per-arm table: agents, models, caps, probes, metrics."""
+    def money(v: float) -> str:
+        return f"${v:g}" if v > 0 else "-"
+
+    head = ("arm", "agents", "model(s)", "soft", "hard", "meas.", "rounds", "probes", "metrics")
+    body = []
+    for arm, a in data["arms"].items():
+        b = a["budget"]
+        body.append((arm, str(a["n_agents"]),
+                     ", ".join(f"{m} x{n}" for m, n in a["models"].items()),
+                     money(b["soft_usd"]), money(b["hard_usd"]), money(b["measurement_usd"]),
+                     str(a["max_rounds"] or "-"), ", ".join(a["probes"]) or "-",
+                     ", ".join(a["metrics"]) or "-"))
+    widths = [max(len(h), *(len(r[i]) for r in body)) for i, h in enumerate(head)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    total = data["total_usd"]
+    lines = [f"ok: {data['spec']} ({data['name']}): {len(body)} arm(s) resolve",
+             fmt.format(*head).rstrip(), *(fmt.format(*r).rstrip() for r in body),
+             "caps are per run (0 / - = not enforced); total cap: "
+             + (f"${total:g} for the whole experiment" if total > 0 else "none")]
+    return "\n".join(lines)
+
+
+def is_swarmlab_checkout(path: Path) -> bool:
+    """True when `path` holds swarmlab's own pyproject.toml (`[project] name = "swarmlab"`)."""
+    import tomllib
+
+    try:
+        data = tomllib.loads((path / "pyproject.toml").read_text())
+    except (OSError, ValueError):
+        return False
+    return (data.get("project") or {}).get("name") == "swarmlab"
 
 
 def _say(line: str, as_json: bool) -> None:
@@ -324,13 +377,22 @@ def run(
     arm: Annotated[str | None, typer.Option(
         "--arm", help="Run only this arm (default: every arm).")] = None,
     max_rounds: Annotated[int | None, typer.Option("--max-rounds", help="Override options.max_rounds.")] = None,
-    out: Annotated[Path, typer.Option("--out", help="Parent directory for run dirs.")] = Path("runs"),
+    out: Annotated[Path | None, typer.Option(
+        "--out", help="Parent directory for run dirs (default: runs/ under the current directory; "
+                      "required inside the swarmlab repo checkout).")] = None,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask before spending.")] = False,
     rerun: Annotated[bool, typer.Option(
         "--rerun", help="Run again into runs/<id>__r<N> even if runs/<id> exists.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
     """Run an experiment: every arm x every seed of the YAML, or the arm/seed you pick."""
+    if out is None:
+        if is_swarmlab_checkout(Path.cwd()):
+            _fail(SpecError(
+                "the current directory is the swarmlab repo checkout; run experiments from a "
+                "project directory outside it (`cd ~/my-exp && uv run --project "
+                f"{Path.cwd()} swarmlab run SPEC`) or pass --out DIR"), 2, as_json)
+        out = Path("runs")
     try:
         doc = load_experiment_yaml(spec)
         arms = [arm] if arm is not None else list(doc["arms"])
@@ -723,9 +785,17 @@ def init(
             text = (files("swarmlab") / "templates" / template).read_text()
             target.write_text(text.replace("__NAME__", name))
         yaml_path = directory / f"{name}.yaml"
+        text = (f"wrote {yaml_path} and {directory / f'{name}.py'}\n"
+                f"next: swarmlab run {yaml_path}   (writes runs/ under the current directory)")
+        inside = is_swarmlab_checkout(Path.cwd()) or is_swarmlab_checkout(directory)
+        if inside:
+            text += ("\nnote: this is the swarmlab repo checkout. Keep experiments in a project "
+                     "directory outside it, e.g. `mkdir ~/my-exp && cd ~/my-exp && uv run "
+                     f"--project {Path.cwd().resolve()} swarmlab init {name}` (or `pip install -e "
+                     "<repo>` into that project's environment); `swarmlab run` refuses to write "
+                     "runs/ here without --out.")
         return {"ok": True, "yaml": str(yaml_path), "python": str(directory / f"{name}.py"),
-                "text": (f"wrote {yaml_path} and {directory / f'{name}.py'}\n"
-                         f"next: swarmlab run {yaml_path}")}
+                "inside_checkout": inside, "text": text}
 
     _execute(go, as_json)
 

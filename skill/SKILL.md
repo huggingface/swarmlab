@@ -37,8 +37,12 @@ Do these in order. Each item is done when its check holds; a failing check is fi
 next item.
 
 1. **Environment.** `swarmlab doctor SPEC.yaml` -> exit 0 (keys, extras, provider reachability,
-   clean git). A new experiment starts from `swarmlab init NAME` (writes `NAME.yaml`, `NAME.py`).
-2. **Spec.** `swarmlab validate SPEC.yaml` -> every arm resolves. Model ids come from
+   clean git). A new experiment starts from `swarmlab init NAME` (writes `NAME.yaml`, `NAME.py`)
+   in a project directory outside the swarmlab checkout (`uv run --project <repo> swarmlab ...`
+   from there); `swarmlab run` refuses to write `runs/` inside the checkout unless `--out` is
+   given.
+2. **Spec.** `swarmlab validate SPEC.yaml` -> every arm resolves; its table shows each arm's
+   agents, models, soft/hard/measurement caps, probes and metrics, so check those match the plan. Model ids come from
    `swarmlab models --tools --search QWEN` (prices are looked up, never typed). Every arm that
    calls a paid model has `budget: {hard_usd: X}`; `hard_usd: 0` means no ceiling.
 3. **Dry run with scripted agents.** Copy the arm into a dry-run arm whose participants are
