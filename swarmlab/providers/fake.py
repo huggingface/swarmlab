@@ -13,7 +13,9 @@ The provider fills in what the script leaves unset: `provider`, `model`, `latenc
 `prompt_tokens = estimate_prompt_tokens(request)` and
 `completion_tokens = max(1, ceil(len(text + tool-call JSON) / 4))`.
 
-Built-in `flaggame_reader` (FlagGame text observations). Within one turn (the messages after the
+Built-in `flaggame_reader` (FlagGame text observations; in the image modality it needs
+`image_text_hint=True`, whose text parts joined with newlines form the same listing, and ignores
+the images; `FlagGame.check_participants` refuses it otherwise). Within one turn (the messages after the
 last `user` message that is not a json-protocol `[tool results]` message):
 
 1. If `read_board` is offered and has not been called this turn: call `post` with
@@ -119,6 +121,8 @@ def parse_listing(text: str) -> tuple[dict[str, list[str]], list[str]]:
             current = candidates.setdefault(line[:-1], [])
         elif _ROW_RE.match(line) and current is not None:
             current.append(line)
+        elif current is None:
+            continue  # prose before the first section (FlagGame image modality framing line)
         else:
             break
     return candidates, crop

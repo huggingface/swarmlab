@@ -2,7 +2,8 @@
 
 `grid_to_png(rows, palette, cell_px)` draws every letter as a solid `cell_px x cell_px` square in
 `palette[letter]` and encodes the picture as an 8-bit RGB, non-interlaced PNG with zlib + struct
-only. `png_size(data) -> (w, h)` reads the IHDR; `decode_png_rgb(data)` returns the pixel rows as
+only. `png_size(data) -> (w, h)` reads the IHDR; `image_label(png_b64)` is the text stand-in
+`[image: PNG w×h]` that exports and prompt listings use for an image part; `decode_png_rgb(data)` returns the pixel rows as
 lists of `(r, g, b)` tuples (used by tests; it accepts any 8-bit RGB non-interlaced PNG, all five
 scanline filters).
 
@@ -76,6 +77,18 @@ def png_size(data: bytes) -> tuple[int, int]:
             w, h = struct.unpack(">II", body[:8])
             return w, h
     raise ValueError("PNG has no IHDR chunk")
+
+
+def image_label(png_b64: str | None) -> str:
+    """Text stand-in for an image part: `[image: PNG <w>×<h>]` (exports, prompt listings)."""
+    import base64
+    import binascii
+
+    try:
+        w, h = png_size(base64.b64decode(png_b64 or "", validate=True))
+    except (ValueError, struct.error, binascii.Error):
+        return "[image: not a readable PNG]"
+    return f"[image: PNG {w}×{h}]"
 
 
 def _paeth(a: int, b: int, c: int) -> int:

@@ -36,7 +36,9 @@ Decisions where the contract is silent:
   `.response`, `probes.question` / `.raw`) holds the blob decoded as UTF-8 when it is at most
   64 KiB (`INLINE_LIMIT`); otherwise (or when not UTF-8) it holds `"sha256:<hash>"`, and the
   blob is guaranteed to be in `raw/blobs/`. A missing blob gives null. The hash column is always
-  present next to it.
+  present next to it. A request blob with image parts (M5 §4, FlagGame `modality="image"`)
+  is never inlined: `inference.request` holds `"sha256:<hash>"` at any size and the blob is
+  kept in `raw/blobs/` like an oversize one.
 - **Raw blobs.** `raw/blobs/` mirrors the run's `blobs/` (shards, `cache/` included) when the
   run directory (log, snapshots, artifacts, blobs) is under 500 MB (`FULL_BLOBS_LIMIT`). Above
   that it holds only the snapshot blobs (needed by `Run.load`) and the blobs too large to
@@ -74,6 +76,8 @@ Decisions where the contract is silent:
     later rounds under it); its response is emitted where the next readable request places the
     assistant message (or right after it, when window memory dropped it). With window memory the
     lost round's user message cannot be recovered and is missing from the session.
+  - An image part of a message becomes a text block `[image: PNG <w>×<h>]` (M5 §4,
+    `render.image_label`); the pixels stay in the request blobs.
   - pi `usage.cost` holds the logged `cost_usd` in `total` only (the run does not split cost
     by token kind); `api` is `anthropic-messages` for Anthropic and `openai-completions`
     otherwise.
@@ -108,8 +112,11 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .world.render import image_label
+
 EXPORT_SCHEMA = "swarmlab-export/2"
 INLINE_LIMIT = 64 * 1024
+IMAGE_MARK = b'"type":"image"'  # an image Part in a canonical-JSON request blob
 FULL_BLOBS_LIMIT = 500 * 1024 * 1024
 KEY_COLUMNS = ("experiment", "arm", "seed", "run", "round", "agent")
 
@@ -239,11 +246,13 @@ class _Blobs:
         except ValueError:
             return None
 
-    def inline(self, sha: str | None) -> str | None:
+    def inline(self, sha: str | None, *, images_by_ref: bool = False) -> str | None:
         data = self.get(sha)
         if data is None:
             return None
-        if len(data) <= INLINE_LIMIT:
+        if images_by_ref and IMAGE_MARK in data:
+            pass  # M5 §4: a request with image parts is kept by hash only
+        elif len(data) <= INLINE_LIMIT:
             try:
                 return data.decode("utf-8")
             except UnicodeDecodeError:
@@ -350,7 +359,7 @@ def build_tables(events: list[dict], meta: dict, blobs: _Blobs) -> dict[str, lis
             row = {**key(ev), "call_id": ev.get("call_id"), "category": ev.get("category"),
                    "provider": ev.get("provider"), "model": ev.get("model"),
                    "request_hash": ev.get("request_hash"), "reserved_usd": ev.get("reserved_usd"),
-                   "request": blobs.inline(ev.get("request_hash"))}
+                   "request": blobs.inline(ev.get("request_hash"), images_by_ref=True)}
             open_inf[str(ev.get("call_id"))].append(row)
             rows["inference"].append(row)
         elif t == "inference_response":
@@ -483,8 +492,7 @@ def _content_blocks(content: Any) -> str | list[dict]:
     out: list[dict] = []
     for p in content or []:
         if p.get("type") == "image" or p.get("image_png_b64"):
-            out.append({"type": "image", "data": p.get("image_png_b64") or "",
-                        "mimeType": "image/png"})
+            out.append({"type": "text", "text": image_label(p.get("image_png_b64"))})  # M5 §4
         else:
             out.append({"type": "text", "text": p.get("text") or ""})
     return out

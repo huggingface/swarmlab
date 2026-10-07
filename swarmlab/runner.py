@@ -159,6 +159,11 @@ the agent streams. Repeat 0 is a plain run. Repeat i > 0 binds agent `a` with
 derived from `derive(seed, "repeat", i, "agent", a, call_id)` (`RepeatSeeded`), so the sampling of
 seeded providers, the fake provider and the request cache differ per repeat. World, schedule and
 topology streams never depend on the repeat.
+
+World participant check (M5): on a fresh run (and a fork at round 0), right after the participants
+are bound and roles applied and before `world.reset`, the runner calls
+`world.check_participants(participants, experiment)` when the world defines it; FlagGame's image
+modality uses it to refuse text-grid readers without `image_text_hint` (a `ValueError`).
 """
 from __future__ import annotations
 
@@ -535,6 +540,9 @@ class Runner:
             p.bind(a, agent_stream(seed, a, self.options.repeat))
         self.roles = bind_roles(self.board, self.participants, agent_roles(  # M3c
             self.spec.roles, self.spec.participant_roles, len(self.agents)))
+        check = getattr(self.world, "check_participants", None)  # M5: FlagGame image modality
+        if callable(check):
+            check(self.participants, self.experiment)
         self.world.reset(derive(seed, "world"), list(self.agents))
         self._set_truth()
         self._set_agents()

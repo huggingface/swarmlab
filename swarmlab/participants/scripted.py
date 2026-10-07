@@ -2,7 +2,9 @@
 
 All three draw randomness only from the rng passed to `bind` (the runner passes
 `derive(seed, "agent", agent)`), keep plain Python state (pickled by `Persistable`), and parse
-the world's observation with `swarmlab.world.flaggame.parse_observation`.
+the world's observation with `swarmlab.world.flaggame.parse_observation` (the text parts joined
+with newlines). In FlagGame's image modality they need `image_text_hint=True` (M5): they set
+`reads_text_observation = True` and `FlagGame.check_participants` refuses them otherwise.
 
 - `Silent`: in round 1 guesses a candidate containing its crop (ties broken by its rng), then
   `end_turn`. Later rounds: `end_turn` only. Never reads or posts.
@@ -32,6 +34,7 @@ from ..world.flaggame import candidates_containing, contains, parse_observation
 from .base import Participant, TurnUsage
 
 CROP_PREFIX = "crop:"
+_INTRO_LINE_RE = re.compile(r"^Candidates .+ are shown as images in that order.*$", re.MULTILINE)
 
 
 def _observation_text(view: View) -> str:
@@ -40,6 +43,7 @@ def _observation_text(view: View) -> str:
 
 class Silent(Participant):
     entry_point: ClassVar[str | None] = "silent"
+    reads_text_observation: ClassVar[bool] = True  # M5: needs image_text_hint in image mode
 
     async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
         calls = 0
@@ -54,6 +58,7 @@ class Silent(Participant):
 
 class EvidenceAggregator(Participant):
     entry_point: ClassVar[str | None] = "evidence_aggregator"
+    reads_text_observation: ClassVar[bool] = True
 
     def bind(self, agent: Any, rng: Any) -> None:
         super().bind(agent, rng)
@@ -91,6 +96,7 @@ def _bare(name: str, text: str) -> bool:
 
 class Enumerator(Participant):
     entry_point: ClassVar[str | None] = "enumerator"
+    reads_text_observation: ClassVar[bool] = True
 
     def __init__(self, truth_name: str | None = None) -> None:
         self.truth_name = truth_name
@@ -110,7 +116,7 @@ class Enumerator(Participant):
         text = _observation_text(view)
         candidates, _ = parse_observation(text)
         names = sorted(candidates)
-        stripped = text
+        stripped = _INTRO_LINE_RE.sub("", text)  # M5: the framing line lists every name
         for n in names:
             stripped = stripped.replace(f"\n{n}:\n", "\n")
         self._check_name("observation", stripped)

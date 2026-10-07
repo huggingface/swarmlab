@@ -14,7 +14,8 @@ Candidates hook: the runner calls `probe.candidates_from_context(participant.pro
 once per agent and passes the result to every `parse` of that probe answer (also the coder
 model's reply). The base returns None. `BeliefProbe` reads the names from the latest FlagGame
 observation in the context (`flaggame.parse_observation` on a text part that starts with the
-"Candidate flags:" preamble); any other world yields None and parsing stays name-agnostic.
+"Candidate flags:" preamble; in the image modality the names listed in that part's framing line,
+`flaggame.candidate_names`); any other world yields None and parsing stays name-agnostic.
 
 Tolerant parsing (`BeliefProbe.parse`, after the 2026-10-06 smoke where 9 of 12 Qwen3.5-9B answers
 did not parse, mostly because reasoning used the whole token budget):
@@ -184,17 +185,14 @@ class BeliefProbe(Probe):
         self._coder_model = coder_model
 
     def candidates_from_context(self, context: list[ChatMessage]) -> list[str] | None:
-        from .world.flaggame import PREAMBLE, parse_observation
+        from .world.flaggame import PREAMBLE, candidate_names
 
         for m in reversed(context):
             if m.role != "user" or isinstance(m.content, str):
                 continue
             for part in m.content:
                 if part.type == "text" and (part.text or "").lstrip().startswith(PREAMBLE):
-                    try:
-                        names = list(parse_observation(part.text or "")[0])
-                    except ValueError:
-                        continue
+                    names = candidate_names(part.text or "")
                     if names:
                         return names
         return None

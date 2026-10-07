@@ -18,7 +18,7 @@ Decisions:
   provider receives under the native protocol.
 - A participant without these rendering methods (scripted participants) is listed with
   `system: null` and a note; nothing else of it is rendered.
-- Image parts of the user message render as `[image: <n> base64 chars]` in the text output (the
+- Image parts of the user message render as `[image: PNG <w>×<h>]` (M5) in the text output (the
   JSON output keeps the parts as they are).
 - M3c roles: groups split where the assigned role changes; every agent is bound and its role
   applied (`roles.bind_roles`, which also lays out a `Tree` topology's channels) before
@@ -38,6 +38,7 @@ from .ids import agent_id
 from .rng import derive
 from .roles import agent_roles, bind_roles, role_name, spec_roles
 from .view import View
+from .world.render import image_label
 
 
 def participant_groups(exp: Experiment) -> list[tuple[int, int]]:
@@ -61,7 +62,7 @@ def _text(message: Any) -> str:
     out = []
     for p in content:
         if p.type == "image":
-            out.append(f"[image: {len(p.image_png_b64 or '')} base64 chars]")
+            out.append(image_label(p.image_png_b64))
         else:
             out.append(p.text or "")
     return "\n".join(out)
