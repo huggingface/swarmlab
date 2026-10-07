@@ -18,6 +18,10 @@ Decisions:
   `system: null` and a note; nothing else of it is rendered.
 - Image parts of the user message render as `[image: <n> base64 chars]` in the text output (the
   JSON output keeps the parts as they are).
+- M3c roles: groups split where the assigned role changes; every agent is bound and its role
+  applied (`roles.bind_roles`, which also lays out a `Tree` topology's channels) before
+  rendering, so the system prompt carries the role's `prompt_append` and the tools are the
+  role's. Each row has `role` (the role name or None).
 - The seed defaults to the first of the YAML's `seeds:` (0 when none); FlagGame crops depend on
   it, prompts otherwise do not.
 """
@@ -30,6 +34,7 @@ from .executor import RoundExecutor
 from .experiment import Experiment, participant_model
 from .ids import agent_id
 from .rng import derive
+from .roles import agent_roles, bind_roles, role_name, spec_roles
 from .view import View
 
 
@@ -38,7 +43,7 @@ def participant_groups(exp: Experiment) -> list[tuple[int, int]]:
     groups: list[tuple[int, int]] = []
     prev: Any = None
     for i, p in enumerate(exp.participants):
-        spec = p.spec()
+        spec = (p.spec(), role_name(p))
         if groups and spec == prev:
             groups[-1] = (groups[-1][0], groups[-1][1] + 1)
         else:
@@ -68,14 +73,19 @@ def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
     board = copy.deepcopy(exp.medium)
     commit = exp.options.get("commit", "round_end")
     board.commit_mode = commit
+    bound = {a: copy.deepcopy(p) for a, p in zip(agents, exp.participants, strict=True)}
+    for a, p in bound.items():
+        p.bind(a, derive(seed, "agent", a))
+    names = [role_name(p) for p in exp.participants]
+    roles = bind_roles(board, bound, agent_roles(*spec_roles(exp.roles, names), len(agents)))
     ex = RoundExecutor(run="prompts", round=1, world=world, board=board, blobs=None,
                        agents=list(agents), commit=commit,
-                       max_calls_per_turn=int(exp.options.get("max_calls_per_turn", 20)))
+                       max_calls_per_turn=int(exp.options.get("max_calls_per_turn", 20)),
+                       roles=roles)
     out = []
     for first, count in participant_groups(exp):
         a = agents[first]
-        p = copy.deepcopy(exp.participants[first])
-        p.bind(a, derive(seed, "agent", a))
+        p = bound[a]
         obs = world.observe(a).model_copy(update={"private": {}})
         view = View(round=1, agent=a, observation=obs, outcomes=[], pushed=[],
                     tools=ex.schemas(a), description=world.description())
@@ -84,6 +94,7 @@ def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
             "group": len(out) + 1, "agent": str(a), "agents": [str(x) for x in
                                                               agents[first:first + count]],
             "type": spec["type"], "count": count, "model": participant_model(p),
+            "role": names[first],
             "tool_protocol": getattr(p, "tool_protocol", None),
             "tools": [t.name for t in view.tools], "system": None, "user": None,
             "user_parts": None, "note": None,
@@ -108,6 +119,7 @@ def prompts_text(rows: list[dict], arm: str | None, seed: int) -> str:
     for r in rows:
         span = r["agents"][0] if r["count"] == 1 else f"{r['agents'][0]}..{r['agents'][-1]}"
         model = f"  model {r['model']}" if r["model"] else ""
+        model += f"  role {r['role']}" if r.get("role") else ""
         proto = f"  tool_protocol {r['tool_protocol']}" if r["tool_protocol"] else ""
         lines += ["", (f"=== group {r['group']}: {r['type']} x{r['count']} ({span}){model}{proto}"
                        f"  -- showing {r['agent']} ==="),

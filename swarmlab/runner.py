@@ -192,6 +192,7 @@ from .metrics.base import get as get_metric
 from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
 from .providers.base import ChatMessage, ChatRequest, ProviderError
 from .rng import derive
+from .roles import agent_roles, bind_roles
 from .scheduler import SeededShuffle
 from .snapshot import SnapshotManifest, SnapshotStore
 from .spec import (
@@ -407,6 +408,8 @@ class Runner:
         seed = self.options.seed
         for a, p in self.participants.items():
             p.bind(a, agent_stream(seed, a, self.options.repeat))
+        self.roles = bind_roles(self.board, self.participants, agent_roles(  # M3c
+            self.spec.roles, self.spec.participant_roles, len(self.agents)))
         self.world.reset(derive(seed, "world"), list(self.agents))
         self._set_truth()
         self._set_agents()
@@ -948,7 +951,7 @@ class Runner:
             pushed = [
                 {"delivery_id": d.delivery_id, "post_id": d.post_id,
                  "eligible_round": d.eligible_round, "content": self.board.content(d, self.blobs)}
-                for d in self.board.pushable(agent, round, self.board.push_limit)
+                for d in ex.pushable(agent, self.board.push_limit)  # M3c: role channel filter
             ]
         view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
@@ -994,6 +997,7 @@ class Runner:
             max_calls_per_turn=self.options.max_calls_per_turn,
             topology_rng=lambda: derive(seed, "topology", r), inference=self.inference,
             registry=self.registry, claim_policy=self.board.claim_policy,
+            roles=self.roles,  # M3c
         )
         self.executor = ex
         if self.options.commit == "round_end":

@@ -36,6 +36,14 @@ path is what goes into `params`). Rendering uses `trim_blocks`/`lstrip_blocks` a
 `StrictUndefined`. Under `tool_protocol="json"` a fixed JSON-protocol section (with each tool's
 parameter schema, since no tools go through the provider API) is appended after the template.
 
+**Roles** (M3c, swarmlab/roles.py). The runner calls `apply_role(role)` right after `bind`. It sets
+`role` (the template's role word) to the role's name, `model`, `system_prompt` and `max_tokens`
+(from `role.budget`) when the role sets them, and a transient `_role_prompt_append` that the
+renderer appends to the rendered template, after its last section (and after any
+`system_prompt_append`), before the JSON-protocol section. These are plain attributes or set
+again at every bind, so a resumed run sees the same values; params (the participant's spec) do
+not change, the role is part of the run spec instead.
+
 **Round message.** One user message per round, a list of `Part`s: `Round {r}.`, the observation
 parts unchanged (text and image parts pass through), then, when present, one text part
 `Outcomes of your actions last round:` with a line per outcome
@@ -423,6 +431,18 @@ class LLMAgent(Participant):
         if "system_prompt" in kw:
             self.system = None
 
+    def apply_role(self, role: Any) -> None:
+        """M3c: apply a `swarmlab.roles.Role` at bind (see the module doc)."""
+        self._role_prompt_append = role.prompt_append
+        self.role = role.name
+        if role.system_prompt is not None:
+            self.system_prompt = role.system_prompt
+        if role.model is not None:
+            self.model = role.model
+            self._estimator = None
+        if role.budget and "max_tokens" in role.budget:
+            self.max_tokens = int(role.budget["max_tokens"])
+
     def model_request_defaults(self) -> dict:
         return {"model": self.model, "temperature": self.temperature,
                 "max_tokens": self.max_tokens, "thinking_budget": self.thinking_budget,
@@ -501,6 +521,10 @@ class LLMAgent(Participant):
     def _render_system(self, view: View) -> str:
         text = render_system_prompt(self.system_prompt, agent=str(self.agent), role=self.role,
                                     description=view.description, tools=view.tools)
+        for append in (getattr(self, "system_prompt_append", None),  # both when both exist
+                       getattr(self, "_role_prompt_append", None)):  # M3c: the role's text
+            if append:
+                text += "\n\n" + append.strip()
         if self.tool_protocol == "json":
             text += "\n\n" + json_protocol_text(view.tools)
         return text
