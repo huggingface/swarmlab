@@ -3,6 +3,7 @@
 Runs only when SWARMLAB_REAL=1; otherwise it prints the worst-case estimate and exits.
 
     SWARMLAB_REAL=1 uv run python tools/real_smoke.py [--out runs/real_smoke] [--seed 1]
+        [--arms haiku,qwen,haiku-json | --arms haiku-image]
 
 Three arms of LLMAgents on the Flag Game, broadcast board, a BeliefProbe every round, every agent
 at `max_tokens=1024, max_calls=6`. `haiku` and `qwen` keep `Budget(soft_usd=0.40, hard_usd=0.50,
@@ -23,6 +24,19 @@ or the summed worst-case estimate reaches $1.00.
   of 12 turns and 8 of 12 probes (`finish_reason="length"`, empty text).
 - `haiku-json`: N=2, 2 rounds, Haiku with `tool_protocol="json"` (no native tools sent), to learn
   whether the JSON protocol works on Haiku too.
+- `haiku-image` (M5 §5): N=4, 3 rounds, Haiku on `FlagGame(modality="image")` (candidates and
+  crop as PNG images, no text grids), `Budget(soft_usd=0.40, hard_usd=0.50)`. Not in the
+  default `--arms` (run it with `--arms haiku-image`), so the default total stays under the cap.
+  Its estimate adds the image overhead measured on the round-1 message (image-mode round message
+  minus text-mode round message, in `Provider.estimate_prompt_tokens` tokens: about 730) to the
+  3000-token planning prompt and as per-round growth (full memory keeps every round's images).
+  `max_calls=5` (not 6) keeps that worst case under the $0.50 ceiling; Haiku averaged 2.9 model
+  calls per turn in M2, so the cap does not bind in practice. Its report adds whether posts
+  mention visual features (colour words, layout words such as stripe/band/top/left) and whether
+  they transcribe the image into colour-letter rows.
+
+`--arms` (comma list, default `haiku,qwen,haiku-json`) selects the arms; the total cap applies to
+the selected arms.
 
 Per arm it prints: the estimate, spend (swarm, measurement, calls), cost per turn, tool-call
 success rate, yield kinds, turn notes (`length`, `text_tool_fallback`), finish reasons, probe ok
@@ -33,7 +47,9 @@ had unparseable tool arguments).
 from __future__ import annotations
 
 import argparse
+import copy
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -54,12 +70,21 @@ QWEN_PRICING = (0.10, 0.15, 0.10)  # router-listed DeepInfra price (input, outpu
 HAIKU = "anthropic:claude-haiku-4-5"
 AGENT = {"max_tokens": 1024, "max_calls": 6}
 NO_THINKING = {"chat_template_kwargs": {"enable_thinking": False}}
+DEFAULT_ARMS = ("haiku", "qwen", "haiku-json")
 ARMS: dict[str, dict] = {
     "haiku": {"model": HAIKU, "n": 4, "rounds": 3, "agent": {}},
     "qwen": {"model": f"hf:{QWEN_ID}", "n": 4, "rounds": 3, "agent": {"extra": NO_THINKING}},
     "haiku-json": {"model": HAIKU, "n": 2, "rounds": 2, "agent": {"tool_protocol": "json"},
                    "budget": SMALL_BUDGET},
+    "haiku-image": {"model": HAIKU, "n": 4, "rounds": 3, "agent": {"max_calls": 5},
+                    "world": {"modality": "image"}},
 }
+BASE_PROMPT_TOKENS = 3000  # Experiment.estimate's planning default
+COLOUR_WORDS = ("red", "green", "blue", "yellow", "black", "white", "orange", "purple", "cyan",
+                "magenta", "brown", "teal", "pink", "grey", "gray")
+LAYOUT_WORDS = ("stripe", "band", "block", "top", "bottom", "left", "right", "horizontal",
+                "vertical", "upper", "lower", "middle", "corner", "half", "column", "row")
+_LETTER_ROW = re.compile(r"(?m)^\s*[rgbykwopcmnt]{3,}\s*$")
 
 
 def experiment(arm: str) -> Experiment:
@@ -67,8 +92,8 @@ def experiment(arm: str) -> Experiment:
     return Experiment(
         name="real-smoke",
         arm=arm,
-        world=FlagGame(n_candidates=8),
-        participants=[LLMAgent(model=cfg["model"], **AGENT, **cfg["agent"])] * cfg["n"],
+        world=FlagGame(n_candidates=8, **cfg.get("world", {})),
+        participants=[LLMAgent(model=cfg["model"], **{**AGENT, **cfg["agent"]})] * cfg["n"],
         medium=Board(topology="broadcast"),
         metrics=["belief.accuracy", "belief.consensus",
                  Accuracy(source="probe:belief"), Consensus(source="probe:belief")],
@@ -78,8 +103,38 @@ def experiment(arm: str) -> Experiment:
     )
 
 
+def image_overhead_tokens(exp: Experiment) -> int:
+    """Estimated prompt tokens the image round-1 message adds over the text-mode one."""
+    from swarmlab.prompts_cmd import group_views
+    from swarmlab.providers.base import ChatRequest
+
+    def round_tokens(e: Experiment) -> int:
+        _, _, _, agent, view = group_views(e, 1)[0]
+        req = ChatRequest(model=agent.model, messages=[agent.round_message(view)])
+        return e.provider_for(agent.model)[0].estimate_prompt_tokens(req)
+
+    text = copy.deepcopy(exp)
+    text.world = FlagGame(n_candidates=exp.world.n_candidates)
+    return max(0, round_tokens(exp) - round_tokens(text))
+
+
 def estimate(arm: str, exp: Experiment) -> dict:
-    return exp.estimate(seed=1, max_rounds=ARMS[arm]["rounds"], calls_per_turn=AGENT["max_calls"])
+    calls = {**AGENT, **ARMS[arm]["agent"]}["max_calls"]
+    extra = image_overhead_tokens(exp) if getattr(exp.world, "modality", "text") == "image" else 0
+    return exp.estimate(seed=1, max_rounds=ARMS[arm]["rounds"], calls_per_turn=calls,
+                        prompt_tokens=BASE_PROMPT_TOKENS + extra, prompt_growth=extra)
+
+
+def visual_mentions(texts: list[str]) -> dict:
+    """How many post texts mention colours, layout words, or transcribe colour-letter rows."""
+    def has(words: tuple[str, ...], t: str) -> bool:
+        return any(re.search(rf"\b{w}", t, re.IGNORECASE) for w in words)
+
+    return {"posts": len(texts),
+            "colour_words": sum(1 for t in texts if has(COLOUR_WORDS, t)),
+            "layout_words": sum(1 for t in texts if has(LAYOUT_WORDS, t)),
+            "letter_rows": sum(1 for t in texts if _LETTER_ROW.search(t)),
+            "visual": sum(1 for t in texts if has(COLOUR_WORDS + LAYOUT_WORDS, t))}
 
 
 def report(arm: str, run) -> None:
@@ -117,6 +172,14 @@ def report(arm: str, run) -> None:
         print(f"  {name:28s} {[(r, v) for r, v, _ in run.metrics.get(name, [])]}")
     protocol = cfg["agent"].get("tool_protocol", "native")
     print(f"  {protocol} tool protocol worked: {worked}")
+    if ARMS[arm].get("world", {}).get("modality") == "image":
+        posts = [str((e.get("args") or {}).get("text", "")) for e in called if e["tool"] == "post"]
+        vm = visual_mentions(posts)
+        print(f"  visual features {vm['visual']}/{vm['posts']} posts mention colours or layout "
+              f"(colour words {vm['colour_words']}, layout words {vm['layout_words']}, "
+              f"colour-letter rows {vm['letter_rows']})")
+        for t in posts[:2]:
+            print(f"    e.g. {t[:160]!r}")
     errs = [e for e in turns if e.get("error")]
     if errs:
         print(f"  first turn error: {errs[0]['error'][-400:]}")
@@ -126,8 +189,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", type=Path, default=Path("runs/real_smoke"))
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--arms", default=",".join(DEFAULT_ARMS),
+                    help=f"comma-separated arms out of {', '.join(ARMS)}")
     args = ap.parse_args()
-    exps = {arm: experiment(arm) for arm in ARMS}
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    unknown = [a for a in arms if a not in ARMS]
+    if unknown or not arms:
+        print(f"unknown arms {unknown}; choose from {list(ARMS)}")
+        return 2
+    exps = {arm: experiment(arm) for arm in arms}
     total = 0.0
     for arm, exp in exps.items():
         est = estimate(arm, exp)
