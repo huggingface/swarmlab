@@ -3,7 +3,8 @@
 `LLMAgent(model, system_prompt=None, memory="full", window_rounds=3, max_tokens=2048,
 temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker",
 extra=None, text_tool_fallback=False, context_limit_tokens=None, overflow="drop_oldest",
-summary_model=None, system_prompt_append=None, memory_messages=8)`, entry point `llm`.
+summary_model=None, system_prompt_append=None, memory_messages=8, report_json=False,
+report_fields=None)`, entry point `llm`.
 
 **max_tokens** defaults to 2048 (was 1024). In the 2026-10-06 smoke, Qwen3.5-9B with thinking on
 spent the whole 1024-token budget reasoning (`finish_reason="length"`, empty text, no tool call)
@@ -91,20 +92,40 @@ built from state, and the turn's own tool traffic (if any) follows it during the
 message is the current observation's parts (the crop is re-shown every call), then one text part
 `Transcript memory (oldest -> newest):` with a line `- <content>` per remembered item (or `[]`
 when there is none), then, when the agent has answered before, `Your previous answers (oldest ->
-newest): <JSON list>`. There is no `Round r.` line and
+newest): <JSON list>`, then under `report_json` the schema line. There is no `Round r.` line and
 no outcome lines (the paper's prompt has neither; under OneSpeaker the round number would leak
 the population's step count). Remembered items are delivered board items, ingested from
 `View.pushed` at turn start, from `read_board` results during a turn (pull works too) and from
 the runner's `prepare_probe` hook before probes; an item is added only when its
 `(eligible_round, delivery_id)` is newer than every item ingested so far (so re-pushed items are
 not duplicated), and only the last `memory_messages` are kept. Author ids are not shown (pushed
-items carry none). Own answers are the accepted `guess` arguments, the last `max(1, memory_messages)` kept. State
+items carry none). Own answers are the accepted `guess` arguments (and, under `report_json`
+without a `guess` tool, the reported answer), the last `max(1, memory_messages)` kept. State
 (`received`, `received_upto`, `own_answers`, `last_observation`) is plain data in the snapshot.
 Pair it with `delivery: push`, `push_consume: true` (swarmlab/medium/board.py) so each item is
 pushed once and the newest win. `prepare_probe(view_for)` ingests pending items and, for an agent
 that has not acted yet, stores its observation and renders its system prompt. `probe_context()`
-is `[system, <the message above>]` (`[system]` or `[]` before any
+is `[system, <the message above without the schema line>]` (`[system]` or `[]` before any
 observation). `memory_messages` is in `params` only when `memory="received"` or non-default.
+
+**report_json** (M6 §4; `report_fields` default `["country", "reason"]`, the paper's m=3 format;
+`["country"]` is m=1; any memory mode). The system prompt defaults to `prompts/report_json_system.j2` (the paper's
+JSON-only rules, the task description, "choose exactly one ... follow the exact output schema";
+a `system_prompt` still replaces it, the role text is still appended, the json tool-protocol
+section is not). Each turn's message ends with the schema line `Output JSON exactly:
+{"country":"<one allowed country>","reason":"<one sentence>"}`. The reply's first JSON object
+(reasoning and fences tolerated) is read: the first field (keys case-insensitive) is the answer,
+matched to the observation's allowed names case-insensitively; the other fields are kept when
+present (non-strings as JSON). The harness then calls `guess(<answer>)` (the guess tool's first
+parameter; skipped when the agent has no `guess` tool), `post(text=<the report as compact JSON,
+fields in report_fields order>)` and `end_turn`, all in that one step. A reply without a usable
+answer, or a rejected guess, gets one corrective user message and one more model call (so at
+most 2 calls; `max_calls=1` gives no retry; `calls_per_turn_cap` tells `swarmlab estimate`); a
+second failure ends the turn with no post (turn note `report_json:failed:...`). Under the native
+protocol a reply with native tool calls is executed as such instead and ends the turn (note
+`report_json:native_tools`), so tool-capable models may still act directly; under the json
+protocol no tools go through the API and the JSON answer is the only path. `report_json` and
+`report_fields` are in `params` only when set.
 
 **Probing.** `probe_context()` returns `[system] + memory` as fresh `ChatMessage` objects (callers
 cannot mutate the agent's memory through them); `model_request_defaults()` returns `model,
@@ -176,10 +197,21 @@ log = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 DEFAULT_SYSTEM_TEMPLATE = PROMPTS_DIR / "default_system.j2"
+REPORT_SYSTEM_TEMPLATE = PROMPTS_DIR / "report_json_system.j2"
 MEMORY_MODES = ("full", "window", "received")
+DEFAULT_REPORT_FIELDS = ("country", "reason")
 TRANSCRIPT_HEADER = "Transcript memory (oldest -> newest):"
 OWN_ANSWERS_HEADER = "Your previous answers (oldest -> newest):"
+REPORT_SCHEMA_PREFIX = "Output JSON exactly: "
+_FIELD_PLACEHOLDERS = {"country": "<one allowed country>", "reason": "<one sentence>",
+                       "candidate": "<one allowed candidate>"}
 
+
+def report_schema(fields: list[str] | tuple[str, ...]) -> str:
+    """The schema line of a `report_json` turn, e.g. `Output JSON exactly: {"country":"<one
+    allowed country>","reason":"<one sentence>"}` (the paper's m=3 format)."""
+    body = ",".join(f'"{f}":"{_FIELD_PLACEHOLDERS.get(f, "<" + f + ">")}"' for f in fields)
+    return REPORT_SCHEMA_PREFIX + "{" + body + "}"
 RESULTS_PREFIX = "[tool results]"
 
 JSON_PROTOCOL_TEXT = (
@@ -409,11 +441,16 @@ class LLMAgent(Participant):
         summary_model: str | None = None,
         system_prompt_append: str | None = None,
         memory_messages: int = 8,
+        report_json: bool = False,
+        report_fields: list[str] | None = None,
     ) -> None:
         if memory not in MEMORY_MODES:
             raise ValueError(f"memory must be one of {MEMORY_MODES}, got {memory!r}")
         if isinstance(memory_messages, bool) or not isinstance(memory_messages, int) or memory_messages < 0:
             raise ValueError("memory_messages must be an integer >= 0")
+        fields = list(report_fields) if report_fields is not None else list(DEFAULT_REPORT_FIELDS)
+        if not fields or not all(isinstance(f, str) and f for f in fields) or len(set(fields)) != len(fields):
+            raise ValueError(f"report_fields must be distinct non-empty strings, got {report_fields!r}")
         if tool_protocol not in ("native", "json"):
             raise ValueError(f"tool_protocol must be 'native' or 'json', got {tool_protocol!r}")
         if window_rounds < 1:
@@ -455,7 +492,13 @@ class LLMAgent(Participant):
         # ---- M6 §3-§4: params only when set, so existing spec hashes stay ----
         if memory_messages == 8 and memory != "received":
             params.pop("memory_messages", None)
+        if not report_json:
+            params.pop("report_json", None)
+        if report_fields is None:
+            params.pop("report_fields", None)
         self.memory_messages = memory_messages
+        self.report_json = bool(report_json)
+        self.report_fields = fields
         # conversation state (plain data, snapshotted by Persistable)
         self.system: str | None = None
         self.rounds: list[dict] = []
@@ -478,7 +521,10 @@ class LLMAgent(Participant):
     # ---- memory="received" (M6 §3) -------------------------------------------------------------
     @property
     def calls_per_turn_cap(self) -> int | None:
-        """Most model calls a turn can make (for `swarmlab estimate`): `max_calls`."""
+        """Most model calls a turn can make (for `swarmlab estimate`): `max_calls`, or 2 under
+        `report_json` (one answer plus one retry)."""
+        if self.report_json:
+            return min(self.max_calls or 2, 2)
         return self.max_calls
 
     def ingest(self, items: list[dict]) -> int:
@@ -518,6 +564,8 @@ class LLMAgent(Participant):
         if self.own_answers:
             parts.append(Part(type="text", text=f"{OWN_ANSWERS_HEADER} "
                               + json.dumps(self.own_answers, ensure_ascii=False)))
+        if schema and self.report_json:
+            parts.append(Part(type="text", text=report_schema(self.report_fields)))
         return ChatMessage(role="user", content=parts)
 
     def _note_answer(self, name: str, args: dict, ok: bool) -> None:
@@ -650,13 +698,16 @@ class LLMAgent(Participant):
 
     # ---- the loop ----------------------------------------------------------------------------
     def _render_system(self, view: View) -> str:
+        report = getattr(self, "report_json", False)
         text = render_system_prompt(self.system_prompt, agent=str(self.agent), role=self.role,
                                     description=view.description, tools=view.tools,
-                                    append=getattr(self, "system_prompt_append", None))
+                                    append=getattr(self, "system_prompt_append", None),
+                                    default=REPORT_SYSTEM_TEMPLATE if report else DEFAULT_SYSTEM_TEMPLATE,
+                                    answer=(getattr(self, "report_fields", None) or ["country"])[0])
         role_append = getattr(self, "_role_prompt_append", None)  # M3c: the role's text, at the end
         if role_append:
             text += "\n\n" + role_append.strip()
-        if self.tool_protocol == "json":
+        if self.tool_protocol == "json" and not report:
             text += "\n\n" + json_protocol_text(view.tools)
         return text
 
@@ -700,9 +751,14 @@ class LLMAgent(Participant):
             self._append(self._received_message())
         else:
             self.rounds.append({"round": view.round, "messages": []})
-            self._append(self.round_message(view))
+            msg = self.round_message(view)
+            if self.report_json:  # M6 §4: the schema line ends every turn's message
+                msg.content.append(Part(type="text", text=report_schema(self.report_fields)))
+            self._append(msg)
         usage = LLMTurnUsage()
         self._overflow_events = []
+        if self.report_json:
+            return await self._report_turn(view, tools, usage)
         executed = 0
         model_calls = 0
         retried = False
@@ -793,3 +849,93 @@ class LLMAgent(Participant):
             self._append(ChatMessage(role="user", content=f"{RESULTS_PREFIX}\n"
                                      + json.dumps(results, sort_keys=True)))
         return done, ended
+
+    # ---- report_json (M6 §4) -------------------------------------------------------------------
+    async def _report_turn(self, view: View, tools: AgentTools, usage: LLMTurnUsage) -> LLMTurnUsage:
+        """One JSON answer -> `guess(<answer>)` + `post(text=<json>)` + `end_turn` (see module doc)."""
+        offered = {t.name: t for t in view.tools}
+        attempts = self.calls_per_turn_cap or 2
+        executed = 0
+        for attempt in range(attempts):
+            await self._enforce_context_limit(view.tools, tools)
+            resp = await tools.infer(self._request(view.tools))
+            usage.finish_reasons.append(resp.finish_reason)
+            if resp.finish_reason == "length" and "length" not in usage.notes:
+                usage.notes.append("length")
+            if self.tool_protocol == "native" and resp.tool_calls:  # the model used tools itself
+                self._append(ChatMessage(role="assistant", content=resp.text, tool_calls=resp.tool_calls))
+                n, _ = await self._run_native(resp.tool_calls, tools)
+                usage.calls = executed + n
+                usage.notes.append("report_json:native_tools")
+                return usage
+            self._append(ChatMessage(role="assistant", content=resp.text or ""))
+            report, error = self._parse_report(resp.text or "")
+            results: list[dict] = []
+            if report is not None:
+                answer = report[self.report_fields[0]]
+                guess = offered.get("guess")
+                if guess is not None:
+                    arg = next(iter(guess.parameters.get("properties") or {"candidate": {}}))
+                    res = await tools.call("guess", {arg: answer})
+                    executed += 1
+                    self._note_answer("guess", {arg: answer}, res.ok)
+                    results.append({"name": "guess", **_result_payload(res)})
+                    if not res.ok:
+                        error = f"answer {answer!r} was rejected: {res.error}"
+                else:  # no guess tool (e.g. a blind manager): the answer is still its decision
+                    self._note_answer("guess", {"answer": answer}, True)
+                if error is None:
+                    if "post" in offered:
+                        text = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+                        res = await tools.call("post", {"text": text})
+                        executed += 1
+                        results.append({"name": "post", **_result_payload(res)})
+                    await tools.call("end_turn", {})
+                    executed += 1
+                    if self.memory != "received":
+                        self._append(ChatMessage(role="user", content=f"{RESULTS_PREFIX}\n"
+                                                 + json.dumps(results, sort_keys=True)))
+                    usage.calls = executed
+                    return usage
+            usage.notes.append(f"report_json:retry:{error}"[:120] if attempt + 1 < attempts
+                               else f"report_json:failed:{error}"[:120])
+            self._append(ChatMessage(role="user", content=(
+                f"Your reply could not be used: {error}. Answer with only the JSON object. "
+                + report_schema(self.report_fields))))
+        usage.calls = executed
+        return usage
+
+    def _canonical(self, answer: str) -> str:
+        """`answer` spelled as in the observation's list of allowed names (FlagGame
+        `candidate_names`: candidate headers or `Allowed countries`), matched case-insensitively
+        after collapsing whitespace; unchanged when nothing matches."""
+        from ..world.flaggame import candidate_names
+        from ..world.flags_real import match_country
+
+        parts = self.last_observation
+        if parts is None and self.rounds and self.rounds[-1]["messages"]:
+            parts = self.rounds[-1]["messages"][0].get("content")
+        text = "\n".join(p.get("text") or "" for p in parts or [] if isinstance(p, dict))
+        names = candidate_names(text)
+        return match_country(answer, names) or answer if names else answer
+
+    def _parse_report(self, text: str) -> tuple[dict | None, str | None]:
+        """(report with exactly the `report_fields` present, in order; or None, the error)."""
+        from ..probes import parse_json_object
+
+        obj = parse_json_object(strip_reasoning(text))
+        if obj is None:
+            return None, "no JSON object"
+        lower = {str(k).lower(): v for k, v in obj.items()}
+        key = self.report_fields[0]
+        answer = lower.get(key.lower())
+        if isinstance(answer, (int, float)) and not isinstance(answer, bool):
+            answer = str(answer)
+        if not isinstance(answer, str) or not answer.strip():
+            return None, f"no string {key!r}"
+        report = {key: self._canonical(answer.strip())}
+        for f in self.report_fields[1:]:
+            v = lower.get(f.lower())
+            if v is not None:
+                report[f] = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        return report, None

@@ -30,6 +30,9 @@ last `user` message that is not a json-protocol `[tool results]` message):
 3. With no tools offered at all (a probe), it answers with text
    `{"candidate": <best>, "confidence": <share of crops it contains>}`.
 
+Built-in `country_reporter` (M6): a JSON-only answerer for Flag Game paper dry runs (name-only
+candidates, image crops it cannot see); see its docstring.
+
 Tool-call ids are `fake_<8 hex from the rng>`. Under `tool_protocol == "json"` the calls are
 returned as a JSON array `[{"name", "args"}]` in `text` instead of `tool_calls`; earlier calls are
 recognised in either form.
@@ -186,7 +189,60 @@ def flaggame_reader(request: ChatRequest, rng: random.Random) -> ChatResponse:
     return _response(request, rng, calls)
 
 
-BUILTIN_SCRIPTS: dict[str, Script] = {"flaggame_reader": flaggame_reader, "reader": flaggame_reader}
+_TRANSCRIPT_LINE_RE = re.compile(r"^- (\{.*\})\s*$")
+
+
+def country_reporter(request: ChatRequest, rng: random.Random) -> ChatResponse:
+    """M6 Flag Game paper dry runs: always a JSON text answer, never a tool call.
+
+    The allowed names are read from the latest user message that lists them (`Allowed countries`
+    or a FlagGame candidate listing; `flaggame.candidate_names`). The answer is the most frequent
+    `country` among the transcript lines (`- {...}` JSON, LLMAgent `memory="received"`), ties
+    broken by the rng over the tied names in name order; with no transcript, the agent's latest
+    own answer (`Your previous answers ...`); else a seeded choice of an allowed name. The reply
+    is `{"country": <name>, "reason": "..."}`, which both `report_json` and the belief probe
+    read."""
+    from ..world.flaggame import candidate_names
+
+    names: list[str] = []
+    transcript: list[str] = []
+    own: list[str] = []
+    for m in reversed(request.messages):
+        if m.role != "user":
+            continue
+        text = text_of(m.content)
+        names = candidate_names(text)
+        if names:
+            for line in text.split("\n"):
+                hit = _TRANSCRIPT_LINE_RE.match(line.strip())
+                if hit:
+                    try:
+                        value = json.loads(hit.group(1)).get("country")
+                    except (ValueError, AttributeError):
+                        value = None
+                    if isinstance(value, str):
+                        transcript.append(value)
+                if line.startswith("Your previous answers"):
+                    try:
+                        own = json.loads(line.split(":", 1)[1])
+                    except ValueError:
+                        own = []
+            break
+    if transcript:
+        counts = {n: transcript.count(n) for n in sorted(set(transcript))}
+        top = max(counts.values())
+        answer, why = rng.choice([n for n, c in counts.items() if c == top]), "others report it"
+    elif own:
+        answer, why = str(own[-1]), "my earlier answer"
+    elif names:
+        answer, why = rng.choice(sorted(names)), "my crop fits it"
+    else:
+        answer, why = None, "no allowed names"
+    return _response(request, rng, [], json.dumps({"country": answer, "reason": why}))
+
+
+BUILTIN_SCRIPTS: dict[str, Script] = {"flaggame_reader": flaggame_reader, "reader": flaggame_reader,
+                                      "country_reporter": country_reporter}
 
 
 def resolve_script(name: str) -> Script:

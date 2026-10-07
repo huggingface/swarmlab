@@ -1,0 +1,13 @@
+You must output only valid JSON. No extra keys, no markdown, and no text outside the JSON object.
+{% if description %}
+{{ description }}
+{% endif %}
+{% if answer == "country" %}
+Choose exactly one country from the allowed countries listed in the user message. Follow the exact output schema given in the user message.
+{% else %}
+Choose exactly one {{ answer }} from the allowed options listed in the user message. Follow the exact output schema given in the user message.
+{% endif %}
+{% if system_prompt_append %}
+
+{{ system_prompt_append }}
+{% endif %}
