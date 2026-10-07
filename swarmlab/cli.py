@@ -800,6 +800,50 @@ def fetch_published_cmd(
     _execute(go, as_json)
 
 
+@app.command("report")
+def report_cmd(
+    runs_dir: Annotated[Path, typer.Argument(help="Directory of run directories.")],
+    out: Annotated[Path | None, typer.Option("--out", help="Also write the Markdown here.")] = None,
+    title: Annotated[str, typer.Option("--title", help="Report title.")] = "swarmlab report",
+    as_json: JsonOpt = False,
+) -> None:
+    """Markdown report over the finished runs in RUNS_DIR (accuracy, consensus, reading, health)."""
+    from .report import write_report
+
+    def go() -> dict[str, Any]:
+        if not runs_dir.is_dir():
+            raise SpecError(f"{runs_dir} is not a directory")
+        text = write_report(runs_dir, out, title)
+        if as_json:
+            return {"ok": True, "report": text, "out": str(out) if out else None}
+        return {"text": text}
+
+    _execute(go, as_json)
+
+
+@app.command("prompts")
+def prompts_cmd(
+    spec: Annotated[Path, typer.Argument(help="Experiment YAML.")],
+    arm: Annotated[str | None, typer.Option("--arm", help="Arm (required when the YAML has several).")] = None,
+    seed: Annotated[int | None, typer.Option("--seed", help="Seed (default: the YAML's first seed).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Render the system prompt and round-1 user message for one agent per participant group.
+
+    No model is called; use it for the second-agent review of what each arm sees."""
+    from .prompts_cmd import prompts_text, render_prompts
+
+    def go() -> dict[str, Any]:
+        exp = _build(spec, arm)
+        s = seed if seed is not None else experiment_seeds(load_experiment_yaml(spec))[0]
+        rows = render_prompts(exp, s)
+        if as_json:
+            return {"ok": True, "arm": exp.arm, "seed": s, "groups": rows}
+        return {"text": prompts_text(rows, exp.arm, s)}
+
+    _execute(go, as_json)
+
+
 def main() -> None:  # pragma: no cover - `python -m swarmlab.cli`
     app()
 
