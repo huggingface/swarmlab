@@ -33,4 +33,4 @@ def test_prompts_call_begin_round_1(tmp_path):
     exp = Experiment.from_yaml(p, "A")
     (row,) = render_prompts(exp, 0)
     assert "it is round 1 of the clock" in row["user"]  # not "round 0": no begin_round yet
-    assert exp.world.score() == {"round": 0} or not hasattr(exp.world, "round")  # a copy
+    assert not hasattr(exp.world, "round")  # the preview works on a copy of the world
