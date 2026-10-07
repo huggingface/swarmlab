@@ -111,7 +111,8 @@ def _human(data: dict[str, Any]) -> str:
     if data["metrics"]:
         lines.append("  metrics " + ", ".join(
             f"{k}={_fmt(m['value'])}" for k, m in data["metrics"].items()))
-    for key in ("parent_run", "fork_round", "replay", "view", "skipped", "self_hosted", "fetched"):
+    for key in ("parent_run", "fork_round", "replay", "view", "skipped", "self_hosted", "fetched",
+                "published"):
         if key in data:
             lines.append(f"  {key} {data[key]}")
     return "\n".join(lines)
@@ -477,13 +478,21 @@ def fork(
 @app.command()
 def view(
     run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
+    publish: Annotated[str | None, typer.Option(
+        "--publish", help="Also upload view.html to this dataset repo (owner/name).")] = None,
     as_json: JsonOpt = False,
 ) -> None:
     """Build the self-contained replay page `view.html` for a run."""
 
     def go() -> dict[str, Any]:
         r = Run(run_dir)
-        return {**summary(r), "view": str(r.view())}
+        data = {**summary(r), "view": str(r.view())}
+        if publish is not None:
+            from .publish import publish_view
+
+            res = publish_view(run_dir, publish)
+            data["published"] = f"{res['url']}/blob/main/runs/{r.id}/view.html"
+        return data
 
     _execute(go, as_json)
 
@@ -712,6 +721,125 @@ def job_fetch(
     def go() -> dict[str, Any]:
         d = remote.fetch(run_id, out, bucket, tag)
         return {**summary(Run(d)), "fetched": str(d)}
+
+    _execute(go, as_json)
+
+
+# ---- M4: export, publish, report, prompts (docs/INTERFACE-M4.md) ------------------------------
+@app.command("export")
+def export_cmd(
+    run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
+    out: Annotated[Path | None, typer.Option("--out", help="Export directory (default RUN_DIR/export).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Export a run: Parquet tables per event family, pi-format sessions, raw copies."""
+    from .export import export_run
+
+    def go() -> dict[str, Any]:
+        d = export_run(run_dir, out)
+        doc = json.loads((d / "run.json").read_text())
+        tables = {f: t["rows"] for f, t in doc["tables"].items()}
+        data = {"ok": True, "run_id": doc["run_id"], "export": str(d), "tables": tables,
+                "sessions": len(doc["sessions"]), "blobs": doc["blobs"]["included"]}
+        if as_json:
+            return data
+        rows = ", ".join(f"{f}={n}" for f, n in tables.items())
+        return {"text": (f"exported {doc['run_id']} -> {d}\n  rows: {rows}\n"
+                         f"  sessions: {len(doc['sessions'])}  raw blobs: {doc['blobs']['included']}")}
+
+    _execute(go, as_json)
+
+
+@app.command("publish")
+def publish_cmd(
+    source: Annotated[Path, typer.Argument(help="A run directory or a directory of runs.")],
+    repo: Annotated[str | None, typer.Option(
+        "--repo", help="Dataset repo owner/name (default: <your namespace>/<experiment>).")] = None,
+    public: Annotated[bool, typer.Option(
+        "--public", help="Make the repo public and tag it format:agent-traces.")] = False,
+    tag: Annotated[list[str] | None, typer.Option("--tag", help="Extra card tag (repeatable).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Export (if needed) and upload finished runs to a private Hub dataset repo per experiment."""
+    from .publish import PublishError, publish
+
+    def go() -> dict[str, Any]:
+        try:
+            res = publish(source, repo, public=public, tag=tag or [])
+        except PublishError as e:
+            raise SpecError(str(e)) from e
+        if as_json:
+            return res
+        lines = [f"{r['url']}  {'public' if r['public'] else 'private'}  runs={len(r['runs'])}  "
+                 f"uploaded={r['uploaded']} unchanged={r['unchanged']}" for r in res["repos"]]
+        if res["skipped"]:
+            lines.append("skipped: " + ", ".join(res["skipped"]))
+        return {"text": "\n".join(lines)}
+
+    _execute(go, as_json)
+
+
+@app.command("fetch-published")
+def fetch_published_cmd(
+    repo: Annotated[str, typer.Argument(help="Dataset repo owner/name.")],
+    run_id: Annotated[str, typer.Argument(help="Run id (see the repo's index.json).")],
+    out: Annotated[Path, typer.Option("--out", help="Parent directory for the run dir.")] = Path("runs"),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite an existing run dir.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Rebuild a run dir from a published run so `Run.load`, `replay`, `view` and `fork` work."""
+    from .publish import PublishError, fetch_published
+
+    def go() -> dict[str, Any]:
+        try:
+            d = fetch_published(repo, run_id, out, force=force)
+        except PublishError as e:
+            raise SpecError(str(e)) from e
+        return {**summary(Run(d)), "fetched": str(d)}
+
+    _execute(go, as_json)
+
+
+@app.command("report")
+def report_cmd(
+    runs_dir: Annotated[Path, typer.Argument(help="Directory of run directories.")],
+    out: Annotated[Path | None, typer.Option("--out", help="Also write the Markdown here.")] = None,
+    title: Annotated[str, typer.Option("--title", help="Report title.")] = "swarmlab report",
+    as_json: JsonOpt = False,
+) -> None:
+    """Markdown report over the finished runs in RUNS_DIR (accuracy, consensus, reading, health)."""
+    from .report import write_report
+
+    def go() -> dict[str, Any]:
+        if not runs_dir.is_dir():
+            raise SpecError(f"{runs_dir} is not a directory")
+        text = write_report(runs_dir, out, title)
+        if as_json:
+            return {"ok": True, "report": text, "out": str(out) if out else None}
+        return {"text": text}
+
+    _execute(go, as_json)
+
+
+@app.command("prompts")
+def prompts_cmd(
+    spec: Annotated[Path, typer.Argument(help="Experiment YAML.")],
+    arm: Annotated[str | None, typer.Option("--arm", help="Arm (required when the YAML has several).")] = None,
+    seed: Annotated[int | None, typer.Option("--seed", help="Seed (default: the YAML's first seed).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Render the system prompt and round-1 user message for one agent per participant group.
+
+    No model is called; use it for the second-agent review of what each arm sees."""
+    from .prompts_cmd import prompts_text, render_prompts
+
+    def go() -> dict[str, Any]:
+        exp = _build(spec, arm)
+        s = seed if seed is not None else experiment_seeds(load_experiment_yaml(spec))[0]
+        rows = render_prompts(exp, s)
+        if as_json:
+            return {"ok": True, "arm": exp.arm, "seed": s, "groups": rows}
+        return {"text": prompts_text(rows, exp.arm, s)}
 
     _execute(go, as_json)
 

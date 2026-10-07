@@ -341,6 +341,14 @@ class Experiment(BaseModel):
         doc["options"] = {k: v for k, v in self.options.items() if k != "seed"}
         dump_experiment_yaml(doc, path)
 
+    # ---- M4: publish (docs/INTERFACE-M4.md §2) ------------------------------------------------
+    def publish(self, runs_dir: Path | str = "runs", *, repo: str | None = None,
+                public: bool = False, tag: list[str] | str | None = None, api: Any = None) -> dict:
+        """Publish this experiment's finished runs under `runs_dir` (see `swarmlab.publish`)."""
+        from .publish import publish
+
+        return publish(runs_dir, repo, public=public, tag=tag, api=api, experiment=self.name)
+
 
 class ForkHandle:
     """`run.fork(at_round, experiment)` result; `.run(out=None)` executes the fork."""
@@ -480,6 +488,13 @@ class Run:
 
     def __repr__(self) -> str:
         return f"Run({self.id!r}, status={self.status!r}, dir={str(self.dir)!r})"
+
+    # ---- M4: export (docs/INTERFACE-M4.md §1) -------------------------------------------------
+    def export(self, out: Path | str | None = None) -> Path:
+        """Tables, pi sessions and raw copies into `out` (default `<run dir>/export`)."""
+        from .export import export_run
+
+        return export_run(self.dir, out)
 
 
 def self_hosted_prefixes(providers: dict) -> list[str]:
