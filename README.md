@@ -99,12 +99,29 @@ swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [-
 swarmlab estimate SPEC [--arm A] [--seed N] [--prompt-growth G]
 swarmlab replay RUN_DIR
 swarmlab resume RUN_DIR [--budget-hard X]   swarmlab fork RUN_DIR --at 4 [--spec edited.yaml]
-swarmlab view RUN_DIR
+swarmlab view RUN_DIR [--publish OWNER/REPO]
+swarmlab prompts SPEC --arm A            swarmlab report RUNS_DIR [--out report.md]
+swarmlab export RUN_DIR [--out DIR]
+swarmlab publish RUNS_DIR_OR_RUN [--repo OWNER/REPO] [--public] [--tag T]
+swarmlab fetch-published OWNER/REPO RUN_ID [--out runs/]
 swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 2h] [--launch]
 swarmlab job status JOB_ID    swarmlab job logs JOB_ID [--follow]    swarmlab job fetch RUN_ID [--out runs/]
 ```
 `swarmlab job ...` runs a spec whose models are `vllm:<model>` in an HF Job with vLLM serving the model in the same job, and brings run dirs back from the bucket; `job run` only prints the `hf jobs run` command and the estimate unless `--launch` (docs/handoff/WP8.md).
 Every command takes `--json` and then prints one JSON object. Exit codes: 0 success, 2 invalid spec, 1 any other error (including a declined confirmation or a failed run).
+
+## Analysing and publishing
+
+- `swarmlab prompts SPEC --arm A` prints the system prompt and round-1 user message of one agent per participant group, exactly as the model would receive them, without calling a model. Review them (ideally with a second agent) before spending.
+- `swarmlab report RUNS_DIR` writes a Markdown report over the finished runs: per-arm accuracy and consensus, trajectories, where the swarm went, probe vs world belief, reading behaviour, tool-protocol health.
+- `swarmlab export RUN_DIR` (Python `Run.export(out)`) writes `RUN_DIR/export/`: `run.json` (identity, spec, score, spend, metric finals), `tables/<family>.parquet` (turns, tool_calls, posts, deliveries, reads, actions, inference, probes, metrics, interventions, rounds, run, other; key columns `experiment, arm, seed, run, round, agent`; blob content inlined up to 64 KiB), `sessions/<agent>.jsonl` (one [pi-format](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md) session per agent with `harness: "swarmlab"`, so the Hub's agent-traces viewer renders each conversation) and `raw/` (the byte-identical log, snapshots and blobs).
+- `swarmlab publish runs/` (Python `Experiment.publish(runs_dir)`) exports what is needed and uploads every finished run to one **private** Hub dataset repo per experiment (`<you>/<experiment>`, or `--repo`): `runs/<run_id>/...`, `index.json`, and a dataset card with the arms' specs, a run table and the table schemas. Re-publishing uploads only changed files. `--public` makes the repo public and adds the `format:agent-traces` tag (the Hub's trace viewer renders public repos only); traces hold every prompt and reply, so read them first. Needs the `hub` extra and `HF_TOKEN`.
+- `swarmlab view RUN_DIR --publish OWNER/REPO` uploads `view.html` next to the run and links it from the card.
+- `swarmlab fetch-published OWNER/REPO RUN_ID --out runs/` rebuilds the run directory from the published raw log, snapshots and blobs, so `replay`, `view`, `fork` and `Run.load` work on it.
+
+## Experimenter skill
+
+`skill/SKILL.md` teaches a coding agent the tested workflow, from `swarmlab doctor` to `swarmlab publish`, including the first-real-run checklist. Install it for Claude Code (`~/.claude/skills/swarmlab/SKILL.md`), Codex (`~/.agents/skills/swarmlab/SKILL.md`) or OpenCode (`~/.config/opencode/skills/swarmlab/SKILL.md`); the file has the copy command.
 
 ## Run directory
 
@@ -117,9 +134,10 @@ runs/<run_id>/
   snapshots/        <round:06d>.json manifests, one per round
   artifacts/        spec.yaml, git.txt
   view.html         the static replay page (after `view`)
+  export/           tables, pi sessions and raw copies (after `export` or `publish`)
 ```
 Run ids are `<experiment>__s<seed>` from Python, `<experiment>__<arm>__s<seed>` from YAML, plus `__f<round>_<n>` for a fork.
 
 ## Docs
 
-`docs/DESIGN.md` (why), `docs/INTERFACE.md` and `docs/INTERFACE-M1b.md` (the binding contracts), `docs/handoff/` (per work package notes), `AGENTS.md` (rules for agents working in this repo). Development: `uv run pytest -q` and `uv run ruff check swarmlab tests examples`.
+`docs/DESIGN.md` (why), `docs/INTERFACE.md`, `docs/INTERFACE-M1b.md` and `docs/INTERFACE-M4.md` (the binding contracts), `docs/handoff/` (per work package notes), `AGENTS.md` (rules for agents working in this repo). Development: `uv run pytest -q` and `uv run ruff check swarmlab tests examples tools`.

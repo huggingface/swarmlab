@@ -103,3 +103,23 @@ def test_prompts_cli_on_every_example_arm(no_model_calls):
     data = json.loads(res.output)
     assert data["seed"] == 1 and data["groups"][0]["system"] is None
     assert cli.invoke(app, ["prompts", str(spec)]).exit_code == 2  # several arms, no --arm
+
+
+def test_skill_points_only_at_commands_and_flags_that_exist():
+    """skill/SKILL.md rule: every `swarmlab ...` it mentions is a real command with real flags."""
+    import re
+
+    text = (REPO / "skill" / "SKILL.md").read_text()
+    uses = re.findall(r"(?:`|^)swarmlab ((?:job )?[a-z][a-z-]*)([^`\n]*)", text, re.MULTILINE)
+    assert len(uses) > 20
+    helps: dict[str, str] = {}
+    for cmd, rest in uses:
+        if cmd not in helps:
+            res = cli.invoke(app, [*cmd.split(), "--help"], terminal_width=200)
+            assert res.exit_code == 0, f"swarmlab {cmd} is not a command"
+            helps[cmd] = res.output
+        for flag in re.findall(r"(?<![\w-])--[a-z][a-z-]*", rest.split("`")[0]):
+            assert flag in helps[cmd], f"swarmlab {cmd} has no {flag}"
+    for cmd in ("doctor", "prompts", "estimate", "report", "publish", "fetch-published",
+                "job run", "job fetch", "resume", "fork", "replay", "export", "view"):
+        assert f"swarmlab {cmd}" in text, cmd

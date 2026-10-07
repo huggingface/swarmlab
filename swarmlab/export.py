@@ -825,11 +825,3 @@ def is_current(run_dir: Path | str, out: Path | str | None = None) -> bool:
         return False
     return doc.get("export_schema") == EXPORT_SCHEMA and doc.get("events", {}).get("sha256") == sha
 
-
-def schema_markdown() -> str:
-    """The per-family table schemas as Markdown (used by the dataset card)."""
-    lines = []
-    for fam, schema in TABLE_SCHEMAS.items():
-        cols = ", ".join(f"`{f.name}` {f.type}" for f in schema)
-        lines.append(f"- **{fam}**: {cols}")
-    return "\n".join(lines)
