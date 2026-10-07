@@ -38,8 +38,19 @@ Decisions where the contract is silent:
   blob is guaranteed to be in `raw/blobs/`. A missing blob gives null. The hash column is always
   present next to it.
 - **Raw blobs.** `raw/blobs/` mirrors the run's `blobs/` (shards, `cache/` included) when the
-  run directory is under 500 MB (`FULL_BLOBS_LIMIT`). Above that it holds only the snapshot
-  blobs (needed by `Run.load`) and the blobs too large to inline; `run.json["blobs"]` says which.
+  run directory (log, snapshots, artifacts, blobs) is under 500 MB (`FULL_BLOBS_LIMIT`). Above
+  that it holds only the snapshot blobs (needed by `Run.load`) and the blobs too large to
+  inline; `run.json["blobs"]` says which. The copy is one walk of each directory and one copy
+  per file; a file that cannot be read (EIO on a bucket mount) is reported and the export fails
+  with `ExportError` after trying every file, without writing `run.json`.
+- **`raw=False`** (`--no-raw`): no `raw/` at all, `run.json["export_raw"] = false` and
+  `blobs.included = "none"`; tables and sessions are complete, but `fetch-published` cannot
+  rebuild such a run. Raw export reads every blob, which is slow on object storage
+  (bucket-mounted run dirs): use `--no-raw` there, or export from a local copy.
+- **Unreadable blobs.** A blob that the tables or sessions need and that exists but cannot be
+  read (an I/O error, not a missing file) gives a null cell like a missing one and is listed in
+  `run.json["unreadable_blobs"]` (`{sha: error}`); with raw copies on, the raw copy then fails
+  as above.
 - **Sessions** (pi session format v3, https://github.com/earendil-works/pi/blob/main/packages/
   coding-agent/docs/session-format.md, with the Hub's `harness` header field): header
   `{"type":"session","version":3,"id":"<run>/<agent>","timestamp","cwd":"runs/<run>",
@@ -86,6 +97,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import os
 import pickle
 import shutil
 from collections import defaultdict
@@ -190,12 +202,19 @@ def _ms(ts: float | None) -> int:
     return round((ts or 0.0) * 1000)
 
 
+class ExportError(RuntimeError):
+    """The export could not copy or read part of the run directory (see the message)."""
+
+
 class _Blobs:
-    """Read-only access to a run's blob store plus the inlining rule."""
+    """Read-only access to a run's blob store plus the inlining rule. A missing blob reads as
+    None; any other read error (EIO on a bucket mount, permissions) also reads as None and is
+    recorded in `unreadable` so the export reports it."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self.oversize: set[str] = set()
+        self.unreadable: dict[str, str] = {}
 
     def path(self, sha: str) -> Path:
         return self.root / sha[:2] / sha
@@ -205,7 +224,10 @@ class _Blobs:
             return None
         try:
             return self.path(sha).read_bytes()
-        except OSError:
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            self.unreadable[sha] = f"{type(e).__name__}: {e}"
             return None
 
     def json(self, sha: str | None) -> Any:
@@ -775,8 +797,20 @@ def _tool_events_by_round(evs: list[dict]) -> dict[int, list[tuple[dict, dict | 
 
 
 # ---- raw copies ------------------------------------------------------------------------------
-def _dir_size(path: Path) -> int:
-    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) if path.exists() else 0
+def _files(root: Path) -> list[tuple[Path, int]]:
+    """(path, size) of every file under `root`, sorted, from one directory walk."""
+    out: list[tuple[Path, int]] = []
+    if not root.is_dir():
+        return out
+    stack = [root]
+    while stack:
+        with os.scandir(stack.pop()) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(Path(entry.path))
+                elif entry.is_file():
+                    out.append((Path(entry.path), entry.stat().st_size))
+    return sorted(out)
 
 
 def _snapshot_blobs(run_dir: Path) -> set[str]:
@@ -789,33 +823,49 @@ def _snapshot_blobs(run_dir: Path) -> set[str]:
     return out
 
 
-def _copy_raw(run_dir: Path, raw: Path, blobs: _Blobs) -> dict:
+def _copy_raw(run_dir: Path, raw: Path, blobs: _Blobs) -> tuple[dict, list[str]]:
+    """Copy what `fetch-published` needs into `raw/` in one pass over the files; returns the
+    blob summary and the files that could not be copied (`"<path>: <error>"`)."""
+    errors: list[str] = []
+
+    def copy(src: Path, dst: Path) -> int:
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            return 1
+        except OSError as e:
+            errors.append(f"{src.relative_to(run_dir)}: {type(e).__name__}: {e}")
+            return 0
+
     raw.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(run_dir / "events.jsonl", raw / "events.jsonl")
-    for name in ("discarded.jsonl", "run.json"):
-        if (run_dir / name).exists():
-            shutil.copyfile(run_dir / name, raw / name)
+    size = 0
+    for name in ("events.jsonl", "discarded.jsonl", "run.json"):
+        if (run_dir / name).exists() or name == "events.jsonl":
+            copy(run_dir / name, raw / name)
     for sub in ("snapshots", "artifacts"):
-        if (run_dir / sub).is_dir():
-            shutil.copytree(run_dir / sub, raw / sub)
-    src = run_dir / "blobs"
-    size = _dir_size(run_dir)
-    if not src.is_dir():
-        return {"included": "none", "files": 0, "bytes": 0}
+        for src, n in _files(run_dir / sub):
+            size += n
+            copy(src, raw / src.relative_to(run_dir))
+    src_root = run_dir / "blobs"
+    listed = _files(src_root)
+    size += sum(n for _, n in listed) + sum(
+        (run_dir / f).stat().st_size for f in ("events.jsonl", "discarded.jsonl")
+        if (run_dir / f).exists())
+    if not src_root.is_dir():
+        return {"included": "none", "files": 0, "bytes": 0}, errors
     if size < FULL_BLOBS_LIMIT:
-        shutil.copytree(src, raw / "blobs")
-        mode = "all"
+        mode, wanted = "all", listed
     else:
         mode = "snapshots+oversize"
-        for sha in sorted(_snapshot_blobs(run_dir) | blobs.oversize):
-            data = blobs.get(sha)
-            if data is not None:
-                dst = raw / "blobs" / sha[:2] / sha
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_bytes(data)
-    files = [p for p in (raw / "blobs").rglob("*") if p.is_file()]
-    return {"included": mode, "files": len(files), "bytes": sum(p.stat().st_size for p in files),
-            "run_dir_bytes": size}
+        keep = _snapshot_blobs(run_dir) | blobs.oversize
+        wanted = [(p, n) for p, n in listed if p.name in keep and p.parent.parent == src_root
+                  and p.parent.name == p.name[:2]]
+    files = nbytes = 0
+    for src, n in wanted:
+        ok = copy(src, raw / "blobs" / src.relative_to(src_root))
+        files += ok
+        nbytes += n * ok
+    return {"included": mode, "files": files, "bytes": nbytes, "run_dir_bytes": size}, errors
 
 
 # ---- entry point -----------------------------------------------------------------------------
@@ -838,8 +888,12 @@ def _metric_finals(events: list[dict]) -> dict:
     return out
 
 
-def export_run(run_dir: Path | str, out: Path | str | None = None) -> Path:
-    """Export one run directory (see module doc); returns the export directory."""
+def export_run(run_dir: Path | str, out: Path | str | None = None, *, raw: bool = True) -> Path:
+    """Export one run directory (see module doc); returns the export directory.
+
+    `raw=False` (CLI `--no-raw`) skips `raw/` (tables and sessions only; `run.json["export_raw"]`
+    is false). Raises `ExportError` when a file of `raw/` cannot be copied; `run.json` is then
+    not written, so the export is never taken as current."""
     run_dir = Path(run_dir)
     meta_path = run_dir / "run.json"
     if not meta_path.exists():
@@ -858,7 +912,16 @@ def export_run(run_dir: Path | str, out: Path | str | None = None) -> Path:
     (out / "sessions").mkdir(parents=True, exist_ok=True)
     for agent, lines in sessions.items():
         (out / "sessions" / f"{agent}.jsonl").write_text("\n".join(lines) + "\n")
-    blob_info = _copy_raw(run_dir, out / "raw", blobs)
+    if raw:
+        blob_info, errors = _copy_raw(run_dir, out / "raw", blobs)
+        if errors:
+            shown = "; ".join(errors[:5]) + (f"; ... ({len(errors)} in all)" if len(errors) > 5 else "")
+            raise ExportError(
+                f"could not copy {len(errors)} file(s) of {run_dir} into {out / 'raw'}: {shown}. "
+                "On a bucket-mounted runs dir, retry from a local copy of the run dir, or export "
+                "without raw copies (--no-raw).")
+    else:
+        blob_info = {"included": "none", "files": 0, "bytes": 0}
     spec = meta.get("spec") or {}
     led = meta.get("ledger") or {}
     ev_bytes = (run_dir / "events.jsonl").read_bytes()
@@ -882,14 +945,17 @@ def export_run(run_dir: Path | str, out: Path | str | None = None) -> Path:
         "sessions": sorted(f"sessions/{a}.jsonl" for a in sessions),
         "events": {"n": len(events), "sha256": hashlib.sha256(ev_bytes).hexdigest()},
         "blobs": blob_info,
+        "export_raw": raw,
+        "unreadable_blobs": dict(sorted(blobs.unreadable.items())),
         "spec": spec,
     }
     (out / "run.json").write_text(json.dumps(doc, indent=2, sort_keys=True, default=str) + "\n")
     return out
 
 
-def is_current(run_dir: Path | str, out: Path | str | None = None) -> bool:
-    """True when `out` holds an export of the run's current log with this EXPORT_SCHEMA."""
+def is_current(run_dir: Path | str, out: Path | str | None = None, *, raw: bool = True) -> bool:
+    """True when `out` holds an export of the run's current log with this EXPORT_SCHEMA, made
+    with the same `raw` choice."""
     run_dir = Path(run_dir)
     out = Path(out) if out is not None else run_dir / "export"
     try:
@@ -897,5 +963,6 @@ def is_current(run_dir: Path | str, out: Path | str | None = None) -> bool:
         sha = hashlib.sha256((run_dir / "events.jsonl").read_bytes()).hexdigest()
     except (OSError, ValueError):
         return False
-    return doc.get("export_schema") == EXPORT_SCHEMA and doc.get("events", {}).get("sha256") == sha
+    return (doc.get("export_schema") == EXPORT_SCHEMA and doc.get("events", {}).get("sha256") == sha
+            and doc.get("export_raw", True) == raw)
 

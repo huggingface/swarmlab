@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections import Counter
 from pathlib import Path
 
@@ -188,8 +189,6 @@ def test_oversize_blobs_and_partial_raw(llm_run, tmp_path, monkeypatch):
 
 
 def test_unknown_and_intervention_events(llm_run, tmp_path):
-    import shutil
-
     d = tmp_path / "copy"
     shutil.copytree(llm_run.dir, d)
     extra = [
@@ -268,8 +267,6 @@ def test_unreadable_request_blob_does_not_duplicate_rounds(llm_run, tmp_path):
     """Field notes item 9: a request blob that cannot be read (EIO on a bucket mount, or gone)
     used to reset the overlap, so the next request was emitted in full: a second `Round 1.`
     marker with round-2 content under it. Rounds stay in order and nothing is repeated."""
-    import shutil
-
     d = tmp_path / "copy"
     shutil.copytree(llm_run.dir, d)
     reqs = [e for e in _events(d) if e["type"] == "inference_attempt"
@@ -304,3 +301,56 @@ def test_validator_rejects_a_repeated_round_marker():
     assert validate_lines(ok) == []
     bad = [*ok, user(3, "Round 1.\nz", "e2")]
     assert any("round marker 'Round 1.' after 'Round 2.'" in e for e in validate_lines(bad))
+
+
+def _eio_on(monkeypatch, name: str) -> None:
+    """Reads of any file called `name` fail with EIO, as on a flaky bucket mount."""
+    import errno
+
+    real_read, real_copy = Path.read_bytes, shutil.copyfile
+
+    def read_bytes(self):
+        if self.name == name:
+            raise OSError(errno.EIO, "Input/output error", str(self))
+        return real_read(self)
+
+    def copyfile(src, dst, *a, **kw):
+        if Path(src).name == name:
+            raise OSError(errno.EIO, "Input/output error", str(src))
+        return real_copy(src, dst, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(export.shutil, "copyfile", copyfile)
+
+
+def _a_request_blob(run_dir: Path) -> str:
+    return next(e["request_hash"] for e in _events(run_dir) if e["type"] == "inference_attempt")
+
+
+def test_raw_copy_io_error_fails_the_export(llm_run, tmp_path, monkeypatch):
+    sha = _a_request_blob(llm_run.dir)
+    _eio_on(monkeypatch, sha)
+    out = tmp_path / "e"
+    with pytest.raises(export.ExportError, match=r"could not copy \d+ file.*Errno 5.*--no-raw"):
+        export.export_run(llm_run.dir, out)
+    assert not (out / "run.json").exists() and not export.is_current(llm_run.dir, out)
+    res = CliRunner().invoke(app, ["export", str(llm_run.dir), "--out", str(out)])
+    assert res.exit_code == 1 and "ExportError" in res.output and sha[:12] in res.output
+
+
+def test_no_raw_export_reports_unreadable_blobs(llm_run, tmp_path, monkeypatch):
+    out = export.export_run(llm_run.dir, tmp_path / "plain", raw=False)
+    doc = json.loads((out / "run.json").read_text())
+    assert doc["export_raw"] is False and doc["blobs"]["included"] == "none"
+    assert doc["unreadable_blobs"] == {} and not (out / "raw").exists()
+    assert export.is_current(llm_run.dir, out, raw=False) and not export.is_current(llm_run.dir, out)
+    sha = _a_request_blob(llm_run.dir)
+    _eio_on(monkeypatch, sha)
+    res = CliRunner().invoke(app, ["export", str(llm_run.dir), "--out", str(tmp_path / "e"),
+                                   "--no-raw"])
+    assert res.exit_code == 0, res.output
+    assert "warning: 1 blob(s) could not be read" in res.output
+    doc = json.loads((tmp_path / "e" / "run.json").read_text())
+    assert list(doc["unreadable_blobs"]) == [sha] and "Errno 5" in doc["unreadable_blobs"][sha]
+    for f in sorted((tmp_path / "e" / "sessions").glob("*.jsonl")):
+        assert validate_file(f) == [], f

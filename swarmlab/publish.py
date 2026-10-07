@@ -41,6 +41,12 @@ Decisions where the contract is silent:
   and one config per table family (`runs/*/tables/<family>.parquet`), so Data Studio loads each
   family as one table across runs and the raw logs are not mistaken for data. The body is
   generated from `index.json` alone, so `publish` and `view --publish` write the same card.
+- **Failures.** Bad arguments raise `PublishError` (CLI exit 2). A failing step (an export,
+  e.g. `[Errno 5]` reading blobs on a bucket mount; creating or opening the repo; listing or
+  uploading files) raises `PublishFailed` whose message names the step (CLI: printed on stderr,
+  exit 1), so a publish that did not upload never looks successful. `raw=False`
+  (`publish --no-raw`) exports and uploads tables and sessions only. Runs whose export lists
+  `unreadable_blobs` are named in the result's `warnings`.
 - **fetch-published** downloads `runs/<run_id>/` and rebuilds `<out>/<run_id>/` from `raw/`
   (`run.json`, `events.jsonl`, `discarded.jsonl`, `snapshots/`, `artifacts/`, `blobs/`), puts the
   downloaded export under `<out>/<run_id>/export/` (without its `raw/` copy) and `view.html` next
@@ -66,6 +72,19 @@ REPO_TYPE = "dataset"
 
 class PublishError(ValueError):
     """Bad publish arguments (unknown runs, several experiments for one --repo, ...)."""
+
+
+class PublishFailed(RuntimeError):
+    """A publish step failed (export, repo creation, upload); the message names the step."""
+
+
+def _step(what: str, fn, *args: Any, **kw: Any) -> Any:
+    try:
+        return fn(*args, **kw)
+    except PublishError:
+        raise
+    except Exception as e:  # every failure is re-raised with the step named
+        raise PublishFailed(f"{what} failed: {type(e).__name__}: {e}") from e
 
 
 def _api(api: Any = None) -> Any:
@@ -102,10 +121,10 @@ def find_runs(source: Path | str) -> tuple[list[Path], list[str]]:
     return runs, skipped
 
 
-def ensure_export(run_dir: Path) -> Path:
+def ensure_export(run_dir: Path, raw: bool = True) -> Path:
     out = run_dir / "export"
-    if not is_current(run_dir, out):
-        export_run(run_dir, out)
+    if not is_current(run_dir, out, raw=raw):
+        export_run(run_dir, out, raw=raw)
     return out
 
 
@@ -299,25 +318,27 @@ def _ensure_repo(api: Any, repo: str, public: bool) -> bool:
 
 def _sync(api: Any, repo: str, public: bool, tags: Iterable[str], entries: dict[str, dict],
           uploads: dict[str, bytes | Path], experiment: str | None, message: str) -> dict:
-    is_public = _ensure_repo(api, repo, public)
-    files = remote_files(api, repo)
-    index = _remote_json(api, repo, "index.json", files) or {"runs": {}}
+    is_public = _step(f"creating or opening the dataset repo {repo}", _ensure_repo, api, repo, public)
+    files = _step(f"listing the files of {repo}", remote_files, api, repo)
+    index = _step(f"reading {repo}/index.json", _remote_json, api, repo, "index.json", files) or {"runs": {}}
     index.setdefault("runs", {})
     index["runs"].update(entries)
     index["experiment"] = index.get("experiment") or experiment
     index["export_schema"] = EXPORT_SCHEMA
     uploads = {**uploads, "index.json": _dump(index),
                "README.md": render_card(repo, index, public=is_public, tags=tags).encode()}
-    uploaded, unchanged = _commit(api, repo, uploads, files, message)
+    uploaded, unchanged = _step(f"uploading to {repo}", _commit, api, repo, uploads, files, message)
     return {"repo": repo, "url": f"https://huggingface.co/datasets/{repo}", "public": is_public,
             "uploaded": uploaded, "unchanged": unchanged, "runs": sorted(entries)}
 
 
 def publish(source: Path | str, repo: str | None = None, *, public: bool = False,
             tag: Iterable[str] | str | None = None, api: Any = None,
-            experiment: str | None = None) -> dict:
+            experiment: str | None = None, raw: bool = True) -> dict:
     """Export (if needed) and upload every finished run under `source` (only those of
-    `experiment` when given). Returns a summary."""
+    `experiment` when given). Returns a summary. `raw=False` publishes exports without `raw/`
+    (`export --no-raw`). Raises `PublishFailed` naming the step when an export, the repo
+    creation or an upload fails (repos of experiments handled before it stay published)."""
     api = _api(api)
     tags = [tag] if isinstance(tag, str) else list(tag or [])
     runs, skipped = find_runs(source)
@@ -335,13 +356,14 @@ def publish(source: Path | str, repo: str | None = None, *, public: bool = False
     if repo is not None and len(by_exp) > 1:
         raise PublishError(f"--repo names one repo but the runs belong to {sorted(by_exp)}; "
                            "publish one experiment at a time or omit --repo")
-    results = []
+    results: list[dict] = []
+    warnings: list[str] = []
     for exp, dirs in sorted(by_exp.items()):
-        target = repo or f"{_namespace(api)}/{exp}"
+        target = repo or _step("asking the Hub for your namespace", _namespace, api) + f"/{exp}"
         entries: dict[str, dict] = {}
         uploads: dict[str, bytes | Path] = {}
         for d in dirs:
-            out = ensure_export(d)
+            out = _step(f"export of {d.name}", ensure_export, d, raw)
             entry = index_entry(d, out)
             entries[entry["run_id"]] = entry
             for f in sorted(p for p in out.rglob("*") if p.is_file()):
@@ -350,7 +372,20 @@ def publish(source: Path | str, repo: str | None = None, *, public: bool = False
                 uploads[f"{entry['path']}/view.html"] = d / "view.html"
         results.append(_sync(api, target, public, tags, entries, uploads, exp,
                              f"swarmlab publish: {len(entries)} run(s) of {exp}"))
-    return {"ok": True, "repos": results, "skipped": skipped}
+        for d in dirs:
+            bad = json.loads((d / "export" / "run.json").read_text()).get("unreadable_blobs") or {}
+            if bad:
+                warnings.append(f"{d.name}: {len(bad)} blob(s) could not be read; their cells "
+                                "are null (export run.json unreadable_blobs)")
+    return {"ok": True, "repos": results, "skipped": skipped, "warnings": warnings}
+
+
+def _export_raw(run_dir: Path) -> bool:
+    """The raw choice of the run's existing export (True when there is none)."""
+    try:
+        return bool(json.loads((run_dir / "export" / "run.json").read_text()).get("export_raw", True))
+    except (OSError, ValueError):
+        return True
 
 
 def publish_view(run_dir: Path | str, repo: str, *, api: Any = None) -> dict:
@@ -359,7 +394,7 @@ def publish_view(run_dir: Path | str, repo: str, *, api: Any = None) -> dict:
     run_dir = Path(run_dir)
     if not (run_dir / "view.html").exists():
         raise PublishError(f"{run_dir}/view.html does not exist; build it first (swarmlab view)")
-    out = ensure_export(run_dir)
+    out = _step(f"export of {run_dir.name}", ensure_export, run_dir, _export_raw(run_dir))
     entry = index_entry(run_dir, out)
     uploads: dict[str, bytes | Path] = {f"{entry['path']}/view.html": run_dir / "view.html"}
     return _sync(api, repo, False, [], {entry["run_id"]: entry}, uploads, entry.get("experiment"),

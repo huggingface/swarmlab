@@ -216,3 +216,52 @@ def test_real_hub_round_trip(runs, tmp_path):
         assert Run.load(dest).score == Run(runs / "pubexp__s1").score
     finally:
         api.delete_repo(repo, repo_type="dataset", missing_ok=True)
+
+
+def test_publish_failures_exit_non_zero_and_name_the_step(runs, monkeypatch):
+    """Field notes item 8: an export error (EIO on a bucket mount), a repo that cannot be
+    created or an upload that fails is printed and exits 1; nothing looks published."""
+    import errno
+
+    hub = FakeHub()
+    monkeypatch.setattr(pub, "_api", lambda api=None: hub)
+    cli = CliRunner()
+
+    def eio(*a, **kw):
+        raise OSError(errno.EIO, "Input/output error")
+
+    with monkeypatch.context() as m:
+        m.setattr(pub, "export_run", eio)
+        res = cli.invoke(app, ["publish", str(runs), "--repo", "me/flags"])
+    assert res.exit_code == 1
+    assert "PublishFailed: export of pubexp__s1 failed: OSError: [Errno 5]" in res.output
+    assert hub.repos == {}
+
+    with monkeypatch.context() as m:
+        m.setattr(hub, "create_repo", lambda *a, **kw: eio())
+        res = cli.invoke(app, ["publish", str(runs), "--repo", "me/flags", "--json"])
+    assert res.exit_code == 1 and json.loads(res.stdout.splitlines()[-1])["ok"] is False
+    assert "creating or opening the dataset repo me/flags failed" in res.output
+
+    with monkeypatch.context() as m:
+        m.setattr(hub, "create_commit", lambda *a, **kw: eio())
+        res = cli.invoke(app, ["publish", str(runs), "--repo", "me/flags"])
+    assert res.exit_code == 1 and "uploading to me/flags failed" in res.output
+    assert hub.repos["me/flags"]["files"] == {}
+
+
+def test_publish_no_raw_uploads_tables_and_sessions_only(runs, monkeypatch):
+    hub = FakeHub()
+    monkeypatch.setattr(pub, "_api", lambda api=None: hub)
+    res = CliRunner().invoke(app, ["publish", str(runs), "--repo", "me/flags", "--no-raw"])
+    assert res.exit_code == 0, res.output
+    files = hub.repos["me/flags"]["files"]
+    assert "runs/pubexp__s1/tables/turns.parquet" in files
+    assert "runs/pubexp__s1/sessions/a000.jsonl" in files
+    assert not any("/raw/" in p for p in files)
+    entry = json.loads(files["index.json"])["runs"]["pubexp__s1"]
+    assert entry["blobs"] == "none"
+    assert json.loads((runs / "pubexp__s1" / "export" / "run.json").read_text())["export_raw"] is False
+    # a later full publish re-exports with raw copies
+    res = CliRunner().invoke(app, ["publish", str(runs), "--repo", "me/flags"])
+    assert res.exit_code == 0 and "runs/pubexp__s1/raw/events.jsonl" in hub.repos["me/flags"]["files"]

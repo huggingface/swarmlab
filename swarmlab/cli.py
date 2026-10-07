@@ -1005,13 +1005,14 @@ def job_fetch(
 def export_cmd(
     run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
     out: Annotated[Path | None, typer.Option("--out", help="Export directory (default RUN_DIR/export).")] = None,
+    no_raw: Annotated[bool, typer.Option("--no-raw", help="Tables and sessions only, no raw/ copies.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
     """Export a run: Parquet tables per event family, pi-format sessions, raw copies."""
     from .export import export_run
 
     def go() -> dict[str, Any]:
-        d = export_run(run_dir, out)
+        d = export_run(run_dir, out, raw=not no_raw)
         doc = json.loads((d / "run.json").read_text())
         tables = {f: t["rows"] for f, t in doc["tables"].items()}
         data = {"ok": True, "run_id": doc["run_id"], "export": str(d), "tables": tables,
@@ -1020,7 +1021,9 @@ def export_cmd(
             return data
         rows = ", ".join(f"{f}={n}" for f, n in tables.items())
         return {"text": (f"exported {doc['run_id']} -> {d}\n  rows: {rows}\n"
-                         f"  sessions: {len(doc['sessions'])}  raw blobs: {doc['blobs']['included']}")}
+                         f"  sessions: {len(doc['sessions'])}  raw blobs: {doc['blobs']['included']}"
+                         + (f"\n  warning: {len(doc['unreadable_blobs'])} blob(s) could not be read "
+                            "(run.json unreadable_blobs)" if doc.get("unreadable_blobs") else ""))}
 
     _execute(go, as_json)
 
@@ -1033,6 +1036,7 @@ def publish_cmd(
     public: Annotated[bool, typer.Option(
         "--public", help="Make the repo public and tag it format:agent-traces.")] = False,
     tag: Annotated[list[str] | None, typer.Option("--tag", help="Extra card tag (repeatable).")] = None,
+    no_raw: Annotated[bool, typer.Option("--no-raw", help="Export and upload tables and sessions only.")] = False,
     as_json: JsonOpt = False,
 ) -> None:
     """Export (if needed) and upload finished runs to a private Hub dataset repo per experiment."""
@@ -1040,7 +1044,7 @@ def publish_cmd(
 
     def go() -> dict[str, Any]:
         try:
-            res = publish(source, repo, public=public, tag=tag or [])
+            res = publish(source, repo, public=public, tag=tag or [], raw=not no_raw)
         except PublishError as e:
             raise SpecError(str(e)) from e
         if as_json:
@@ -1049,6 +1053,7 @@ def publish_cmd(
                  f"uploaded={r['uploaded']} unchanged={r['unchanged']}" for r in res["repos"]]
         if res["skipped"]:
             lines.append("skipped: " + ", ".join(res["skipped"]))
+        lines += [f"warning: {w}" for w in res.get("warnings", [])]
         return {"text": "\n".join(lines)}
 
     _execute(go, as_json)
