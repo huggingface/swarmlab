@@ -70,7 +70,8 @@ next item.
    `swarmlab job logs JOB_ID --follow`.
 9. **Fetch** (jobs): `swarmlab job fetch RUN_ID --out runs/` for each run id the log names ->
    `swarmlab replay runs/RUN_ID` exits 0.
-10. **Report.** `swarmlab report runs/ --out report.md` -> one row per arm; read it before
+10. **Report.** `swarmlab report runs/ --out report.md` -> one row per arm (dry runs on `fake:`
+    models are listed as simulated and kept out of the tables and spend); read it before
     claiming any effect, and say how many seeds stand behind each number.
 11. **Publish.** `swarmlab publish runs/ --repo OWNER/EXPERIMENT` -> private dataset repo with
     tables, sessions, raw logs and a card. `swarmlab view RUN_DIR --publish OWNER/EXPERIMENT`

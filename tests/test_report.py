@@ -123,3 +123,24 @@ def test_skill_points_only_at_commands_and_flags_that_exist():
     for cmd in ("doctor", "prompts", "estimate", "report", "publish", "fetch-published",
                 "job run", "job fetch", "resume", "fork", "replay", "export", "view"):
         assert f"swarmlab {cmd}" in text, cmd
+
+
+def test_report_sets_simulated_runs_apart_and_out_is_quiet(tmp_path):
+    out = tmp_path / "runs"
+    spec = REPO / "examples" / "flaggame_m1a.yaml"
+    Experiment.from_yaml(spec, "broadcast").run_all([1], max_rounds=2, out=out)
+    Experiment.from_yaml(spec, "llm").run_all([1], max_rounds=2, out=out)  # fake:reader
+    text = build_report(out)
+    assert "Simulated runs (only `fake:` models" in text and "flaggame-m1a__llm__s1" in text
+    assert "| llm" not in text and "| broadcast | 1 |" in text
+    assert "Total spend (ledger, swarm + measurement) over the 1 real run(s): $0.000" in text
+    assert "1 simulated run(s)" in text
+    full = build_report(out, include_fake=True)
+    assert "| llm (simulated) | 1 |" in full and "| broadcast | 1 |" in full
+    assert "over the 1 real run(s)" in full  # simulated spend is never counted
+    md = tmp_path / "report.md"
+    res = cli.invoke(app, ["report", str(out), "--out", str(md)])
+    assert res.exit_code == 0 and res.output.strip().splitlines() == [res.output.strip()]
+    assert res.output.startswith(f"wrote {md}") and md.read_text() == text + "\n"
+    res = cli.invoke(app, ["report", str(out), "--out", str(md), "--stdout", "--include-fake"])
+    assert res.exit_code == 0 and "| llm (simulated) | 1 |" in res.output

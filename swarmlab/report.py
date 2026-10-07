@@ -20,6 +20,10 @@ Decisions:
   charged spend in discarded rounds (`export.discarded_spend`), a line under the summary gives
   the ledger total and the discarded part, so it reconciles with exports; otherwise the report
   is unchanged (the M2 reproduction stays byte-identical).
+- Simulated runs (every participant model and probe coder model is `fake:`; scripted-only runs
+  are not simulated) are named in a line under the header and left out of all tables and the
+  spend total; `include_fake=True` (CLI `--include-fake`) puts them in the tables as arm
+  `<arm> (simulated)`, still outside the spend total.
 """
 from __future__ import annotations
 
@@ -122,42 +126,71 @@ def truth_info(run, agents):
     return v["truth"], v["rival"], v["truth"] == rec if rec is not None else None
 
 
-def spend_lines(runs) -> list[str]:
-    """Total ledger spend of the summarised runs, when some of it was charged in discarded rounds
-    (otherwise the spend/run column already adds up to the ledger)."""
+def is_simulated(meta: dict) -> bool:
+    """True when every model the run calls (participants, probe coders) is a `fake:` model."""
+    spec = meta.get("spec") or {}
+    models = [(p.get("params") or {}).get("model") for p in spec.get("participants") or []]
+    models += [(p.get("params") or {}).get("coder_model") for p in spec.get("probes") or []]
+    models = [m for m in models if isinstance(m, str) and ":" in m]
+    return bool(models) and all(m.startswith("fake:") for m in models)
+
+
+def spend_lines(runs, n_simulated: int = 0) -> list[str]:
+    """Total ledger spend of the real (non-simulated) runs summarised, when some of it was charged
+    in discarded rounds or simulated runs are around; otherwise the spend/run column already
+    adds up to the ledger and nothing is added."""
     discarded = sum(discarded_spend(r.dir) for r in runs)
-    if discarded <= 0:
+    if discarded <= 0 and not n_simulated:
         return []
     total = sum(ledger_total(r.spend) for r in runs)
-    line = (f"Total spend (ledger, swarm + measurement) over these {len(runs)} run(s): ${total:.3f}, "
-            f"of which ${discarded:.3f} was charged in discarded rounds (hard-ceiling aborts, not in "
-            "the logged rounds; `swarmlab export` puts them in `tables/discarded_inference`).")
-    return [line, ""]
+    line = f"Total spend (ledger, swarm + measurement) over the {len(runs)} real run(s): ${total:.3f}"
+    if discarded > 0:
+        line += (f", of which ${discarded:.3f} was charged in discarded rounds (hard-ceiling "
+                 "aborts, not in the logged rounds; `swarmlab export` puts them in "
+                 "`tables/discarded_inference`)")
+    if n_simulated:
+        line += f"; {n_simulated} simulated run(s) (nominal `fake:` prices) not counted"
+    return [line + ".", ""]
 
 
-def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE) -> str:
-    """The report for every ended run directly under `runs_dir`, as Markdown."""
+def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake: bool = False) -> str:
+    """The report for every ended run directly under `runs_dir`, as Markdown.
+
+    Simulated runs (`is_simulated`: only `fake:` models) are listed but left out of the summary
+    and every section unless `include_fake`, which adds them under arm `<arm> (simulated)`; they
+    never count towards the spend total."""
     arms = defaultdict(list)
     skipped = []
+    simulated = []
     for d in sorted(Path(runs_dir).iterdir()):
         rj = d / "run.json"
         if not rj.is_file():
             continue
         try:
-            if json.loads(rj.read_text()).get("status") != "ended":
+            meta = json.loads(rj.read_text())
+            if meta.get("status") != "ended":
                 skipped.append(d.name)
                 continue
+            fake = is_simulated(meta)
+            if fake:
+                simulated.append(d.name)
+                if not include_fake:
+                    continue
             run = Run.load(d)
         except Exception as e:  # noqa: BLE001
             skipped.append(f"{d.name} ({type(e).__name__})")
             continue
         parts = run.id.split("__")
         arm = parts[1] if len(parts) >= 3 else (run.meta.get("arm") or "?")
-        arms[arm].append((run, scan(run)))
+        arms[f"{arm} (simulated)" if fake else arm].append((run, scan(run)))
     last = [d["last_round"] for rs in arms.values() for _, d in rs]
     R = range(1, max([*last, 1]) + 1)
     flag = any(d["guess_by_round"].get(d["last_round"]) for rs in arms.values() for _, d in rs)
     L = [f"# {title}", "", f"Runs dir: `{runs_dir}`; skipped (not ended / unreadable): {', '.join(skipped) or 'none'}", ""]
+    if simulated:
+        how = ("included below as `<arm> (simulated)`" if include_fake else
+               "left out of every table below (`--include-fake` adds them)")
+        L += [f"Simulated runs (only `fake:` models, nominal prices; {how}): {', '.join(simulated)}", ""]
 
     # summary
     rows = []
@@ -181,7 +214,8 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE) -> str:
     L += ["## Summary", ""] + table(["arm", "n", "final acc (mean ± sd)", "final consensus", "rounds to 0.9 cons. (median)",
                                     f"read_rate r2-{R[-1]}", "posts/agent/round", "spend/run (swarm + meas.)", "calls/run",
                                     "wall/run"], rows) + [""]
-    L += spend_lines([r for rs in arms.values() for r, _ in rs])
+    L += spend_lines([r for rs in arms.values() for r, _ in rs if r.dir.name not in simulated],
+                     len(simulated))
 
     # trajectories
     L += ["## Trajectories (mean over seeds)", ""]
@@ -277,9 +311,9 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE) -> str:
 
 
 def write_report(runs_dir: Path | str, out: Path | str | None = None,
-                 title: str = DEFAULT_TITLE) -> str:
+                 title: str = DEFAULT_TITLE, include_fake: bool = False) -> str:
     """Build the report; also write it to `out` (with a trailing newline) when given."""
-    text = build_report(runs_dir, title)
+    text = build_report(runs_dir, title, include_fake=include_fake)
     if out is not None:
         Path(out).write_text(text + "\n")
     return text

@@ -942,19 +942,29 @@ def fetch_published_cmd(
 @app.command("report")
 def report_cmd(
     runs_dir: Annotated[Path, typer.Argument(help="Directory of run directories.")],
-    out: Annotated[Path | None, typer.Option("--out", help="Also write the Markdown here.")] = None,
+    out: Annotated[Path | None, typer.Option(
+        "--out", help="Write the Markdown here (prints one confirmation line).")] = None,
+    stdout: Annotated[bool, typer.Option("--stdout", help="With --out, also print the report.")] = False,
+    include_fake: Annotated[bool, typer.Option(
+        "--include-fake", help="Include simulated runs (only fake: models) in the tables, "
+                               "labelled '(simulated)'.")] = False,
     title: Annotated[str, typer.Option("--title", help="Report title.")] = "swarmlab report",
     as_json: JsonOpt = False,
 ) -> None:
-    """Markdown report over the finished runs in RUNS_DIR (accuracy, consensus, reading, health)."""
+    """Markdown report over the finished runs in RUNS_DIR (accuracy, consensus, reading, health).
+
+    Simulated runs (only fake: models) are listed but left out of the tables and the spend
+    total unless --include-fake."""
     from .report import write_report
 
     def go() -> dict[str, Any]:
         if not runs_dir.is_dir():
             raise SpecError(f"{runs_dir} is not a directory")
-        text = write_report(runs_dir, out, title)
+        text = write_report(runs_dir, out, title, include_fake=include_fake)
         if as_json:
             return {"ok": True, "report": text, "out": str(out) if out else None}
+        if out is not None and not stdout:
+            return {"text": f"wrote {out} ({len(text.splitlines())} lines)"}
         return {"text": text}
 
     _execute(go, as_json)

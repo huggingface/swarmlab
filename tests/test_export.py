@@ -246,14 +246,15 @@ def test_discarded_rounds_are_exported_with_their_spend(tmp_path):
 
 
 def test_report_reconciles_spend_with_the_ledger(tmp_path):
-    from swarmlab.report import build_report
+    from swarmlab.report import build_report, spend_lines
     from swarmlab.spec import Budget
 
     exp = llm_agent_experiment(4, name="exp-disc", pricing={"*": (10.0, 50.0, 1.0)},
                                agent_kw={"max_tokens": 64, "max_calls": 2},
                                budget=Budget(hard_usd=0.06))
     run = exp.run(seed=1, max_rounds=3, out=tmp_path / "runs").resume(budget=Budget(hard_usd=5.0))
-    text = build_report(tmp_path / "runs")
     total = run.spend["swarm"] + run.spend["measurement"]
-    line = next(ln for ln in text.splitlines() if ln.startswith("Total spend (ledger"))
+    line = spend_lines([run])[0]  # what the report prints for real (non-fake) runs
     assert f"${total:.3f}" in line and f"${export.discarded_spend(run.dir):.3f}" in line
+    # these runs use fake: models, so the report sets them apart and counts none of their spend
+    assert "over the 0 real run(s): $0.000; 1 simulated" in build_report(tmp_path / "runs")

@@ -123,7 +123,7 @@ swarmlab estimate SPEC [--arm A] [--seed N] [--prompt-growth G] [--calls-per-tur
 swarmlab replay RUN_DIR
 swarmlab resume RUN_DIR [--budget-hard X | --add-budget D]   swarmlab fork RUN_DIR --at 4 [--spec edited.yaml]
 swarmlab view RUN_DIR [--publish OWNER/REPO]
-swarmlab prompts SPEC --arm A            swarmlab report RUNS_DIR [--out report.md]
+swarmlab prompts SPEC --arm A            swarmlab report RUNS_DIR [--out report.md] [--include-fake]
 swarmlab export RUN_DIR [--out DIR]
 swarmlab publish RUNS_DIR_OR_RUN [--repo OWNER/REPO] [--public] [--tag T]
 swarmlab fetch-published OWNER/REPO RUN_ID [--out runs/]
@@ -136,7 +136,7 @@ Every command takes `--json` and then prints one JSON object. Exit codes: 0 succ
 ## Analysing and publishing
 
 - `swarmlab prompts SPEC --arm A` prints the system prompt and round-1 user message of one agent per participant group, exactly as the model would receive them, without calling a model. Review them (ideally with a second agent) before spending.
-- `swarmlab report RUNS_DIR` writes a Markdown report over the finished runs: per-arm accuracy and consensus, trajectories, where the swarm went, probe vs world belief, reading behaviour, tool-protocol health.
+- `swarmlab report RUNS_DIR` writes a Markdown report over the finished runs: per-arm accuracy and consensus, trajectories, where the swarm went, probe vs world belief, reading behaviour, tool-protocol health. Simulated runs (only `fake:` models, e.g. dry runs) are listed but left out of the tables and spend totals; `--include-fake` adds them as `<arm> (simulated)`. `--out report.md` writes the file and prints one line (`--stdout` also prints the report).
 - `swarmlab export RUN_DIR` (Python `Run.export(out)`) writes `RUN_DIR/export/`: `run.json` (identity, spec, score, spend, `spend_discarded_usd`, metric finals), `tables/<family>.parquet` (turns, tool_calls, posts, deliveries, reads, actions, inference, probes, metrics, interventions, rounds, run, other, and `discarded_inference`: the calls of rounds discarded at a hard ceiling, with `charged_usd`, so the ledger spend = non-cached `inference.cost_usd` + discarded spend; key columns `experiment, arm, seed, run, round, agent`; blob content inlined up to 64 KiB), `sessions/<agent>.jsonl` (one [pi-format](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md) session per agent with `harness: "swarmlab"`, so the Hub's agent-traces viewer renders each conversation) and `raw/` (the byte-identical log, snapshots and blobs).
 - `swarmlab publish runs/` (Python `Experiment.publish(runs_dir)`) exports what is needed and uploads every finished run to one **private** Hub dataset repo per experiment (`<you>/<experiment>`, or `--repo`): `runs/<run_id>/...`, `index.json`, and a dataset card with the arms' specs, a run table and the table schemas. Re-publishing uploads only changed files. `--public` makes the repo public and adds the `format:agent-traces` tag (the Hub's trace viewer renders public repos only); traces hold every prompt and reply, so read them first. Needs the `hub` extra and `HF_TOKEN`.
 - `swarmlab view RUN_DIR --publish OWNER/REPO` uploads `view.html` next to the run and links it from the card.
