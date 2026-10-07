@@ -64,10 +64,10 @@ def test_measured_figures_and_estimate_from(tmp_path):
 
 def test_gap_warning_uses_a_finished_run_of_the_arm(tmp_path):
     out = tmp_path / "runs"
-    # no finished run: the gap is compared with twice the worst-case round
+    # no finished run: the gap is compared with half the worst-case round
     res, data = invoke("estimate", spec_file(tmp_path), "--seed", 1, "--json")
     worst_round = data["usd_per_round"]
-    gap = 2 * worst_round - 0.001
+    gap = 0.5 * worst_round - 0.001
     spec = spec_file(tmp_path, soft_usd=0.3, hard_usd=0.3 + gap)
     res, _ = invoke("run", spec, "--seed", 1, "--out", out, "--yes")
     assert res.exit_code == 0, res.output
