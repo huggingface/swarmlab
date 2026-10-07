@@ -24,6 +24,8 @@ Decisions where the contract is silent:
   `EventLogCorrupt`.
 - M1b: `inference_attempt` gained `category`, `inference_response` gained `served_by`,
   `finish_reason`, `cached`; new logical types `budget`, `budget_changed`, `probe`.
+- M3a: new logical type `overflow` (`OverflowEvent`, LLM context limit), written into the agent's
+  turn events after its tool events and before `turn_ended`.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
 """
@@ -202,6 +204,23 @@ class ProbeEvent(Event):
     cost_usd: float = 0.0
 
 
+class OverflowEvent(Event):
+    """An LLM participant's prompt exceeded its context limit (M3a §3; logical).
+
+    One per trimming: `dropped_rounds` earlier rounds were removed (0 under `fail_turn`, or when
+    nothing could be dropped); token counts are the provider's estimate before and after.
+    `detail` is set when the policy could not run as configured (e.g. `"measurement_budget"`:
+    the summarize call was refused, the rounds were dropped without a note).
+    """
+
+    type: Literal["overflow"] = "overflow"
+    policy: Literal["drop_oldest", "summarize", "fail_turn"]
+    dropped_rounds: int
+    tokens_before: int
+    tokens_after: int
+    detail: str | None = None
+
+
 class RunEndedEvent(Event):
     type: Literal["run_ended"] = "run_ended"
     reason: Literal["terminal", "max_rounds", "soft_budget", "hard_ceiling", "error"]
@@ -212,6 +231,7 @@ _ALL = (
     InferenceAttemptEvent, InferenceResponseEvent, TurnEndedEvent, ReadEvent, PostEvent,
     DeliveryEvent, ActionCommittedEvent, WorldChangedEvent, MetricEvent, RoundCommittedEvent,
     SnapshotEvent, RunEndedEvent, BudgetEvent, BudgetChangedEvent, ProbeEvent,
+    OverflowEvent,
 )
 EVENT_CLASSES: dict[str, type[Event]] = {c.model_fields["type"].default: c for c in _ALL}
 
@@ -219,7 +239,8 @@ AnyEvent = Annotated[
     RunStartedEvent | RoundStartedEvent | TurnStartedEvent | ToolCalledEvent | ToolReturnedEvent
     | InferenceAttemptEvent | InferenceResponseEvent | TurnEndedEvent | ReadEvent | PostEvent
     | DeliveryEvent | ActionCommittedEvent | WorldChangedEvent | MetricEvent | RoundCommittedEvent
-    | SnapshotEvent | RunEndedEvent | BudgetEvent | BudgetChangedEvent | ProbeEvent,
+    | SnapshotEvent | RunEndedEvent | BudgetEvent | BudgetChangedEvent | ProbeEvent
+    | OverflowEvent,
     Field(discriminator="type"),
 ]
 _ADAPTER: TypeAdapter[Event] = TypeAdapter(AnyEvent)
