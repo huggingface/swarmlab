@@ -7,7 +7,7 @@ evaluator-only and called by the runner alone.
 from __future__ import annotations
 
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from pydantic import BaseModel
 
@@ -101,7 +101,15 @@ class World(Persistable, Plugin):
                                       parameters=NO_ARGS))
         return [s.normalized() for s in schemas]
 
-    def validate(self, agent: AgentId, action: Action) -> Ack:
+    def validate(self, agent: AgentId, action: Action, pending: Sequence[Action] = ()) -> Ack:
+        """Check `action` before it is buffered (round_end) or committed (immediate).
+
+        `pending` is the agent's own world actions already buffered this round, in call order
+        (always empty under immediate commit, where every action has already been committed).
+        A world uses it to refuse at call time what its commit would certainly reject, such as a
+        per-round limit. The executor passes `pending` only to overrides that accept it, so
+        worlds written against `validate(agent, action)` keep working.
+        """
         fn = self._actions().get(action.name)
         if fn is None:
             return Ack(ok=False, error=f"unknown action {action.name!r}")
@@ -126,7 +134,9 @@ class World(Persistable, Plugin):
             outcomes.append(out)
         return outcomes
 
-    def my_status(self, agent: AgentId) -> dict | None:
+    def my_status(self, agent: AgentId, pending: Sequence[Action] = ()) -> dict | None:
+        """The agent's own status, or None (the tool is not exposed). `pending` is as in
+        `validate`, passed only to overrides that accept it."""
         return None
 
     def collective_status(self) -> dict | None:

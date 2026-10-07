@@ -30,9 +30,23 @@ plus, when zones are on, a final line `Zones: 2 x 2 (zone of a cell: zone:<x * z
 
 Actions and commit
 ------------------
-- `paint(x, y, color)`: `validate` rejects out-of-bounds cells and unknown colours at call time.
+- `paint(x, y, color)`: `validate` rejects out-of-bounds cells (`error="out_of_bounds: ..."`)
+  and unknown colours (`"bad_color: ..."`) at call time.
   At most `paints_per_round` paints per agent are applied per round (counted at commit in commit
-  order; further ones get `accepted=False, feedback={"error": "paint_limit"}`).
+  order; further ones get `accepted=False, feedback={"error": "paints_per_round", "detail"}`).
+  `validate(agent, action, pending)` also refuses at call time a paint the commit would reject
+  for the limit: when the agent's buffered `pending` paints (round_end only) already reach
+  `paints_per_round`, the error is `"paints_per_round: at most N
+  paint(s) per round; this one would be rejected at commit"` and the executor does not buffer
+  it. Under immediate commit `pending` is empty and the world's own commit already enforces the
+  limit (the call returns `ok=True` with `accepted=False`), so nothing changes there. Caveat: under an `enforced` claim policy a buffered paint
+  may later be rejected `not_claimed` without reaching the world, and the refused paint would
+  then have been applied; the pre-check counts every buffered paint all the same (the limit is
+  stated to agents as "paints per round", not "applied paints").
+- Commit-time feedback says why a paint was not applied: `error` is `paints_per_round`,
+  `out_of_bounds` or `bad_color` (with a human `detail`); an applied paint that a later one
+  replaced says `{"result": "overwritten"}`. The LLM participant renders these in its
+  "Outcomes of your actions last round" lines.
 - Conflict rule: paints are applied in commit (seeded) order, so the last writer of a cell wins.
   An accepted paint's feedback is `{"result": "painted"}`, or `{"result": "overwritten"}` when a
   later paint in the same commit batch painted the same cell. Under immediate commit every paint
@@ -56,8 +70,13 @@ Dynamics
   per agent, the same as the `kill_agents` intervention. A failure at round 1 is applied before
   round 1's turns.
 
-Status tools (both on by default; `status_tools` toggles): `my_status` -> `{"paints", "cells_mine"}`
-(applied paints, and cells whose current colour is this agent's paint and matches the target);
+Status tools (both on by default; `status_tools` toggles): `my_status` -> `{"paints", "cells_mine",
+"paints_left_this_round"}` (applied paints; cells whose current colour is this agent's paint and
+matches the target; `paints_per_round` minus this round's applied paints (immediate) and
+buffered paints (round_end)). The
+executor passes the buffered actions as `my_status(agent, pending=...)` (the same hook as
+`validate`; least invasive: no executor-to-world callback and no world state touched during
+turns), so under round_end the count drops as the agent paints;
 `collective_status` -> `{"coverage", "cells_matching", "cells"}`. The target is visible to every
 agent in this variant, so these reveal nothing an agent could not compute.
 
@@ -72,6 +91,7 @@ kept on restore, as in FlagGame.
 from __future__ import annotations
 
 import random
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from ..ids import ActionId, AgentId
@@ -190,13 +210,15 @@ class ColoringGrid(World):
 
     # ---- agent-facing ------------------------------------------------------------------------
     def description(self) -> str:
+        n = self.paints_per_round
         return (
             "You are one of several agents colouring a shared grid. Each round you see the target "
             "grid and the current grid. Use paint(x, y, color) to paint a cell (x = column, "
-            f"y = row, both from 0); each agent's first {self.paints_per_round} paint(s) per round "
-            "are applied, at the end of the round. When several agents paint the same cell in one "
-            "round, the last one applied wins. The task is done when the current grid equals the "
-            "target."
+            f"y = row, both from 0). You may paint at most {n} cell{'s' if n != 1 else ''} per "
+            "round; paints are applied at the end of the round, and a paint beyond the limit is "
+            "refused. Painting a cell that already has its target colour wastes your paint. When "
+            "several agents paint the same cell in one round, the last one applied wins. The task "
+            "is done when the current grid equals the target."
         )
 
     def observe(self, agent: AgentId) -> Observation:
@@ -213,33 +235,48 @@ class ColoringGrid(World):
                          f"<y * {zy} // {self.height}>)")
         return text_observation("\n".join(lines))
 
-    def _cell_error(self, x: Any, y: Any, color: Any) -> str | None:
+    def _cell_error(self, x: Any, y: Any, color: Any) -> tuple[str, str] | None:
+        """(reason code, message) when the paint is malformed, else None."""
         if not isinstance(x, int) or isinstance(x, bool) or not isinstance(y, int) or isinstance(y, bool):
-            return "x and y must be integers"
+            return "out_of_bounds", "x and y must be integers"
         if not (0 <= x < self.width and 0 <= y < self.height):
-            return f"cell ({x}, {y}) is outside the {self.width} x {self.height} grid"
+            return "out_of_bounds", f"cell ({x}, {y}) is outside the {self.width} x {self.height} grid"
         if color not in self.colours:
-            return f"unknown color {color!r}; colours: {' '.join(self.colours)}"
+            return "bad_color", f"unknown color {color!r}; colours: {' '.join(self.colours)}"
         return None
 
-    def validate(self, agent: AgentId, action: Action) -> Ack:
+    def _limit_text(self) -> str:
+        n = self.paints_per_round
+        return f"at most {n} paint{'s' if n != 1 else ''} per round"
+
+    def validate(self, agent: AgentId, action: Action, pending: Sequence[Action] = ()) -> Ack:
         ack = super().validate(agent, action)
         if not ack.ok or action.name != "paint":
             return ack
         err = self._cell_error(action.args.get("x"), action.args.get("y"), action.args.get("color"))
-        return Ack(ok=False, error=err) if err else ack
+        if err:
+            return Ack(ok=False, error=f"{err[0]}: {err[1]}")
+        if sum(1 for a in pending if a.name == "paint") >= self.paints_per_round:
+            return Ack(ok=False, error=f"paints_per_round: {self._limit_text()}; this one would be "
+                                       "rejected at commit")
+        return ack
+
+    def _paints_used(self, agent: AgentId, pending: Sequence[Action]) -> int:
+        """Paints `agent` has applied this round (immediate) plus those buffered (round_end)."""
+        return self.round_paints.get(agent, 0) + sum(1 for a in pending if a.name == "paint")
 
     @tool("paint", "Paint cell (x = column, y = row) with a colour letter.",
           {"x": "integer", "y": "integer", "color": "string"})
     def paint(self, agent: AgentId, x: int, y: int, color: str) -> Outcome:
         err = self._cell_error(x, y, color)
         if err:
-            return Outcome(accepted=False, feedback={"error": err})
+            return Outcome(accepted=False, feedback={"error": err[0], "detail": err[1]})
         if agent not in self.agents:
             return Outcome(accepted=False, feedback={"error": "unknown agent"})
         n = self.round_paints.get(agent, 0)
         if n >= self.paints_per_round:
-            return Outcome(accepted=False, feedback={"error": "paint_limit"})
+            return Outcome(accepted=False, feedback={"error": "paints_per_round",
+                                                     "detail": self._limit_text()})
         self.round_paints[agent] = n + 1
         want = self.target[y][x]
         before = self.grid[y][x]
@@ -284,12 +321,14 @@ class ColoringGrid(World):
         return sum(1 for y in range(self.height) for x in range(self.width)
                    if self.grid[y][x] == self.target[y][x])
 
-    def my_status(self, agent: AgentId) -> dict | None:
+    def my_status(self, agent: AgentId, pending: Sequence[Action] = ()) -> dict | None:
         if "my_status" not in self.status_tools:
             return None
         mine = sum(1 for y in range(self.height) for x in range(self.width)
                    if self.painter and self.painter[y][x] == agent and self.grid[y][x] == self.target[y][x])
-        return {"paints": self.paint_counts.get(agent, 0), "cells_mine": mine}
+        left = max(0, self.paints_per_round - self._paints_used(agent, pending))
+        return {"paints": self.paint_counts.get(agent, 0), "cells_mine": mine,
+                "paints_left_this_round": left}
 
     def collective_status(self) -> dict | None:
         if "collective_status" not in self.status_tools:

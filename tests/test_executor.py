@@ -157,3 +157,32 @@ async def test_concurrent_calls_keep_per_agent_state(tmp_path):
         assert all(e.agent == a for e in ex.events(a))
         calls = [e.call_id for e in ex.events(a) if e.type == "tool_called"]
         assert calls == [f"c0001-{a}-{n:03d}" for n in range(1, 6)]
+
+
+async def test_round_end_guess_limit_counts_buffered_guesses(tmp_path):
+    from swarmlab.world.base import Action
+
+    world, _, _, ex = setup(tmp_path)
+    world.guess_limit = 2
+    a = AGENTS[0]
+    assert (await ex.call(a, "guess", {"candidate": "A"})).ok
+    assert (await ex.call(a, "guess", {"candidate": "B"})).ok
+    third = await ex.call(a, "guess", {"candidate": "C"})
+    assert not third.ok and third.error == ("guess limit reached: at most 2 guesses; this one would be "
+                                            "rejected at commit")
+    assert [act.args["candidate"] for _, _, act in ex.buffered_actions(a)] == ["A", "B"]
+    assert (await ex.call(AGENTS[1], "guess", {"candidate": "C"})).ok  # per agent
+    # one guess already recorded plus one buffered also reaches the limit
+    world.guesses_made[AGENTS[2]] = 1
+    pend = [Action(name="guess", args={"candidate": "A"})]
+    assert world.validate(AGENTS[2], pend[0]).ok
+    assert not world.validate(AGENTS[2], pend[0], pending=pend).ok
+
+
+async def test_immediate_guess_limit_unchanged(tmp_path):
+    world, _, _, ex = setup(tmp_path, commit="immediate")
+    world.guess_limit = 1
+    a = AGENTS[0]
+    assert (await ex.call(a, "guess", {"candidate": "A"})).result["accepted"]
+    second = await ex.call(a, "guess", {"candidate": "B"})
+    assert not second.ok and second.error == "guess limit reached"  # validate, as before

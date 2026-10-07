@@ -3,7 +3,7 @@
 Generalised from `tools/m2_report.py` (the M2 phase-1 Flag Game report); on the archived M2 runs
 with `--title "M2 phase-1 Flag Game report"` it reproduces
 `docs/notes/m2-phase1-report-2026-10-06.md` byte for byte apart from the rows and lines added
-since (`post_rate` trajectory rows, "probes skipped" lines, the tool-health `max_tokens` column). Read-only over the runs dir.
+since (`post_rate` trajectory rows, "probes skipped" lines, the tool-health `max_tokens` and `rejected tool calls` columns). Read-only over the runs dir.
 
 Decisions:
 
@@ -24,6 +24,10 @@ Decisions:
 - Tool protocol health counts truncated responses (`inference_response.finish_reason`) in two
   columns: `length` (OpenAI-compatible providers) and `max_tokens` (Anthropic); both mean the
   reply hit `max_tokens`. (`max_tokens` is the last column so the M2 table keeps its layout.)
+  `rejected tool calls` (appended after it) is `rejected/answered`: `tool_returned` events with
+  `ok=False` (a world refusal such as `paints_per_round`, `turn_ended`, `not_allowed`, bad args)
+  over all of them, both without the call that hit the turn cap (counted as a `cap` yield). A
+  high share alongside many `cap` yields means agents were spinning, not busy.
 - The spend/run column is the ledger (discarded rounds included). When some summarised run
   charged spend in discarded rounds (`export.discarded_spend`), a line under the summary gives
   the ledger total and the discarded part, so it reconciles with exports; otherwise the report
@@ -82,7 +86,8 @@ def scan(run):
     d = {"guess_by_round": {}, "turns": Counter(), "reads": Counter(), "read_deliv": Counter(),
          "read_turns": Counter(), "agents_read": set(), "agents": set(), "yields": Counter(),
          "finish": Counter(), "err": 0, "cached": 0, "nresp": 0, "posts": Counter(), "t0": None,
-         "t1": None, "turn_n": Counter(), "length": 0, "max_tokens": 0, "posters": defaultdict(set)}
+         "t1": None, "turn_n": Counter(), "length": 0, "max_tokens": 0, "posters": defaultdict(set),
+         "tool_returns": 0, "rejected_calls": 0}
     cur = {}
     last_round = 0
     for ev in run.events_all:
@@ -99,6 +104,11 @@ def scan(run):
                 d["err"] += 1
             for fr in (ev.usage or {}).get("finish_reasons", []) if isinstance(ev.usage, dict) else []:
                 d["finish"][fr] += 1
+        elif t == "tool_returned":
+            res = ev.result if isinstance(ev.result, dict) else {}
+            if res.get("error") != "cap":  # the capping call is counted by the `cap` yield kind
+                d["tool_returns"] += 1
+                d["rejected_calls"] += not res.get("ok", True)
         elif t == "read":
             d["reads"][r] += 1
             d["read_deliv"][r] += len(ev.delivery_ids)
@@ -328,9 +338,10 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
         rows.append([arm, dict(y) or NA, dict(fr) or NA, sum(d["length"] for _, d in rs),
                      sum(d["err"] for _, d in rs),
                      f"{sum(d['cached'] for _, d in rs)}/{sum(d['nresp'] for _, d in rs)}",
-                     sum(d["max_tokens"] for _, d in rs)])
+                     sum(d["max_tokens"] for _, d in rs),
+                     f"{sum(d['rejected_calls'] for _, d in rs)}/{sum(d['tool_returns'] for _, d in rs)}"])
     L += table(["arm", "yield kinds", "finish reasons (turn usage)", "length (responses)", "errored turns",
-                "cache hits/responses", "max_tokens (responses)"], rows) + [""]
+                "cache hits/responses", "max_tokens (responses)", "rejected tool calls"], rows) + [""]
     return "\n".join(L)
 
 

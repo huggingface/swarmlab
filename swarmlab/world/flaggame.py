@@ -68,8 +68,10 @@ the crop section. `observation.private == {"crop_y": y, "crop_x": x}` (top-left 
 Decisions where the contract is silent
 --------------------------------------
 - Guesses for unknown candidates and guesses beyond `guess_limit` are rejected by `validate`; the
-  `guess` method re-checks both (returning `accepted=False`) because several guesses buffered in
-  one round are validated against round-start state. Guesses from agents not passed to `reset`
+  `guess` method re-checks both (returning `accepted=False`). Under round_end the executor passes
+  the agent's buffered actions as `validate(..., pending=...)`, and a guess is refused at call
+  time when recorded plus buffered guesses already reach `guess_limit` (the commit would reject
+  it); a direct `validate` call without `pending` checks round-start state only. Guesses from agents not passed to `reset`
   are rejected the same way.
 - `collective_status()["guess_counts"]` lists every candidate name (zeros included), in name
   order, so the key set carries no information.
@@ -87,6 +89,7 @@ from __future__ import annotations
 
 import random
 import string
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from ..ids import AgentId
@@ -384,11 +387,16 @@ class FlagGame(World):
         self.guesses_made[agent] = self.guesses_made.get(agent, 0) + 1
         return Outcome(accepted=True, feedback={"recorded": True})
 
-    def validate(self, agent: AgentId, action: Action) -> Ack:
+    def validate(self, agent: AgentId, action: Action, pending: Sequence[Action] = ()) -> Ack:
         ack = super().validate(agent, action)
         if not ack.ok or action.name != "guess":
             return ack
         err = self._guess_error(agent, action.args["candidate"])
+        if err is None and self.guess_limit is not None:
+            buffered = sum(1 for a in pending if a.name == "guess")
+            if self.guesses_made.get(agent, 0) + buffered >= self.guess_limit:
+                err = (f"guess limit reached: at most {self.guess_limit} guesses; this one would be "
+                       "rejected at commit")
         return Ack(ok=False, error=err) if err else ack
 
     # ---- status -------------------------------------------------------------------------------

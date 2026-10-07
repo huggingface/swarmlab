@@ -144,7 +144,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 
 `ToolSchema`, `ToolCall`, `ToolResult`, `TurnCapReached` are in `tools.py` as shipped. The executor is the only mutation path. **A participant never receives the round executor itself.** It receives an agent-bound handle `AgentTools` with `agent`, `schemas() -> list[ToolSchema]`, `call(name, args) -> ToolResult`, and (M1b) `infer(request) -> response`; the handle carries the agent identity, so a participant cannot act or read as another agent and has no path to the world or board objects. `end_turn()` does not raise: it marks the turn ended and returns `ok=True`; any later call in the same turn returns `ok=False, error="turn_ended"`. `TurnCapReached` still raises after `max_calls_per_turn` calls. (`EndTurn` remains defined for backward compatibility but is no longer raised.) Namespaces: world tools from `World.tool_schemas()`; board tools `read_board(channel?, limit?)` and `post(channel, text, fields?)`; `my_status()` and `collective_status()` if the world enables them; `end_turn()` always. A call outside the agent's allowlist returns `ok=False, error="not_allowed"` and is logged.
 
-Under `commit == "round_end"`: `post` and world actions return `pending=True` with `{"id": ...}`; `read_board` returns eligible unread inbox items (`eligible_round <= round`), marks them read, logs `read`; status tools answer from round-start state. Under `commit == "immediate"`: every call applies at once and returns the real outcome with `pending=False`.
+Under `commit == "round_end"`: `post` and world actions return `pending=True` with `{"id": ...}`; `read_board` returns eligible unread inbox items (`eligible_round <= round`), marks them read, logs `read`; status tools answer from round-start state. A world action is first checked with `world.validate(agent, action, pending=<the agent's world actions buffered this round>)` (and `my_status` gets the same `pending=`), so a world can refuse at call time (`ok=False`, nothing buffered) what its commit would certainly reject, such as a per-round limit; both are passed only to overrides that accept a `pending` keyword. Under `commit == "immediate"`: every call applies at once and returns the real outcome with `pending=False`.
 
 ## 7. View
 
@@ -162,10 +162,13 @@ class World(Persistable, Plugin):
     def score(self) -> dict: ...                       # evaluator-only
     # actions: methods decorated with @tool(name, description, params); signature (self, agent, **args) -> Outcome
     # defaults, override when needed
-    def validate(self, agent, action) -> Ack            # checks the tool exists and args match the schema
+    def validate(self, agent, action, pending=()) -> Ack
+                                                        # checks the tool exists and args match the schema;
+                                                        # `pending`: the agent's actions buffered this round
     def commit(self, actions: list[tuple[AgentId, ActionId, Action]]) -> list[Outcome]
                                                         # calls the decorated method per action, in the given order
-    def my_status(self, agent) -> dict | None           # None (default) means the tool is not exposed
+    def my_status(self, agent, pending=()) -> dict | None
+                                                        # None (default) means the tool is not exposed
     def collective_status(self) -> dict | None
     def terminal(self) -> bool                          # False
     def verify(self) -> dict                            # {}

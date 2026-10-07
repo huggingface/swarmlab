@@ -7,6 +7,7 @@ import pytest
 
 from swarmlab import Board, Experiment, Run
 from swarmlab.ids import agent_id
+from swarmlab.participants.base import Participant
 from swarmlab.participants.scripted import QueuePainter, RandomPainter, RowMajorPainter
 from swarmlab.rng import derive
 from swarmlab.viewer.build import build
@@ -71,7 +72,7 @@ def test_conflict_rule_last_writer_wins_and_accounting():
     # next round: a duplicate (correct cell painted again) and the paint limit
     w.begin_round(2)
     outs = w.commit([paint(C, 1, 0, w.target[0][1]), paint(C, 2, 0, w.target[0][2], 1)])
-    assert outs[0].accepted and outs[1].feedback == {"error": "paint_limit"} and not outs[1].accepted
+    assert outs[0].accepted and outs[1].feedback == {"error": "paints_per_round", "detail": "at most 1 paint per round"} and not outs[1].accepted
     s = w.score()
     assert s["duplicate_paints"] == 1 and s["wasted_paints"] == 2 and s["paints"] == 4
 
@@ -79,8 +80,8 @@ def test_conflict_rule_last_writer_wins_and_accounting():
 def test_status_tools_and_toggles():
     w = world()
     w.commit([paint(A, 0, 0, w.target[0][0])])
-    assert w.my_status(A) == {"paints": 1, "cells_mine": 1}
-    assert w.my_status(B) == {"paints": 0, "cells_mine": 0}
+    assert w.my_status(A) == {"paints": 1, "cells_mine": 1, "paints_left_this_round": 0}
+    assert w.my_status(B) == {"paints": 0, "cells_mine": 0, "paints_left_this_round": 1}
     assert w.collective_status() == {"coverage": 1 / 12, "cells_matching": 1, "cells": 12}
     quiet = ColoringGrid(status_tools=())
     names = [s.name for s in quiet.tool_schemas()]
@@ -252,3 +253,149 @@ def test_example_spec_loads_and_runs_scripted_arms(tmp_path):
     assert arms["queue_enforced"].medium.claim_policy.type_name() == "enforced"
     run = arms["queue_enforced"].run(seed=0, out=tmp_path)
     assert run.score["coverage"] == 1.0
+
+
+# ---- paint limit at call time, status, cap notes (paint-limit change) -------------------------------
+
+def coloring_executor(tmp_path, commit="round_end", **kw):
+    from swarmlab.blobs import BlobStore
+    from swarmlab.executor import RoundExecutor
+
+    w = world(**kw)
+    board = Board()
+    board.commit_mode = commit
+    ex = RoundExecutor(run="r", round=1, world=w, board=board, blobs=BlobStore(tmp_path / "blobs"),
+                       agents=[A, B, C], commit=commit, topology_rng=lambda: derive(0, "topology", 1))
+    return w, ex
+
+
+def cell(w, i):
+    y, x = divmod(i, w.width)
+    return {"x": x, "y": y, "color": w.target[y][x]}
+
+
+async def test_round_end_refuses_a_paint_beyond_the_limit_at_call_time(tmp_path):
+    w, ex = coloring_executor(tmp_path)
+    first = await ex.call(A, "paint", cell(w, 0))
+    assert first.ok and first.pending
+    second = await ex.call(A, "paint", cell(w, 1))
+    assert not second.ok and not second.pending
+    assert second.error == ("paints_per_round: at most 1 paint per round; this one would be "
+                            "rejected at commit")
+    assert [a.args for _, _, a in ex.buffered_actions(A)] == [cell(w, 0)]  # not buffered
+    ret = ex.events(A)[-1]
+    assert ret.type == "tool_returned" and ret.result["ok"] is False
+    assert (await ex.call(B, "paint", cell(w, 1))).ok  # the limit is per agent
+    # malformed paints say why
+    bad = await ex.call(C, "paint", {"x": 9, "y": 0, "color": "r"})
+    assert bad.error.startswith("out_of_bounds: ")
+    assert (await ex.call(C, "paint", {"x": 0, "y": 0, "color": "z"})).error.startswith("bad_color: ")
+
+
+async def test_round_end_limit_counts_pending_paints_up_to_paints_per_round(tmp_path):
+    w, ex = coloring_executor(tmp_path, paints_per_round=2)
+    assert (await ex.call(A, "my_status", {})).result["paints_left_this_round"] == 2
+    assert (await ex.call(A, "paint", cell(w, 0))).ok
+    assert (await ex.call(A, "my_status", {})).result["paints_left_this_round"] == 1
+    assert (await ex.call(A, "paint", cell(w, 1))).ok
+    assert (await ex.call(A, "my_status", {})).result["paints_left_this_round"] == 0
+    third = await ex.call(A, "paint", cell(w, 2))
+    assert third.error.startswith("paints_per_round: at most 2 paints per round")
+    assert len(ex.buffered_actions(A)) == 2
+    assert (await ex.call(B, "my_status", {})).result["paints_left_this_round"] == 2
+
+
+async def test_immediate_mode_paint_limit_is_unchanged(tmp_path):
+    w, ex = coloring_executor(tmp_path, commit="immediate")
+    first = await ex.call(A, "paint", cell(w, 0))
+    assert first.ok and not first.pending and first.result["accepted"]
+    assert (await ex.call(A, "my_status", {})).result["paints_left_this_round"] == 0
+    second = await ex.call(A, "paint", cell(w, 1))  # the world's commit rejects it, as before
+    assert second.ok and not second.pending and not second.result["accepted"]
+    assert second.result["feedback"] == {"error": "paints_per_round", "detail": "at most 1 paint per round"}
+
+
+def test_validate_without_pending_keeps_old_behaviour():
+    w = world()
+    act = Action(name="paint", args=cell(w, 0))
+    assert w.validate(A, act).ok
+    assert not w.validate(A, act, pending=[act]).ok
+    assert w.validate(A, act, pending=[Action(name="other", args={})]).ok
+
+
+async def test_executor_passes_pending_only_to_worlds_that_accept_it(tmp_path):
+    from swarmlab.blobs import BlobStore
+    from swarmlab.executor import RoundExecutor
+
+    class OldStyle(ColoringGrid):
+        def validate(self, agent, action):  # written against the old signature
+            return super().validate(agent, action)
+
+        def my_status(self, agent):
+            return super().my_status(agent)
+
+    w = OldStyle(height=3, width=4)
+    w.reset(derive(0, "world"), [A])
+    w.begin_round(1)
+    ex = RoundExecutor(run="r", round=1, world=w, board=Board(), blobs=BlobStore(tmp_path / "b"),
+                       agents=[A])
+    assert (await ex.call(A, "paint", cell(w, 0))).ok
+    assert (await ex.call(A, "paint", cell(w, 1))).ok  # no pre-check: buffered, rejected at commit
+    assert (await ex.call(A, "my_status", {})).result["paints_left_this_round"] == 1
+
+
+def test_description_states_the_limit_and_wasted_paints():
+    text = ColoringGrid().description()
+    assert "at most 1 cell per round" in text and "refused" in text
+    assert "already has its target colour wastes your paint" in text
+    assert "at most 3 cells per round" in ColoringGrid(paints_per_round=3).description()
+
+
+def test_commit_feedback_says_why():
+    w = world()
+    outs = w.commit([paint(A, 9, 0, "r"), paint(A, 0, 0, "z", 1), paint(B, 0, 0, w.target[0][0]),
+                     paint(B, 1, 0, w.target[0][1], 1), paint(C, 0, 0, w.target[0][0])])
+    assert [o.feedback.get("error") or o.feedback.get("result") for o in outs] == [
+        "out_of_bounds", "bad_color", "overwritten", "paints_per_round", "painted"]
+
+
+class Spinner(Participant):
+    """Keeps painting until the cap: every call after the first is refused."""
+
+    async def turn(self, view, tools):
+        while True:
+            await tools.call("paint", {"x": 0, "y": 0, "color": "r"})
+
+
+class Busy(Participant):
+    """Keeps asking for its status until the cap: every call succeeds."""
+
+    async def turn(self, view, tools):
+        while True:
+            await tools.call("my_status", {})
+
+
+def test_cap_note_marks_spinning_turns_and_report_counts_rejected_calls(tmp_path):
+    from swarmlab.report import build_report
+
+    out = tmp_path / "runs"
+    exp = Experiment(name="cap", world=ColoringGrid(height=2, width=2),
+                     participants=[Spinner(), Busy()], metrics=GRID_METRICS)
+    run = exp.run(seed=0, max_rounds=2, out=out, max_calls_per_turn=5)
+    ended = {e["agent"]: e for e in run.events if e["type"] == "turn_ended" and e["round"] == 1}
+    spinner, busy = ended[agent_id(0)], ended[agent_id(1)]
+    assert spinner["yield_kind"] == "cap" and spinner["usage"]["notes"] == ["cap:4"]
+    assert busy["yield_kind"] == "cap" and "notes" not in busy["usage"]
+    Run.load(run.dir)  # replay reproduces the run
+    text = build_report(out, "cap")
+    assert "| rejected tool calls |" in text
+    assert "| 8/20 |" in text  # per round: spinner 4 of 5 answered calls refused, busy 0 of 5
+
+
+def test_m3_vllm_spec_caps_model_calls_per_turn():
+    import yaml  # the spec needs a vLLM base_url to build, so read it as data
+
+    doc = yaml.safe_load((REPO / "experiments" / "m3_coloring_vllm.yaml").read_text())
+    assert set(doc["arms"]) == {"s0", "claims-advisory", "claims-enforced"}
+    for arm in doc["arms"].values():
+        assert [g["params"]["max_calls"] for g in arm["participants"]] == [4]

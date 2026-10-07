@@ -22,6 +22,9 @@ Round `r` (phase-commit, `commit == "round_end"`):
    the agent called `end_turn()` during the turn, else `no_tool`; `TurnCapReached` -> `cap`; any
    other exception -> `error` (traceback in `turn_ended.error`). An exception wins over an earlier
    `end_turn()`. A returned `TurnUsage` goes to `turn_ended.usage` (also after `end_turn`).
+   On `cap`, when more than half of the turn's answered tool calls (the capping call excluded)
+   returned `ok=False`, `turn_ended.usage.notes` gets `cap:<rejected calls>` ("spinning", as
+   opposed to a busy turn of accepted calls; `RoundExecutor.rejected_calls`).
 3. After all turns, each agent's buffered events are appended in `order`.
 4. Buffered posts go to `board.buffer_post` in `order` (each agent's in call order), then
    `board.commit(r, live, derive(seed, "topology", r), blobs)`; log `post*`, `delivery*`.
@@ -996,6 +999,10 @@ class Runner:
         inferred = ex.inference_usage(agent)
         if inferred is not None:
             usage = {**usage, **inferred}
+        if kind == "cap":  # "spinning" (mostly rejected calls) vs "busy" (mostly accepted ones)
+            rejected, answered = ex.rejected_calls(agent)
+            if rejected * 2 > answered:
+                usage = {**usage, "notes": [*usage.get("notes", []), f"cap:{rejected}"]}
         ex.end_turn_event(agent, kind, usage, error)
 
     async def _round(self, r: int) -> None:

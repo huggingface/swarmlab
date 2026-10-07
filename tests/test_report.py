@@ -40,10 +40,10 @@ def since_m2(text: str) -> str:
     out, drop_blank, health = [], False, False
     for line in text.splitlines(keepends=True):
         health = health or line.startswith("## Tool protocol health")
-        if health and line.startswith("|---"):  # the max_tokens column was appended later
-            line = line.replace("---|", "", 1)
+        if health and line.startswith("|---"):  # max_tokens, rejected tool calls appended later
+            line = line.replace("---|", "", 2)
         elif health and line.startswith("|"):
-            line = line.rstrip("\n").rstrip(" |").rsplit(" | ", 1)[0] + " |\n"
+            line = line.rstrip("\n").rstrip(" |").rsplit(" | ", 2)[0] + " |\n"
         if line.startswith(("| post_rate |", "Probes skipped:")):
             drop_blank = line.startswith("Probes skipped:")
             continue

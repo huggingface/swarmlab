@@ -37,6 +37,16 @@ Decisions where the contract is silent:
   `tools.strict_violations` and providers can send it strict.
 - World actions are validated with `world.validate` at call time against current (round-start in
   round_end mode) state; a failed `Ack` returns `ok=False, error=<ack.error>` and nothing is buffered.
+  `validate` also gets `pending=`, the agent's world actions already buffered this round
+  (`pending_actions(agent)`, always empty under immediate commit), so a world can refuse at call
+  time what its commit would certainly reject (ColoringGrid `paints_per_round`, FlagGame
+  `guess_limit`). `my_status` gets the same `pending=` so it can count them (ColoringGrid
+  `paints_left_this_round`). Both are passed only when the world's override accepts a `pending`
+  keyword (checked once per executor with `inspect.signature`), so worlds written against
+  `validate(agent, action)` / `my_status(agent)` are unaffected.
+- `rejected_calls(agent) -> (rejected, answered)` counts this turn's `ok=False` returns; the
+  runner uses it to add a `cap:<rejected>` note when a turn that ended by the cap was mostly
+  rejected calls.
   In immediate mode the action is committed at once and the result is
   `{"id", "accepted", "feedback"}` with `pending=False`.
 - Status tools answer from the world's current state, which under round_end is round-start state
@@ -81,6 +91,7 @@ Decisions where the contract is silent:
 """
 from __future__ import annotations
 
+import inspect
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -114,6 +125,15 @@ from .world.base import Action, Outcome, World
 BOARD_TOOLS = ("read_board", "post")
 STATUS_TOOLS = ("my_status", "collective_status")
 REGISTRY_TOOLS = ("registry_get", *TOOL_OPS)
+
+
+def _takes_pending(fn: Callable) -> bool:
+    """True when `fn` accepts a `pending` keyword (World.validate / my_status, see base.py)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "pending" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
 
 
 def _obj(props: dict, required: list[str]) -> dict:
@@ -242,6 +262,8 @@ class RoundExecutor:
         self._state: dict[AgentId, _AgentState] = {}
         self.committed = Committed()
         self._world_tools = {s.name: s for s in world.tool_schemas()}
+        self._validate_pending = _takes_pending(world.validate)
+        self._status_pending = _takes_pending(world.my_status)
 
     # ---- per-agent bookkeeping ---------------------------------------------------------------
     def _st(self, agent: AgentId) -> _AgentState:
@@ -293,6 +315,17 @@ class RoundExecutor:
 
     def buffered_actions(self, agent: AgentId) -> list[tuple[AgentId, ActionId, Action]]:
         return list(self._st(agent).actions)
+
+    def pending_actions(self, agent: AgentId) -> list[Action]:
+        """The agent's world actions buffered this round, in call order (empty under immediate)."""
+        return [a for _, _, a in self._st(agent).actions]
+
+    def rejected_calls(self, agent: AgentId) -> tuple[int, int]:
+        """(rejected, answered) tool calls of `agent` this round: `tool_returned` events with
+        `ok=False`, and all `tool_returned` events, both without the call that hit the cap."""
+        rets = [e for e in self._st(agent).events if isinstance(e, ToolReturnedEvent)
+                and e.result.get("error") != "cap"]
+        return sum(1 for e in rets if not e.result.get("ok")), len(rets)
 
     # ---- ToolExecutor ------------------------------------------------------------------------
     def _allowed(self, agent: AgentId, name: str) -> bool:
@@ -502,14 +535,19 @@ class RoundExecutor:
     def _status(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
         if args:
             return self._err(call_id, "bad args: takes no arguments")
-        value = self.world.my_status(agent) if name == "my_status" else self.world.collective_status()
+        if name == "my_status":
+            value = (self.world.my_status(agent, pending=self.pending_actions(agent))
+                     if self._status_pending else self.world.my_status(agent))
+        else:
+            value = self.world.collective_status()
         if value is None:
             return self._err(call_id, "not_allowed")
         return ToolResult(call_id=call_id, ok=True, result=dict(value))
 
     def _world_action(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
         action = Action(name=name, args=args)
-        ack = self.world.validate(agent, action)
+        ack = (self.world.validate(agent, action, pending=self.pending_actions(agent))
+               if self._validate_pending else self.world.validate(agent, action))
         if not ack.ok:
             return self._err(call_id, ack.error or "rejected")
         st = self._st(agent)
