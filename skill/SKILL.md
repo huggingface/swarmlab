@@ -79,6 +79,13 @@ next item.
 
 - **Change the spec, never the code, to change the hypothesis.** One arm per condition; arms of
   one experiment differ only in the manipulated variable. `swarmlab prompts` shows what differs.
+- **Change prompts through params, then diff.** An `llm` group's `system_prompt_append: "..."`
+  adds text after the default prompt's task section (before the tool list); `system_prompt`
+  replaces the whole Jinja2 template (variables `agent`, `role`, `description`, `tools`,
+  `system_prompt_append`; `file:<path>` works). Prefer the append: copying the template invites
+  accidental differences. `swarmlab prompts SPEC.yaml --arm A > A.txt` per arm, then `diff`, must
+  show only the manipulated text. The default prompt already lists every tool (`read_board`,
+  `post`), so a "mention the board" arm is a nudge, not awareness.
 - **Resume or fork instead of rerunning.** A crashed or budget-ended run continues with
   `swarmlab resume RUN_DIR [--budget-hard X]`; a counterfactual from round R is
   `swarmlab fork RUN_DIR --at R --spec edited.yaml`. Both reuse the inference cache, so the

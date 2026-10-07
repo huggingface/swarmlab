@@ -90,6 +90,29 @@ class Counter(World):
 - Each `inference_response` event records `attempts`; a call that still fails after its retries raises `ProviderError`.
 - **Budgets** (USD, per run): `soft_usd` ends the run at the next round boundary once agent spend reaches it; `hard_usd` is an absolute ceiling on agent + probe spend (the round in flight is discarded and `swarmlab resume RUN --budget-hard X` continues); `measurement_usd` caps probes. 0 means "not enforced", so set `hard_usd` before using a paid model. These caps are per run; `total_usd` (top-level `budget:` only) caps the whole experiment: `swarmlab run` (and `Experiment.run_all`) starts a run only if the spend of the runs before it plus its `hard_usd` fits under `total_usd`, otherwise it stops and lists the skipped runs. `run` prints every arm's caps and the total cap before starting, and warns when `hard_usd - soft_usd` is less than one round's estimated cost (the soft budget is checked between rounds, so a round can start under it, hit the hard ceiling and be discarded). When any budget is non-zero `run` asks before starting (`--yes` skips the question); `swarmlab estimate spec.yaml` prints the estimate alone (every arm x seed; `--arm`/`--seed` narrow it, `--prompt-growth TOKENS` models a context that grows each round under full memory).
 
+## Changing what agents are told
+
+An `llm` participant's system prompt is a Jinja2 template, rendered once per agent at its first turn; the default is `swarmlab/participants/prompts/default_system.j2` (who the agent is, the task description, how rounds and tools work, then the tool list). Two params change it, per participant group:
+
+- `system_prompt_append: "One more sentence."` adds plain text after the task section and before `Tools:`, leaving the rest of the default prompt as is. Use it for "one sentence differs" arms. It is recorded in the run spec only when set, so arms without it keep their spec hash.
+- `system_prompt: |` replaces the whole template (inline text, or `"file:prompts/mine.j2"`). Template variables: `agent` (id, e.g. `a003`), `role` (the `role` param, default `worker`), `description` (the world's task description, may be empty), `tools` (list with `.name`, `.description`, `.parameters`) and `system_prompt_append` (empty unless set; a custom template that does not use it gets the appended text at its end). Undefined variables are errors.
+
+```yaml
+participants:
+  - type: llm
+    count: 6
+    params:
+      model: "anthropic:claude-haiku-4-5"
+      system_prompt_append: "A shared message board exists: `read_board` shows what other agents have posted."
+```
+The round message (round number, observation, last round's outcomes, deliveries) is fixed by the agent and the world. Check what each arm actually sends, with no model call, and diff two arms:
+```
+swarmlab prompts exp.yaml --arm default > default.txt
+swarmlab prompts exp.yaml --arm board > board.txt
+diff default.txt board.txt      # should show only the manipulated sentence
+```
+Note that the default prompt already lists every tool the world and board offer (`read_board`, `post`, ...), so an "agents are told about the board" arm tests a nudge, not awareness.
+
 ## CLI
 
 ```

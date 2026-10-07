@@ -2,7 +2,8 @@
 
 `LLMAgent(model, system_prompt=None, memory="full", window_rounds=3, max_tokens=2048,
 temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker",
-extra=None, text_tool_fallback=False)`, entry point `llm`.
+extra=None, text_tool_fallback=False, context_limit_tokens=None, overflow="drop_oldest",
+summary_model=None, system_prompt_append=None)`, entry point `llm`.
 
 **max_tokens** defaults to 2048 (was 1024). In the 2026-10-06 smoke, Qwen3.5-9B with thinking on
 spent the whole 1024-token budget reasoning (`finish_reason="length"`, empty text, no tool call)
@@ -33,7 +34,11 @@ model call, and `notes`, e.g. `"length"` when a response hit `max_tokens` and
 (`view.tools`, `ToolSchema` objects). The default is `prompts/default_system.j2`;
 `system_prompt` replaces it with a template string or `file:<path>` (read at render time; the
 path is what goes into `params`). Rendering uses `trim_blocks`/`lstrip_blocks` and
-`StrictUndefined`. Under `tool_protocol="json"` a fixed JSON-protocol section (with each tool's
+`StrictUndefined`. `system_prompt_append` (text, not a template) adds to the prompt without
+copying it: it is the template variable `system_prompt_append` (empty when unset), which the
+default template places after the task section and before `Tools:`; a custom `system_prompt`
+that never names the variable gets the text appended at its end. It is in `params` (and the spec
+hash) only when set, so the default prompt and existing hashes are unchanged. Under `tool_protocol="json"` a fixed JSON-protocol section (with each tool's
 parameter schema, since no tools go through the provider API) is appended after the template.
 
 **Round message.** One user message per round, a list of `Part`s: `Round {r}.`, the observation
@@ -157,16 +162,24 @@ _ENV = jinja2.Environment(trim_blocks=True, lstrip_blocks=True, undefined=jinja2
 
 
 def render_system_prompt(template: str | None, *, agent: str, role: str, description: str,
-                         tools: list[ToolSchema]) -> str:
-    """Render `template` (text, `file:<path>`, or None for the default) with the agent's context."""
+                         tools: list[ToolSchema], append: str | None = None) -> str:
+    """Render `template` (text, `file:<path>`, or None for the default) with the agent's context.
+
+    `append` (`system_prompt_append`) is the template variable `system_prompt_append`; the
+    default template puts it after the task section, before the tool list. A custom template
+    that does not use the variable gets it appended at the end."""
     if template is None:
         text = DEFAULT_SYSTEM_TEMPLATE.read_text()
     elif template.startswith("file:"):
         text = Path(template[len("file:"):]).read_text()
     else:
         text = template
-    return _ENV.from_string(text).render(agent=agent, role=role, description=description,
-                                         tools=tools).strip()
+    extra = (append or "").strip()
+    out = _ENV.from_string(text).render(agent=agent, role=role, description=description,
+                                        tools=tools, system_prompt_append=extra).strip()
+    if extra and "system_prompt_append" not in text:
+        out += "\n\n" + extra
+    return out
 
 
 def json_protocol_text(tools: list[ToolSchema]) -> str:
@@ -359,6 +372,7 @@ class LLMAgent(Participant):
         context_limit_tokens: int | None = None,
         overflow: Literal["drop_oldest", "summarize", "fail_turn"] = "drop_oldest",
         summary_model: str | None = None,
+        system_prompt_append: str | None = None,
     ) -> None:
         if memory not in ("full", "window"):
             raise ValueError(f"memory must be 'full' or 'window', got {memory!r}")
@@ -397,6 +411,9 @@ class LLMAgent(Participant):
         self.overflow = overflow
         self.summary_model = summary_model
         self._overflow_events: list[dict] = []
+        if system_prompt_append is None:  # in params (and the spec hash) only when set
+            params.pop("system_prompt_append", None)
+        self.system_prompt_append = system_prompt_append
         # conversation state (plain data, snapshotted by Persistable)
         self.system: str | None = None
         self.rounds: list[dict] = []
@@ -500,7 +517,8 @@ class LLMAgent(Participant):
     # ---- the loop ----------------------------------------------------------------------------
     def _render_system(self, view: View) -> str:
         text = render_system_prompt(self.system_prompt, agent=str(self.agent), role=self.role,
-                                    description=view.description, tools=view.tools)
+                                    description=view.description, tools=view.tools,
+                                    append=getattr(self, "system_prompt_append", None))
         if self.tool_protocol == "json":
             text += "\n\n" + json_protocol_text(view.tools)
         return text
