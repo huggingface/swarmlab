@@ -136,6 +136,7 @@ from .events import (
     Event,
     EventLog,
     MetricEvent,
+    OverflowEvent,
     PostEvent,
     ProbeEvent,
     RoundCommittedEvent,
@@ -847,11 +848,14 @@ class Runner:
             raise
         except TurnCapReached:
             kind = "cap"
-        except Exception:  # noqa: BLE001 - any participant failure ends its turn as "error"
+        except Exception as e:  # noqa: BLE001 - any participant failure ends its turn as "error"
             kind = "error"
-            error = traceback.format_exc()
+            error = getattr(e, "turn_error", None) or traceback.format_exc()  # M3a: e.g. context_limit
         if ex.hard_ceiling:  # the participant swallowed it; the round is aborted all the same
             raise HardCeilingReached(f"{agent}: hard ceiling reached during the turn")
+        drain = getattr(self.participants[agent], "drain_overflow", None)  # M3a §3 context limit
+        for fields in drain() if callable(drain) else ():
+            ex.note(OverflowEvent, agent, **fields)
         inferred = ex.inference_usage(agent)
         if inferred is not None:
             usage = {**usage, **inferred}

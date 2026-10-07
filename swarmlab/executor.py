@@ -194,6 +194,10 @@ class RoundExecutor:
         self._ev(TurnEndedEvent, agent, yield_kind=yield_kind, calls=st.calls,
                  usage=dict(usage or {}), error=error)
 
+    def note(self, cls: type[Event], agent: AgentId, **kw: Any) -> Event:
+        """Buffer a participant-reported event (M3a: `overflow`) with the agent's turn events."""
+        return self._ev(cls, agent, **kw)
+
     def events(self, agent: AgentId) -> list[Event]:
         return list(self._st(agent).events)
 

@@ -77,12 +77,52 @@ cannot mutate the agent's memory through them); `model_request_defaults()` retur
 temperature, max_tokens, thinking_budget, extra`.
 
 `TurnUsage.calls` counts executed tool calls; tokens and cost are filled in by the executor.
+
+**Context limit** (M3a §3; `context_limit_tokens=None`, `overflow="drop_oldest"`,
+`summary_model=None`). Before every model request of a turn the prompt (system + memory + tool
+schemas) is estimated with the provider's `estimate_prompt_tokens`; the provider is a preset
+resolved from the model prefix once per agent (`providers.preset`), falling back to ceil(chars/4)
+of the request JSON when no preset can be built (e.g. `vllm` without a base url). Experiment-level
+provider overrides are not visible to a participant; every built-in provider uses the base
+estimator anyway. If the estimate exceeds the limit:
+
+- `drop_oldest`: whole memory entries are removed from the front until the estimate fits. The
+  system prompt and the current round (the last entry) are never dropped; if only those remain
+  and it still does not fit, the request is sent as is (the event's `tokens_after` stays over
+  the limit). This is checked before each request, so a long current round can trigger further
+  drops mid-turn.
+- `summarize`: entries are dropped from the front until the estimate plus `SUMMARY_MAX_TOKENS`
+  (room for the note) fits, then one `infer(category="measurement")` call on `summary_model`
+  (default `DEFAULT_SUMMARY_MODEL`, Claude Haiku 4.5, DESIGN's cheap model; `max_tokens=400`,
+  `temperature=0`, no tools) turns the dropped entries into a note of under 200 words that keeps
+  beliefs, evidence and decisions. The note is stored as a memory entry
+  `{"round": <last dropped round>, "from_round": <first summarised round>, "summary": True,
+  "messages": [assistant message]}` (text `[Summary of my earlier rounds a-b]` + the note) in front of
+  the remaining rounds, so it persists in snapshots and `probe_context()`. An earlier note is
+  dropped first and so is folded into the next one. If the measurement budget refuses the call
+  (`MeasurementBudgetReached`), the entries stay dropped without a note and the event carries
+  `detail="measurement_budget"`; `HardCeilingReached` propagates. `summary_model` is not priced at
+  `Experiment` construction; the gate resolves it at call time.
+- `fail_turn`: the turn ends at once by raising `ContextLimitExceeded`, whose `turn_error`
+  (`"context_limit"`) the runner writes as `turn_ended.error` with `yield_kind="error"`. Memory
+  keeps the current round's messages (what the agent saw), so later turns overflow too unless the
+  window memory makes room.
+
+Every overflow (one per trimming, also under `fail_turn` and when nothing could be dropped)
+appends `{policy, dropped_rounds, tokens_before, tokens_after[, detail]}` to a transient list the
+runner drains after the turn (`drain_overflow()`) into `overflow` events, placed after the turn's
+tool events and before `turn_ended`. `dropped_rounds` counts real rounds (a dropped summary note is
+not a round). Window trimming happens first, at turn start. A summary note counts as one entry of
+the window. Dropped messages are gone from memory by design, so snapshots, resume and forks see
+the trimmed memory. `context_limit_tokens`, `overflow` and `summary_model` are in `params` (and the
+spec hash) only when set: `overflow` and `summary_model` only together with a limit.
 """
 from __future__ import annotations
 
 import ast
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -90,8 +130,10 @@ from typing import Any, ClassVar, Literal
 import jinja2
 from pydantic import Field
 
+from ..budget import MeasurementBudgetReached
 from ..probes import strip_reasoning
-from ..providers.base import ChatMessage, ChatRequest
+from ..providers.base import ChatMessage, ChatRequest, split_model, text_of
+from ..spec import canonical_json
 from ..tools import AgentTools, ToolCall, ToolSchema
 from ..view import Part, View
 from .base import Participant, TurnUsage
@@ -251,6 +293,41 @@ def parse_text_tool_calls(text: str, tools: list[ToolSchema]) -> list[tuple[str,
     return [c for c in calls if c[0] in names]
 
 
+# ---- context limit (M3a §3) ---------------------------------------------------------------------
+OVERFLOW_POLICIES = ("drop_oldest", "summarize", "fail_turn")
+DEFAULT_SUMMARY_MODEL = "anthropic:claude-haiku-4-5"
+SUMMARY_MAX_TOKENS = 400
+SUMMARY_SYSTEM = (
+    "You compress the earlier part of an agent's conversation so it fits its context window. "
+    "Write one note, in the agent's first person and under 200 words, that preserves: its current "
+    "beliefs (with confidence), the evidence behind them (what it saw or was told, by whom, in "
+    "which round), and the decisions, actions and commitments it has made. Drop pleasantries and "
+    "repetition. Reply with the note only, as plain text."
+)
+
+
+class ContextLimitExceeded(RuntimeError):
+    """`overflow="fail_turn"`: the prompt is over the limit; the runner ends the turn as an error."""
+
+    turn_error = "context_limit"
+
+
+def _render_for_summary(entries: list[dict]) -> str:
+    lines: list[str] = []
+    for entry in entries:
+        head = "Earlier summary" if entry.get("summary") else f"Round {entry.get('round')}"
+        lines.append(f"## {head}")
+        for raw in entry["messages"]:
+            m = ChatMessage.model_validate(raw)
+            body = text_of(m.content)
+            if not isinstance(m.content, str) and any(p.type == "image" for p in m.content):
+                body += "\n[image]"
+            for tc in m.tool_calls or []:
+                body += f"\n[call] {tc.name}({canonical_json(tc.args)})"
+            lines.append(f"{m.role}: {body.strip()}")
+    return "\n".join(lines)
+
+
 class LLMTurnUsage(TurnUsage):
     """`TurnUsage` plus per-turn diagnostics (lands in `turn_ended.usage`)."""
 
@@ -279,6 +356,9 @@ class LLMAgent(Participant):
         role: str = "worker",
         extra: dict | None = None,
         text_tool_fallback: bool = False,
+        context_limit_tokens: int | None = None,
+        overflow: Literal["drop_oldest", "summarize", "fail_turn"] = "drop_oldest",
+        summary_model: str | None = None,
     ) -> None:
         if memory not in ("full", "window"):
             raise ValueError(f"memory must be 'full' or 'window', got {memory!r}")
@@ -300,6 +380,23 @@ class LLMAgent(Participant):
         self.role = role
         self.extra = dict(extra or {})
         self.text_tool_fallback = bool(text_tool_fallback)
+        # ---- context limit (M3a §3): params only when set, so existing spec hashes stay ----
+        if context_limit_tokens is not None and context_limit_tokens < 1:
+            raise ValueError("context_limit_tokens must be >= 1 or None")
+        if overflow not in OVERFLOW_POLICIES:
+            raise ValueError(f"overflow must be one of {OVERFLOW_POLICIES}, got {overflow!r}")
+        if summary_model is not None:
+            split_model(summary_model)
+        params = getattr(self, "params", {})
+        if context_limit_tokens is None:
+            for k in ("context_limit_tokens", "overflow", "summary_model"):
+                params.pop(k, None)
+        elif summary_model is None:
+            params.pop("summary_model", None)
+        self.context_limit_tokens = context_limit_tokens
+        self.overflow = overflow
+        self.summary_model = summary_model
+        self._overflow_events: list[dict] = []
         # conversation state (plain data, snapshotted by Persistable)
         self.system: str | None = None
         self.rounds: list[dict] = []
@@ -313,6 +410,75 @@ class LLMAgent(Participant):
         return {"model": self.model, "temperature": self.temperature,
                 "max_tokens": self.max_tokens, "thinking_budget": self.thinking_budget,
                 "extra": dict(self.extra)}
+
+    # ---- context limit (M3a §3) ----------------------------------------------------------------
+    def drain_overflow(self) -> list[dict]:
+        """Overflow records of the last turn (the runner turns them into `overflow` events)."""
+        out, self._overflow_events = list(getattr(self, "_overflow_events", [])), []
+        return out
+
+    def _estimate_tokens(self, request: ChatRequest) -> int:
+        est = getattr(self, "_estimator", None)
+        if est is None:
+            from ..providers import preset
+
+            try:
+                est = preset(split_model(self.model)[0])
+            except Exception:  # noqa: BLE001 - no preset (e.g. vllm without base url): chars/4
+                est = False
+            self._estimator = est
+        if est:
+            return est.estimate_prompt_tokens(request)
+        return math.ceil(len(canonical_json(request.model_dump(mode="json",
+                                                               include={"messages", "tools"}))) / 4)
+
+    async def _enforce_context_limit(self, tools_offered: list[ToolSchema], tools: AgentTools) -> None:
+        """Apply the overflow policy if the next request would exceed `context_limit_tokens`."""
+        limit = self.context_limit_tokens
+        if limit is None:
+            return
+        before = self._estimate_tokens(self._request(tools_offered))
+        if before <= limit:
+            return
+        record = {"policy": self.overflow, "dropped_rounds": 0, "tokens_before": before,
+                  "tokens_after": before}
+        if self.overflow == "fail_turn":
+            self._overflow_events.append(record)
+            raise ContextLimitExceeded(f"prompt estimate {before} > context_limit_tokens {limit}")
+        reserve = SUMMARY_MAX_TOKENS if self.overflow == "summarize" else 0
+        dropped: list[dict] = []
+        est = before
+        while len(self.rounds) > 1 and est + reserve > limit:
+            dropped.append(self.rounds.pop(0))
+            est = self._estimate_tokens(self._request(tools_offered))
+        record["dropped_rounds"] = sum(1 for e in dropped if not e.get("summary"))
+        if self.overflow == "summarize" and dropped:
+            note = await self._summarize(dropped, tools)
+            if note is None:
+                record["detail"] = "measurement_budget"
+            else:
+                self.rounds.insert(0, {"round": dropped[-1]["round"], "from_round": note[0],
+                                       "summary": True, "messages": [ChatMessage(
+                                           role="assistant", content=note[1]).model_dump(mode="json")]})
+            est = self._estimate_tokens(self._request(tools_offered))
+        record["tokens_after"] = est
+        self._overflow_events.append(record)
+
+    async def _summarize(self, dropped: list[dict], tools: AgentTools) -> tuple[int, str] | None:
+        first = dropped[0].get("from_round", dropped[0]["round"])
+        req = ChatRequest(
+            model=self.summary_model or DEFAULT_SUMMARY_MODEL, max_tokens=SUMMARY_MAX_TOKENS,
+            temperature=0.0, tools=[], messages=[
+                ChatMessage(role="system", content=SUMMARY_SYSTEM),
+                ChatMessage(role="user", content=f"Agent: {self.agent}\n\n"
+                            + _render_for_summary(dropped)),
+            ])
+        try:
+            resp = await tools.infer(req, category="measurement")
+        except MeasurementBudgetReached:
+            return None
+        text = strip_reasoning(resp.text or "").strip()
+        return first, f"[Summary of my earlier rounds {first}-{dropped[-1]['round']}]\n{text}"
 
     # ---- the loop ----------------------------------------------------------------------------
     def _render_system(self, view: View) -> str:
@@ -361,7 +527,9 @@ class LLMAgent(Participant):
         model_calls = 0
         retried = False
         usage = LLMTurnUsage()
+        self._overflow_events = []
         while self.max_calls is None or model_calls < self.max_calls:
+            await self._enforce_context_limit(view.tools, tools)  # M3a §3 context limit
             resp = await tools.infer(self._request(view.tools))
             model_calls += 1
             usage.finish_reasons.append(resp.finish_reason)
