@@ -18,10 +18,12 @@ uv run --project ~/swarmlab swarmlab view runs/demo__gossip__s1   # writes the r
 
 ```
 run                  outcome  end         score                                 spend
-demo__broadcast__s1  ran      max_rounds  accuracy=1, n_guessed=8, truth=G      $0.2556
-demo__gossip__s1     ran      max_rounds  accuracy=0.875, n_guessed=8, truth=G  $0.2362
+demo__broadcast__s1  ran      max_rounds  accuracy=1, n_guessed=8, truth=G      $0.2577 (simulated)
+demo__broadcast__s2  ran      max_rounds  accuracy=1, n_guessed=8, truth=H      $0.2577 (simulated)
+demo__gossip__s1     ran      max_rounds  accuracy=0.625, n_guessed=8, truth=G  $0.2383 (simulated)
 ...
 ```
+`(simulated)` marks runs on `fake:` models only: the spend is computed from a nominal price table and nothing is billed.
 `--arm A` and `--seed N` narrow it; `--json` prints one JSON object. `demo.py` is the same experiment in Python (`python demo.py`).
 
 ## What exists

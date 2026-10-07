@@ -15,7 +15,7 @@ Last checked against main on 2026-10-07. Items fixed since the first version (pe
 
 - `Experiment.estimate` / `swarmlab estimate` assume the per-turn call cap every turn and overstate real spend 4-6x unless you pass `--calls-per-turn` and `--prompt-growth` by hand; there is no mode seeded from a measured run yet.
 - `estimate` prices each participant by its own model, not a role's `model` override.
-- Fake-provider runs report a non-zero "spend" (the fake pricing table); `swarmlab report` labels them simulated, the `run` table and `run.json` do not.
+- Fake-provider runs report a non-zero "spend" (the fake pricing table); `swarmlab report`, the `run` table and status lines label it `(simulated)`, `run.json` does not.
 - A fork's `Run.spend` includes the parent's prefix spend (correct for the ledger, confusing in tables); "inherited" and "new" are not shown separately.
 - Probe-sourced metrics must be declared as `{type: belief.consensus, params: {source: "probe:belief"}}`; the string `belief.consensus@probe:belief` is only the resulting metric name and is rejected in the `metrics:` list.
 - `swarmlab validate` rejects specs that use `vllm:` models ("provider 'vllm' needs a base_url") because the base_url is injected only by `swarmlab job run`. Use `job run` (without `--launch`) as the validator for them, or give `providers: {vllm: {type: openai_compat, params: {name: vllm, base_url: ...}}}`.

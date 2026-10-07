@@ -34,7 +34,9 @@ Decisions where the contract is silent:
   soft = swarm spend + X and hard = swarm + measurement spend + X (only the enforced ones).
   `resume` prints the spend so far and the budget it resumes with (stderr under --json).
 - Run summaries (status line of `run`, `resume`, `replay`, `fork`, ...) carry
-  `spend=$x.xxx (swarm $a + measurement $b)` from the ledger, and for runs with probes
+  `spend=$x.xxx (swarm $a + measurement $b)` from the ledger (followed by `(simulated)` when the
+  run calls only `fake:` models: nominal prices, nothing billed; JSON `simulated: true`; the
+  `run` table's spend column says the same), and for runs with probes
   `probes_skipped=N (reason n, ...)` (`Run.probes_skipped()`); the JSON adds `spend_usd`, and
   `resume --json` adds the `budget` it resumed with.
 - Setup UX: `run SPEC` without `--arm`/`--seed` runs every arm (document order) x every seed in
@@ -120,9 +122,14 @@ def _build(spec: Path, arm: str | None) -> Experiment:
 
 
 def summary(run: Run) -> dict[str, Any]:
-    """`Run.summary()` plus `spend_usd` (ledger swarm + measurement, discarded rounds included)."""
+    """`Run.summary()` plus `spend_usd` (ledger swarm + measurement, discarded rounds included)
+    and `simulated: true` when every model the run calls is a `fake:` model."""
+    from .report import is_simulated
+
     data = run.summary()
     data["spend_usd"] = ledger_total(data.get("spend"))
+    if is_simulated(run.meta):
+        data["simulated"] = True  # only fake: models: the spend is nominal, nothing is billed
     return data
 
 
@@ -153,6 +160,7 @@ def _human(data: dict[str, Any]) -> str:
     lines = [
         (f"run {data['run_id']}  status={data['status']}  end={data['end_reason']}  "
          f"rounds={data['last_round']}  {_spend_text(data.get('spend'))}"
+         + (" (simulated)" if data.get("simulated") else "")
          + _skips_text(data.get("probes_skipped"))),
         f"  dir    {data['run_dir']}",
         f"  spec   {str(data['spec_hash'])[:16]}",
@@ -330,6 +338,8 @@ def _table(rows: list[dict[str, Any]]) -> str:
         spend = r.get("spend") or {}
         total = (spend.get("swarm") or 0) + (spend.get("measurement") or 0) if spend else None
         money = _usd(total)
+        if r.get("simulated") and total is not None:
+            money += " (simulated)"
         if r.get("self_hosted"):
             money += " +compute (self-hosted)"
         body.append((r.get("run_id") or "?", r["outcome"], str(r.get("end_reason") or "-"),

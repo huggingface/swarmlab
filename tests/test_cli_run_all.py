@@ -93,3 +93,25 @@ def test_python_run_all_summary_and_load(tmp_path):
     llm = arms["llm"]
     est = llm.estimate(seed=1, max_rounds=2, seeds=[1, 2, 3])
     assert est["runs"] == 3 and est["total_usd"] == pytest.approx(3 * est["usd"])
+
+
+def test_fake_spend_is_labelled_simulated(tmp_path):
+    out = tmp_path / "runs"
+    res, _ = invoke("run", EXAMPLE, "--max-rounds", 2, "--out", out, "--arm", "llm", "--yes")
+    assert res.exit_code == 0, res.output
+    row = next(line for line in res.stdout.splitlines()
+               if line.startswith("flaggame-m1a__llm__s") and " ran " in line)
+    assert row.rstrip().endswith("(simulated)") and "$" in row
+    res, data = invoke("replay", next(out.iterdir()), "--json")
+    assert data["simulated"] is True
+    res, _ = invoke("replay", next(out.iterdir()))
+    assert ") (simulated)" in res.stdout.splitlines()[0]
+
+
+def test_readme_sample_labels_simulated_spend():
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    sample = readme.split("and ends with a table:")[1].split("```")[1]
+    rows = [line for line in sample.splitlines() if line.startswith("demo__")]
+    assert rows and all(line.endswith("(simulated)") for line in rows)
