@@ -21,6 +21,19 @@ arms:
     metrics: [belief.consensus, {type: belief.consensus, params: {source: "probe:belief"}}]
 """
 
+SPENDS = """\
+name: spends
+budget: {hard_usd: 0.05}
+providers:
+  fake: {type: fake, params: {pricing: {"*": [10.0, 50.0, 1.0]}}}
+options: {max_rounds: 3}
+arms:
+  A:
+    world: {type: flaggame}
+    participants: [{type: llm, count: 2, params: {model: "fake:reader", max_tokens: 64, max_calls: 2}}]
+    metrics: [belief.consensus]
+"""
+
 
 def test_estimate_command():
     res, data = invoke("estimate", EXAMPLE, "--arm", "llm", "--seed", 1, "--json")
@@ -101,3 +114,36 @@ def test_resume_with_budget_flags(tmp_path):
     meta = json.loads((Run(run_dir).dir / "run.json").read_text())
     assert meta["budget"] == {"soft_usd": 0.0, "hard_usd": 5.0, "measurement_usd": 1.0}
     assert any(e["type"] == "budget_changed" for e in Run(run_dir).events)
+
+
+def test_resume_reports_spend_and_add_budget_is_relative_to_it(tmp_path):
+    spec = tmp_path / "spends.yaml"
+    spec.write_text(SPENDS)
+    res, data = invoke("run", spec, "--seed", 1, "--out", tmp_path, "--json", "--yes")
+    assert data["end_reason"] == "hard_ceiling"
+    spent = data["spend"]["swarm"] + data["spend"]["measurement"]
+    assert data["spend_usd"] == pytest.approx(spent) and spent > 0
+    run_dir = data["run_dir"]
+    res, _ = invoke("replay", run_dir)
+    assert f"spend=${spent:.3f} (swarm ${data['spend']['swarm']:.3f} + measurement $" in res.stdout
+    # the help says the budget flags are run totals
+    import typer
+
+    from swarmlab.cli import app
+
+    opts = {p.name: p.help for p in typer.main.get_command(app).commands["resume"].params}
+    for name in ("budget_soft", "budget_hard"):
+        assert "including spend already recorded (discarded rounds included)" in opts[name]
+    res, _ = invoke("resume", run_dir, "--add-budget", 1, "--budget-hard", 2)
+    assert res.exit_code == 2 and "cannot be combined" in res.stderr
+    res, out = invoke("resume", run_dir, "--add-budget", 0.5, "--json")
+    assert res.exit_code == 0, res.output
+    assert f"spend=${spent:.3f}" in res.stderr  # printed before resuming
+    assert out["budget"]["hard_usd"] == pytest.approx(spent + 0.5)
+    assert out["budget"]["soft_usd"] == 0  # not enforced before, still not enforced
+    assert out["end_reason"] == "max_rounds" and out["spend_usd"] >= spent
+    meta = json.loads((Run(run_dir).dir / "run.json").read_text())
+    assert meta["budget"]["hard_usd"] == pytest.approx(spent + 0.5)
+    res, _ = invoke("resume", run_dir)
+    status = next(ln for ln in res.stdout.splitlines() if ln.startswith("run "))
+    assert res.exit_code == 0 and "status=ended" in status and "spend=$" in status

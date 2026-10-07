@@ -29,7 +29,13 @@ Decisions where the contract is silent:
   [--seed N] [--max-rounds R] [--calls-per-turn C]` prints the same dict (default
   calls_per_turn: the worst case as above). `resume` takes `--budget-soft/--budget-hard/
   --budget-measurement`; given any of them, the effective budget (`run.json["budget"]`) is
-  updated with those fields and passed to `Run.resume(budget=...)`.
+  updated with those fields and passed to `Run.resume(budget=...)`. The values are run totals
+  (the ledger, discarded rounds included, counts against them). `--add-budget X` sets
+  soft = swarm spend + X and hard = swarm + measurement spend + X (only the enforced ones).
+  `resume` prints the spend so far and the budget it resumes with (stderr under --json).
+- Run summaries (status line of `run`, `resume`, `replay`, `fork`, ...) carry
+  `spend=$x.xxx (swarm $a + measurement $b)` from the ledger; the JSON adds `spend_usd`, and
+  `resume --json` adds the `budget` it resumed with.
 - Setup UX: `run SPEC` without `--arm`/`--seed` runs every arm (document order) x every seed in
   the YAML's `seeds:` (default `[0]`); `--arm`/`--seed` narrow it. With one arm and a `--seed`
   (the M1a form) the output is the single run summary as before; otherwise it is
@@ -99,7 +105,16 @@ def _build(spec: Path, arm: str | None) -> Experiment:
 
 
 def summary(run: Run) -> dict[str, Any]:
-    return run.summary()
+    """`Run.summary()` plus `spend_usd` (ledger swarm + measurement, discarded rounds included)."""
+    data = run.summary()
+    data["spend_usd"] = ledger_total(data.get("spend"))
+    return data
+
+
+def _spend_text(spend: dict | None) -> str:
+    spend = spend or {}
+    swarm, meas = float(spend.get("swarm") or 0), float(spend.get("measurement") or 0)
+    return f"spend=${swarm + meas:.3f} (swarm ${swarm:.3f} + measurement ${meas:.3f})"
 
 
 def _fmt(v: Any) -> str:
@@ -113,7 +128,7 @@ def _human(data: dict[str, Any]) -> str:
         return "\n".join(f"{k}: {v}" for k, v in data.items())
     lines = [
         (f"run {data['run_id']}  status={data['status']}  end={data['end_reason']}  "
-         f"rounds={data['last_round']}"),
+         f"rounds={data['last_round']}  {_spend_text(data.get('spend'))}"),
         f"  dir    {data['run_dir']}",
         f"  spec   {str(data['spec_hash'])[:16]}",
         "  score  " + ", ".join(f"{k}={_fmt(v)}" for k, v in (data["score"] or {}).items()),
@@ -125,6 +140,8 @@ def _human(data: dict[str, Any]) -> str:
                 "published"):
         if key in data:
             lines.append(f"  {key} {data[key]}")
+    if isinstance(data.get("budget"), dict):
+        lines.append("  " + _budget_text(data["budget"]))
     return "\n".join(lines)
 
 
@@ -365,7 +382,7 @@ def run(
             state, found = exp.existing(sd, max_rounds, out)
             if state == "same" and not rerun and found is not None:
                 _say(f"{rid}: exists, skipping ({found.dir})", as_json)
-                rows.append({**found.summary(), "outcome": "skipped"})
+                rows.append({**summary(found), "outcome": "skipped"})
                 continue
             spent = sum(ledger_total(r.get("spend")) for r in rows)
             why = total_cap_refusal(spent, exp.budget.hard_usd, total_cap)
@@ -383,7 +400,7 @@ def run(
             if not single:
                 _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
             r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
-            rows.append({**r.summary(), "outcome": "ran"})
+            rows.append({**summary(r), "outcome": "ran"})
         except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
             msg = f"{type(e).__name__}: {e}"
             print(f"error: {rid}: {msg}", file=sys.stderr)
@@ -520,23 +537,51 @@ def replay(
 @app.command()
 def resume(
     run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
-    budget_soft: Annotated[float | None, typer.Option("--budget-soft", help="New soft budget (USD).")] = None,
-    budget_hard: Annotated[float | None, typer.Option("--budget-hard", help="New hard ceiling (USD).")] = None,
+    budget_soft: Annotated[float | None, typer.Option(
+        "--budget-soft", help="New soft budget (USD) for the run's swarm spend in total, including "
+                              "spend already recorded (discarded rounds included), not an "
+                              "amount to add.")] = None,
+    budget_hard: Annotated[float | None, typer.Option(
+        "--budget-hard", help="New hard ceiling (USD) for the run's total spend, including spend "
+                              "already recorded (discarded rounds included), not an amount to "
+                              "add.")] = None,
     budget_measurement: Annotated[float | None, typer.Option(
-        "--budget-measurement", help="New measurement budget (USD).")] = None,
+        "--budget-measurement", help="New measurement budget (USD) for the run's total probe "
+                                     "spend, including spend already recorded.")] = None,
+    add_budget: Annotated[float | None, typer.Option(
+        "--add-budget", help="Allow this many more USD from now: soft = swarm spend so far + X, "
+                             "hard = total spend so far + X (each only if enforced).")] = None,
     as_json: JsonOpt = False,
 ) -> None:
-    """Resume an interrupted (or budget-ended) run from its last committed round."""
+    """Resume an interrupted (or budget-ended) run from its last committed round.
+
+    The budget values are totals for the whole run; the current spend is printed before
+    resuming (stderr under --json)."""
 
     def go() -> dict[str, Any]:
         r = Run(run_dir)
         changes = {k: v for k, v in (("soft_usd", budget_soft), ("hard_usd", budget_hard),
                                      ("measurement_usd", budget_measurement)) if v is not None}
-        budget = None
-        if changes:
-            current = r.meta.get("budget") or r.meta["spec"]["budget"]
-            budget = Budget(**{**current, **changes})
-        return summary(r.resume(budget=budget))
+        current = dict(r.meta.get("budget") or r.meta["spec"]["budget"])
+        spend = r.spend
+        if add_budget is not None:
+            if add_budget <= 0:
+                raise SpecError("--add-budget must be > 0")
+            if {"soft_usd", "hard_usd"} & set(changes):
+                raise SpecError("--add-budget cannot be combined with --budget-soft/--budget-hard")
+            if not (current.get("soft_usd", 0) > 0 or current.get("hard_usd", 0) > 0):
+                raise SpecError("--add-budget: the run has no soft or hard budget to raise; pass "
+                                "--budget-hard X (the run's total)")
+            if current.get("soft_usd", 0) > 0:
+                changes["soft_usd"] = round(float(spend["swarm"]) + add_budget, 9)
+            if current.get("hard_usd", 0) > 0:
+                changes["hard_usd"] = round(ledger_total(spend) + add_budget, 9)
+        _say(f"resume {r.id}: {_spend_text(spend)} so far; " + _budget_text(
+            {k: v for k, v in {**current, **changes}.items() if k != "total_usd"}), as_json)
+        budget = Budget(**{**current, **changes}) if changes else None
+        data = summary(r.resume(budget=budget))
+        data["budget"] = (budget or Budget(**current)).model_dump(mode="json")
+        return data
 
     _execute(go, as_json)
 

@@ -55,7 +55,8 @@ next item.
    `swarmlab run SPEC.yaml --arm smoke --seed 0` -> `end=max_rounds` (not `hard_ceiling`), then
    `swarmlab report RUNS_DIR` -> tool protocol health shows no errored turns and few `length`
    finishes. A `hard_ceiling` end means raise the budget or cut rounds; `swarmlab resume RUN_DIR
-   --budget-hard X` continues the same run.
+   --add-budget D` continues the same run with D more dollars (`--budget-hard X` sets the run's
+   total, spend so far and discarded rounds included).
 6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS --calls-per-turn C` -> total
    for every arm x seed. Take the growth and calls per turn from the smoke run's `inference` table
    (`swarmlab export RUN_DIR`); without them the worst case (each group's `max_calls`, else the
@@ -88,7 +89,7 @@ next item.
   show only the manipulated text. The default prompt already lists every tool (`read_board`,
   `post`), so a "mention the board" arm is a nudge, not awareness.
 - **Resume or fork instead of rerunning.** A crashed or budget-ended run continues with
-  `swarmlab resume RUN_DIR [--budget-hard X]`; a counterfactual from round R is
+  `swarmlab resume RUN_DIR [--add-budget D]`; a counterfactual from round R is
   `swarmlab fork RUN_DIR --at R --spec edited.yaml`. Both reuse the inference cache, so the
   shared prefix costs nothing.
 - **Re-running a finished run is a skip.** `swarmlab run` skips run dirs with the same spec hash;
