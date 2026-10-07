@@ -1,0 +1,213 @@
+"""M4 acceptance 1: export of a finished fake-provider run (docs/INTERFACE-M4.md §1)."""
+from __future__ import annotations
+
+import json
+from collections import Counter
+from pathlib import Path
+
+import pyarrow.parquet as pq
+import pytest
+from typer.testing import CliRunner
+
+from swarmlab import Run, export
+from swarmlab.cli import app
+from swarmlab.participants import LLMAgent
+from swarmlab.probes import BeliefProbe
+
+from .helpers import Chatter, flag_experiment, llm_agent_experiment
+from .pi_session import validate_file
+
+
+def _events(run_dir: Path) -> list[dict]:
+    return [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+
+
+def _expected_rows(evs: list[dict]) -> dict[str, int]:
+    c = Counter(e["type"] for e in evs)
+    covered = {"turn_started", "turn_ended", "tool_called", "tool_returned", "post", "delivery",
+               "read", "action_committed", "inference_attempt", "inference_response", "probe",
+               "metric", "intervention", "round_started", "round_committed", "budget",
+               "snapshot", "run_started", "run_ended"}
+    return {
+        "turns": c["turn_ended"], "tool_calls": c["tool_called"], "posts": c["post"],
+        "deliveries": c["delivery"],
+        "reads": sum(max(1, len(e["delivery_ids"])) for e in evs if e["type"] == "read"),
+        "actions": c["action_committed"], "inference": c["inference_attempt"],
+        "probes": c["probe"], "metrics": c["metric"], "interventions": c["intervention"],
+        "rounds": len({e["round"] for e in evs if e["type"] in ("round_started", "round_committed")}),
+        "run": 1, "other": sum(n for t, n in c.items() if t not in covered),
+    }
+
+
+@pytest.fixture(scope="module")
+def llm_run(tmp_path_factory) -> Run:
+    """3 fake LLM agents (full memory) + 1 scripted chatter, belief probe, 3 rounds."""
+    exp = llm_agent_experiment(3, name="exp-llm", probes=[BeliefProbe()])
+    exp.participants.append(Chatter())
+    out = tmp_path_factory.mktemp("runs")
+    return exp.run(seed=3, max_rounds=3, out=out)
+
+
+def _check_export(run_dir: Path, out: Path) -> dict:
+    evs = _events(run_dir)
+    doc = json.loads((out / "run.json").read_text())
+    assert doc["export_schema"] == export.EXPORT_SCHEMA
+    expected = _expected_rows(evs)
+    for fam in export.FAMILIES:
+        table = pq.read_table(out / "tables" / f"{fam}.parquet")
+        assert table.column_names[:6] == list(export.KEY_COLUMNS), fam
+        assert table.schema.equals(export.TABLE_SCHEMAS[fam]), fam
+        assert table.num_rows == expected[fam], (fam, table.num_rows, expected[fam])
+        assert doc["tables"][fam]["rows"] == expected[fam]
+    assert (out / "raw" / "events.jsonl").read_bytes() == (run_dir / "events.jsonl").read_bytes()
+    for f in sorted((out / "sessions").glob("*.jsonl")):
+        assert validate_file(f) == [], f
+    return doc
+
+
+def _session(out: Path, agent: str) -> list[dict]:
+    lines = (out / "sessions" / f"{agent}.jsonl").read_text().splitlines()
+    return [json.loads(x)["message"] for x in lines[1:]]
+
+
+def _memory(run: Run, agent: str) -> list[dict]:
+    from swarmlab.snapshot import SnapshotStore
+
+    store = SnapshotStore(run.dir)
+    manifest = store.latest()
+    p = LLMAgent(model="fake:reader")
+    p.restore(store.load(manifest)[f"participant:{agent}"])
+    return [m.model_dump(mode="json") for m in p.probe_context()]
+
+
+def _flat(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(b.get("text") or "" for b in content)
+
+
+def test_export_tables_sessions_and_raw(llm_run, tmp_path):
+    out = llm_run.export(tmp_path / "export")
+    doc = _check_export(llm_run.dir, out)
+    assert doc["run_id"] == llm_run.id and doc["score"] == llm_run.score
+    assert doc["end_reason"] == "max_rounds"
+    assert set(doc["metrics_final"]) == set(llm_run.metrics)
+    assert doc["blobs"]["included"] == "all"
+    assert (out / "raw" / "run.json").exists() and (out / "raw" / "snapshots").is_dir()
+    turns = pq.read_table(out / "tables" / "turns.parquet").to_pylist()
+    assert {t["agent"] for t in turns} == {"a000", "a001", "a002", "a003"}
+    inf = pq.read_table(out / "tables" / "inference.parquet").to_pylist()
+    assert all(r["request"] and r["response"] for r in inf)  # small blobs are inlined
+    assert {r["category"] for r in inf} == {"swarm", "measurement"}
+    assert json.loads(inf[0]["request"])["model"] == "fake:reader"
+    dl = pq.read_table(out / "tables" / "deliveries.parquet").to_pylist()
+    posts = {p["post_id"]: p["text"] for p in
+             pq.read_table(out / "tables" / "posts.parquet").to_pylist()}
+    assert dl and all(r["content"] == posts[r["post_id"]] for r in dl)
+    probes = pq.read_table(out / "tables" / "probes.parquet").to_pylist()
+    assert probes and all(r["question"] for r in probes if r["question_hash"])
+
+
+def test_llm_session_matches_the_agent_memory(llm_run, tmp_path):
+    out = llm_run.export(tmp_path / "export")
+    for agent in ("a000", "a001", "a002"):
+        msgs = _session(out, agent)
+        mem = _memory(llm_run, agent)
+        assert msgs[0]["role"] == "system" and msgs[0]["content"] == mem[0]["content"]
+        assert {t["name"] for t in msgs[0]["toolsAdded"]} >= {"guess", "end_turn"}
+        role = {"tool": "toolResult"}
+        assert [m["role"] for m in msgs] == [role.get(m["role"], m["role"]) for m in mem]
+        got = [_flat(m["content"]) for m in msgs if m["role"] in ("user", "toolResult")]
+        want = [_flat(m["content"]) for m in mem if m["role"] in ("user", "tool")]
+        assert got == want
+        users = [m for m in msgs if m["role"] == "user"]
+        assert [_flat(u["content"]).split("\n")[0] for u in users] == ["Round 1.", "Round 2.",
+                                                                       "Round 3."]
+        asst = [m for m in msgs if m["role"] == "assistant"]
+        assert all(a["provider"] == "fake" and a["usage"]["totalTokens"] > 0 for a in asst)
+
+
+def test_window_memory_session(tmp_path):
+    exp = llm_agent_experiment(2, name="exp-window", agent_kw={"memory": "window",
+                                                               "window_rounds": 1})
+    run = exp.run(seed=1, max_rounds=4, out=tmp_path / "runs")
+    out = run.export(tmp_path / "export")
+    _check_export(run.dir, out)
+    msgs = _session(out, "a000")
+    users = [_flat(m["content"]).split("\n")[0] for m in msgs if m["role"] == "user"]
+    assert users == [f"Round {r}." for r in range(1, 5)]  # nothing duplicated by the window
+    calls = [b["id"] for m in msgs if m["role"] == "assistant" for b in m["content"]
+             if b["type"] == "toolCall"]
+    results = [m["toolCallId"] for m in msgs if m["role"] == "toolResult"]
+    assert calls == results
+
+
+def test_scripted_session(tmp_path):
+    run = flag_experiment(4, name="exp-scripted").run(seed=2, max_rounds=3, out=tmp_path / "runs")
+    out = export.export_run(run.dir)
+    assert out == run.dir / "export"
+    _check_export(run.dir, out)
+    evs = _events(run.dir)
+    for agent in ("a000", "a003"):
+        msgs = _session(out, agent)
+        n_calls = sum(1 for e in evs if e["type"] == "tool_called" and e["agent"] == agent)
+        assert sum(1 for m in msgs if m["role"] == "toolResult") == n_calls
+        assert sum(1 for m in msgs if m["role"] == "user") == 3
+        assert all(m["provider"] == "scripted" for m in msgs if m["role"] == "assistant")
+
+
+def test_reexport_is_deterministic(llm_run, tmp_path):
+    a = llm_run.export(tmp_path / "a")
+    b = llm_run.export(tmp_path / "b")
+    files = sorted(p.relative_to(a) for p in a.rglob("*") if p.is_file())
+    assert files == sorted(p.relative_to(b) for p in b.rglob("*") if p.is_file())
+    for f in files:
+        assert (a / f).read_bytes() == (b / f).read_bytes(), f
+    assert export.is_current(llm_run.dir, a)
+
+
+def test_oversize_blobs_and_partial_raw(llm_run, tmp_path, monkeypatch):
+    monkeypatch.setattr(export, "INLINE_LIMIT", 200)
+    monkeypatch.setattr(export, "FULL_BLOBS_LIMIT", 1)
+    out = llm_run.export(tmp_path / "export")
+    doc = json.loads((out / "run.json").read_text())
+    assert doc["blobs"]["included"] == "snapshots+oversize"
+    inf = pq.read_table(out / "tables" / "inference.parquet").to_pylist()
+    big = [r["request"] for r in inf if r["request"].startswith("sha256:")]
+    assert big
+    for cell in big:
+        sha = cell.removeprefix("sha256:")
+        assert (out / "raw" / "blobs" / sha[:2] / sha).exists()
+    assert not (out / "raw" / "blobs" / "cache").exists()
+
+
+def test_unknown_and_intervention_events(llm_run, tmp_path):
+    import shutil
+
+    d = tmp_path / "copy"
+    shutil.copytree(llm_run.dir, d)
+    extra = [
+        {"seq": 9001, "run": llm_run.id, "round": 2, "agent": "a000", "ts": 1.0,
+         "type": "intervention", "intervention": "mute1", "op": "mute", "ok": True,
+         "affected": ["a000"]},
+        {"seq": 9002, "run": llm_run.id, "round": 2, "agent": "a001", "ts": 1.0,
+         "type": "overflow", "policy": "drop_oldest", "dropped_rounds": [1]},
+    ]
+    with open(d / "events.jsonl", "a") as f:
+        f.writelines(json.dumps(e) + "\n" for e in extra)
+    out = export.export_run(d, tmp_path / "export")
+    _check_export(d, out)
+    iv = pq.read_table(out / "tables" / "interventions.parquet").to_pylist()
+    assert iv[0]["op"] == "mute" and json.loads(iv[0]["affected"]) == ["a000"]
+    other = pq.read_table(out / "tables" / "other.parquet").to_pylist()
+    assert [o["type"] for o in other] == ["overflow"]
+
+
+def test_cli_export(llm_run, tmp_path):
+    res = CliRunner().invoke(app, ["export", str(llm_run.dir), "--out", str(tmp_path / "e"),
+                                   "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+    assert data["export"] == str(tmp_path / "e")
+    assert data["tables"]["turns"] == 12
+    assert data["sessions"] == 4

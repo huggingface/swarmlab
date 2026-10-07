@@ -476,6 +476,13 @@ class Run:
     def __repr__(self) -> str:
         return f"Run({self.id!r}, status={self.status!r}, dir={str(self.dir)!r})"
 
+    # ---- M4: export (docs/INTERFACE-M4.md §1) -------------------------------------------------
+    def export(self, out: Path | str | None = None) -> Path:
+        """Tables, pi sessions and raw copies into `out` (default `<run dir>/export`)."""
+        from .export import export_run
+
+        return export_run(self.dir, out)
+
 
 def self_hosted_prefixes(providers: dict) -> list[str]:
     """Model prefixes whose provider spec is self-hosted (`params.self_hosted`, or an

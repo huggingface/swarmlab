@@ -716,6 +716,31 @@ def job_fetch(
     _execute(go, as_json)
 
 
+# ---- M4: export, publish, report, prompts (docs/INTERFACE-M4.md) ------------------------------
+@app.command("export")
+def export_cmd(
+    run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
+    out: Annotated[Path | None, typer.Option("--out", help="Export directory (default RUN_DIR/export).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Export a run: Parquet tables per event family, pi-format sessions, raw copies."""
+    from .export import export_run
+
+    def go() -> dict[str, Any]:
+        d = export_run(run_dir, out)
+        doc = json.loads((d / "run.json").read_text())
+        tables = {f: t["rows"] for f, t in doc["tables"].items()}
+        data = {"ok": True, "run_id": doc["run_id"], "export": str(d), "tables": tables,
+                "sessions": len(doc["sessions"]), "blobs": doc["blobs"]["included"]}
+        if as_json:
+            return data
+        rows = ", ".join(f"{f}={n}" for f, n in tables.items())
+        return {"text": (f"exported {doc['run_id']} -> {d}\n  rows: {rows}\n"
+                         f"  sessions: {len(doc['sessions'])}  raw blobs: {doc['blobs']['included']}")}
+
+    _execute(go, as_json)
+
+
 def main() -> None:  # pragma: no cover - `python -m swarmlab.cli`
     app()
 
