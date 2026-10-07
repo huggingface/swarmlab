@@ -1,4 +1,4 @@
-"""FlagGame, text variant (docs/INTERFACE.md §8).
+"""FlagGame, text and image variants (docs/INTERFACE.md §8, docs/INTERFACE-M5.md §1).
 
 A hidden "truth" flag is one of `n_candidates` named candidate flags. Each agent privately sees
 one `crop_h x crop_w` window of the truth (position withheld) and records guesses with the
@@ -65,8 +65,34 @@ Candidates are listed in name order. Every row is the colour letters with no sep
 section header is a line ending in ":"; "Candidate flags:" is the preamble and "Your crop:" opens
 the crop section. `observation.private == {"crop_y": y, "crop_x": x}` (top-left of the crop).
 
+Image modality (M5)
+-------------------
+`FlagGame(modality="image", cell_px=12, image_text_hint=False)`. `observe()` returns, in order:
+
+1. a text part, two lines: `Candidate flags:` and the framing sentence (`IMAGE_INTRO`), which
+   names the candidates in order and says that the order of the images is the labelling;
+2. one image part per candidate, in name order (`grid_to_png` of the grid, no label drawn);
+3. the text part `Your crop:`;
+4. one image part for the crop, at the same `cell_px`;
+5. after a `patch_private` crop move, the text part `Your crop has changed.` (once).
+
+With `image_text_hint=True` the grids are given as text too: after each candidate image a text
+part `<name>:\n<rows>`, after the crop image a text part with the crop rows. Joining the text
+parts with "\n" then gives a listing that `parse_observation` (and the fake provider's reader)
+reads exactly like the text variant (they skip the prose line before the first section).
+`private` is unchanged. `description()` says the candidates and the crop are images.
+
 Decisions where the contract is silent
 --------------------------------------
+- `modality`, `cell_px` and `image_text_hint` are part of `spec()` only when they differ from
+  their defaults, so every text-mode run keeps its spec hash. `image_text_hint` is ignored in
+  text mode (allowed, so an arm grid can vary `modality` alone).
+- Images are base64 PNG (`Part.image_png_b64`); rendered PNGs are cached per grid in a transient
+  attribute (`_png_cache`, never snapshotted).
+- `check_participants(participants, experiment)` (called by the runner after bind, fresh runs and
+  forks) raises `ValueError` in image mode without `image_text_hint` when a participant reads the
+  text grids: scripted FlagGame participants (`reads_text_observation = True`) and `LLMAgent`s
+  whose model resolves to the fake provider's `flaggame_reader` script.
 - Guesses for unknown candidates and guesses beyond `guess_limit` are rejected by `validate`; the
   `guess` method re-checks both (returning `accepted=False`). Under round_end the executor passes
   the agent's buffered actions as `validate(..., pending=...)`, and a guess is refused at call
@@ -87,20 +113,28 @@ Decisions where the contract is silent
 """
 from __future__ import annotations
 
+import base64
 import random
+import re
 import string
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from ..ids import AgentId
 from ..rng import derive
-from ..view import Observation, text_observation
+from ..view import Observation, Part, text_observation
 from .base import Ack, Action, Outcome, World, tool
+from .render import PALETTE, grid_to_png
 
 COLOURS = "rgbykwopcmnt"
 PREAMBLE = "Candidate flags:"
 CROP_HEADER = "Your crop:"
 CROP_CHANGED = "Your crop has changed."
+IMAGE_INTRO = ("Candidates {names} are shown as images in that order (no label is drawn inside an "
+               "image: the order is the labelling); your crop follows. Each colour cell is "
+               "{cell_px}x{cell_px} pixels in every image.")
+_IMAGE_INTRO_RE = re.compile(r"^Candidates (.+?) are shown as images in that order")
+MODALITIES = ("text", "image")
 _LAYOUTS = ("h_stripes", "v_stripes", "blocks_2x2", "blocks_2x3")
 _MAX_ATTEMPTS = 1000
 
@@ -126,9 +160,27 @@ def parse_observation(text: str) -> tuple[dict[str, list[str]], list[str]]:
             current = candidates.setdefault(line[:-1], [])
         elif current is not None:
             current.append(line)
+        elif " " in line:
+            continue  # prose before the first section (the image modality's framing line)
         else:
             raise ValueError(f"row outside any section: {line!r}")
     return candidates, crop
+
+
+def candidate_names(text: str) -> list[str]:
+    """Candidate names from an observation's text: the section headers, else (image modality
+    without the text hint) the names listed in the framing line."""
+    try:
+        names = list(parse_observation(text)[0])
+    except ValueError:
+        names = []
+    if names:
+        return names
+    for line in text.split("\n"):
+        m = _IMAGE_INTRO_RE.match(line.strip())
+        if m:
+            return [n.strip() for n in m.group(1).split(",") if n.strip()]
+    return []
 
 
 def contains(grid: list[str], crop: list[str]) -> bool:
@@ -234,7 +286,9 @@ def _names(kind: str, n: int) -> list[str]:
 _CONFIG = (
     "height", "width", "palette", "n_candidates", "rival_edits", "crop_h", "crop_w",
     "candidate_names", "status_tools", "guess_limit", "crop_overrides",
+    "modality", "cell_px", "image_text_hint",
 )
+_M5_DEFAULTS = {"modality": "text", "cell_px": 12, "image_text_hint": False}
 
 
 def _check_overrides(overrides: dict[str, list[int]] | None, max_y: int,
@@ -270,6 +324,9 @@ class FlagGame(World):
         status_tools: tuple[str, ...] | list[str] = ("my_status", "collective_status"),
         guess_limit: int | None = None,
         crop_overrides: dict[str, list[int]] | None = None,
+        modality: str = "text",
+        cell_px: int = 12,
+        image_text_hint: bool = False,
     ) -> None:
         if not 3 <= palette <= len(COLOURS):
             raise ValueError(f"palette must be in 3..{len(COLOURS)}")
@@ -285,6 +342,11 @@ class FlagGame(World):
         if unknown:
             raise ValueError(f"unknown status tools {sorted(unknown)}")
         _names(candidate_names, n_candidates)  # validates
+        if modality not in MODALITIES:
+            raise ValueError(f"modality must be one of {MODALITIES}, got {modality!r}")
+        if not isinstance(cell_px, int) or isinstance(cell_px, bool) or cell_px < 1:
+            raise ValueError("cell_px must be an integer >= 1")
+        self.modality, self.cell_px, self.image_text_hint = modality, cell_px, bool(image_text_hint)
         self.height, self.width, self.palette = height, width, palette
         self.n_candidates, self.rival_edits = n_candidates, rival_edits
         self.crop_h, self.crop_w = crop_h, crop_w
@@ -295,6 +357,11 @@ class FlagGame(World):
         if crop_overrides is None and isinstance(getattr(self, "params", None), dict):
             # absent from spec() when unset, so runs without overrides keep their spec hash
             self.params.pop("crop_overrides", None)
+        if isinstance(getattr(self, "params", None), dict):
+            # M5: absent from spec() at their defaults, so text-mode spec hashes are unchanged
+            for k, default in _M5_DEFAULTS.items():
+                if k in self.params and self.params[k] == default and type(self.params[k]) is type(default):
+                    self.params.pop(k)
         # game state (plain Python data only)
         self.agents: list[str] = []
         self.candidates: dict[str, list[str]] = {}
@@ -349,7 +416,34 @@ class FlagGame(World):
         truth = self.candidates[self.truth]  # type: ignore[index]
         return [row[x : x + self.crop_w] for row in truth[y : y + self.crop_h]]
 
+    def _png_b64(self, grid: list[str]) -> str:
+        cache = self.__dict__.setdefault("_png_cache", {})
+        key = (self.cell_px, tuple(grid))
+        if key not in cache:
+            cache[key] = base64.b64encode(grid_to_png(list(grid), PALETTE, self.cell_px)).decode()
+        return cache[key]
+
+    def _observe_image(self, agent: AgentId) -> Observation:
+        names = ", ".join(self.candidates)
+        parts = [Part(type="text", text=PREAMBLE + "\n"
+                      + IMAGE_INTRO.format(names=names, cell_px=self.cell_px))]
+        for name, grid in self.candidates.items():
+            parts.append(Part(type="image", image_png_b64=self._png_b64(grid)))
+            if self.image_text_hint:
+                parts.append(Part(type="text", text="\n".join([f"{name}:", *grid])))
+        crop = self.crop_rows(agent)
+        parts += [Part(type="text", text=CROP_HEADER), Part(type="image", image_png_b64=self._png_b64(crop))]
+        if self.image_text_hint:
+            parts.append(Part(type="text", text="\n".join(crop)))
+        if agent in getattr(self, "crops_changed", ()):
+            self.crops_changed = [a for a in self.crops_changed if a != agent]
+            parts.append(Part(type="text", text=CROP_CHANGED))
+        y, x = self.crops[agent]
+        return Observation(parts=parts, private={"crop_y": y, "crop_x": x})
+
     def observe(self, agent: AgentId) -> Observation:
+        if getattr(self, "modality", "text") == "image":
+            return self._observe_image(agent)
         lines = [PREAMBLE]
         for name, grid in self.candidates.items():
             lines += ["", f"{name}:", *grid]
@@ -419,6 +513,18 @@ class FlagGame(World):
     def description(self) -> str:
         limit = (f" You may record at most {self.guess_limit} guesses."
                  if self.guess_limit is not None else "")
+        if getattr(self, "modality", "text") == "image":
+            hint = (" Each image is also written out as a grid of colour letters."
+                    if self.image_text_hint else "")
+            return (
+                f"There are {self.n_candidates} candidate flags, each shown as an image of coloured "
+                "cells, and exactly one of them is the hidden flag. You privately see a "
+                f"{self.crop_h}x{self.crop_w}-cell crop of the hidden flag, shown as an image at "
+                "the same scale, at an undisclosed position, and more than one candidate may "
+                f"contain your crop.{hint} Record which candidate you believe is the hidden flag "
+                "with the `guess` tool; only your latest guess counts and you may change it in any "
+                f"round.{limit} You are never told whether a guess is right."
+            )
         return (
             f"There are {self.n_candidates} candidate flags, each a grid of colour letters, and "
             "exactly one of them is the hidden flag. You privately see a "
@@ -427,6 +533,18 @@ class FlagGame(World):
             "the hidden flag with the `guess` tool; only your latest guess counts and you may "
             f"change it in any round.{limit} You are never told whether a guess is right."
         )
+
+    # ---- M5: participants that read the text grids ------------------------------------------------
+    def check_participants(self, participants: dict, experiment: Any = None) -> None:
+        """Image mode without `image_text_hint`: refuse participants that read the text grids."""
+        if getattr(self, "modality", "text") != "image" or self.image_text_hint:
+            return
+        bad = sorted(str(a) for a, p in participants.items() if reads_text_grids(p, experiment))
+        if bad:
+            raise ValueError(
+                f"FlagGame(modality='image') without image_text_hint=True gives no text grids, but "
+                f"participants {bad} read them (scripted FlagGame participants and the fake "
+                "provider's reader script); set image_text_hint=True or use a vision model")
 
     # ---- interventions (M3a, docs/INTERFACE-M3a.md §1) --------------------------------------------
     def patch_private(self, agent: AgentId, data: dict) -> None:
@@ -464,3 +582,33 @@ class FlagGame(World):
             "candidates": {n: list(g) for n, g in self.candidates.items()},
             "crops": {a: [y, x] for a, (y, x) in self.crops.items()},
         }
+
+
+def reads_text_grids(participant: Any, experiment: Any = None) -> bool:
+    """True for a participant that can only play FlagGame from the text grids: scripted FlagGame
+    participants (`reads_text_observation = True`) and model participants whose model resolves to
+    the fake provider's `flaggame_reader` script."""
+    if getattr(participant, "reads_text_observation", False):
+        return True
+    model = getattr(participant, "model", None)
+    if not isinstance(model, str) or ":" not in model:
+        return False
+    from ..providers.base import ChatMessage, ChatRequest
+    from ..providers.fake import BUILTIN_SCRIPTS, FakeProvider, flaggame_reader
+
+    provider = None
+    if experiment is not None and hasattr(experiment, "provider_for"):
+        try:
+            provider = experiment.provider_for(model)[0]
+        except Exception:  # noqa: BLE001 - an unresolvable model is reported elsewhere
+            return False
+    elif model.split(":", 1)[0] == "fake":
+        provider = FakeProvider()
+    if not isinstance(provider, FakeProvider):
+        return False
+    try:
+        script = provider.script_for(ChatRequest(model=model, messages=[
+            ChatMessage(role="user", content="")]))
+    except Exception:  # noqa: BLE001
+        return False
+    return script is flaggame_reader or script is BUILTIN_SCRIPTS.get("reader")
