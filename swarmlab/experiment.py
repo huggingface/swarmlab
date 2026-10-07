@@ -126,6 +126,7 @@ from .spec import (
     load_experiment_yaml,
     runspec_to_doc,
     spec_hash,
+    unbilled_spec,
 )
 from .world.base import World
 
@@ -333,11 +334,16 @@ class Experiment(BaseModel):
         """`<out>/<name>.ledger.jsonl`: spend of every run of this experiment under `out`."""
         return ExperimentLedger(out, self.name)
 
+    def unbilled(self) -> bool:
+        """Nothing this experiment calls is billed (only `fake:` models; `spec.unbilled_spec`)."""
+        return unbilled_spec(self.to_spec(0, 1).model_dump(mode="json"))
+
     def admit(self, seed: int, out: Path | str = "runs") -> tuple[str | None, float]:
         """The `budget.total_usd` start check for the run of `seed` under `out` (see
-        `ExperimentLedger.admit`): (refusal or None, spend + reserved it was checked against)."""
+        `ExperimentLedger.admit`): (refusal or None, spend + reserved it was checked against).
+        An unbilled experiment (only `fake:` models) is always admitted."""
         total = self.budget.total_usd
-        if total <= 0:
+        if total <= 0 or self.unbilled():
             return None, 0.0
         led = self.experiment_ledger(out)
         led.backfill_dir(out)  # run dirs from before the ledger existed

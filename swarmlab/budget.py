@@ -40,7 +40,8 @@ Decisions where the contract is silent:
   starts (`swarmlab run --parallel`, or two shells) cannot both take the same headroom. A run
   whose process died keeps its spend but no longer reserves headroom. The runner ends a run
   with `total_budget` at a round boundary when the ledger's spend (its own included) reaches
-  `total_usd` (swarmlab/runner.py). Delete the file to forget past spend.
+  `total_usd` (swarmlab/runner.py). Rows with `simulated: true` (runs on `fake:` models only:
+  nominal prices, nothing billed) are ignored. Delete the file to forget past spend.
 """
 from __future__ import annotations
 
@@ -192,7 +193,7 @@ class ExperimentLedger:
         spent = 0
         reserved = 0
         for key, row in latest.items():
-            if exclude in (key, row.get("run_id")):
+            if exclude in (key, row.get("run_id")) or row.get("simulated"):
                 continue
             spent += to_nano(float(row.get("spend_usd") or 0))
             if row.get("status") == "running" and self._live(row):
@@ -225,13 +226,16 @@ class ExperimentLedger:
     def backfill(self, meta: Mapping) -> bool:
         """Add a row for a run dir's `run.json` when the ledger has none for that run instance
         (run dirs written before the ledger existed, or copied in); True if one was added."""
+        from .spec import unbilled_spec
+
         key = f"{meta['run_id']}@{meta.get('started_at') or 'legacy'}"
         if any(r["key"] == key for r in self.rows()):
             return False
+        extra = {"simulated": True} if unbilled_spec(meta.get("spec") or {}) else {}
         self.record(meta["run_id"], key, ledger_total(meta.get("ledger")),
                     str(meta.get("status") or "ended"),
                     hard=float((meta.get("budget") or {}).get("hard_usd") or 0),
-                    spec_hash=meta.get("spec_hash"), backfilled=True)
+                    spec_hash=meta.get("spec_hash"), backfilled=True, **extra)
         return True
 
     def backfill_dir(self, out: Path | str) -> int:

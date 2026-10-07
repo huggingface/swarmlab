@@ -69,7 +69,11 @@ Decisions where the contract is silent:
   reaches the total. `run --parallel N` runs up to N runs at once as threads of this process
   (each thread builds its own `Experiment` from the YAML, so providers and plugin prototypes are
   not shared, and runs its own asyncio loop); the rows come back in plan order. After the first
-  refusal no further run starts (outcome `capped`), as in the sequential case.
+  refusal no further billed run starts (outcome `capped`), as in the sequential case; runs of
+  unbilled arms (only `fake:` models) still run.
+- Arms that bill nothing (only `fake:` models and scripted participants; `Experiment.unbilled()`)
+  are exempt from `budget.total_usd`: they need no `hard_usd`, are always admitted, and their
+  nominal spend is not counted (field notes item 4).
 - Total cap (`budget.total_usd`, top level): `run` prints the per-run caps of every arm and the
   total cap before anything runs, plus one `existing:` line per run dir that already exists with
   its actual ledger spend (resumed spend included), rounds and per-round cost (not the spec's
@@ -429,11 +433,11 @@ def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_r
             per = f", ${spent / rounds:.4f}/round" if rounds else ""
             what = ("same spec: skipped, its spend counts toward the total" if state == "same"
                     else "different spec: fails unless --rerun")
-            if state == "same":
+            if state == "same" and not exp.unbilled():
                 already += spent
             lines.append(f"  existing: arm={a} seed={sd} spent ${spent:.4f} actual over "
                          f"{rounds} round(s){per} (end={r.end_reason}; {what})")
-    hard_sum = sum(e.budget.hard_usd for e in exps.values()) * n_seeds
+    hard_sum = sum(e.budget.hard_usd for e in exps.values() if not e.unbilled()) * n_seeds
     if total_cap > 0:
         line = (f"caps: total ${total_cap:g} for the {n_runs} run(s) (budget.total_usd); a run "
                 "starts only if spend so far + its hard_usd fits")
@@ -515,10 +519,11 @@ def run(
         ests = {a: _estimate(exp, seeds[0], max_rounds) for a, exp in exps.items()}
         total_cap = float(doc["budget"].get("total_usd") or 0)
         if total_cap > 0:
-            unbounded = [a for a, e in exps.items() if e.budget.hard_usd <= 0]
+            unbounded = [a for a, e in exps.items() if e.budget.hard_usd <= 0 and not e.unbilled()]
             if unbounded:
                 raise SpecError(f"{spec}: budget.total_usd ${total_cap:g} needs hard_usd > 0 on "
-                                f"every arm that runs; arms without one: {unbounded}")
+                                f"every arm that runs a billed model (arms on fake: models only "
+                                f"are exempt); arms without one: {unbounded}")
     except SpecError as e:
         _fail(e, 2, as_json)
     except Exception as e:  # noqa: BLE001
@@ -550,8 +555,9 @@ def run(
     def attempt(a: str, sd: int, exp: Experiment) -> dict[str, Any]:
         """One run of the plan: skip, cap, fail or run it (thread-safe: `--parallel`)."""
         rid = exp.run_id(sd)
+        free = exp.unbilled()  # fake: arms are never capped (they bill nothing)
         with state_lock:
-            if capped_box:
+            if capped_box and not free:
                 capped_box["skipped"].append(rid)
                 return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
         admitted = False
@@ -572,7 +578,7 @@ def run(
                     f"{exp.spec_hash(sd, max_rounds)}); pass --rerun (writes {rid}__r<N>) or "
                     "another --out")
             with state_lock:  # the admission and the capped flag move together
-                if capped_box:
+                if capped_box and not free:
                     capped_box["skipped"].append(rid)
                     return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
                 why, spent = exp.admit(sd, out)

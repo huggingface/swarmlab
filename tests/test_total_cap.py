@@ -12,13 +12,13 @@ CAP = """\
 name: cap
 seeds: [1, 2, 3]
 budget: {soft_usd: 0.04, hard_usd: 0.05, total_usd: 0.12}
-providers:
-  fake: {type: fake, params: {pricing: {"*": [10.0, 50.0, 1.0]}}}
+providers:  # `paid:` is a FakeProvider standing in for a billed provider (fake: arms are exempt)
+  paid: {type: fake, params: {pricing: {"*": [10.0, 50.0, 1.0]}}}
 options: {max_rounds: 2}
 arms:
   A:
     world: {type: flaggame}
-    participants: [{type: llm, count: 2, params: {model: "fake:reader", max_tokens: 64, max_calls: 2}}]
+    participants: [{type: llm, count: 2, params: {model: "paid:reader", max_tokens: 64, max_calls: 2}}]
     metrics: [belief.consensus]
 """
 

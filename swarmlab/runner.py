@@ -62,7 +62,9 @@ run's ledger) >= `total_usd` -> `run_ended(total_budget)`, all checked at the ro
 Experiment ledger (swarmlab/budget.py `ExperimentLedger`): every `run.json` write also appends a
 row (run id, instance key `<run_id>@<started_at>`, spec hash, spend so far, status, hard_usd,
 pid, host, time) to `<run dir's parent>/<experiment>.ledger.jsonl`; a live/resume call that
-leaves without ending appends a final `interrupted` row. `run.json["started_at"]` is set when
+leaves without ending appends a final `interrupted` row. A run that bills nothing (only `fake:`
+models, `spec.unbilled_spec`) writes rows with `simulated: true`, which the ledger does not
+count, and is never stopped with `total_budget`. `run.json["started_at"]` is set when
 the run first starts and kept by resume.
 
 Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
@@ -226,6 +228,7 @@ from .spec import (
     dump_runspec_yaml,
     git_identity,
     spec_hash,
+    unbilled_spec,
 )
 from .tools import AgentTools, TurnCapReached
 from .view import View
@@ -462,9 +465,15 @@ class Runner:
 
     def _ledger_row(self, status: str, spec_hash_: str | None = None) -> None:
         """Append this run's spend so far to `<out>/<experiment>.ledger.jsonl`."""
+        extra = {"simulated": True} if self.unbilled else {}
         self.experiment_ledger.record(
             self.run_id, f"{self.run_id}@{self.started_at}", self.ledger.spent_total, status,
-            hard=self.budget.hard_usd, spec_hash=spec_hash_ or spec_hash(self.spec))
+            hard=self.budget.hard_usd, spec_hash=spec_hash_ or spec_hash(self.spec), **extra)
+
+    @property
+    def unbilled(self) -> bool:
+        """Only `fake:` models: nominal spend, exempt from `budget.total_usd`."""
+        return unbilled_spec(self.spec.model_dump(mode="json"))
 
     def _ledger_interrupted(self) -> None:
         """A live/resume that leaves without ending (an exception, Ctrl-C): stop reserving."""
@@ -1042,7 +1051,7 @@ class Runner:
         if soft > 0 and self.ledger.spent["swarm"] >= soft:
             return "soft_budget"
         total = self.budget.total_usd
-        if total > 0:  # experiment-wide: every run in <out>/<experiment>.ledger.jsonl
+        if total > 0 and not self.unbilled:  # experiment-wide: every run in <out>/<experiment>.ledger.jsonl
             others = self.experiment_ledger.spent(exclude=f"{self.run_id}@{self.started_at}")
             if others + self.ledger.spent_total >= total:
                 return "total_budget"

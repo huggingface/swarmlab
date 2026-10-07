@@ -139,3 +139,38 @@ def test_parallel_runs_concurrently_under_the_shared_cap(tmp_path):
     res, data = invoke("run", spec, "--out", out, "--yes", "--parallel", 2, "--json")
     assert res.exit_code == 0, res.output
     assert [r["outcome"] for r in data["runs"]] == ["skipped", "skipped", "ran", "ran"]
+
+
+FAKE_DRY = SPEC.replace("budget: {hard_usd: 0.05, total_usd: 0.12}", "budget: {total_usd: 0.12}") + """\
+  dry:
+    world: {type: flaggame}
+    participants:
+      - {type: llm, count: 2, params: {model: "fake:reader", max_tokens: 64, max_calls: 2}}
+      - {type: evidence_aggregator, count: 1}
+    budget: {hard_usd: 0}
+"""
+
+
+def test_fake_arms_are_exempt_from_the_total(tmp_path):
+    """Field notes 4: dry arms on fake: models need no hard_usd and spend nothing real."""
+    doc = yaml.safe_load(FAKE_DRY)
+    doc["arms"]["A"]["budget"] = {"hard_usd": 0.05}
+    spec, out = tmp_path / "dry.yaml", tmp_path / "runs"
+    spec.write_text(yaml.safe_dump(doc))
+    assert Experiment.from_yaml(spec, "dry").unbilled()
+    assert not Experiment.from_yaml(spec, "A").unbilled()
+    # the dry arm alone: accepted without hard_usd, runs every seed, nominal spend not counted
+    res, data = invoke("run", spec, "--arm", "dry", "--out", out, "--yes", "--json")
+    assert res.exit_code == 0, res.output
+    assert [r["outcome"] for r in data["runs"]] == ["ran"] * 3
+    assert all(r["spend"]["swarm"] > 0 for r in data["runs"])  # nominal fake prices
+    led = ExperimentLedger(out, "led")
+    assert led.spent() == 0 and all(r.get("simulated") for r in led.rows())
+    # the billed arm still needs its ceiling and still gets the whole total
+    res, data = invoke("run", spec, "--out", out, "--yes", "--json")
+    assert [r["outcome"] for r in data["runs"]] == ["ran", "ran", "capped", "skipped", "skipped",
+                                                     "skipped"]
+    doc["arms"]["A"]["budget"] = {"hard_usd": 0}
+    spec.write_text(yaml.safe_dump(doc))
+    res, _ = invoke("run", spec, "--out", tmp_path / "r2", "--yes")
+    assert res.exit_code == 2 and "arms without one: ['A']" in res.stderr

@@ -42,7 +42,9 @@ shells and `swarmlab run --parallel N` all count against the same T (same `--out
   eat a large share of the money, and one round's worst-case estimate can be a fifth of the
   total, so size the caps from measured spend, not from the estimate:
   1. `swarmlab doctor SPEC.yaml` and `swarmlab validate SPEC.yaml` (items 1-2 below).
-  2. Dry run with `fake:reader` (item 3; free): checks the metrics and the replay.
+  2. Dry run with `fake:reader` (item 3; free): checks the metrics and the replay. A dry arm
+     (only `fake:` models and scripted agents) needs no `hard_usd` and does not count toward
+     `total_usd`.
   3. Prompt review without a second agent: `swarmlab prompts SPEC.yaml --arm A > A.txt` for
      every arm, then `diff A.txt B.txt` -> only the manipulated text differs, no correctness
      hints, every needed tool named.
