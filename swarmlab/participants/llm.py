@@ -309,11 +309,6 @@ class LLMAgent(Participant):
         msgs = [ChatMessage(role="system", content=self.system)] if self.system else []
         return msgs + [ChatMessage.model_validate(m) for r in self.rounds for m in r["messages"]]
 
-    def model_request_defaults(self) -> dict:
-        return {"model": self.model, "temperature": self.temperature,
-                "max_tokens": self.max_tokens, "thinking_budget": self.thinking_budget,
-                "extra": dict(self.extra)}
-
     def reconfigure(self, **kw: Any) -> None:
         """M3a `Ops.reconfigure`: change `model`, `system_prompt` (re-rendered at the next turn),
         `memory`, `window_rounds` or `max_tokens` from the next turn on. The settings are plain
@@ -330,6 +325,11 @@ class LLMAgent(Participant):
             setattr(self, k, v)
         if "system_prompt" in kw:
             self.system = None
+
+    def model_request_defaults(self) -> dict:
+        return {"model": self.model, "temperature": self.temperature,
+                "max_tokens": self.max_tokens, "thinking_budget": self.thinking_budget,
+                "extra": dict(self.extra)}
 
     # ---- the loop ----------------------------------------------------------------------------
     def _render_system(self, view: View) -> str:
