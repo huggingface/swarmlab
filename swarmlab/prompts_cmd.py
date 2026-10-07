@@ -65,8 +65,9 @@ def _text(message: Any) -> str:
     return "\n".join(out)
 
 
-def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
-    """One dict per participant group: agent, type, count, model, system, user, tools."""
+def group_views(exp: Experiment, seed: int = 0) -> list[tuple[int, int, Any, Any, View]]:
+    """`(first agent index, count, agent id, bound participant, round-1 view)` per participant
+    group, built exactly as the runner builds them (also used by `swarmlab preflight`)."""
     agents = [agent_id(i) for i in range(len(exp.participants))]
     world = copy.deepcopy(exp.world)
     world.reset(derive(seed, "world"), list(agents))
@@ -85,10 +86,19 @@ def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
     out = []
     for first, count in participant_groups(exp):
         a = agents[first]
-        p = bound[a]
         obs = world.observe(a).model_copy(update={"private": {}})
         view = View(round=1, agent=a, observation=obs, outcomes=[], pushed=[],
                     tools=ex.schemas(a), description=world.description())
+        out.append((first, count, a, bound[a], view))
+    return out
+
+
+def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
+    """One dict per participant group: agent, type, count, model, system, user, tools."""
+    agents = [agent_id(i) for i in range(len(exp.participants))]
+    names = [role_name(p) for p in exp.participants]
+    out = []
+    for first, count, a, p, view in group_views(exp, seed):
         spec = p.spec()
         row: dict[str, Any] = {
             "group": len(out) + 1, "agent": str(a), "agents": [str(x) for x in

@@ -77,7 +77,8 @@ Decisions where the contract is silent:
 - `Run.summary()` is the CLI's run summary: run_dir, run_id, arm, seed, spec_hash, status,
   end_reason, last_round, score, metrics (last value per name), spend, `probes_skipped`
   (`{reason: count}`, only when the spec has probes; `Run.probes_skipped()`) (+ parent_run/fork_round
-  for a fork; + `self_hosted`: the model prefixes served self-hosted, e.g. `["vllm"]`, only when
+  for a fork; + `turns_total`, `turns_errored`, and `first_error` and `health: "degraded"` when
+present: more than half of the turns ended `error`, see swarmlab/runner.py; + `self_hosted`: the model prefixes served self-hosted, e.g. `["vllm"]`, only when
   there are any, so a $0 spend reads as compute time, not free). `Run.load(dir, run_id=None)` accepts a run dir, or a parent dir plus run id.
 - M3a §2: `run(..., repeat=None, run_id=None)`: `repeat` is `RunOptions.repeat` (paired-run
   sampling repeat, see swarmlab/runner.py); `run_id` overrides the derived run id (and, without
@@ -629,6 +630,7 @@ class Run:
             "metrics": metrics,
             "spend": self.spend,
         }
+        out.update(self.turn_health())
         if (meta.get("spec") or {}).get("probes"):
             out["probes_skipped"] = self.probes_skipped()
         hosted = self_hosted_prefixes((meta.get("spec") or {}).get("providers") or {})
@@ -638,6 +640,19 @@ class Run:
             out["parent_run"] = meta["parent_run"]
             out["fork_round"] = meta.get("fork_round")
         return out
+
+    def turn_health(self) -> dict[str, Any]:
+        """`turns_total`, `turns_errored`, and `first_error` / `health: "degraded"` when present
+        (from run.json; counted from the log for run dirs written before these fields existed)."""
+        meta = self.meta
+        if "turns_total" in meta:
+            data = {k: meta[k] for k in ("turns_total", "turns_errored", "first_error", "health")
+                    if k in meta}
+        else:
+            from .runner import TurnTally
+
+            data = TurnTally.of(list(self.events_all)).meta()
+        return data
 
     def __repr__(self) -> str:
         return f"Run({self.id!r}, status={self.status!r}, dir={str(self.dir)!r})"

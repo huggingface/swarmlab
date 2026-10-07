@@ -51,6 +51,14 @@ Decisions where the contract is silent:
   command asks for confirmation on stderr unless `--yes`; declining (or no TTY to answer)
   exits 1 before anything runs. A failed run does not stop the others; the exit code is then 1
   (2 if every failure was a SpecError).
+- Errored runs (field notes item 2): a run whose `health` is `degraded` (more than half of its
+  turns ended `error`; `run.json` and the summary carry `turns_total`, `turns_errored`,
+  `first_error`) keeps its end reason, but every command that prints its summary first prints
+  `WARNING: <run>: E/T turns errored (first error: <line>)` on stderr, `run` gives it outcome
+  `errored` in the table and JSON, and `run` exits 1.
+- `preflight SPEC [--arm A] [--max-usd 0.05]` (swarmlab/preflight.py): one real request per LLM
+  participant group with the arm's exact model settings and tools; prints the worst-case cost
+  first and refuses above `--max-usd`; exit 1 on any failure.
 - Total cap (`budget.total_usd`, top level): `run` prints the per-run caps of every arm and the
   total cap before anything runs, plus one `existing:` line per run dir that already exists with
   its actual ledger spend (resumed spend included), rounds and per-round cost (not the spec's
@@ -178,6 +186,23 @@ def _human(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def health_warning(data: dict[str, Any]) -> str | None:
+    """`WARNING: 36/36 turns errored (first error: ...)` for a run whose health is degraded."""
+    if data.get("health") != "degraded":
+        return None
+    first = data.get("first_error") or "?"
+    return (f"WARNING: {data.get('run_id', 'run')}: {data.get('turns_errored')}/"
+            f"{data.get('turns_total')} turns errored (first error: {first}); the run's results "
+            "are not usable. `swarmlab preflight SPEC --arm ARM` sends one real request with the "
+            "arm's settings and shows the provider's error")
+
+
+def _warn_health(data: dict[str, Any]) -> None:
+    line = health_warning(data)
+    if line:
+        print(line, file=sys.stderr, flush=True)
+
+
 def _execute(fn: Callable[[], dict[str, Any]], as_json: bool) -> None:
     try:
         data = fn()
@@ -187,6 +212,7 @@ def _execute(fn: Callable[[], dict[str, Any]], as_json: bool) -> None:
         raise
     except Exception as e:  # noqa: BLE001 - the CLI reports every failure the same way
         _fail(e, 1, as_json)
+    _warn_health(data)
     typer.echo(json.dumps(data, default=str) if as_json else _human(data))
 
 
@@ -523,7 +549,9 @@ def run(
             if not single:
                 _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
             r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
-            rows.append({**summary(r), "outcome": "ran"})
+            data = summary(r)
+            _warn_health(data)
+            rows.append({**data, "outcome": "errored" if health_warning(data) else "ran"})
         except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
             msg = f"{type(e).__name__}: {e}"
             print(f"error: {rid}: {msg}", file=sys.stderr)
@@ -531,6 +559,8 @@ def run(
                          "error": msg, "spec_error": isinstance(e, SpecError)})
     failed = [r for r in rows if r["outcome"] == "failed"]
     code = 0 if not failed else (2 if all(r["spec_error"] for r in failed) else 1)
+    if any(r["outcome"] == "errored" for r in rows):
+        code = code or 1
     if capped is not None:
         code = code or 1
         print(f"error: total cap ${total_cap:g} reached; skipped {len(capped['skipped'])} "
@@ -550,11 +580,13 @@ def run(
         if r["outcome"] == "skipped":
             data["skipped"] = True
         typer.echo(json.dumps(data, default=str) if as_json else _human(data))
+        if code:
+            raise typer.Exit(code)
         return
     for r in rows:
         r.pop("spec_error", None)
     if as_json:
-        typer.echo(json.dumps({"ok": not failed and capped is None, "exit_code": code,
+        typer.echo(json.dumps({"ok": not code, "exit_code": code,
                                "runs": rows, "capped": capped,
                                "estimate": {"arms": ests, "total_usd": total, "runs": n_runs,
                                             "total_cap_usd": total_cap}},
@@ -1127,6 +1159,48 @@ def prompts_cmd(
         return {"text": prompts_text(rows, exp.arm, s)}
 
     _execute(go, as_json)
+
+
+@app.command("preflight")
+def preflight_cmd(
+    spec: Annotated[Path, typer.Argument(help="Experiment YAML.")],
+    arm: Annotated[str | None, typer.Option("--arm", help="Arm (required when the YAML has several).")] = None,
+    seed: Annotated[int | None, typer.Option("--seed", help="Seed (default: the YAML's first seed).")] = None,
+    max_usd: Annotated[float, typer.Option(
+        "--max-usd", help="Refuse (send nothing) when the worst case of the requests is above this.")] = 0.05,
+    as_json: JsonOpt = False,
+) -> None:
+    """Send ONE real request per LLM participant group with the arm's exact model settings
+    (`extra` included) and tools; exit 1 if any fails or parses no tool call.
+
+    Prints the worst-case cost first; nothing is sent when it is above --max-usd."""
+    from .preflight import PreflightRefused, plan, result_lines, run_preflight, worst_case
+
+    try:
+        exp = _build(spec, arm)
+        s = seed if seed is not None else experiment_seeds(load_experiment_yaml(spec))[0]
+        rows = plan(exp, s)
+    except SpecError as e:
+        _fail(e, 2, as_json)
+    except Exception as e:  # noqa: BLE001
+        _fail(e, 1, as_json)
+    n = sum(1 for r in rows if "request" in r)
+    _say(f"preflight: arm={exp.arm} {n} request(s), worst case ${worst_case(rows):.4f} "
+         f"(--max-usd ${max_usd:g})", as_json)
+    try:
+        results = run_preflight(rows, max_usd)
+    except PreflightRefused as e:
+        _fail(e, 1, as_json)
+    ok = all(r["ok"] for r in results)
+    if as_json:
+        typer.echo(json.dumps({"ok": ok, "arm": exp.arm, "seed": s,
+                               "worst_case_usd": worst_case(rows), "groups": results}, default=str))
+    else:
+        spent = sum(r.get("cost_usd") or 0 for r in results)
+        last = f"preflight {'ok' if ok else 'FAILED'}: {n} request(s), spent ${spent:.5f}"
+        typer.echo("\n".join([*result_lines(results), last]))
+    if not ok:
+        raise typer.Exit(1)
 
 
 @app.command("metrics")

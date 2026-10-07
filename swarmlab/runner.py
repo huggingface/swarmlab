@@ -87,7 +87,12 @@ git_commit, dirty, parent_run, fork_round, restored (what a fork restored), stat
 after the last commit), metrics_rev (the metric-semantics revision the run logs with,
 `swarmlab.metrics.base.METRICS_REV` for new runs; absent in older run.json files, which are
 revision 1: replay, resume and report then fold with `Metric.use_rev(1)`), import_dir (only
-when the experiment came from a YAML: its directory, put on `sys.path` by `Run.experiment`).
+when the experiment came from a YAML: its directory, put on `sys.path` by `Run.experiment`),
+`turns_total` / `turns_errored` (`turn_ended` events in the log, and of those the ones with
+`yield_kind == "error"`; recounted from the log on resume and fork), `first_error` (the first
+errored turn's exception line, when there is one) and `health: "degraded"` when more than half
+of the turns ended `error` (the end reason is left as it is: a run whose every turn failed still
+ends `max_rounds`, but `swarmlab run` reports it `errored` and exits 1).
 
 Recovery (`resume(budget=None)`): if the log has `run_ended` with a reason other than
 `soft_budget`/`hard_ceiling`/`hard_ceiling_probes`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
@@ -295,6 +300,62 @@ class RepeatSeeded:
         return getattr(self.inner, name)
 
 
+def error_headline(text: str | None) -> str:
+    """The first line of the exception a `turn_ended.error` traceback ends with (or of `text`)."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    if not lines[0].startswith("Traceback"):
+        return lines[0].strip()
+    # the exception line: the first unindented line after the last `  File ...` frame
+    last_frame = max((i for i, ln in enumerate(lines) if ln.startswith("  File ")), default=0)
+    head = lines[-1]
+    for ln in lines[last_frame + 1:]:
+        if not ln.startswith((" ", "\t")):
+            head = ln
+            break
+    name, sep, rest = head.strip().partition(": ")
+    if sep and "." in name and name.replace(".", "").replace("_", "").isalnum():
+        name = name.rsplit(".", 1)[1]  # swarmlab.providers.base.ProviderError -> ProviderError
+    return f"{name}{sep}{rest}"
+
+
+class TurnTally:
+    """Turns ended and turns ended `error` in the log, plus the first error's headline."""
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.errored = 0
+        self.first_error: str | None = None
+
+    @classmethod
+    def of(cls, events: list[Event]) -> TurnTally:
+        tally = cls()
+        for ev in events:
+            if ev.type == "turn_ended":
+                tally.add(ev)
+        return tally
+
+    def add(self, ev: Any) -> None:
+        self.total += 1
+        if ev.yield_kind == "error":
+            self.errored += 1
+            if self.first_error is None:
+                self.first_error = error_headline(ev.error) or "(no error text)"
+
+    @property
+    def degraded(self) -> bool:
+        return self.errored * 2 > self.total
+
+    def meta(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"turns_total": self.total, "turns_errored": self.errored}
+        if self.first_error is not None:
+            out["first_error"] = self.first_error
+        if self.degraded:
+            out["health"] = "degraded"
+        return out
+
+
 class Runner:
     def __init__(
         self,
@@ -332,6 +393,7 @@ class Runner:
         self.end_reason: str | None = None
         self.last_round = 0
         self._round_events: list[Event] = []
+        self.turns = TurnTally()
 
     # ---- paths and metadata ------------------------------------------------------------------
     @property
@@ -371,6 +433,7 @@ class Runner:
             "ledger": self.ledger.to_dict(),
             "ledger_seq": self.log.next_seq - 1 if getattr(self, "log", None) is not None else -1,
             "metrics_rev": self.metrics_rev,
+            **self.turns.meta(),
         }
         if self.import_dir:
             data["import_dir"] = self.import_dir
@@ -508,6 +571,8 @@ class Runner:
         self.log.append(ev)
         if ev.type not in OPERATIONAL_TYPES:
             self._round_events.append(ev)
+        if ev.type == "turn_ended":
+            self.turns.add(ev)
 
     def log_operational(self, event: Event) -> int:
         """Append an operational event (`inference_attempt`, `inference_response`) immediately.
@@ -838,10 +903,12 @@ class Runner:
 
     # ---- the round loop ----------------------------------------------------------------------
     async def _loop(self, start: int) -> None:
+        logged = list(self.log)
         self._probe_no_context = {
-            (e.probe, str(e.agent)) for e in self.log
+            (e.probe, str(e.agent)) for e in logged
             if e.type == "probe" and (e.parsed or {}).get("skipped") == "no_context"
         }
+        self.turns = TurnTally.of(logged)  # resume / fork: the turns already in the log count
         r = start
         while True:
             reason = self._end_reason(r - 1)

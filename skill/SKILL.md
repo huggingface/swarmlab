@@ -47,20 +47,23 @@ level): `swarmlab run` then never starts a run that could push the experiment pa
   4. Caps go in each arm's own `budget:` (`arms.A.budget: {soft_usd: 0, hard_usd: X}`), not the
      top level: budgets are part of the spec hash, so changing a top-level cap later would make
      the finished first arm look like a different run. Keep only `total_usd: T` at the top.
-  5. First real arm = smoke = data, at N <= 6 agents, with `hard_usd` = 50% of the total and no
+  5. `swarmlab preflight SPEC.yaml --arm A` for every arm with a real model -> exit 0: one real
+     request per participant group with the arm's exact `extra` and tools; it shows the
+     provider's HTTP error if a body field is rejected (cents at most; `--max-usd` caps it).
+  6. First real arm = smoke = data, at N <= 6 agents, with `hard_usd` = 50% of the total and no
      soft cap (`soft_usd: 0`: a soft cap at this size stops the run a round early):
      `swarmlab run SPEC.yaml --arm FIRST --seed S` -> `end=max_rounds`. Note its actual spend
      (`spend=$X` on the status line, `spend_usd` under `--json`) and X / rounds = its measured
      per-round cost. The run is kept as the arm's data, not repeated.
-  6. Set the second arm's `hard_usd` from that measurement: about 1.5 x the first arm's actual
+  7. Set the second arm's `hard_usd` from that measurement: about 1.5 x the first arm's actual
      `spend_usd` (same model and N, one variable changed), and no more than T minus that spend;
      `soft_usd: 0`. `swarmlab run SPEC.yaml` then skips the finished first arm and prints an
      `existing:` line with its actual spend and per-round cost; `total_usd` counts that spend
      (including anything added by `resume`) before starting the second arm.
-  7. A `hard_ceiling` end (round in flight discarded) or `hard_ceiling_probes` (last round kept,
+  8. A `hard_ceiling` end (round in flight discarded) or `hard_ceiling_probes` (last round kept,
      some probes skipped): `swarmlab resume RUN_DIR --add-budget D` if T minus the spend so far
      allows (resume itself does not check `total_usd`), else report the rounds you have.
-  8. `swarmlab report runs/ --out report.md`; it lists skipped probes per arm.
+  9. `swarmlab report runs/ --out report.md`; it lists skipped probes per arm.
 - **Total of $2 or more: the full checklist below**, all eleven items.
 
 Do these in order. Each item is done when its check holds; a failing check is fixed before the
@@ -90,7 +93,10 @@ next item.
    checks that each arm's system prompt and round-1 message differ only in the manipulated
    variable, carry no correctness hints, and name every tool the arm needs. Fix the spec and
    re-render until the reviewer signs off.
-5. **Smoke at N=4 with a hard ceiling.** A smoke arm: the real model, `count: 4`,
+5. **Preflight, then smoke at N=4 with a hard ceiling.** First `swarmlab preflight SPEC.yaml
+   --arm A` for every arm with a real model -> exit 0, every group `tool call parsed` (one real
+   request per participant group with the arm's exact `extra` and tools; a rejected body field
+   shows the provider's HTTP error here instead of as a run of errored turns). Then a smoke arm: the real model, `count: 4`,
    `options: {max_rounds: 3}`, `budget: {hard_usd: 0.50, measurement_usd: 0.10}`.
    `swarmlab run SPEC.yaml --arm smoke --seed 0` -> `end=max_rounds` (not `hard_ceiling`), then
    `swarmlab report RUNS_DIR` -> tool protocol health shows no errored turns and few `length`
@@ -149,6 +155,11 @@ next item.
   it replays like a local one.
 - **Slow providers and sequential commit do not mix**: `commit: immediate` puts every call on the
   critical path; keep it to fast providers or small N (`swarmlab estimate` does not model this).
-- **Reasoning models need room**: set `max_tokens: 2048` or turn thinking off through
-  `params: {extra: {chat_template_kwargs: {enable_thinking: false}}}`; `swarmlab report` counts
-  `length` and `max_tokens` finishes (truncated replies).
+- **Reasoning models need room**: set `max_tokens: 2048` or turn thinking off through `extra`,
+  in the serving provider's own field: `{chat_template_kwargs: {enable_thinking: false}}` for
+  Qwen3 on vLLM/SGLang/DeepInfra, `{reasoning_effort: "none"}` on Cerebras (which rejects
+  `chat_template_kwargs`; Qwen3.8 there reasons by default). `swarmlab preflight` checks the
+  field is accepted; `swarmlab report` counts `length` and `max_tokens` finishes.
+- **An `errored` run is not data.** `WARNING: E/T turns errored (first error: ...)`, outcome
+  `errored` and exit 1 mean most turns raised (usually a provider error); fix the spec (run
+  `preflight`) and rerun with `--rerun`, do not analyse it.

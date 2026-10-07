@@ -32,7 +32,12 @@ Mapping:
   `extra={"chat_template_kwargs": {"enable_thinking": False}}` (DeepInfra documents exactly this
   body field for Qwen/Qwen3.5-9B; the HF router forwards the body to the provider), and
   OpenAI-style reasoning knobs (`reasoning_effort`, `reasoning: {...}`) pass the same way. A key
-  `extra_body` (the OpenAI SDK's spelling) is flattened into the body too.
+  `extra_body` (the OpenAI SDK's spelling) is flattened into the body too. Field names are the
+  serving provider's: Cerebras (`hf:<model>:cerebras`) rejects `chat_template_kwargs` with HTTP
+  400 (seen in the 2026-10-07 crowding pilot) and documents `reasoning_effort` (`none`, `low`,
+  `medium`, `high`; default `high` for Qwen 3.8 27B, which therefore reasons unless told
+  `"none"`). `swarmlab preflight` (swarmlab/preflight.py) sends one request with a spec's exact
+  `extra` to check it is accepted.
 - Response: `choices[0].message.content` (None -> ""), `tool_calls[].function.arguments` parsed as
   JSON; a non-JSON string becomes `{"_raw": <string>}` and `finish_reason = "bad_tool_args"`.
   Usage from `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`,
