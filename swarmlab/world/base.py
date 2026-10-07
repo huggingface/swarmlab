@@ -172,6 +172,18 @@ class World(Persistable, Plugin):
         """
         return None
 
+    # ---- per-agent hooks (WP16: Flag Game blind agents) ----------------------------------------
+    def allows_tool(self, agent: AgentId, name: str) -> bool:
+        """False hides the world tool `name` from `agent` (not offered; a call is `not_allowed`).
+        Default: every world tool is offered to every agent."""
+        return True
+
+    def excluded_from_belief(self) -> list[AgentId]:
+        """Agents left out of belief metrics' populations (numerator and denominator), e.g. agents
+        with no private evidence of their own. The runner removes them from the live list it
+        passes to belief metrics' `set_agents`. Default: none."""
+        return []
+
     # ---- round, claim and failure hooks (M3b; swarmlab/medium/registry.py) ----------------------
     def begin_round(self, round: int) -> None:
         """Called by the runner at the start of every round, before any observation (no-op)."""

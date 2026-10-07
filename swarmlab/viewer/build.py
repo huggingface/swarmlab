@@ -127,7 +127,7 @@ def _world(run_dir: Path, meta: dict, blobs: BlobStore) -> tuple[dict | None, st
     data = {
         "kind": "flaggame",
         "candidates": {n: list(g) for n, g in world.candidates.items()},
-        "crops": {a: world.crop_rows(a) for a in world.agents},
+        "crops": {a: world.crop_rows(a) for a in world.agents if a in world.crops},
     }
     return data, world.verify().get("truth")
 

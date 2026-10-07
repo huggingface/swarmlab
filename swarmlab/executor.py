@@ -333,7 +333,13 @@ class RoundExecutor:
             return True
         if self.allowlist is not None and agent in self.allowlist and name not in self.allowlist[agent]:
             return False
+        if name in self._world_tools and not self._world_allows(agent, name):
+            return False  # WP16: the world withholds this tool from the agent (blind agents)
         return self._role_allows(agent, name)
+
+    def _world_allows(self, agent: AgentId, name: str) -> bool:
+        allows = getattr(self.world, "allows_tool", None)
+        return allows(agent, name) if callable(allows) else True
 
     def _role_allows(self, agent: AgentId, name: str) -> bool:
         """M3c: the agent's role permits calling `name` at all (channel checks come later)."""
