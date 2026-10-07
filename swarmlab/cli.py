@@ -111,7 +111,8 @@ def _human(data: dict[str, Any]) -> str:
     if data["metrics"]:
         lines.append("  metrics " + ", ".join(
             f"{k}={_fmt(m['value'])}" for k, m in data["metrics"].items()))
-    for key in ("parent_run", "fork_round", "replay", "view", "skipped", "self_hosted", "fetched"):
+    for key in ("parent_run", "fork_round", "replay", "view", "skipped", "self_hosted", "fetched",
+                "published"):
         if key in data:
             lines.append(f"  {key} {data[key]}")
     return "\n".join(lines)
@@ -477,13 +478,21 @@ def fork(
 @app.command()
 def view(
     run_dir: Annotated[Path, typer.Argument(help="Run directory.")],
+    publish: Annotated[str | None, typer.Option(
+        "--publish", help="Also upload view.html to this dataset repo (owner/name).")] = None,
     as_json: JsonOpt = False,
 ) -> None:
     """Build the self-contained replay page `view.html` for a run."""
 
     def go() -> dict[str, Any]:
         r = Run(run_dir)
-        return {**summary(r), "view": str(r.view())}
+        data = {**summary(r), "view": str(r.view())}
+        if publish is not None:
+            from .publish import publish_view
+
+            res = publish_view(run_dir, publish)
+            data["published"] = f"{res['url']}/blob/main/runs/{r.id}/view.html"
+        return data
 
     _execute(go, as_json)
 
@@ -737,6 +746,56 @@ def export_cmd(
         rows = ", ".join(f"{f}={n}" for f, n in tables.items())
         return {"text": (f"exported {doc['run_id']} -> {d}\n  rows: {rows}\n"
                          f"  sessions: {len(doc['sessions'])}  raw blobs: {doc['blobs']['included']}")}
+
+    _execute(go, as_json)
+
+
+@app.command("publish")
+def publish_cmd(
+    source: Annotated[Path, typer.Argument(help="A run directory or a directory of runs.")],
+    repo: Annotated[str | None, typer.Option(
+        "--repo", help="Dataset repo owner/name (default: <your namespace>/<experiment>).")] = None,
+    public: Annotated[bool, typer.Option(
+        "--public", help="Make the repo public and tag it format:agent-traces.")] = False,
+    tag: Annotated[list[str] | None, typer.Option("--tag", help="Extra card tag (repeatable).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Export (if needed) and upload finished runs to a private Hub dataset repo per experiment."""
+    from .publish import PublishError, publish
+
+    def go() -> dict[str, Any]:
+        try:
+            res = publish(source, repo, public=public, tag=tag or [])
+        except PublishError as e:
+            raise SpecError(str(e)) from e
+        if as_json:
+            return res
+        lines = [f"{r['url']}  {'public' if r['public'] else 'private'}  runs={len(r['runs'])}  "
+                 f"uploaded={r['uploaded']} unchanged={r['unchanged']}" for r in res["repos"]]
+        if res["skipped"]:
+            lines.append("skipped: " + ", ".join(res["skipped"]))
+        return {"text": "\n".join(lines)}
+
+    _execute(go, as_json)
+
+
+@app.command("fetch-published")
+def fetch_published_cmd(
+    repo: Annotated[str, typer.Argument(help="Dataset repo owner/name.")],
+    run_id: Annotated[str, typer.Argument(help="Run id (see the repo's index.json).")],
+    out: Annotated[Path, typer.Option("--out", help="Parent directory for the run dir.")] = Path("runs"),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite an existing run dir.")] = False,
+    as_json: JsonOpt = False,
+) -> None:
+    """Rebuild a run dir from a published run so `Run.load`, `replay`, `view` and `fork` work."""
+    from .publish import PublishError, fetch_published
+
+    def go() -> dict[str, Any]:
+        try:
+            d = fetch_published(repo, run_id, out, force=force)
+        except PublishError as e:
+            raise SpecError(str(e)) from e
+        return {**summary(Run(d)), "fetched": str(d)}
 
     _execute(go, as_json)
 

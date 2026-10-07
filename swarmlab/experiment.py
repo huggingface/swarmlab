@@ -336,6 +336,14 @@ class Experiment(BaseModel):
         doc["options"] = {k: v for k, v in self.options.items() if k != "seed"}
         dump_experiment_yaml(doc, path)
 
+    # ---- M4: publish (docs/INTERFACE-M4.md §2) ------------------------------------------------
+    def publish(self, runs_dir: Path | str = "runs", *, repo: str | None = None,
+                public: bool = False, tag: list[str] | str | None = None, api: Any = None) -> dict:
+        """Publish this experiment's finished runs under `runs_dir` (see `swarmlab.publish`)."""
+        from .publish import publish
+
+        return publish(runs_dir, repo, public=public, tag=tag, api=api, experiment=self.name)
+
 
 class ForkHandle:
     """`run.fork(at_round, experiment)` result; `.run(out=None)` executes the fork."""
