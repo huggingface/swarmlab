@@ -1,0 +1,45 @@
+# M3c: a two-level hierarchy on the Flag Game, as a spec (docs/INTERFACE-M3c.md §3).
+# 18 LLM agents; `flat` is a broadcast board of workers, `tree` splits them into 3 groups of 6
+# (Tree topology: channels group:0..2 plus `coordinators`), the first agent of each group being
+# its coordinator (built-in `coordinator` role: reads its group's reports, posts assignments and
+# summaries, may not act in the world).
+#
+#   swarmlab validate examples/hierarchy_flaggame.yaml
+#   swarmlab prompts examples/hierarchy_flaggame.yaml --arm tree     # see the coordinator prompt
+#   swarmlab run examples/hierarchy_flaggame.yaml --yes              # both arms, every seed
+#
+# Runs on the deterministic fake provider (`fake:reader`: no network, no spend). For a real
+# model, replace every `model: "fake:reader"` (the &llm anchor below) with e.g.
+# "anthropic:claude-haiku-4-5" (needs ANTHROPIC_API_KEY), run `swarmlab estimate` and set a
+# real `budget` first. The scripted fake does not relay between groups, so under it the tree arm
+# mostly measures what each group can find on its own.
+#
+# Ablation switch: let coordinators act too (a different spec hash, so a separate arm or file):
+#   roles:
+#     coordinator: {may_act: true}
+name: hierarchy-flaggame
+seeds: [1, 2]
+budget: {soft_usd: 0, hard_usd: 1.0, measurement_usd: 0}   # fake pricing (1, 5, 0.1) per M tokens
+options:
+  max_rounds: 6
+roles:
+  worker: {}
+  coordinator: {}          # the built-in; override any field here, e.g. {may_act: true}
+arms:
+  flat:
+    world: {type: flaggame, params: {n_candidates: 8, rival_edits: 1}}
+    participants:
+      - {type: llm, count: 18, role: worker, params: &llm {model: "fake:reader", max_tokens: 256, max_calls: 4}}
+    medium: {topology: broadcast}
+    metrics: [belief.consensus, belief.accuracy, comm.read_rate, comm.posts_per_round]
+  tree:
+    world: {type: flaggame, params: {n_candidates: 8, rival_edits: 1}}
+    participants:
+      - {type: llm, role: coordinator, params: *llm}
+      - {type: llm, count: 5, role: worker, params: *llm}
+      - {type: llm, role: coordinator, params: *llm}
+      - {type: llm, count: 5, role: worker, params: *llm}
+      - {type: llm, role: coordinator, params: *llm}
+      - {type: llm, count: 5, role: worker, params: *llm}
+    medium: {topology: {type: tree, params: {groups: 3}}}
+    metrics: [belief.consensus, belief.accuracy, comm.read_rate, comm.posts_per_round]

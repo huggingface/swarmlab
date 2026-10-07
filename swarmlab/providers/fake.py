@@ -17,7 +17,8 @@ Built-in `flaggame_reader` (FlagGame text observations). Within one turn (the me
 last `user` message that is not a json-protocol `[tool results]` message):
 
 1. If `read_board` is offered and has not been called this turn: call `post` with
-   `"crop:\\n<rows>"` first if `post` is offered and the conversation shows no earlier `post` of a
+   `"crop:\\n<rows>"` (on `main`, or with no channel when the `post` schema's channel enum does
+   not offer `main`) first if `post` is offered and the conversation shows no earlier `post` of a
    crop, then `read_board(limit=200)`.
 2. Otherwise: collect every distinct crop in the conversation (any `crop:` block of lowercase rows,
    in any message text or tool result, JSON-escaped newlines included; this covers the
@@ -158,7 +159,12 @@ def flaggame_reader(request: ChatRequest, rng: random.Random) -> ChatResponse:
         posted = any(name == "post" and "crop:" in str(args.get("text", ""))
                      for m in msgs for name, args in _assistant_calls(m))
         if "post" in tools and not posted and own_crop:
-            calls.append(("post", {"channel": "main", "text": "crop:\n" + "\n".join(own_crop)}))
+            # post to `main` when offered, else to the executor's default channel (M3c: a Tree
+            # topology offers only group channels)
+            enum = next((t.parameters.get("properties", {}).get("channel", {}).get("enum")
+                         for t in request.tools if t.name == "post"), None)
+            where = {"channel": "main"} if enum is None or "main" in enum else {}
+            calls.append(("post", {**where, "text": "crop:\n" + "\n".join(own_crop)}))
         calls.append(("read_board", {"limit": 200}))
         return _response(request, rng, calls)
     crops = sorted({c for t in _texts(request) for c in parse_crops(t)})
