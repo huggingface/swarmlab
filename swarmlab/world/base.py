@@ -146,6 +146,18 @@ class World(Persistable, Plugin):
     def verify(self) -> dict:
         return {}
 
+    # ---- round, claim and failure hooks (M3b; swarmlab/medium/registry.py) ----------------------
+    def begin_round(self, round: int) -> None:
+        """Called by the runner at the start of every round, before any observation (no-op)."""
+
+    def claim_key(self, agent: AgentId, action: Action) -> str | None:
+        """The registry key of the resource `action` works on, or None (not claimable)."""
+        return None
+
+    def killed_at(self, round: int) -> list[AgentId]:
+        """Agents that fail at the start of `round` (the runner removes them from the live set)."""
+        return []
+
     # ---- intervention hooks (M3a, docs/INTERFACE-M3a.md §1) -----------------------------------
     def patch_private(self, agent: AgentId, data: dict) -> None:
         """Change `agent`'s private information; deliver it as new evidence in its next observation."""

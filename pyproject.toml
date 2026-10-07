@@ -24,6 +24,11 @@ swarmlab = "swarmlab.cli:app"
 
 [project.entry-points."swarmlab.worlds"]
 flaggame = "swarmlab.world.flaggame:FlagGame"
+coloring = "swarmlab.world.coloring:ColoringGrid"
+
+[project.entry-points."swarmlab.claim_policies"]
+advisory = "swarmlab.medium.registry:Advisory"
+enforced = "swarmlab.medium.registry:Enforced"
 
 [project.entry-points."swarmlab.topologies"]
 broadcast = "swarmlab.medium.topology:Broadcast"
@@ -37,6 +42,9 @@ delay = "swarmlab.medium.board:DelayPolicy"
 silent = "swarmlab.participants.scripted:Silent"
 evidence_aggregator = "swarmlab.participants.scripted:EvidenceAggregator"
 enumerator = "swarmlab.participants.scripted:Enumerator"
+row_major_painter = "swarmlab.participants.scripted:RowMajorPainter"
+queue_painter = "swarmlab.participants.scripted:QueuePainter"
+random_painter = "swarmlab.participants.scripted:RandomPainter"
 llm = "swarmlab.participants.llm:LLMAgent"
 
 [project.entry-points."swarmlab.metrics"]
@@ -47,6 +55,12 @@ llm = "swarmlab.participants.llm:LLMAgent"
 "comm.read_rate" = "swarmlab.metrics.comm:ReadRate"
 "comm.posts_per_round" = "swarmlab.metrics.comm:PostsPerRound"
 "comm.hops" = "swarmlab.metrics.comm:Hops"
+"coloring.coverage" = "swarmlab.metrics.coloring:Coverage"
+"coloring.duplicate_paints" = "swarmlab.metrics.coloring:DuplicatePaints"
+"coloring.wrong_paints" = "swarmlab.metrics.coloring:WrongPaints"
+"coloring.parallel_efficiency" = "swarmlab.metrics.coloring:ParallelEfficiency"
+"claims.violations" = "swarmlab.metrics.coloring:ClaimViolations"
+"claims.held" = "swarmlab.metrics.coloring:ClaimsHeld"
 
 [project.entry-points."swarmlab.probes"]
 belief = "swarmlab.probes:BeliefProbe"
@@ -66,6 +80,7 @@ fake = "swarmlab.providers.fake:FakeProvider"
 
 [project.entry-points."swarmlab.fake_scripts"]
 flaggame_reader = "swarmlab.providers.fake:flaggame_reader"
+painter = "swarmlab.world.coloring:fake_painter"
 
 [build-system]
 requires = ["hatchling"]

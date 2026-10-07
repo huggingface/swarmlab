@@ -49,6 +49,15 @@ Decisions where the contract is silent:
   `HardCeilingReached` sets `hard_ceiling` on the executor before propagating, so the runner aborts
   the round even if a participant swallows the exception. Without an `Inference` (unit tests
   that build a bare executor), `infer` raises `RuntimeError`.
+- Registry (M3b, swarmlab/medium/registry.py): with a `registry`, the schemas add
+  `registry_get(key)`, `registry_put(key, value)`, `registry_cas(key, expected_version, value)`,
+  `registry_acquire(key, ttl_rounds)`, `registry_release(key)`. Args are checked at call time
+  (`ok=False, error="bad args: ..."`, nothing buffered). Under round_end a write is buffered per
+  agent (`buffered_registry(agent)`) and returns `pending=True` with `{"id": op_id}`; `get`
+  answers from round-start state plus the caller's own buffered writes. Under immediate commit a
+  write applies at once (`committed.registry`) and returns its outcome with `pending=False`, and
+  a world action passes the claim check (`commit_world`) before the world commits it
+  (`committed.claims`).
 - Concurrency: `call` contains no `await`, so under asyncio each call is atomic. During round_end
   turns it only reads shared world state and touches the calling agent's own board inbox
   (`board.read`), so concurrent turns cannot observe each other.
@@ -71,12 +80,47 @@ from .events import (
 )
 from .ids import ActionId, AgentId, CallId
 from .medium.board import Board, Delivery, Post
+from .medium.registry import (
+    TOOL_OPS,
+    ClaimPolicy,
+    Registry,
+    RegistryOp,
+    RegistryOutcome,
+    check_op_args,
+    commit_world,
+)
 from .providers.base import ChatRequest, ChatResponse, Usage
 from .tools import ToolResult, ToolSchema, TurnCapReached
 from .world.base import Action, Outcome, World
 
 BOARD_TOOLS = ("read_board", "post")
 STATUS_TOOLS = ("my_status", "collective_status")
+REGISTRY_TOOLS = ("registry_get", *TOOL_OPS)
+
+
+def _obj(props: dict, required: list[str]) -> dict:
+    return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
+
+
+def registry_schemas() -> list[ToolSchema]:
+    key = {"type": "string", "description": "Registry key, e.g. cell:3,4"}
+    value = {"type": "string"}
+    return [
+        ToolSchema(name="registry_get", description="Read a registry entry: value, version, owner "
+                   "(the agent holding a live claim) and expires_round.", parameters=_obj({"key": key}, ["key"])),
+        ToolSchema(name="registry_put", description="Set a registry value (applied at the end of the round).",
+                   parameters=_obj({"key": key, "value": value}, ["key", "value"])),
+        ToolSchema(name="registry_cas", description="Set a registry value only if the entry's version "
+                   "still equals expected_version at the end of the round (0 for a missing key).",
+                   parameters=_obj({"key": key, "expected_version": {"type": "integer"}, "value": value},
+                                   ["key", "expected_version", "value"])),
+        ToolSchema(name="registry_acquire", description="Claim a key for ttl_rounds rounds (this round "
+                   "counts as the first). Succeeds at the end of the round only if nobody else holds a "
+                   "live claim on it; earlier-scheduled agents win ties. The result arrives next round.",
+                   parameters=_obj({"key": key, "ttl_rounds": {"type": "integer"}}, ["key", "ttl_rounds"])),
+        ToolSchema(name="registry_release", description="Release your claim on a key.",
+                   parameters=_obj({"key": key}, ["key"])),
+    ]
 
 END_TURN_SCHEMA = ToolSchema(
     name="end_turn",
@@ -122,6 +166,7 @@ class _AgentState:
     actions: list[tuple[AgentId, ActionId, Action]] = field(default_factory=list)
     posts: list[tuple[str, str, dict]] = field(default_factory=list)  # (channel, text, fields)
     post_ids: list[str] = field(default_factory=list)  # provisional ids, parallel to `posts`
+    registry: list[RegistryOp] = field(default_factory=list)  # buffered registry writes (M3b)
     calls: int = 0
     n_actions: int = 0
     ended: bool = False
@@ -138,6 +183,8 @@ class Committed:
     posts: list[Post] = field(default_factory=list)
     deliveries: list[Delivery] = field(default_factory=list)
     actions: list[tuple[AgentId, ActionId, Action, Outcome]] = field(default_factory=list)
+    registry: list[RegistryOutcome] = field(default_factory=list)  # M3b
+    claims: list[dict] = field(default_factory=list)  # M3b: commit_world claim records
 
 
 class RoundExecutor:
@@ -155,6 +202,8 @@ class RoundExecutor:
         topology_rng: Callable[[], random.Random] | None = None,
         allowlist: dict[AgentId, set[str]] | None = None,
         inference: Any = None,
+        registry: Registry | None = None,
+        claim_policy: ClaimPolicy | None = None,
     ) -> None:
         self.run = run
         self.round = round
@@ -167,6 +216,8 @@ class RoundExecutor:
         self._topology_rng = topology_rng or (lambda: random.Random(0))
         self.allowlist = allowlist
         self.inference = inference
+        self.registry = registry
+        self.claim_policy = claim_policy
         self.hard_ceiling = False
         self._state: dict[AgentId, _AgentState] = {}
         self.committed = Committed()
@@ -215,6 +266,9 @@ class RoundExecutor:
         """Provisional ids returned to the agent, parallel to `buffered_posts(agent)`."""
         return list(self._st(agent).post_ids)
 
+    def buffered_registry(self, agent: AgentId) -> list[RegistryOp]:
+        return list(self._st(agent).registry)
+
     def buffered_actions(self, agent: AgentId) -> list[tuple[AgentId, ActionId, Action]]:
         return list(self._st(agent).actions)
 
@@ -227,7 +281,8 @@ class RoundExecutor:
         return name in self.allowlist[agent]
 
     def schemas(self, agent: AgentId) -> list[ToolSchema]:
-        out = [*self._world_tools.values(), *board_schemas(self.board), END_TURN_SCHEMA]
+        reg = registry_schemas() if self.registry is not None else []
+        out = [*self._world_tools.values(), *board_schemas(self.board), *reg, END_TURN_SCHEMA]
         return [s.normalized() for s in out if self._allowed(agent, s.name)]
 
     async def call(self, agent: AgentId, name: str, args: dict | None = None) -> ToolResult:
@@ -250,6 +305,8 @@ class RoundExecutor:
             res = self._read_board(agent, call_id, args)
         elif name == "post":
             res = self._post(agent, call_id, args)
+        elif name in REGISTRY_TOOLS and self.registry is not None:
+            res = self._registry(agent, call_id, name, args)
         elif name in STATUS_TOOLS and name in self._world_tools:
             res = self._status(agent, call_id, name, args)
         elif name in self._world_tools:
@@ -353,8 +410,32 @@ class RoundExecutor:
         if self.commit_mode == "round_end":
             st.actions.append((agent, action_id, action))
             return ToolResult(call_id=call_id, ok=True, result={"id": action_id}, pending=True)
-        outcome = self.world.commit([(agent, action_id, action)])[0]
+        outs, claims = commit_world(self.world, [(agent, action_id, action)], registry=self.registry,
+                                    policy=self.claim_policy, round=self.round)
+        outcome = outs[0]
         outcome.action_id = action_id
+        self.committed.claims.extend(claims)
         self.committed.actions.append((agent, action_id, action, outcome))
         return ToolResult(call_id=call_id, ok=True, pending=False, result={
             "id": action_id, "accepted": outcome.accepted, "feedback": dict(outcome.feedback)})
+
+    def _registry(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
+        assert self.registry is not None
+        op_name = "get" if name == "registry_get" else TOOL_OPS[name]
+        op, error = check_op_args(op_name, args)
+        if op is None:
+            return self._err(call_id, error or "bad args")
+        st = self._st(agent)
+        if op_name == "get":
+            pending = st.registry if self.commit_mode == "round_end" else []
+            return ToolResult(call_id=call_id, ok=True,
+                              result=self.registry.get(op.key, self.round, pending))
+        op = op.model_copy(update={"agent": agent,
+                                   "op_id": f"g{self.round:04d}-{agent}-{len(st.registry):02d}"})
+        st.registry.append(op)
+        if self.commit_mode == "round_end":
+            return ToolResult(call_id=call_id, ok=True, result={"id": op.op_id}, pending=True)
+        outcome = self.registry.apply(op, self.round)
+        self.committed.registry.append(outcome)
+        return ToolResult(call_id=call_id, ok=True, pending=False,
+                          result={"id": op.op_id, "accepted": outcome.ok, "feedback": outcome.feedback()})

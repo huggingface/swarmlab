@@ -136,3 +136,113 @@ class Enumerator(Participant):
             self._check_name("tool result", json.dumps({**data, "result": body}, sort_keys=True))
         await tools.call("end_turn", {})
         return TurnUsage(calls=len(results) + 1)
+
+
+# ---- ColoringGrid painters (M3b; swarmlab/world/coloring.py) -----------------------------------
+#
+# Each paints at most `paints` cells per turn, chosen from its own observation of the target and
+# the current grid (round-start state), then calls `end_turn`.
+#
+# - `RowMajorPainter`: the first cells, in row-major order, whose colour differs from the target.
+#   Every such agent picks the same cells: the duplicate-work baseline.
+# - `QueuePainter(ttl_rounds=1)`: the work-queue baseline. Picks cells that differ from the target
+#   at random (its rng) among those whose registry entry shows no live claim by another agent
+#   (`registry_get` at round start; at most `max_checks` reads per turn), then
+#   `registry_acquire("cell:x,y", ttl_rounds)` and paints them in the same turn. Registry writes
+#   commit before world actions, so under `enforced` the paint of an agent that lost the acquire
+#   race is rejected; under `advisory` it goes through and counts as a claim violation. With
+#   zones on it claims `zone:..` keys as the world reports them via `claim_key`; it computes the
+#   key with the same formula from the observation's `Zones:` line.
+# - `RandomPainter`: random cells (any) with random palette colours: the noise baseline.
+
+
+def _coloring_obs(view: View) -> tuple[list[str], list[str], list[str], tuple[int, int] | None]:
+    from ..world.coloring import parse_observation as parse_coloring
+
+    text = _observation_text(view)
+    target, current, colours = parse_coloring(text)
+    zones = None
+    m = re.search(r"^Zones: (\d+) x (\d+)", text, re.MULTILINE)
+    if m:
+        zones = (int(m.group(1)), int(m.group(2)))
+    return target, current, colours, zones
+
+
+def _cell_key(x: int, y: int, h: int, w: int, zones: tuple[int, int] | None) -> str:
+    if zones is None:
+        return f"cell:{x},{y}"
+    zy, zx = zones
+    return f"zone:{x * zx // w},{y * zy // h}"
+
+
+class RowMajorPainter(Participant):
+    entry_point: ClassVar[str | None] = "row_major_painter"
+
+    def __init__(self, paints: int = 1) -> None:
+        self.paints = paints
+
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
+        from ..world.coloring import needed_cells
+
+        target, current, _, _ = _coloring_obs(view)
+        calls = 0
+        for x, y, c in needed_cells(target, current)[: self.paints]:
+            await tools.call("paint", {"x": x, "y": y, "color": c})
+            calls += 1
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=calls + 1)
+
+
+class QueuePainter(Participant):
+    entry_point: ClassVar[str | None] = "queue_painter"
+
+    def __init__(self, paints: int = 1, ttl_rounds: int = 1, max_checks: int = 4) -> None:
+        self.paints = paints
+        self.ttl_rounds = ttl_rounds
+        self.max_checks = max_checks
+
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
+        from ..world.coloring import needed_cells
+
+        target, current, _, zones = _coloring_obs(view)
+        h, w = len(target), len(target[0]) if target else 0
+        need = needed_cells(target, current)
+        self.rng.shuffle(need)
+        calls = 0
+        checks = 0
+        done = 0
+        for x, y, c in need:
+            if done >= self.paints:
+                break
+            key = _cell_key(x, y, h, w, zones)
+            if checks < self.max_checks:
+                checks += 1
+                calls += 1
+                res = await tools.call("registry_get", {"key": key})
+                owner = res.result.get("owner") if res.ok else None
+                if owner not in (None, self.agent):
+                    continue
+            await tools.call("registry_acquire", {"key": key, "ttl_rounds": self.ttl_rounds})
+            await tools.call("paint", {"x": x, "y": y, "color": c})
+            calls += 2
+            done += 1
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=calls + 1)
+
+
+class RandomPainter(Participant):
+    entry_point: ClassVar[str | None] = "random_painter"
+
+    def __init__(self, paints: int = 1) -> None:
+        self.paints = paints
+
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
+        target, _, colours, _ = _coloring_obs(view)
+        calls = 0
+        if target and colours:
+            for _ in range(self.paints):
+                x, y = self.rng.randrange(len(target[0])), self.rng.randrange(len(target))
+                await tools.call("paint", {"x": x, "y": y, "color": self.rng.choice(colours)})
+                calls += 1
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=calls + 1)

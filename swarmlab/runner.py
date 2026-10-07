@@ -111,6 +111,15 @@ continuation; a world whose snapshot carries config would revert it); a particip
 only when its spec equals the parent's spec for that agent, else it starts fresh (bound, no
 memory); a metric is restored when its spec is in the parent's metric list, else it starts fresh
 at the fork round. The number of participants must not change.
+
+Registry and claims (M3b, swarmlab/medium/registry.py): when the board's `registry` is on, the
+runner owns a `Registry` (snapshot key `plugins["registry"]`, restored whenever present) and the
+board's claim policy, and hands both to each round's executor. Each round starts with
+`world.begin_round(r)` and then removes `world.killed_at(r)` from the live set (logged as
+`intervention` events, `intervention="worker_failures"`, `op="kill"`) before the order is drawn.
+Commit order under phase-commit: posts, then registry writes (in `order`, each agent's in call
+order; `registry*` events), then world actions through the claim check (`claim*` events, then
+`action_committed*`). Registry outcomes join `View.outcomes` after the world-action outcomes.
 """
 from __future__ import annotations
 
@@ -132,6 +141,7 @@ from .events import (
     ActionCommittedEvent,
     BudgetChangedEvent,
     BudgetEvent,
+    ClaimEvent,
     DeliveryEvent,
     Event,
     EventLog,
@@ -139,6 +149,7 @@ from .events import (
     OverflowEvent,
     PostEvent,
     ProbeEvent,
+    RegistryEvent,
     RoundCommittedEvent,
     RoundStartedEvent,
     RunEndedEvent,
@@ -153,11 +164,13 @@ from .ids import run_id as make_run_id
 from .inference import Inference, InferenceCache
 from .interventions import (
     Intervention,
+    Ops,
     build_intervention,
     check_names,
     fire_interventions,
     replay_world_op,
 )
+from .medium.registry import Registry, commit_world
 from .metrics.base import Metric
 from .metrics.base import get as get_metric
 from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
@@ -325,6 +338,7 @@ class Runner:
             raise ValueError(f"probe names must be unique, got {pnames}")
         self.interventions: list[Intervention] = [build_intervention(i) for i in exp.interventions]
         check_names(self.interventions)  # M3a
+        self.registry = Registry() if getattr(self.board, "registry", False) else None  # M3b
         self._probes_stopped = False
         self._probe_hard_ceiling = False
         self._probe_no_context: set[tuple[str, str]] = set()
@@ -370,6 +384,8 @@ class Runner:
             out[f"metric:{m.name}"] = m.snapshot()
         for iv in self.interventions:
             out[f"intervention:{iv.name}"] = iv.snapshot()
+        if self.registry is not None:  # M3b
+            out["registry"] = self.registry.snapshot()
         return out
 
     def _restore(self, manifest: SnapshotManifest, parent_spec: RunSpec | None) -> None:
@@ -401,6 +417,8 @@ class Runner:
             key = f"intervention:{iv.name}"
             if key in blobs and (same or PluginSpec(**iv.spec()) in parent_spec.interventions):
                 iv.restore(blobs[key])
+        if self.registry is not None and "registry" in blobs:  # M3b
+            self.registry.restore(blobs["registry"])
         self._set_truth()
         self.outcomes_prev = {a: list(v) for a, v in manifest.outcomes_prev.items()}
         self.live_agents = [AgentId(a) for a in manifest.live]
@@ -881,6 +899,10 @@ class Runner:
     async def _round(self, r: int) -> None:
         seed = self.options.seed
         self._round_events = []
+        self.world.begin_round(r)  # M3b: world dynamics, then scheduled worker failures
+        failed = [a for a in self.world.killed_at(r) if a in self.live_agents]
+        if failed:
+            Ops(self, "worker_failures", r).kill(failed)
         if self.live_agents != getattr(self, "_metric_agents", None):
             self._set_agents()
         order = self.scheduler.order(r, list(self.live_agents), derive(seed, "schedule", r))
@@ -890,6 +912,7 @@ class Runner:
             agents=list(self.live_agents), commit=self.options.commit,
             max_calls_per_turn=self.options.max_calls_per_turn,
             topology_rng=lambda: derive(seed, "topology", r), inference=self.inference,
+            registry=self.registry, claim_policy=self.board.claim_policy,
         )
         self.executor = ex
         if self.options.commit == "round_end":
@@ -915,12 +938,16 @@ class Runner:
                     provisional[self.board.buffer_post(a, r, channel, text, fields)] = tmp
             posts, deliveries = self.board.commit(r, list(self.live_agents),
                                                   derive(seed, "topology", r), self.blobs)
+            reg = (self.registry.commit(r, [op for a in order for op in ex.buffered_registry(a)])
+                   if self.registry is not None else [])  # M3b: registry before world actions
             actions = [x for a in order for x in ex.buffered_actions(a)]
-            outcomes = self.world.commit(actions)
+            outcomes, claims = commit_world(self.world, actions, registry=self.registry,
+                                            policy=self.board.claim_policy, round=r)
             applied = [(a, aid, act, out) for (a, aid, act), out in zip(actions, outcomes, strict=True)]
         else:
             posts, deliveries = ex.committed.posts, ex.committed.deliveries
             applied = ex.committed.actions
+            reg, claims = ex.committed.registry, ex.committed.claims
         for p in posts:
             self._append(PostEvent, r, p.agent, post_id=p.post_id,
                          provisional_id=provisional.get(p.post_id, p.post_id), channel=p.channel,
@@ -929,6 +956,12 @@ class Runner:
             self._append(DeliveryEvent, r, d.recipient, post_id=d.post_id, recipient=d.recipient,
                          delivery_id=d.delivery_id, eligible_round=d.eligible_round,
                          content_hash=d.content_hash)
+        for o in reg:  # M3b
+            self._append(RegistryEvent, r, o.agent, op_id=o.op_id, op=o.op, key=o.key, ok=o.ok,
+                         version=o.version, owner=o.owner, expires_round=o.expires_round,
+                         value=_jsonable(o.value), error=o.error)
+        for c in claims:
+            self._append(ClaimEvent, r, c["agent"], **{k: v for k, v in c.items() if k != "agent"})
         self.outcomes_prev = {a: [] for a in self.live_agents}
         for a, aid, act, out in applied:
             feedback = _jsonable(out.feedback)
@@ -936,6 +969,8 @@ class Runner:
                          accepted=out.accepted, feedback=feedback)
             self.outcomes_prev.setdefault(a, []).append(
                 {"action_id": aid, "tool": act.name, "accepted": out.accepted, "feedback": feedback})
+        for o in reg:  # M3b
+            self.outcomes_prev.setdefault(o.agent, []).append(_jsonable(o.view_outcome()))
         # interventions (M3a: after the commit, before probes, in spec order)
         fire_interventions(self, r)
         # probes (after the commit, before metrics, so probe-sourced metrics see this round)

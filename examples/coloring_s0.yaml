@@ -1,0 +1,46 @@
+# Coloring S0 (DESIGN.md M3): framework validation of the registry and claim policies on an
+# 8x8 ColoringGrid with 16 agents and full visibility, board-only medium otherwise.
+#   swarmlab validate examples/coloring_s0.yaml
+#   swarmlab run examples/coloring_s0.yaml --yes          # every arm x every seed below
+#   swarmlab run examples/coloring_s0.yaml --arm queue_enforced --seed 0
+# Arms:
+#   row_major       16 RowMajorPainters, no registry: everyone paints the same first cell (duplicate work)
+#   queue_advisory  16 QueuePainters, registry on, advisory claims: lost acquire races still paint
+#                   (counted as claims.violations and duplicate paints)
+#   queue_enforced  16 QueuePainters, registry on, enforced claims: the world rejects paints on
+#                   cells the painter does not hold
+#   llm             16 LLMAgents on the fake provider (`fake:painter`, no network, no spend)
+name: coloring-s0
+seeds: [0, 1, 2]
+budget: {soft_usd: 0, hard_usd: 0}
+options:
+  max_rounds: 20
+arms:
+  row_major:
+    world: {type: coloring, params: {height: 8, width: 8, palette: 4}}
+    participants:
+      - {type: row_major_painter, count: 16}
+    metrics: [coloring.coverage, coloring.duplicate_paints, coloring.wrong_paints,
+              coloring.parallel_efficiency]
+  queue_advisory:
+    world: {type: coloring, params: {height: 8, width: 8, palette: 4}}
+    participants:
+      - {type: queue_painter, count: 16}
+    medium: {registry: true, claim_policy: advisory}
+    metrics: [coloring.coverage, coloring.duplicate_paints, coloring.wrong_paints,
+              coloring.parallel_efficiency, claims.violations, claims.held]
+  queue_enforced:
+    world: {type: coloring, params: {height: 8, width: 8, palette: 4}}
+    participants:
+      - {type: queue_painter, count: 16}
+    medium: {registry: true, claim_policy: enforced}
+    metrics: [coloring.coverage, coloring.duplicate_paints, coloring.wrong_paints,
+              coloring.parallel_efficiency, claims.violations, claims.held]
+  llm:
+    world: {type: coloring, params: {height: 8, width: 8, palette: 4}}
+    participants:
+      - {type: llm, count: 16, params: {model: "fake:painter", max_tokens: 256}}
+    medium: {registry: true}
+    metrics: [coloring.coverage, coloring.duplicate_paints, coloring.wrong_paints,
+              coloring.parallel_efficiency, claims.violations, claims.held]
+    budget: {hard_usd: 1.0}   # fake pricing (1, 5, 0.1) per M tokens

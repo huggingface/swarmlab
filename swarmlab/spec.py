@@ -37,6 +37,10 @@ Decisions where the contract is silent:
   the run spec gets the experiment's list followed by the arm's. `RunSpec.interventions` is left
   out of `spec_hash` when empty, and empty lists are left out of the normalised document, so
   earlier specs, documents and hashes are unchanged.
+- M3b: `MediumSpec.registry: bool = False` turns on the registry tools and
+  `MediumSpec.claim_policy` (default `advisory`; `enforced`; bare strings allowed) links it to
+  the world (swarmlab/medium/registry.py). `MediumSpec` serialises without either field while it
+  is at its default, so earlier run specs, documents and hashes are unchanged.
 """
 from __future__ import annotations
 
@@ -48,7 +52,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_serializer,
+)
 
 from ._io import atomic_write_bytes
 
@@ -84,11 +95,24 @@ class MediumSpec(BaseModel):
     push_limit: int = 20
     policies: list[PluginSpec] = []
     channels: list[str] = ["main"]
+    registry: bool = False  # M3b
+    claim_policy: PluginSpec = PluginSpec(type="advisory")  # M3b
 
-    @field_validator("topology", mode="before")
+    @field_validator("topology", "claim_policy", mode="before")
     @classmethod
     def _topology(cls, v: Any) -> Any:
         return _coerce_plugin(v)
+
+    @model_serializer(mode="wrap")
+    def _drop_m3b_defaults(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict):
+            if data.get("registry") is False:
+                data.pop("registry")
+            if data.get("claim_policy") in ({"type": "advisory", "params": {}},
+                                            PluginSpec(type="advisory")):
+                data.pop("claim_policy")
+        return data
 
     @field_validator("policies", mode="before")
     @classmethod
