@@ -33,6 +33,10 @@ Decisions where the contract is silent:
   `experiment_seeds(doc)` use; absent or empty means `[0]`. It is not part of any `RunSpec`, so
   it never changes a `spec_hash`. The normalised document omits it when empty.
 - Validation failures raise `SpecError` (a `ValueError`); the CLI maps it to exit code 2.
+- M3a: `interventions: [{type, params}]` (bare strings allowed) on the experiment and/or an arm;
+  the run spec gets the experiment's list followed by the arm's. `RunSpec.interventions` is left
+  out of `spec_hash` when empty, and empty lists are left out of the normalised document, so
+  earlier specs, documents and hashes are unchanged.
 """
 from __future__ import annotations
 
@@ -114,6 +118,7 @@ class RunSpec(BaseModel):
     options: RunOptions
     providers: dict[str, PluginSpec] = {}  # M1b: provider overrides by model prefix
     probes: list[PluginSpec] = []  # M1b: probes run after each commit (swarmlab/probes.py)
+    interventions: list[PluginSpec] = []  # M3a: swarmlab/interventions.py
 
 
 def canonical_json(data: Any) -> str:
@@ -125,6 +130,8 @@ def spec_hash(run_spec: RunSpec) -> str:
     data = run_spec.model_dump(mode="json")
     if not data.get("probes"):  # M1b field; omitted when empty so earlier specs keep their hash
         data.pop("probes", None)
+    if not data.get("interventions"):  # M3a, likewise
+        data.pop("interventions", None)
     return hashlib.sha256(canonical_json(data).encode()).hexdigest()
 
 
@@ -145,6 +152,7 @@ class ArmDoc(BaseModel):
     medium: MediumSpec = MediumSpec()
     metrics: list[PluginSpec] = []
     probes: list[PluginSpec] = []
+    interventions: list[PluginSpec] = []
     options: dict = {}
     budget: dict = {}
 
@@ -158,7 +166,7 @@ class ArmDoc(BaseModel):
     def _participants(cls, v: Any) -> Any:
         return [_coerce_plugin(x) for x in v] if isinstance(v, (list, tuple)) else v
 
-    @field_validator("metrics", "probes", mode="before")
+    @field_validator("metrics", "probes", "interventions", mode="before")
     @classmethod
     def _metrics(cls, v: Any) -> Any:
         return [_coerce_plugin(x) for x in v] if isinstance(v, (list, tuple)) else v
@@ -172,6 +180,12 @@ class ExperimentDoc(BaseModel):
     options: dict = {}
     providers: dict[str, PluginSpec] = {}
     seeds: list[int] = []
+    interventions: list[PluginSpec] = []
+
+    @field_validator("interventions", mode="before")
+    @classmethod
+    def _interventions(cls, v: Any) -> Any:
+        return [_coerce_plugin(x) for x in v] if isinstance(v, (list, tuple)) else v
 
     @field_validator("providers", mode="before")
     @classmethod
@@ -206,6 +220,11 @@ def validate_experiment_doc(doc: dict) -> dict:
     out = parsed.model_dump(mode="json")
     if not out["seeds"]:
         out.pop("seeds")
+    if not out["interventions"]:
+        out.pop("interventions")
+    for arm in out["arms"].values():
+        if not arm["interventions"]:
+            arm.pop("interventions")
     return out
 
 
@@ -261,6 +280,7 @@ def arm_to_runspec(doc: dict, arm: str, seed: int, **option_overrides: Any) -> R
             medium=MediumSpec(**a["medium"]),
             metrics=[PluginSpec(**m) for m in a["metrics"]],
             probes=[PluginSpec(**p) for p in a["probes"]],
+            interventions=[PluginSpec(**i) for i in norm.get("interventions", []) + a.get("interventions", [])],
             budget=Budget(**{**norm["budget"], **a["budget"]}),
             options=RunOptions(**options),
             providers={k: PluginSpec(**v) for k, v in norm["providers"].items()},
@@ -297,6 +317,7 @@ def runspec_to_doc(run_spec: RunSpec, arm: str | None = None) -> dict:
                     "medium": run_spec.medium.model_dump(mode="json"),
                     "metrics": [m.model_dump(mode="json") for m in run_spec.metrics],
                     "probes": [p.model_dump(mode="json") for p in run_spec.probes],
+                    "interventions": [i.model_dump(mode="json") for i in run_spec.interventions],
                 }
             },
         }

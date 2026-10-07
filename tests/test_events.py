@@ -14,6 +14,7 @@ from swarmlab.events import (
     EventLogCorrupt,
     InferenceAttemptEvent,
     InferenceResponseEvent,
+    InterventionEvent,
     MetricEvent,
     OverflowEvent,
     PostEvent,
@@ -72,6 +73,8 @@ def one_of_each() -> list[Event]:
                    parsed={"candidate": "A"}, ok=True, cost_usd=0.001),
         OverflowEvent(run=R, round=1, agent="a000", policy="drop_oldest", dropped_rounds=2,
                       tokens_before=900, tokens_after=400),
+        InterventionEvent(run=R, round=1, agent="a000", intervention="mute", op="mute",
+                          affected=["a000"], params={"rounds": 2}),
     ]
 
 
@@ -80,7 +83,7 @@ def test_every_type_has_a_class():
         "run_started", "round_started", "turn_started", "tool_called", "tool_returned",
         "inference_attempt", "inference_response", "turn_ended", "read", "post", "delivery",
         "action_committed", "world_changed", "metric", "round_committed", "snapshot", "run_ended",
-        "budget", "budget_changed", "probe", "overflow",
+        "budget", "budget_changed", "probe", "overflow", "intervention",
     }
     assert set(EVENT_CLASSES) == expected
     assert {e.type for e in one_of_each()} == expected

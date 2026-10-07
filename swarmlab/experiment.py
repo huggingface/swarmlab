@@ -79,6 +79,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .events import Event, EventLog, logical_view
 from .ids import run_id as make_run_id
+from .interventions import build_intervention, check_names
 from .medium.board import Board
 from .metrics.base import Metric
 from .participants.base import Participant
@@ -126,6 +127,8 @@ class Experiment(BaseModel):
         names = [p.name for p in self.probes]
         if len(set(names)) != len(names):
             raise ValueError(f"probe names must be unique, got {names}")
+        self.interventions = [build_intervention(i) for i in self.interventions]  # M3a
+        check_names(self.interventions)
         # after validation, so UnknownModelPricing propagates as itself (not a ValidationError)
         models = [participant_model(p) for p in self.participants]
         models += [p.coder_model() for p in self.probes]
@@ -301,6 +304,7 @@ class Experiment(BaseModel):
             options=RunOptions(seed=seed, max_rounds=max_rounds, **run_options),
             providers={k: PluginSpec(**p.spec()) for k, p in (self.providers or {}).items()},
             probes=[PluginSpec(**p.spec()) for p in self.probes],
+            interventions=[PluginSpec(**i.spec()) for i in self.interventions],
         )
 
     @classmethod
@@ -316,6 +320,7 @@ class Experiment(BaseModel):
             budget=spec.budget,
             providers={k: build(p, "swarmlab.providers") for k, p in spec.providers.items()} or None,
             probes=[build(p, "swarmlab.probes") for p in spec.probes],
+            interventions=list(spec.interventions),
         )
 
     @classmethod

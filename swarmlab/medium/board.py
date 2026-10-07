@@ -36,6 +36,19 @@ Decisions where the contract is silent:
   the board keeps the plugins it was constructed with, and a nested plugin's saved state is
   restored only when its `spec()` equals the saved one. A fork under an edited medium therefore
   continues with the new topology and policies and the old inboxes.
+
+Intervention overlays (M3a, docs/INTERFACE-M3a.md §1), owned by the runner's `Ops`:
+
+- `set_delay(agents, rounds, until=None)`: deliveries to these recipients of posts committed in
+  rounds <= `until` (forever when None) get `rounds` added to their eligible round, after the
+  policies (counting from `round + 1` in immediate mode too, like `DelayPolicy`). Setting replaces an agent's previous delay; `rounds == 0` clears it.
+- `mute(agents, until)`: posts by these authors committed in rounds <= `until` are returned by
+  `commit` (and logged) but fanned out to nobody. A later mute extends, never shortens.
+- `set_policies(policies)` / `set_topology(topology)` replace the configured plugins and record the
+  replacement's spec, so it survives snapshot/restore (it wins over the constructor's config).
+- `commit(..., recipients=...)`: an explicit recipient list bypasses the topology (used for
+  injected posts whose author is not an agent); policies and overlays still apply.
+- All of this is in `snapshot()` (keys absent from pre-M3a snapshots restore as empty).
 """
 from __future__ import annotations
 
@@ -163,6 +176,11 @@ class Board(Persistable, Plugin):
         self._post_channel: dict[PostId, str] = {}
         self._post_seq: tuple[int, int] = (0, 0)       # (round, next n)
         self._delivery_seq: tuple[int, int] = (0, 0)
+        # intervention overlays (M3a)
+        self._delays: dict[AgentId, tuple[int, int | None]] = {}   # agent -> (rounds, until)
+        self._mutes: dict[AgentId, int] = {}                        # author -> last muted round
+        self._policy_override: list[dict] | None = None
+        self._topology_override: dict | None = None
 
     # -- spec ------------------------------------------------------------------------------
 
@@ -225,19 +243,27 @@ class Board(Persistable, Plugin):
         return max(eligible, round), content
 
     def commit(
-        self, round: int, agents: list[AgentId], rng: random.Random, blobs: BlobStoreLike
+        self, round: int, agents: list[AgentId], rng: random.Random, blobs: BlobStoreLike,
+        recipients: list[AgentId] | None = None,
     ) -> tuple[list[Post], list[Delivery]]:
         posts = list(self._buffer)
         deliveries: list[Delivery] = []
         for post in posts:
             self._post_channel[post.post_id] = post.channel
-            for reader in self.topology.recipients(post, list(agents), round, rng):
+            if self._mutes.get(post.agent, -1) >= round:
+                continue  # muted author: the post is logged, nobody receives it
+            readers = (list(recipients) if recipients is not None
+                       else self.topology.recipients(post, list(agents), round, rng))
+            for reader in readers:
                 if reader == post.agent:
                     continue
                 resolved = self._resolve(reader, post, round)
                 if resolved is None:
                     continue
                 eligible, content = resolved
+                extra = self._delay_for(reader, round)
+                if extra:  # like DelayPolicy, an explicit delay counts from round + 1 in both modes
+                    eligible = max(eligible, round + 1) + extra
                 n, self._delivery_seq = self._next(self._delivery_seq, round)
                 delivery = Delivery(
                     delivery_id=DeliveryId(f"d{round:04d}-{n:05d}"),
@@ -250,6 +276,40 @@ class Board(Persistable, Plugin):
                 deliveries.append(delivery.model_copy())
         self._buffer.clear()
         return posts, deliveries
+
+    # -- intervention overlays (M3a) ---------------------------------------------------------
+
+    def _delay_for(self, reader: AgentId, round: int) -> int:
+        rounds, until = self._delays.get(reader, (0, None))
+        return rounds if until is None or round <= until else 0
+
+    def set_delay(self, agents: Sequence[AgentId], rounds: int, until: int | None = None) -> None:
+        if rounds < 0:
+            raise ValueError(f"delay rounds must be >= 0, got {rounds}")
+        for a in agents:
+            if rounds == 0:
+                self._delays.pop(AgentId(a), None)
+            else:
+                self._delays[AgentId(a)] = (rounds, until)
+
+    def mute(self, agents: Sequence[AgentId], until: int) -> None:
+        for a in agents:
+            self._mutes[AgentId(a)] = max(until, self._mutes.get(AgentId(a), until))
+
+    def overlays(self, round: int) -> dict[str, Any]:
+        """Active delays and mutes for commits in `round` (for tests and the viewer)."""
+        return {
+            "delays": {a: r for a in sorted(self._delays) if (r := self._delay_for(a, round))},
+            "mutes": sorted(a for a, until in self._mutes.items() if until >= round),
+        }
+
+    def set_policies(self, policies: Sequence[Policy | Mapping[str, Any]]) -> None:
+        self.policies = [_policy(p) for p in policies]
+        self._policy_override = [p.spec() for p in self.policies]
+
+    def set_topology(self, topology: str | Topology | Mapping[str, Any]) -> None:
+        self.topology = _topology(topology)
+        self._topology_override = self.topology.spec()
 
     # -- reads -----------------------------------------------------------------------------
 
@@ -302,6 +362,10 @@ class Board(Persistable, Plugin):
             "delivery_seq": self._delivery_seq,
             "topology": (self.topology.spec(), self.topology.snapshot()),
             "policies": [(p.spec(), p.snapshot()) for p in self.policies],
+            "delays": {a: list(v) for a, v in self._delays.items()},
+            "mutes": dict(self._mutes),
+            "policy_override": self._policy_override,
+            "topology_override": self._topology_override,
         }
         return pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -314,6 +378,12 @@ class Board(Persistable, Plugin):
         self._post_channel = dict(state["post_channel"])
         self._post_seq = tuple(state["post_seq"])
         self._delivery_seq = tuple(state["delivery_seq"])
+        self._delays = {AgentId(a): (int(v[0]), v[1]) for a, v in state.get("delays", {}).items()}
+        self._mutes = {AgentId(a): int(v) for a, v in state.get("mutes", {}).items()}
+        if state.get("topology_override") is not None:
+            self.set_topology(state["topology_override"])
+        if state.get("policy_override") is not None:
+            self.set_policies(state["policy_override"])
         topo_spec, topo_state = state["topology"]
         if topo_spec == self.topology.spec():
             self.topology.restore(topo_state)

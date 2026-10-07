@@ -1,0 +1,59 @@
+# Scale check: N=256 on self-hosted Qwen3.5-9B. Two arms: default prompt (agents are not told about the board)
+# and a variant whose only change is one sentence stating that a board exists (window memory to bound context).
+name: m3-scale-qwen9b
+seeds: [1]
+options: { max_rounds: 10, commit: round_end }
+budget: { soft_usd: 0, hard_usd: 0, measurement_usd: 0 }
+arms:
+  bc-9b-256:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - { type: llm, count: 256, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 2048, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+    probes: [ { type: belief } ]
+    metrics:
+      - belief.accuracy
+      - belief.consensus
+      - belief.entropy
+      - comm.read_rate
+      - comm.posts_per_round
+      - comm.hops
+      - { type: belief.consensus, params: { source: "probe:belief" } }
+      - { type: belief.accuracy, params: { source: "probe:belief" } }
+  bc-9b-256-board:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - type: llm
+        count: 256
+        params:
+          model: "vllm:Qwen/Qwen3.5-9B"
+          max_tokens: 2048
+          memory: window
+          window_rounds: 3
+          extra: { chat_template_kwargs: { enable_thinking: false } }
+          system_prompt: |
+            You are agent {{ agent }} with the role "{{ role }}" in a multi-agent environment.
+
+            {% if description %}
+            Task: {{ description }}
+
+            {% endif %}
+            The environment runs in rounds. At the start of each round you receive one message with the round number, your current observation, the outcomes of your actions in the previous round, and any items delivered to you. You act only by calling tools; each tool call returns a result to you, and you may make several calls in one turn. Call `end_turn` when you are done for this round; a reply without any tool call also ends your turn.
+
+            A shared message board exists: `read_board` shows what other agents have posted, and `post` writes a message that other agents can read next round.
+
+            Tools:
+            {% for t in tools %}
+            - {{ t.name }}: {{ t.description }}
+            {% endfor %}
+    probes: [ { type: belief } ]
+    metrics:
+      - belief.accuracy
+      - belief.consensus
+      - belief.entropy
+      - comm.read_rate
+      - comm.posts_per_round
+      - comm.hops
+      - { type: belief.consensus, params: { source: "probe:belief" } }
+      - { type: belief.accuracy, params: { source: "probe:belief" } }
