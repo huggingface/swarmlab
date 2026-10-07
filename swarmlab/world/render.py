@@ -7,6 +7,12 @@ only. `png_size(data) -> (w, h)` reads the IHDR; `image_label(png_b64)` is the t
 lists of `(r, g, b)` tuples (used by tests; it accepts any 8-bit RGB non-interlaced PNG, all five
 scanline filters).
 
+Triangle rasterisation (M6, docs/INTERFACE-M6.md §1): `triangle_cells(width, height, vertices)` is
+the set of grid cells `(y, x)` whose centre `(x + 0.5, y + 0.5)` lies inside or on the triangle
+with the given `(x, y)` vertices (continuous grid coordinates, origin top-left, one unit per
+cell); `fill_triangle(rows, vertices, letter)` paints those cells. Used by the real-flag layouts
+(swarmlab/world/flags_real.py) for hoist triangles.
+
 Decisions where the contract is silent:
 
 - Every scanline uses filter type 0 (none) and the stream is `zlib.compress(raw, 9)`, so the bytes
@@ -55,6 +61,37 @@ def grid_to_png(rows: list[str], palette: dict[str, RGB] | None = None, cell_px:
     ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
     return (PNG_SIGNATURE + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
             + _chunk(b"IEND", b""))
+
+
+Point = tuple[float, float]
+
+
+def _cross(o: Point, a: Point, b: Point) -> float:
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def in_triangle(p: Point, vertices: tuple[Point, Point, Point]) -> bool:
+    """True when `p` lies inside the triangle or on its boundary (either winding order)."""
+    a, b, c = vertices
+    d1, d2, d3 = _cross(a, b, p), _cross(b, c, p), _cross(c, a, p)
+    has_neg = d1 < 0 or d2 < 0 or d3 < 0
+    has_pos = d1 > 0 or d2 > 0 or d3 > 0
+    return not (has_neg and has_pos)
+
+
+def triangle_cells(width: int, height: int,
+                   vertices: tuple[Point, Point, Point]) -> set[tuple[int, int]]:
+    """Cells `(y, x)` of a `width x height` grid whose centre is inside or on the triangle."""
+    return {(y, x) for y in range(height) for x in range(width)
+            if in_triangle((x + 0.5, y + 0.5), vertices)}
+
+
+def fill_triangle(rows: list[str], vertices: tuple[Point, Point, Point], letter: str) -> list[str]:
+    """`rows` with every cell of the triangle (by cell centre) set to `letter`."""
+    height, width = len(rows), len(rows[0]) if rows else 0
+    cells = triangle_cells(width, height, vertices)
+    return ["".join(letter if (y, x) in cells else ch for x, ch in enumerate(row))
+            for y, row in enumerate(rows)]
 
 
 def _chunks(data: bytes):

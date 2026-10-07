@@ -128,10 +128,38 @@ Decisions where the contract is silent
   unchanged.
 - Snapshots carry game state only. Constructor config (the kwargs) is skipped, so a restored or
   forked world keeps the config it was constructed with (e.g. a fork may change `guess_limit`).
+
+Real flags and name-only candidates (M6, docs/INTERFACE-M6.md §1)
+-----------------------------------------------------------------
+`FlagGame(flags="synthetic"|"real", candidates="grids"|"names", canvas=None, crop=None)`.
+
+- `canvas=(width, height)` and `crop=(width, height)` (the paper's 24x16 and 6x4) override
+  `width`/`height` and `crop_w`/`crop_h`; `None` (the default) keeps those, whose defaults are the
+  contract's (12, 8) and (4, 3). Width first, as in "24x16".
+- `flags="real"`: the candidates are the 28 flags of swarmlab/world/flags_real.py, named by
+  country and listed in alphabetical order, each rendered on the canvas (`render_flag`). The truth
+  is `rng.choice(names)` (one draw, uniform); `rival` is None. `n_candidates`, `rival_edits`,
+  `candidate_names` and `palette` are ignored (still validated, so leave them at their defaults).
+  Crops are drawn after the truth exactly as for synthetic flags. PNGs use the flag's own RGB
+  (`flag_palette`), so a crop shows the official shades; candidate PNGs (grids mode) likewise.
+  `cell_px` defaults to 25 for real flags (a 6x4 crop is 150x100 px) and 12 otherwise.
+  `verify()` adds `country` (the truth's name) and `layout` (its layout id, e.g. `h3+tri`).
+  `guess` accepts a country name case-insensitively (exact match after `normalise_name`:
+  whitespace collapsed, casefolded) and records the canonical name.
+- `candidates="names"` (requires `flags="real"`, a ValueError otherwise: synthetic flags have no
+  names to recognise): no candidate grids or images. The observation is the text part
+  `Allowed countries: <JSON list>` followed by the crop: in image mode a text part `Your crop:`
+  and the crop image, in text mode `Your crop:` and the crop rows in the same text part. Blind
+  agents get `BLIND_NOTE` in place of the crop. `description()` is the paper's framing (`NAMES_TASK`
+  with the allowed list), with no instruction to cooperate or be truthful; `candidate_names()`
+  reads the list back from the observation text.
+- All four params are left out of `spec()` at their defaults (and `cell_px` when not given), so
+  earlier spec hashes are unchanged.
 """
 from __future__ import annotations
 
 import base64
+import json
 import random
 import re
 import string
@@ -142,6 +170,15 @@ from ..ids import AgentId
 from ..rng import derive
 from ..view import Observation, Part, text_observation
 from .base import Ack, Action, Outcome, World, tool
+from .flags_real import (
+    ALLOWED_PREFIX,
+    BY_NAME,
+    COUNTRY_NAMES,
+    allowed_names,
+    flag_palette,
+    match_country,
+    render_flag,
+)
 from .render import PALETTE, grid_to_png
 
 COLOURS = "rgbykwopcmnt"
@@ -157,6 +194,13 @@ IMAGE_INTRO_BLIND = ("Candidates {names} are shown as images in that order (no l
                      "{cell_px}x{cell_px} pixels in every image.")
 _IMAGE_INTRO_RE = re.compile(r"^Candidates (.+?) are shown as images in that order")
 MODALITIES = ("text", "image")
+FLAG_SETS = ("synthetic", "real")
+CANDIDATE_MODES = ("grids", "names")
+NAMES_TASK = ("You are one player in a flag identification game. All players are identifying the "
+              "same underlying flag. You see a crop of it. Allowed countries: {names}.")
+NAMES_TASK_BLIND = ("You are one player in a flag identification game. All players are identifying "
+                    "the same underlying flag. You have no crop of your own; you see what other "
+                    "players report. Allowed countries: {names}.")
 _LAYOUTS = ("h_stripes", "v_stripes", "blocks_2x2", "blocks_2x3")
 _MAX_ATTEMPTS = 1000
 
@@ -196,6 +240,9 @@ def candidate_names(text: str) -> list[str]:
         names = list(parse_observation(text)[0])
     except ValueError:
         names = []
+    if names:
+        return names
+    names = allowed_names(text)
     if names:
         return names
     for line in text.split("\n"):
@@ -309,6 +356,7 @@ _CONFIG = (
     "height", "width", "palette", "n_candidates", "rival_edits", "crop_h", "crop_w",
     "candidate_names", "status_tools", "guess_limit", "crop_overrides",
     "modality", "cell_px", "image_text_hint", "blind_agents", "blind_may_guess",
+    "flags", "candidates_mode", "canvas", "crop",
 )
 _M5_DEFAULTS = {"modality": "text", "cell_px": 12, "image_text_hint": False}
 
@@ -326,6 +374,16 @@ def _check_overrides(overrides: dict[str, list[int]] | None, max_y: int,
             raise ValueError(f"crop_overrides[{agent!r}] = {[y, x]} is outside 0..{max_y} x 0..{max_x}")
         out[str(agent)] = (y, x)
     return out
+
+
+def _pair(name: str, value: Any, default: tuple[int, int]) -> tuple[int, int]:
+    """`canvas` / `crop` as `(width, height)` positive ints, or `default` when None."""
+    if value is None:
+        return default
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or not all(isinstance(v, int) and not isinstance(v, bool) and v >= 1 for v in value)):
+        raise ValueError(f"{name} must be [width, height] (positive integers), got {value!r}")
+    return int(value[0]), int(value[1])
 
 
 def _check_blind(blind: list[str] | int | None) -> list[str] | int:
@@ -362,11 +420,25 @@ class FlagGame(World):
         guess_limit: int | None = None,
         crop_overrides: dict[str, list[int]] | None = None,
         modality: str = "text",
-        cell_px: int = 12,
+        cell_px: int | None = None,
         image_text_hint: bool = False,
         blind_agents: list[str] | int | None = None,
         blind_may_guess: bool = False,
+        flags: str = "synthetic",
+        candidates: str = "grids",
+        canvas: tuple[int, int] | list[int] | None = None,
+        crop: tuple[int, int] | list[int] | None = None,
     ) -> None:
+        if flags not in FLAG_SETS:
+            raise ValueError(f"flags must be one of {FLAG_SETS}, got {flags!r}")
+        if candidates not in CANDIDATE_MODES:
+            raise ValueError(f"candidates must be one of {CANDIDATE_MODES}, got {candidates!r}")
+        if candidates == "names" and flags != "real":
+            raise ValueError("candidates='names' needs flags='real' (synthetic flags have no names)")
+        width, height = _pair("canvas", canvas, (width, height))
+        crop_w, crop_h = _pair("crop", crop, (crop_w, crop_h))
+        if cell_px is None:
+            cell_px = 25 if flags == "real" else 12
         if not 3 <= palette <= len(COLOURS):
             raise ValueError(f"palette must be in 3..{len(COLOURS)}")
         if n_candidates < 2 or n_candidates % 2:
@@ -404,6 +476,18 @@ class FlagGame(World):
                 self.params.pop("blind_agents", None)
             if not self.blind_may_guess:
                 self.params.pop("blind_may_guess", None)
+        self.flags, self.candidates_mode = flags, candidates
+        self.canvas = None if canvas is None else [width, height]
+        self.crop = None if crop is None else [crop_w, crop_h]
+        if isinstance(getattr(self, "params", None), dict):
+            # M6: absent from spec() at their defaults / when not given (hashes unchanged)
+            for k, default in (("flags", "synthetic"), ("candidates", "grids"), ("canvas", None),
+                               ("crop", None), ("cell_px", None)):
+                if k in self.params and self.params[k] == default:
+                    self.params.pop(k)
+            for k in ("canvas", "crop"):
+                if self.params.get(k) is not None:
+                    self.params[k] = list(self.params[k])
         if isinstance(getattr(self, "params", None), dict):
             # M5: absent from spec() at their defaults, so text-mode spec hashes are unchanged
             for k, default in _M5_DEFAULTS.items():
@@ -420,7 +504,29 @@ class FlagGame(World):
         self.guesses_made: dict[str, int] = {}
 
     # ---- required -----------------------------------------------------------------------------
+    @property
+    def n_flags(self) -> int:
+        return len(COUNTRY_NAMES) if self.real else self.n_candidates
+
+    @property
+    def real(self) -> bool:
+        return getattr(self, "flags", "synthetic") == "real"
+
+    @property
+    def names_only(self) -> bool:
+        return getattr(self, "candidates_mode", "grids") == "names"
+
+    def _reset_real(self, rng: random.Random) -> None:
+        names = sorted(COUNTRY_NAMES)
+        self.candidates = {n: render_flag(BY_NAME[n], self.width, self.height) for n in names}
+        self.truth = rng.choice(names)
+        self.rival = None
+
     def reset(self, rng: random.Random, agents: list[AgentId]) -> None:
+        if self.real:
+            self._reset_real(rng)
+            self._reset_agents(rng, agents)
+            return
         colours = COLOURS[: self.palette]
         h, w = self.height, self.width
         pairs: list[tuple[Grid, Grid]] = []
@@ -445,6 +551,11 @@ class FlagGame(World):
         self.candidates = {names[pos]: flags[i] for pos, i in enumerate(order)}
         self.truth = names[order.index(truth_i)]
         self.rival = names[order.index(rival_i)]
+        self._reset_agents(rng, agents)
+
+    def _reset_agents(self, rng: random.Random, agents: list[AgentId]) -> None:
+        """Crops (one 64-bit draw per agent from the world rng), overrides, blind agents."""
+        h, w = self.height, self.width
         seeds = [rng.getrandbits(64) for _ in agents]
         self.agents = [str(a) for a in agents]
         self.crops = {}
@@ -497,12 +608,41 @@ class FlagGame(World):
         truth = self.candidates[self.truth]  # type: ignore[index]
         return [row[x : x + self.crop_w] for row in truth[y : y + self.crop_h]]
 
-    def _png_b64(self, grid: list[str]) -> str:
+    def _png_b64(self, grid: list[str], flag: str | None = None) -> str:
+        """PNG of `grid`; `flag` (a real flag's name) selects that flag's RGB palette."""
         cache = self.__dict__.setdefault("_png_cache", {})
-        key = (self.cell_px, tuple(grid))
+        palette_key = flag if self.real and flag in BY_NAME else None
+        key = (self.cell_px, palette_key, tuple(grid))
         if key not in cache:
-            cache[key] = base64.b64encode(grid_to_png(list(grid), PALETTE, self.cell_px)).decode()
+            palette = flag_palette(BY_NAME[flag]) if palette_key else PALETTE
+            cache[key] = base64.b64encode(grid_to_png(list(grid), palette, self.cell_px)).decode()
         return cache[key]
+
+    def allowed_line(self) -> str:
+        return ALLOWED_PREFIX + json.dumps(list(self.candidates), ensure_ascii=False)
+
+    def _observe_names(self, agent: AgentId) -> Observation:
+        """M6 `candidates="names"`: the allowed list as text, then the crop (no candidates)."""
+        image = getattr(self, "modality", "text") == "image"
+        allowed = self.allowed_line()
+        if self.is_blind(agent):
+            return Observation(parts=[Part(type="text", text=allowed + "\n" + BLIND_NOTE)], private={})
+        crop = self.crop_rows(agent)
+        changed = agent in getattr(self, "crops_changed", ())
+        if changed:
+            self.crops_changed = [a for a in self.crops_changed if a != agent]
+        if image:
+            parts = [Part(type="text", text=allowed), Part(type="text", text=CROP_HEADER),
+                     Part(type="image", image_png_b64=self._png_b64(crop, self.truth))]
+            if self.image_text_hint:
+                parts.append(Part(type="text", text="\n".join(crop)))
+            if changed:
+                parts.append(Part(type="text", text=CROP_CHANGED))
+        else:
+            lines = [allowed, "", CROP_HEADER, *crop] + (["", CROP_CHANGED] if changed else [])
+            parts = [Part(type="text", text="\n".join(lines))]
+        y, x = self.crops[agent]
+        return Observation(parts=parts, private={"crop_y": y, "crop_x": x})
 
     def _observe_image(self, agent: AgentId) -> Observation:
         names = ", ".join(self.candidates)
@@ -511,14 +651,15 @@ class FlagGame(World):
         parts = [Part(type="text", text=PREAMBLE + "\n"
                       + intro.format(names=names, cell_px=self.cell_px))]
         for name, grid in self.candidates.items():
-            parts.append(Part(type="image", image_png_b64=self._png_b64(grid)))
+            parts.append(Part(type="image", image_png_b64=self._png_b64(grid, name)))
             if self.image_text_hint:
                 parts.append(Part(type="text", text="\n".join([f"{name}:", *grid])))
         if blind:
             parts.append(Part(type="text", text=BLIND_NOTE))
             return Observation(parts=parts, private={})
         crop = self.crop_rows(agent)
-        parts += [Part(type="text", text=CROP_HEADER), Part(type="image", image_png_b64=self._png_b64(crop))]
+        parts += [Part(type="text", text=CROP_HEADER),
+                  Part(type="image", image_png_b64=self._png_b64(crop, self.truth))]
         if self.image_text_hint:
             parts.append(Part(type="text", text="\n".join(crop)))
         if agent in getattr(self, "crops_changed", ()):
@@ -528,6 +669,8 @@ class FlagGame(World):
         return Observation(parts=parts, private={"crop_y": y, "crop_x": x})
 
     def observe(self, agent: AgentId) -> Observation:
+        if self.names_only:
+            return self._observe_names(agent)
         if getattr(self, "modality", "text") == "image":
             return self._observe_image(agent)
         lines = [PREAMBLE]
@@ -561,6 +704,8 @@ class FlagGame(World):
                 return "blind agents may not guess"
         elif agent not in self.crops:
             return "unknown agent"
+        if self.real:
+            candidate = match_country(candidate, list(self.candidates))
         if not isinstance(candidate, str) or candidate not in self.candidates:
             return f"unknown candidate {candidate!r}"
         if self.guess_limit is not None and self.guesses_made.get(agent, 0) >= self.guess_limit:
@@ -572,6 +717,8 @@ class FlagGame(World):
         err = self._guess_error(agent, candidate)
         if err is not None:
             return Outcome(accepted=False, feedback={"error": err})
+        if self.real:  # M6: case-insensitive country names, recorded canonically
+            candidate = match_country(candidate, list(self.candidates)) or candidate
         self.guesses[agent] = candidate
         self.guesses_made[agent] = self.guesses_made.get(agent, 0) + 1
         return Outcome(accepted=True, feedback={"recorded": True})
@@ -606,6 +753,9 @@ class FlagGame(World):
         return {"guess_counts": counts, "agents_with_guess": len(self.guesses)}
 
     def description(self) -> str:
+        if self.names_only:
+            return NAMES_TASK.format(names=json.dumps(list(self.candidates) or sorted(COUNTRY_NAMES),
+                                                      ensure_ascii=False))
         limit = (f" You may record at most {self.guess_limit} guesses."
                  if self.guess_limit is not None else "")
         if getattr(self, "blind_agents", None):
@@ -615,7 +765,7 @@ class FlagGame(World):
             hint = (" Each image is also written out as a grid of colour letters."
                     if self.image_text_hint else "")
             return (
-                f"There are {self.n_candidates} candidate flags, each shown as an image of coloured "
+                f"There are {self.n_flags} candidate flags, each shown as an image of coloured "
                 "cells, and exactly one of them is the hidden flag. You privately see a "
                 f"{self.crop_h}x{self.crop_w}-cell crop of the hidden flag, shown as an image at "
                 "the same scale, at an undisclosed position, and more than one candidate may "
@@ -624,7 +774,7 @@ class FlagGame(World):
                 f"round.{limit} You are never told whether a guess is right."
             )
         return (
-            f"There are {self.n_candidates} candidate flags, each a grid of colour letters, and "
+            f"There are {self.n_flags} candidate flags, each a grid of colour letters, and "
             "exactly one of them is the hidden flag. You privately see a "
             f"{self.crop_h}x{self.crop_w} crop of the hidden flag at an undisclosed position, and "
             "more than one candidate may contain your crop. Record which candidate you believe is "
@@ -636,6 +786,9 @@ class FlagGame(World):
         """Blind agents (WP16) get their own task text; everyone else gets `description()`."""
         if not self.is_blind(agent):
             return self.description()
+        if self.names_only:
+            return NAMES_TASK_BLIND.format(names=json.dumps(
+                list(self.candidates) or sorted(COUNTRY_NAMES), ensure_ascii=False))
         image = getattr(self, "modality", "text") == "image"
         shown = "shown as an image of coloured cells" if image else "a grid of colour letters"
         if self.blind_may_guess:
@@ -644,7 +797,7 @@ class FlagGame(World):
         else:
             act = "You do not record guesses yourself."
         return (
-            f"There are {self.n_candidates} candidate flags, each {shown}, and exactly one of "
+            f"There are {self.n_flags} candidate flags, each {shown}, and exactly one of "
             "them is the hidden flag. Other agents each privately see a "
             f"{self.crop_h}x{self.crop_w} crop of the hidden flag at an undisclosed position, and "
             "more than one candidate may contain any one crop. You have no crop of your own: you "
@@ -703,6 +856,9 @@ class FlagGame(World):
         }
         if getattr(self, "blind", None):
             out["blind"] = list(self.blind)
+        if self.real and self.truth in BY_NAME:  # M6
+            out["country"] = self.truth
+            out["layout"] = BY_NAME[self.truth].layout_id
         return out
 
 

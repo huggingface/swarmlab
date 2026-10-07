@@ -15,7 +15,8 @@ once per agent and passes the result to every `parse` of that probe answer (also
 model's reply). The base returns None. `BeliefProbe` reads the names from the latest FlagGame
 observation in the context (`flaggame.parse_observation` on a text part that starts with the
 "Candidate flags:" preamble; in the image modality the names listed in that part's framing line,
-`flaggame.candidate_names`); any other world yields None and parsing stays name-agnostic.
+`flaggame.candidate_names`; M6 name-only candidates: the `Allowed countries: [...]` list); any
+other world yields None and parsing stays name-agnostic.
 
 Tolerant parsing (`BeliefProbe.parse`, after the 2026-10-06 smoke where 9 of 12 Qwen3.5-9B answers
 did not parse, mostly because reasoning used the whole token budget):
@@ -25,8 +26,8 @@ did not parse, mostly because reasoning used the whole token budget):
 - the first JSON object anywhere in the text is used (prose and code fences around it are fine);
   if there is none, a `"candidate": "<name>"` pair inside truncated JSON is still accepted and
   marked `parsed["partial"] = True`;
-- the candidate key may be `candidate`, `answer`, `guess` or `flag` (keys matched
-  case-insensitively, first match in that order);
+- the candidate key may be `candidate`, `answer`, `guess`, `flag` or (M6, the paper's schema)
+  `country` (keys matched case-insensitively, first match in that order);
 - with known candidate names, the value is matched case-insensitively, also after stripping a
   leading "candidate"/"flag" word and surrounding punctuation ("candidate c" -> "C"); a value that
   matches no name keeps its text and is marked `parsed["unknown_candidate"] = True` (still ok: the
@@ -88,8 +89,8 @@ CODER_SYSTEM = (
 
 _ENV = jinja2.Environment(undefined=jinja2.StrictUndefined, autoescape=False)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
-_CANDIDATE_KEYS = ("candidate", "answer", "guess", "flag")
-_PAIR_RE = re.compile(r'"(candidate|answer|guess|flag)"\s*:\s*"([^"\n]{1,64})"', re.IGNORECASE)
+_CANDIDATE_KEYS = ("candidate", "answer", "guess", "flag", "country")
+_PAIR_RE = re.compile(r'"(candidate|answer|guess|flag|country)"\s*:\s*"([^"\n]{1,64})"', re.IGNORECASE)
 _PREFIX_RE = re.compile(r"^(?:candidate|flag)\s*[:#]?\s*", re.IGNORECASE)
 
 
@@ -185,13 +186,13 @@ class BeliefProbe(Probe):
         self._coder_model = coder_model
 
     def candidates_from_context(self, context: list[ChatMessage]) -> list[str] | None:
-        from .world.flaggame import PREAMBLE, candidate_names
+        from .world.flaggame import ALLOWED_PREFIX, PREAMBLE, candidate_names
 
         for m in reversed(context):
             if m.role != "user" or isinstance(m.content, str):
                 continue
             for part in m.content:
-                if part.type == "text" and (part.text or "").lstrip().startswith(PREAMBLE):
+                if part.type == "text" and (part.text or "").lstrip().startswith((PREAMBLE, ALLOWED_PREFIX)):
                     names = candidate_names(part.text or "")
                     if names:
                         return names
