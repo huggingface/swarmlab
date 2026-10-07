@@ -27,6 +27,9 @@ Decisions where the contract is silent:
   state is None are left out, and a world that returns None for every round (FlagGame, which
   has its own panel; any world without the hook), cannot be imported, or fails to restore gives
   None and no panel. States are passed through `json` (non-JSON values become strings).
+- The colour-letter table (`COLOURS` in the page) is `swarmlab.colors.PALETTE_HEX`, the palette
+  the FlagGame image renderer uses; it is injected before the title and data so neither can
+  inject a palette.
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from ..blobs import BlobStore
+from ..colors import PALETTE_HEX
 from ..events import EventLog, logical_view
 from ..registry import build as build_plugin
 from ..snapshot import SnapshotStore
@@ -201,6 +205,7 @@ def build(run_dir: Path | str) -> Path:
     blob = blob.replace("<", "\\u003c")  # "<" only occurs inside JSON strings
     title = f"swarmlab · {data['meta']['run_id']}"
     page = TEMPLATE.read_text(encoding="utf-8")
+    page = page.replace("__COLOURS__", json.dumps(PALETTE_HEX, sort_keys=False))  # before title/data (module doc)
     page = page.replace("__TITLE__", _html_escape(title)).replace("__DATA__", blob)
     out = run_dir / "view.html"
     out.write_text(page, encoding="utf-8")

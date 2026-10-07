@@ -131,8 +131,7 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
   "use strict";
   var D = JSON.parse(document.getElementById("swarmlab-data").textContent);
   var M = D.meta, EV = D.events, LAST = M.last_round || 0;
-  var COLOURS = { r: "#d62728", g: "#2ca02c", b: "#1f77b4", y: "#f2c80f", k: "#111111", w: "#ffffff",
-    o: "#ff7f0e", p: "#7b4fa0", c: "#17becf", m: "#e377c2", n: "#8c564b", t: "#0f766e" };
+  var COLOURS = __COLOURS__;  /* swarmlab/colors.py PALETTE_HEX, injected by build.py */
   var isFlag = !!(D.world && D.world.kind === "flaggame");
   var byRound = {}, postAuthor = {};
   EV.forEach(function (e) {
