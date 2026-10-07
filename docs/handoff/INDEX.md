@@ -18,3 +18,4 @@ One line per work package. Contracts are in `docs/INTERFACE*.md`; run notes in `
 | [WP12](WP12.md) | M4 | Export (Parquet tables, pi sessions), Hub publish and fetch-published, report, prompts, experimenter skill |
 | [WP13](WP13.md) | M3b | Registry with claim policies (advisory, enforced), ColoringGrid world, coloring and claim metrics, Coloring S0 example |
 | [WP14](WP14.md) | M3c | Roles (built-ins plus overrides), executor role enforcement, Tree topology, hierarchy examples |
+| [field-notes-report](field-notes-report.md) | field notes | Report protocol health for any world, export/publish robustness and `--no-raw`, session round-marker fix, analysis docs, `World.render_state` viewer panel |
