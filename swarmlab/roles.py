@@ -4,7 +4,10 @@ A `Role` is declared on the experiment (`Experiment.roles`, YAML `roles:`) and a
 (`assign(participant, name)`, YAML `participants[].role`). The executor enforces its permissions
 (swarmlab/executor.py); `LLMAgent.apply_role` applies its prompt, model and `max_tokens` when the
 runner binds the participant. The built-in library is `WORKER`, `COORDINATOR`, `REVIEWER`,
-`SKEPTIC`, `SCRIBE` (`BUILTIN_ROLES` by name).
+`SKEPTIC`, `SCRIBE`, `MANAGER` (`BUILTIN_ROLES` by name). `MANAGER` (WP16) is the Flag Game
+paper's blind manager: it never acts (`may_act=False`), reads and writes every channel, and posts
+one summary per round of which candidate the members' evidence supports; pair it with a `star`
+topology centred on it and `FlagGame(blind_agents=...)` naming it.
 
 Decisions where the contract is silent:
 
@@ -153,7 +156,23 @@ SCRIBE = Role(
     ),
 )
 
-BUILTIN_ROLES: dict[str, Role] = {r.name: r for r in (WORKER, COORDINATOR, REVIEWER, SKEPTIC, SCRIBE)}
+MANAGER = Role(
+    name="manager",
+    may_act=False,
+    channels_read=None,   # all channels
+    channels_write=None,
+    prompt_append=(
+        "Your job: you are the manager. You have no evidence of your own and you never act in the "
+        "world yourself; every other agent reports to you and only you, and your posts are the "
+        "only thing they hear. Each round, read the board to collect the members' reports, then "
+        "post a single summary that states which candidate the evidence supports and why, citing "
+        "the reported evidence (or, if the evidence does not yet single one out, which candidates "
+        "remain and what would tell them apart)."
+    ),
+)
+
+BUILTIN_ROLES: dict[str, Role] = {r.name: r for r in (WORKER, COORDINATOR, REVIEWER, SKEPTIC, SCRIBE,
+                                                        MANAGER)}
 
 
 # ---- resolution ------------------------------------------------------------------------------------

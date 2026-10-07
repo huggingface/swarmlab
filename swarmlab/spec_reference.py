@@ -84,13 +84,15 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
         "type": "participant type: `llm`, `evidence_aggregator`, `enumerator`, `silent`, ...",
         "count": "number of agents in this group (>= 1)",
         "role": "role name (declared in `roles`, or a built-in: worker, coordinator, reviewer, "
-                "skeptic, scribe)",
+                "skeptic, scribe, manager)",
         "params": "constructor params, e.g. `{model: \"anthropic:claude-haiku-4-5\", "
                   "max_tokens: 1024}` for `llm`",
     },
     MediumSpec: {
         "topology": "who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per "
-                    "agent per round), `groups`, `tree`; e.g. `{type: gossip, params: {k: 2}}`",
+                    "agent per round), `groups`, `star` (params `{center: a000}`: members reach only the "
+                    "center, the center reaches all), `tree`; e.g. "
+                    "`{type: gossip, params: {k: 2}}`",
         "delivery": "`pull` (agents call `read_board`) or `push` (deliveries come with the turn)",
         "push_limit": "most items pushed per turn under `delivery: push`",
         "policies": "visibility policies applied in order, e.g. `[{type: delay, params: "

@@ -34,6 +34,7 @@ enforced = "swarmlab.medium.registry:Enforced"
 broadcast = "swarmlab.medium.topology:Broadcast"
 gossip = "swarmlab.medium.topology:Gossip"
 groups = "swarmlab.medium.topology:Groups"
+star = "swarmlab.medium.topology:Star"
 tree = "swarmlab.medium.topology:Tree"
 
 [project.entry-points."swarmlab.policies"]

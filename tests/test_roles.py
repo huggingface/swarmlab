@@ -59,7 +59,7 @@ def executor(tmp_path, roles, *, board=None, registry=None, max_calls=20):
 
 # ---- the Role model and library ----------------------------------------------------------------
 def test_builtin_library():
-    assert set(BUILTIN_ROLES) == {"worker", "coordinator", "reviewer", "skeptic", "scribe"}
+    assert set(BUILTIN_ROLES) == {"worker", "coordinator", "reviewer", "skeptic", "scribe", "manager"}
     assert BUILTIN_ROLES["worker"] == Role(name="worker")
     assert COORDINATOR.may_act is False and COORDINATOR.post_fields == {"kind": ["assignment", "summary"]}
     assert BUILTIN_ROLES["reviewer"].may_act is False and BUILTIN_ROLES["scribe"].may_act is False

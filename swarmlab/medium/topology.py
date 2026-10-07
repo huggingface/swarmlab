@@ -11,9 +11,20 @@ Decisions where the contract is silent:
   commits (immediate mode). The cached assignment is not part of the snapshot. If `k` exceeds
   the number of other agents, every other agent is a partner. An author not in `agents` (not
   live) gets no recipients.
+  This is the Flag Game paper's "gossip" protocol (pairwise: one speaker, one listener) at
+  `k=1`: in each round every speaker's posts reach exactly one listener, drawn afresh each round.
+  It is directed and not a matching: a listener may hear from several speakers in a round (or
+  from none), and A->B does not imply B->A. There is no separate `Pairwise` class; `gossip`
+  with `params: {k: 1}` is the pairwise protocol.
 - `Groups(size)` partitions by agent index: `a000..a{size-1}` are group 0, and so on. Recipients
   are the live members of the author's group, minus the author.
 - No topology ever returns the author.
+- `Star(center="a000")` (WP16, the Flag Game paper's "manager" protocol together with a blind
+  manager: `FlagGame(blind_agents=1)` and the `manager` role). A member's post goes only to the
+  center (none when the center is not live); the center's posts go to every live member. No
+  channels and no permissions: it changes deliveries only, so a member that calls `read_board`
+  sees only the center's posts (and its own, as on any board). An agent list without the center
+  delivers member posts to nobody. Pure function of params and the agent list; no snapshot.
 - `Tree(groups, coordinators=None, top=None)` (docs/INTERFACE-M3c.md §2). With `groups` an int
   the agents (in agent order, `top` excluded) are split into that many contiguous groups whose
   sizes differ by at most one (earlier groups get the extra agent); explicit lists are used as
@@ -99,6 +110,23 @@ class Groups(Topology):
     def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
         g = self.group(post.agent)
         return [a for a in agents if a != post.agent and self.group(a) == g]
+
+
+class Star(Topology):
+    """Hub and spokes: members' posts reach only the center; the center's posts reach everyone."""
+
+    entry_point: ClassVar[str | None] = "star"
+    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "center")
+
+    def __init__(self, center: str = "a000") -> None:
+        if not isinstance(center, str) or not center:
+            raise ValueError(f"Star center must be an agent id, got {center!r}")
+        self.center = AgentId(center)
+
+    def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
+        if post.agent == self.center:
+            return [a for a in agents if a != self.center]
+        return [self.center] if self.center in agents else []
 
 
 class Tree(Topology):
@@ -216,5 +244,6 @@ TOPOLOGIES: dict[str, type[Topology]] = {
     "broadcast": Broadcast,
     "gossip": Gossip,
     "groups": Groups,
+    "star": Star,
     "tree": Tree,
 }

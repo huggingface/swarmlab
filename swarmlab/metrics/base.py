@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from importlib.metadata import entry_points
-from typing import Any
+from typing import Any, ClassVar
 
 from ..base import Persistable, Plugin
 
@@ -39,6 +39,10 @@ class Metric(Persistable, Plugin):
 
     def set_truth(self, truth: dict) -> None:
         pass
+
+    # True for metrics over agents' beliefs (belief.*): the runner passes them the live agents
+    # minus `World.excluded_from_belief()` (WP16) instead of every live agent.
+    belief_population: ClassVar[bool] = False
 
     def set_agents(self, agents: list[Any]) -> None:
         """The runner calls this at reset and whenever the live agent list changes. No-op default."""

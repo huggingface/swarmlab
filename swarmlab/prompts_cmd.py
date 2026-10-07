@@ -37,7 +37,7 @@ from .experiment import Experiment, participant_model
 from .ids import agent_id
 from .rng import derive
 from .roles import agent_roles, bind_roles, role_name, spec_roles
-from .view import View
+from .view import View, describe
 from .world.render import image_label
 
 
@@ -92,7 +92,7 @@ def group_views(exp: Experiment, seed: int = 0) -> list[tuple[int, int, Any, Any
         a = agents[first]
         obs = world.observe(a).model_copy(update={"private": {}})
         view = View(round=1, agent=a, observation=obs, outcomes=[], pushed=[],
-                    tools=ex.schemas(a), description=world.description())
+                    tools=ex.schemas(a), description=describe(world, a))
         out.append((first, count, a, bound[a], view))
     return out
 

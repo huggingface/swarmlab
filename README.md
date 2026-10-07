@@ -140,9 +140,9 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
     - `arms.NAME.participants[].type`: `str` (required): participant type: `llm`, `evidence_aggregator`, `enumerator`, `silent`, ...
     - `arms.NAME.participants[].count`: `int` (default `1`): number of agents in this group (>= 1)
     - `arms.NAME.participants[].params`: `{...}` (optional): constructor params, e.g. `{model: "anthropic:claude-haiku-4-5", max_tokens: 1024}` for `llm`
-    - `arms.NAME.participants[].role`: `str | null` (optional): role name (declared in `roles`, or a built-in: worker, coordinator, reviewer, skeptic, scribe)
+    - `arms.NAME.participants[].role`: `str | null` (optional): role name (declared in `roles`, or a built-in: worker, coordinator, reviewer, skeptic, scribe, manager)
   - `arms.NAME.medium`: `{topology, delivery, push_limit, policies, channels, registry, claim_policy}` (default: see keys): the message board: topology, policies, registry
-    - `arms.NAME.medium.topology`: `{type: NAME, params: {...}}` (default `broadcast`): who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per agent per round), `groups`, `tree`; e.g. `{type: gossip, params: {k: 2}}`
+    - `arms.NAME.medium.topology`: `{type: NAME, params: {...}}` (default `broadcast`): who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per agent per round), `groups`, `star` (params `{center: a000}`: members reach only the center, the center reaches all), `tree`; e.g. `{type: gossip, params: {k: 2}}`
     - `arms.NAME.medium.delivery`: `pull | push` (default `pull`): `pull` (agents call `read_board`) or `push` (deliveries come with the turn)
     - `arms.NAME.medium.push_limit`: `int` (default `20`): most items pushed per turn under `delivery: push`
     - `arms.NAME.medium.policies`: `[{type: NAME, params: {...}}, ...]` (optional): visibility policies applied in order, e.g. `[{type: delay, params: {rounds: 1}}]`
