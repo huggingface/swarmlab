@@ -317,6 +317,9 @@ class SiteWorld(World):
     def score(self):
         return dict(self.picks)
 
+    def verify(self):
+        return {"best_site": "A"}
+
     def render_state(self):
         return {"picks": dict(self.picks), "round": self.round,
                 "last_choice": [{"agent": a, "site": s} for a, s in sorted(self.last.items())]}
