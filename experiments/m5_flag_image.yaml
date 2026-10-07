@@ -1,0 +1,26 @@
+# M5: Flag Game image modality (docs/INTERFACE-M5.md §5-§6). NOT LAUNCHED: needs the user's
+# approval of the estimate first (`swarmlab estimate experiments/m5_flag_image.yaml`).
+# Haiku 4.5 at N=8 on the same worlds (same seeds -> same candidates, truth and crops), with the
+# candidates and crops given as PNG images (image-haiku) or as colour-letter grids (text-haiku).
+# Everything else is identical, so the arms differ only in modality.
+# Before launch: run the `haiku-image` arm of tools/real_smoke.py (N=4, 3 rounds, <= $0.50) and
+# `swarmlab preflight experiments/m5_flag_image.yaml --arm image-haiku`.
+name: m5-flag-image
+seeds: [1, 2, 3]
+options: { max_rounds: 8, commit: round_end }
+budget: { soft_usd: 2.5, hard_usd: 3.5, measurement_usd: 1.0, total_usd: 20.0 }
+arms:
+  image-haiku:
+    world: { type: flaggame, params: { n_candidates: 8, modality: image } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - { type: llm, count: 8, params: { model: "anthropic:claude-haiku-4-5", max_tokens: 1024 } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round]
+  text-haiku:
+    world: { type: flaggame, params: { n_candidates: 8 } }
+    medium: { topology: { type: broadcast } }
+    participants:
+      - { type: llm, count: 8, params: { model: "anthropic:claude-haiku-4-5", max_tokens: 1024 } }
+    probes: [ { type: belief } ]
+    metrics: [belief.accuracy, belief.consensus, belief.polarization, belief.entropy, comm.read_rate, comm.posts_per_round]

@@ -166,3 +166,15 @@ def test_png_sizes_follow_cell_px():
     imgs = [p for p in w.observe("a000").parts if p.type == "image"]
     assert png_size(base64.b64decode(imgs[0].image_png_b64)) == (48, 32)
     assert png_size(base64.b64decode(imgs[-1].image_png_b64)) == (16, 12)
+
+
+def test_m5_experiment_spec_pairs_image_and_text():
+    from pathlib import Path
+    exp_dir = Path(__file__).resolve().parents[1] / "experiments"
+    img = Experiment.from_yaml(exp_dir / "m5_flag_image.yaml", arm="image-haiku")
+    txt = Experiment.from_yaml(exp_dir / "m5_flag_image.yaml", arm="text-haiku")
+    assert img.world.modality == "image" and not img.world.image_text_hint
+    assert txt.world.modality == "text" and "modality" not in txt.world.spec()["params"]
+    assert len(img.participants) == len(txt.participants) == 8
+    assert [p.spec() for p in img.participants] == [p.spec() for p in txt.participants]
+    assert all(p.model == "anthropic:claude-haiku-4-5" for p in img.participants)
