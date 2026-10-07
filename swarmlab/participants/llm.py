@@ -314,6 +314,23 @@ class LLMAgent(Participant):
                 "max_tokens": self.max_tokens, "thinking_budget": self.thinking_budget,
                 "extra": dict(self.extra)}
 
+    def reconfigure(self, **kw: Any) -> None:
+        """M3a `Ops.reconfigure`: change `model`, `system_prompt` (re-rendered at the next turn),
+        `memory`, `window_rounds` or `max_tokens` from the next turn on. The settings are plain
+        attributes, so they are in the snapshot and survive resume; `params` (the spec) is unchanged."""
+        allowed = {"model", "system_prompt", "memory", "window_rounds", "max_tokens"}
+        unknown = set(kw) - allowed
+        if unknown:
+            raise ValueError(f"LLMAgent.reconfigure: unknown settings {sorted(unknown)}; allowed {sorted(allowed)}")
+        if kw.get("memory", self.memory) not in ("full", "window"):
+            raise ValueError(f"memory must be 'full' or 'window', got {kw['memory']!r}")
+        if kw.get("window_rounds", self.window_rounds) < 1:
+            raise ValueError("window_rounds must be >= 1")
+        for k, v in kw.items():
+            setattr(self, k, v)
+        if "system_prompt" in kw:
+            self.system = None
+
     # ---- the loop ----------------------------------------------------------------------------
     def _render_system(self, view: View) -> str:
         text = render_system_prompt(self.system_prompt, agent=str(self.agent), role=self.role,

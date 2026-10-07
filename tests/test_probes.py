@@ -233,6 +233,7 @@ def test_yaml_probes_round_trip_and_spec_hash(tmp_path):
     from swarmlab.spec import canonical_json
     old = plain.model_dump(mode="json")
     del old["probes"]
+    old.pop("interventions", None)  # M3a field, likewise left out when empty
     assert spec_hash(plain) == hashlib.sha256(canonical_json(old).encode()).hexdigest()
 
 

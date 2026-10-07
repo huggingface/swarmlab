@@ -150,6 +150,13 @@ from .executor import RoundExecutor
 from .ids import AgentId, agent_id, fork_run_id
 from .ids import run_id as make_run_id
 from .inference import Inference, InferenceCache
+from .interventions import (
+    Intervention,
+    build_intervention,
+    check_names,
+    fire_interventions,
+    replay_world_op,
+)
 from .metrics.base import Metric
 from .metrics.base import get as get_metric
 from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
@@ -315,6 +322,8 @@ class Runner:
         pnames = [p.name for p in self.probes]
         if len(set(pnames)) != len(pnames):
             raise ValueError(f"probe names must be unique, got {pnames}")
+        self.interventions: list[Intervention] = [build_intervention(i) for i in exp.interventions]
+        check_names(self.interventions)  # M3a
         self._probes_stopped = False
         self._probe_hard_ceiling = False
         self._probe_no_context: set[tuple[str, str]] = set()
@@ -358,6 +367,8 @@ class Runner:
             out[f"participant:{a}"] = p.snapshot()
         for m in self.metrics:
             out[f"metric:{m.name}"] = m.snapshot()
+        for iv in self.interventions:
+            out[f"intervention:{iv.name}"] = iv.snapshot()
         return out
 
     def _restore(self, manifest: SnapshotManifest, parent_spec: RunSpec | None) -> None:
@@ -385,6 +396,10 @@ class Runner:
             if key in blobs and (same or metric_spec(m) in parent_spec.metrics):
                 m.restore(blobs[key])
                 restored["metrics"].append(m.name)
+        for iv in self.interventions:  # M3a: same rule as metrics
+            key = f"intervention:{iv.name}"
+            if key in blobs and (same or PluginSpec(**iv.spec()) in parent_spec.interventions):
+                iv.restore(blobs[key])
         self._set_truth()
         self.outcomes_prev = {a: list(v) for a, v in manifest.outcomes_prev.items()}
         self.live_agents = [AgentId(a) for a in manifest.live]
@@ -672,6 +687,8 @@ class Runner:
             if ev.type == "round_started" and sorted(ev.order) != sorted(self._metric_agents):
                 self.live_agents = [AgentId(a) for a in ev.order]
                 self._set_agents()
+            if ev.type == "intervention" and replay_world_op(self.world, ev):  # M3a
+                self._set_truth()
             if ev.type not in NOT_FED:
                 for m in self.metrics:
                     m.update(ev)
@@ -915,6 +932,8 @@ class Runner:
                          accepted=out.accepted, feedback=feedback)
             self.outcomes_prev.setdefault(a, []).append(
                 {"action_id": aid, "tool": act.name, "accepted": out.accepted, "feedback": feedback})
+        # interventions (M3a: after the commit, before probes, in spec order)
+        fire_interventions(self, r)
         # probes (after the commit, before metrics, so probe-sourced metrics see this round)
         await self._probe_round(r, order, ex)
         # metrics

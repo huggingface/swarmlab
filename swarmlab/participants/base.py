@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from ..base import Persistable, Plugin
 from ..ids import AgentId
+from ..interventions import NotSupported
 from ..tools import AgentTools
 from ..view import View
 
@@ -28,3 +29,7 @@ class Participant(Persistable, Plugin):
 
     async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
         raise NotImplementedError
+
+    def reconfigure(self, **kw: object) -> None:
+        """Change settings from the next turn on (M3a `Ops.reconfigure`); default: not supported."""
+        raise NotSupported(f"{type(self).__name__} does not support reconfigure")

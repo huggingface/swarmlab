@@ -93,6 +93,7 @@ from .base import Ack, Action, Outcome, World, tool
 COLOURS = "rgbykwopcmnt"
 PREAMBLE = "Candidate flags:"
 CROP_HEADER = "Your crop:"
+CROP_CHANGED = "Your crop has changed."
 _LAYOUTS = ("h_stripes", "v_stripes", "blocks_2x2", "blocks_2x3")
 _MAX_ATTEMPTS = 1000
 
@@ -110,7 +111,7 @@ def parse_observation(text: str) -> tuple[dict[str, list[str]], list[str]]:
     current: list[str] | None = None
     for raw in text.split("\n"):
         line = raw.strip()
-        if not line or line == PREAMBLE:
+        if not line or line in (PREAMBLE, CROP_CHANGED):
             continue
         if line == CROP_HEADER:
             current = crop
@@ -320,6 +321,9 @@ class FlagGame(World):
         lines = [PREAMBLE]
         for name, grid in self.candidates.items():
             lines += ["", f"{name}:", *grid]
+        if agent in getattr(self, "crops_changed", ()):  # M3a patch_private: said once
+            self.crops_changed = [a for a in self.crops_changed if a != agent]
+            lines += ["", CROP_CHANGED]
         lines += ["", CROP_HEADER, *self.crop_rows(agent)]
         y, x = self.crops[agent]
         return text_observation("\n".join(lines), crop_y=y, crop_x=x)
@@ -386,6 +390,34 @@ class FlagGame(World):
             "the hidden flag with the `guess` tool; only your latest guess counts and you may "
             f"change it in any round.{limit} You are never told whether a guess is right."
         )
+
+    # ---- interventions (M3a, docs/INTERFACE-M3a.md §1) --------------------------------------------
+    def patch_private(self, agent: AgentId, data: dict) -> None:
+        """`{"crop": [y, x]}` moves the agent's crop; its next observation (only) carries a line
+        `Your crop has changed.` before the crop section."""
+        if set(data) != {"crop"}:
+            raise ValueError(f"FlagGame.patch_private takes {{'crop': [y, x]}}, got keys {sorted(data)}")
+        if str(agent) not in self.crops:
+            raise ValueError(f"unknown agent {agent!r}")
+        y, x = (int(v) for v in data["crop"])
+        if not (0 <= y <= self.height - self.crop_h and 0 <= x <= self.width - self.crop_w):
+            raise ValueError(f"crop {[y, x]} does not fit a {self.height}x{self.width} flag")
+        self.crops[str(agent)] = (y, x)
+        changed = getattr(self, "crops_changed", [])
+        self.crops_changed = changed + ([str(agent)] if str(agent) not in changed else [])
+
+    def intervene(self, name: str, **args: Any) -> dict:
+        """`set_truth(name=...)` makes another candidate the hidden flag (the rival swaps with the
+        truth when the new truth is the rival, else it is unchanged)."""
+        if name != "set_truth":
+            return super().intervene(name, **args)
+        new = args.get("name")
+        if set(args) != {"name"} or new not in self.candidates:
+            raise ValueError(f"set_truth needs name=<candidate>, got {args}")
+        if new == self.rival:
+            self.rival = self.truth
+        self.truth = new
+        return {"truth": self.truth, "rival": self.rival}
 
     # ---- evaluator-only -----------------------------------------------------------------------
     def verify(self) -> dict:

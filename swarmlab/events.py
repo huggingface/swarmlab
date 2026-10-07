@@ -24,6 +24,7 @@ Decisions where the contract is silent:
   `EventLogCorrupt`.
 - M1b: `inference_attempt` gained `category`, `inference_response` gained `served_by`,
   `finish_reason`, `cached`; new logical types `budget`, `budget_changed`, `probe`.
+- M3a: new logical type `intervention` (`InterventionEvent`).
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
 """
@@ -202,6 +203,26 @@ class ProbeEvent(Event):
     cost_usd: float = 0.0
 
 
+class InterventionEvent(Event):
+    """An intervention operation (M3a, docs/INTERFACE-M3a.md §1; logical).
+
+    One event per affected agent (`agent` and `affected == [agent]`), or one event with
+    `affected == []` and `agent` None for a swarm-wide operation. `ok` is False when the world or
+    participant hook raised (`NotSupported` or another error, text in `error`). `params` are the
+    operation's arguments as JSON; `result` is what the hook returned (`World.intervene`).
+    """
+
+    type: Literal["intervention"] = "intervention"
+    intervention: str
+    op: str
+    affected: list[str] = []
+    ok: bool = True
+    post_id: str | None = None
+    params: dict = {}
+    result: dict = {}
+    error: str | None = None
+
+
 class RunEndedEvent(Event):
     type: Literal["run_ended"] = "run_ended"
     reason: Literal["terminal", "max_rounds", "soft_budget", "hard_ceiling", "error"]
@@ -211,7 +232,7 @@ _ALL = (
     RunStartedEvent, RoundStartedEvent, TurnStartedEvent, ToolCalledEvent, ToolReturnedEvent,
     InferenceAttemptEvent, InferenceResponseEvent, TurnEndedEvent, ReadEvent, PostEvent,
     DeliveryEvent, ActionCommittedEvent, WorldChangedEvent, MetricEvent, RoundCommittedEvent,
-    SnapshotEvent, RunEndedEvent, BudgetEvent, BudgetChangedEvent, ProbeEvent,
+    SnapshotEvent, RunEndedEvent, BudgetEvent, BudgetChangedEvent, ProbeEvent, InterventionEvent,
 )
 EVENT_CLASSES: dict[str, type[Event]] = {c.model_fields["type"].default: c for c in _ALL}
 
@@ -219,7 +240,8 @@ AnyEvent = Annotated[
     RunStartedEvent | RoundStartedEvent | TurnStartedEvent | ToolCalledEvent | ToolReturnedEvent
     | InferenceAttemptEvent | InferenceResponseEvent | TurnEndedEvent | ReadEvent | PostEvent
     | DeliveryEvent | ActionCommittedEvent | WorldChangedEvent | MetricEvent | RoundCommittedEvent
-    | SnapshotEvent | RunEndedEvent | BudgetEvent | BudgetChangedEvent | ProbeEvent,
+    | SnapshotEvent | RunEndedEvent | BudgetEvent | BudgetChangedEvent | ProbeEvent
+    | InterventionEvent,
     Field(discriminator="type"),
 ]
 _ADAPTER: TypeAdapter[Event] = TypeAdapter(AnyEvent)

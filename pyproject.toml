@@ -51,6 +51,14 @@ llm = "swarmlab.participants.llm:LLMAgent"
 [project.entry-points."swarmlab.probes"]
 belief = "swarmlab.probes:BeliefProbe"
 
+[project.entry-points."swarmlab.interventions"]
+inject_post = "swarmlab.interventions:InjectPost"
+delay_delivery = "swarmlab.interventions:DelayDelivery"
+mute = "swarmlab.interventions:Mute"
+kill_agents = "swarmlab.interventions:KillAgents"
+patch_private = "swarmlab.interventions:PatchPrivate"
+reconfigure = "swarmlab.interventions:Reconfigure"
+
 [project.entry-points."swarmlab.providers"]
 anthropic = "swarmlab.providers.anthropic:AnthropicProvider"
 openai_compat = "swarmlab.providers.openai_compat:OpenAICompatProvider"
