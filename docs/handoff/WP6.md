@@ -157,3 +157,19 @@ resp = await tools.infer(request)                         # category="swarm"
 - `RunSpec` has a new `providers` field (default `{}`). It is part of the spec hash, so hashes of
   new runs differ from M1a runs of the same configuration. Old `run.json` files still load.
 - The CLI has no `--budget` flag on `resume` yet (`Run.resume(budget=...)` only).
+
+## Follow-ups from the first external user (field notes 2026-10-07, branch `field-notes-cli`)
+
+- Errored turns: `run.json` and `Run.summary()` carry `turns_total`, `turns_errored`,
+  `first_error`, and `health: "degraded"` when more than half the turns ended `error`; the CLI
+  warns, `run` reports the run `errored` and exits 1 (swarmlab/runner.py `TurnTally`).
+- `swarmlab preflight SPEC --arm A` (swarmlab/preflight.py): one real request per LLM group with
+  the arm's exact `extra` and tools, straight to the provider (no gate, nothing on disk),
+  capped by `--max-usd`. Cerebras rejects `chat_template_kwargs`; use
+  `extra: {reasoning_effort: "none"}` there (swarmlab/providers/openai_compat.py docstring).
+- `budget.total_usd` is enforced over `<out>/<experiment>.ledger.jsonl`
+  (`budget.ExperimentLedger`), across processes and `run --parallel N`; new end reason
+  `total_budget`. Arms on `fake:` models only are exempt.
+- `estimate --from RUN_DIR` prices a spec with `Run.measured()`; `Experiment.estimate` takes
+  float figures and `probe_call_usd`.
+

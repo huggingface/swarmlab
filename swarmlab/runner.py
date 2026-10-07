@@ -54,7 +54,18 @@ the same shape in both modes.
 
 Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else
 `r == max_rounds` -> `run_ended(max_rounds)`, else (M1b) `soft_usd > 0` and
-`ledger.spent["swarm"] >= soft_usd` -> `run_ended(soft_budget)`, all checked at the round boundary.
+`ledger.spent["swarm"] >= soft_usd` -> `run_ended(soft_budget)`, else `budget.total_usd > 0` and
+the experiment's spend (`<out>/<experiment>.ledger.jsonl` over every other run instance, plus this
+run's ledger) >= `total_usd` -> `run_ended(total_budget)`, all checked at the round boundary
+(also before round 1). `total_budget` is resumable like `soft_budget`.
+
+Experiment ledger (swarmlab/budget.py `ExperimentLedger`): every `run.json` write also appends a
+row (run id, instance key `<run_id>@<started_at>`, spec hash, spend so far, status, hard_usd,
+pid, host, time) to `<run dir's parent>/<experiment>.ledger.jsonl`; a live/resume call that
+leaves without ending appends a final `interrupted` row. A run that bills nothing (only `fake:`
+models, `spec.unbilled_spec`) writes rows with `simulated: true`, which the ledger does not
+count, and is never stopped with `total_budget`. `run.json["started_at"]` is set when
+the run first starts and kept by resume.
 
 Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
 
@@ -86,7 +97,13 @@ git_commit, dirty, parent_run, fork_round, restored (what a fork restored), stat
 ("running" | "ended"), end_reason, last_round (last committed round), score (`world.score()`
 after the last commit), metrics_rev (the metric-semantics revision the run logs with,
 `swarmlab.metrics.base.METRICS_REV` for new runs; absent in older run.json files, which are
-revision 1: replay, resume and report then fold with `Metric.use_rev(1)`).
+revision 1: replay, resume and report then fold with `Metric.use_rev(1)`), import_dir (only
+when the experiment came from a YAML: its directory, put on `sys.path` by `Run.experiment`),
+`turns_total` / `turns_errored` (`turn_ended` events in the log, and of those the ones with
+`yield_kind == "error"`; recounted from the log on resume and fork), `first_error` (the first
+errored turn's exception line, when there is one) and `health: "degraded"` when more than half
+of the turns ended `error` (the end reason is left as it is: a run whose every turn failed still
+ends `max_rounds`, but `swarmlab run` reports it `errored` and exits 1).
 
 Recovery (`resume(budget=None)`): if the log has `run_ended` with a reason other than
 `soft_budget`/`hard_ceiling`/`hard_ceiling_probes`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
@@ -150,6 +167,7 @@ import copy
 import json
 import random
 import shutil
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -158,7 +176,7 @@ from typing import TYPE_CHECKING, Any
 
 from ._io import atomic_write_bytes
 from .blobs import BlobStore
-from .budget import Gate, HardCeilingReached, Ledger, MeasurementBudgetReached
+from .budget import ExperimentLedger, Gate, HardCeilingReached, Ledger, MeasurementBudgetReached
 from .events import (
     OPERATIONAL_TYPES,
     ActionCommittedEvent,
@@ -210,6 +228,7 @@ from .spec import (
     dump_runspec_yaml,
     git_identity,
     spec_hash,
+    unbilled_spec,
 )
 from .tools import AgentTools, TurnCapReached
 from .view import View
@@ -221,7 +240,7 @@ if TYPE_CHECKING:
 NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "run_ended", "budget",
                      "budget_changed"})
 # run_ended reasons that resume() continues from
-BUDGET_REASONS = ("soft_budget", "hard_ceiling", "hard_ceiling_probes")
+BUDGET_REASONS = ("soft_budget", "hard_ceiling", "hard_ceiling_probes", "total_budget")
 REPO_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -294,6 +313,62 @@ class RepeatSeeded:
         return getattr(self.inner, name)
 
 
+def error_headline(text: str | None) -> str:
+    """The first line of the exception a `turn_ended.error` traceback ends with (or of `text`)."""
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    if not lines[0].startswith("Traceback"):
+        return lines[0].strip()
+    # the exception line: the first unindented line after the last `  File ...` frame
+    last_frame = max((i for i, ln in enumerate(lines) if ln.startswith("  File ")), default=0)
+    head = lines[-1]
+    for ln in lines[last_frame + 1:]:
+        if not ln.startswith((" ", "\t")):
+            head = ln
+            break
+    name, sep, rest = head.strip().partition(": ")
+    if sep and "." in name and name.replace(".", "").replace("_", "").isalnum():
+        name = name.rsplit(".", 1)[1]  # swarmlab.providers.base.ProviderError -> ProviderError
+    return f"{name}{sep}{rest}"
+
+
+class TurnTally:
+    """Turns ended and turns ended `error` in the log, plus the first error's headline."""
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.errored = 0
+        self.first_error: str | None = None
+
+    @classmethod
+    def of(cls, events: list[Event]) -> TurnTally:
+        tally = cls()
+        for ev in events:
+            if ev.type == "turn_ended":
+                tally.add(ev)
+        return tally
+
+    def add(self, ev: Any) -> None:
+        self.total += 1
+        if ev.yield_kind == "error":
+            self.errored += 1
+            if self.first_error is None:
+                self.first_error = error_headline(ev.error) or "(no error text)"
+
+    @property
+    def degraded(self) -> bool:
+        return self.errored * 2 > self.total
+
+    def meta(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"turns_total": self.total, "turns_errored": self.errored}
+        if self.first_error is not None:
+            out["first_error"] = self.first_error
+        if self.degraded:
+            out["health"] = "degraded"
+        return out
+
+
 class Runner:
     def __init__(
         self,
@@ -323,11 +398,19 @@ class Runner:
             self.budget = experiment.budget
         # semantics revision of the metrics this run logs (swarmlab/metrics/base.py)
         self.metrics_rev = int((meta or {}).get("metrics_rev", 1)) if meta is not None else METRICS_REV
+        # the spec YAML's dir, for module:Class plugins next to it (registry.add_import_dir)
+        self.import_dir: str | None = (getattr(experiment, "_import_dir", None)
+                                       or (meta or {}).get("import_dir"))
+        # one run instance in the experiment ledger (swarmlab/budget.py ExperimentLedger)
+        # (run dirs from before the ledger existed are the instance "legacy")
+        self.started_at: str = (f"{time.time():.6f}" if meta is None
+                                else meta.get("started_at") or "legacy")
         self._aborted_score: Any = None
         self.status = "running"
         self.end_reason: str | None = None
         self.last_round = 0
         self._round_events: list[Event] = []
+        self.turns = TurnTally()
 
     # ---- paths and metadata ------------------------------------------------------------------
     @property
@@ -367,9 +450,38 @@ class Runner:
             "ledger": self.ledger.to_dict(),
             "ledger_seq": self.log.next_seq - 1 if getattr(self, "log", None) is not None else -1,
             "metrics_rev": self.metrics_rev,
+            **self.turns.meta(),
         }
+        if self.import_dir:
+            data["import_dir"] = self.import_dir
+        data["started_at"] = self.started_at
         text = json.dumps(data, indent=2, sort_keys=True) + "\n"
         atomic_write_bytes(self.dir / "run.json", text.encode())
+        self._ledger_row(self.status, data["spec_hash"])
+
+    @property
+    def experiment_ledger(self) -> ExperimentLedger:
+        return ExperimentLedger(self.dir.parent, self.spec.experiment)
+
+    def _ledger_row(self, status: str, spec_hash_: str | None = None) -> None:
+        """Append this run's spend so far to `<out>/<experiment>.ledger.jsonl`."""
+        extra = {"simulated": True} if self.unbilled else {}
+        self.experiment_ledger.record(
+            self.run_id, f"{self.run_id}@{self.started_at}", self.ledger.spent_total, status,
+            hard=self.budget.hard_usd, spec_hash=spec_hash_ or spec_hash(self.spec), **extra)
+
+    @property
+    def unbilled(self) -> bool:
+        """Only `fake:` models: nominal spend, exempt from `budget.total_usd`."""
+        return unbilled_spec(self.spec.model_dump(mode="json"))
+
+    def _ledger_interrupted(self) -> None:
+        """A live/resume that leaves without ending (an exception, Ctrl-C): stop reserving."""
+        if self.status != "ended" and getattr(self, "ledger", None) is not None:
+            try:
+                self._ledger_row("interrupted")
+            except OSError:
+                pass
 
     def _write_artifacts(self) -> None:
         art = self.dir / "artifacts"
@@ -502,6 +614,8 @@ class Runner:
         self.log.append(ev)
         if ev.type not in OPERATIONAL_TYPES:
             self._round_events.append(ev)
+        if ev.type == "turn_ended":
+            self.turns.add(ev)
 
     def log_operational(self, event: Event) -> int:
         """Append an operational event (`inference_attempt`, `inference_response`) immediately.
@@ -553,6 +667,7 @@ class Runner:
             _run_coro(self._loop(start))
         finally:
             self.log.close()
+            self._ledger_interrupted()
         return self
 
     def resume(self, budget: Budget | None = None) -> Runner:
@@ -590,6 +705,7 @@ class Runner:
             _run_coro(self._loop(start))
         finally:
             self.log.close()
+            self._ledger_interrupted()
         return self
 
     def recover(self, events: list[Event] | None = None, meta: dict | None = None) -> int:
@@ -832,10 +948,12 @@ class Runner:
 
     # ---- the round loop ----------------------------------------------------------------------
     async def _loop(self, start: int) -> None:
+        logged = list(self.log)
         self._probe_no_context = {
-            (e.probe, str(e.agent)) for e in self.log
+            (e.probe, str(e.agent)) for e in logged
             if e.type == "probe" and (e.parsed or {}).get("skipped") == "no_context"
         }
+        self.turns = TurnTally.of(logged)  # resume / fork: the turns already in the log count
         r = start
         while True:
             reason = self._end_reason(r - 1)
@@ -932,6 +1050,11 @@ class Runner:
         soft = self.budget.soft_usd
         if soft > 0 and self.ledger.spent["swarm"] >= soft:
             return "soft_budget"
+        total = self.budget.total_usd
+        if total > 0 and not self.unbilled:  # experiment-wide: every run in <out>/<experiment>.ledger.jsonl
+            others = self.experiment_ledger.spent(exclude=f"{self.run_id}@{self.started_at}")
+            if others + self.ledger.spent_total >= total:
+                return "total_budget"
         return None
 
     def _abort_round(self, r: int) -> None:

@@ -34,33 +34,40 @@ Project-level copies work too: `.claude/skills/swarmlab/`, `.agents/skills/swarm
 ## First real run: the checklist
 
 Size it to the budget first. Put the user's total in the spec as `budget: {total_usd: T}` (top
-level): `swarmlab run` then never starts a run that could push the experiment past T.
+level): `swarmlab run` then never starts a run that could push the experiment past T. The
+spend is shared through `runs/<experiment>.ledger.jsonl`, so separate invocations, parallel
+shells and `swarmlab run --parallel N` all count against the same T (same `--out`).
 
 - **Total under $2: the short checklist.** A separate smoke run and a second-agent review would
   eat a large share of the money, and one round's worst-case estimate can be a fifth of the
   total, so size the caps from measured spend, not from the estimate:
   1. `swarmlab doctor SPEC.yaml` and `swarmlab validate SPEC.yaml` (items 1-2 below).
-  2. Dry run with `fake:reader` (item 3; free): checks the metrics and the replay.
+  2. Dry run with `fake:reader` (item 3; free): checks the metrics and the replay. A dry arm
+     (only `fake:` models and scripted agents) needs no `hard_usd` and does not count toward
+     `total_usd`.
   3. Prompt review without a second agent: `swarmlab prompts SPEC.yaml --arm A > A.txt` for
      every arm, then `diff A.txt B.txt` -> only the manipulated text differs, no correctness
      hints, every needed tool named.
   4. Caps go in each arm's own `budget:` (`arms.A.budget: {soft_usd: 0, hard_usd: X}`), not the
      top level: budgets are part of the spec hash, so changing a top-level cap later would make
      the finished first arm look like a different run. Keep only `total_usd: T` at the top.
-  5. First real arm = smoke = data, at N <= 6 agents, with `hard_usd` = 50% of the total and no
+  5. `swarmlab preflight SPEC.yaml --arm A` for every arm with a real model -> exit 0: one real
+     request per participant group with the arm's exact `extra` and tools; it shows the
+     provider's HTTP error if a body field is rejected (cents at most; `--max-usd` caps it).
+  6. First real arm = smoke = data, at N <= 6 agents, with `hard_usd` = 50% of the total and no
      soft cap (`soft_usd: 0`: a soft cap at this size stops the run a round early):
      `swarmlab run SPEC.yaml --arm FIRST --seed S` -> `end=max_rounds`. Note its actual spend
      (`spend=$X` on the status line, `spend_usd` under `--json`) and X / rounds = its measured
      per-round cost. The run is kept as the arm's data, not repeated.
-  6. Set the second arm's `hard_usd` from that measurement: about 1.5 x the first arm's actual
+  7. Set the second arm's `hard_usd` from that measurement: about 1.5 x the first arm's actual
      `spend_usd` (same model and N, one variable changed), and no more than T minus that spend;
      `soft_usd: 0`. `swarmlab run SPEC.yaml` then skips the finished first arm and prints an
      `existing:` line with its actual spend and per-round cost; `total_usd` counts that spend
      (including anything added by `resume`) before starting the second arm.
-  7. A `hard_ceiling` end (round in flight discarded) or `hard_ceiling_probes` (last round kept,
+  8. A `hard_ceiling` end (round in flight discarded) or `hard_ceiling_probes` (last round kept,
      some probes skipped): `swarmlab resume RUN_DIR --add-budget D` if T minus the spend so far
      allows (resume itself does not check `total_usd`), else report the rounds you have.
-  8. `swarmlab report runs/ --out report.md`; it lists skipped probes per arm.
+  9. `swarmlab report runs/ --out report.md`; it lists skipped probes per arm.
 - **Total of $2 or more: the full checklist below**, all eleven items.
 
 Do these in order. Each item is done when its check holds; a failing check is fixed before the
@@ -90,7 +97,10 @@ next item.
    checks that each arm's system prompt and round-1 message differ only in the manipulated
    variable, carry no correctness hints, and name every tool the arm needs. Fix the spec and
    re-render until the reviewer signs off.
-5. **Smoke at N=4 with a hard ceiling.** A smoke arm: the real model, `count: 4`,
+5. **Preflight, then smoke at N=4 with a hard ceiling.** First `swarmlab preflight SPEC.yaml
+   --arm A` for every arm with a real model -> exit 0, every group `tool call parsed` (one real
+   request per participant group with the arm's exact `extra` and tools; a rejected body field
+   shows the provider's HTTP error here instead of as a run of errored turns). Then a smoke arm: the real model, `count: 4`,
    `options: {max_rounds: 3}`, `budget: {hard_usd: 0.50, measurement_usd: 0.10}`.
    `swarmlab run SPEC.yaml --arm smoke --seed 0` -> `end=max_rounds` (not `hard_ceiling`), then
    `swarmlab report RUNS_DIR` -> tool protocol health shows no errored turns and few `length`
@@ -99,11 +109,10 @@ next item.
    skipped) means raise the budget or cut rounds; `swarmlab resume RUN_DIR --add-budget D`
    continues the same run with D more dollars (`--budget-hard X` sets the run's
    total, spend so far and discarded rounds included).
-6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS --calls-per-turn C` -> total
-   for every arm x seed. Take the growth and calls per turn from the smoke run's `inference` table
-   (`swarmlab export RUN_DIR`); without them the worst case (each group's `max_calls`, else the
-   runner cap) overstates real spend 4-6x. The user approves
-   the total before launch.
+6. **Estimate.** `swarmlab estimate SPEC.yaml --from runs/SMOKE_RUN_ID` -> total for every arm
+   x seed, priced with the smoke run's measured calls per turn, prompt-token growth per round,
+   completion tokens and probe cost; without `--from` the worst case (each group's `max_calls`,
+   else the runner cap) overstates real spend 4-6x. The user approves the total before launch.
 7. **Launch.** Local: `swarmlab run SPEC.yaml` (every arm x seed; asks before spending; already
    finished runs are skipped). Self-hosted model on HF Jobs (spec models `vllm:<model>`):
    `swarmlab job run SPEC.yaml --model ORG/MODEL` prints the plan and estimate; add `--launch`
@@ -136,7 +145,9 @@ next item.
   `swarmlab fork RUN_DIR --at R --spec edited.yaml`. Both reuse the inference cache, so the
   shared prefix costs nothing.
 - **Re-running a finished run is a skip.** `swarmlab run` skips run dirs with the same spec hash;
-  `--rerun` writes `RUN_ID__rN` beside it when you need a repeat.
+  `--rerun` writes `RUN_ID__rN` beside it when you need a repeat. After a spec edit the hash
+  differs and `run` refuses that run (both hashes in the error, outcome `failed`): `--rerun`
+  (new `__rN` dir) or `--out` elsewhere; nothing is overwritten.
 - **Replay before you trust a run.** `swarmlab replay RUN_DIR` recomputes metrics and score from
   the log with zero provider calls and exits 1 on any mismatch.
 - **Analyse from exports.** `swarmlab export RUN_DIR` writes `export/tables/<family>.parquet`
@@ -149,6 +160,11 @@ next item.
   it replays like a local one.
 - **Slow providers and sequential commit do not mix**: `commit: immediate` puts every call on the
   critical path; keep it to fast providers or small N (`swarmlab estimate` does not model this).
-- **Reasoning models need room**: set `max_tokens: 2048` or turn thinking off through
-  `params: {extra: {chat_template_kwargs: {enable_thinking: false}}}`; `swarmlab report` counts
-  `length` and `max_tokens` finishes (truncated replies).
+- **Reasoning models need room**: set `max_tokens: 2048` or turn thinking off through `extra`,
+  in the serving provider's own field: `{chat_template_kwargs: {enable_thinking: false}}` for
+  Qwen3 on vLLM/SGLang/DeepInfra, `{reasoning_effort: "none"}` on Cerebras (which rejects
+  `chat_template_kwargs`; Qwen3.8 there reasons by default). `swarmlab preflight` checks the
+  field is accepted; `swarmlab report` counts `length` and `max_tokens` finishes.
+- **An `errored` run is not data.** `WARNING: E/T turns errored (first error: ...)`, outcome
+  `errored` and exit 1 mean most turns raised (usually a provider error); fix the spec (run
+  `preflight`) and rerun with `--rerun`, do not analyse it.

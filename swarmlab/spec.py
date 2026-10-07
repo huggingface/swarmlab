@@ -55,7 +55,9 @@ Decisions where the contract is silent:
 - `budget.total_usd` (top level only; an arm-level one is a `SpecError`) caps the experiment's
   total spend: `swarmlab run` / `Experiment.run_all` refuse to start a run when the spend of the
   runs already done plus the next run's `hard_usd` would exceed it. It is never part of
-  `spec_hash`, so changing the total cap does not make finished runs look different.
+  `spec_hash`, so changing the total cap does not make finished runs look different. Arms that
+  bill nothing (`unbilled_spec`: only `fake:` models and scripted participants) are exempt: they
+  need no `hard_usd` and their nominal spend does not count toward the total.
 """
 from __future__ import annotations
 
@@ -339,6 +341,22 @@ def _check_roles(out: dict) -> None:
                 g.pop("role", None)
     if not out["roles"]:
         out.pop("roles")
+
+
+def spec_models(spec: dict) -> list[str]:
+    """Every `"<prefix>:<id>"` model a run spec (`RunSpec.model_dump(mode="json")`) can call:
+    participants' `model`, probes' `coder_model`, roles' `model` overrides."""
+    models = [(p.get("params") or {}).get("model") for p in spec.get("participants") or []]
+    models += [(p.get("params") or {}).get("coder_model") for p in spec.get("probes") or []]
+    models += [(r or {}).get("model") for r in (spec.get("roles") or {}).values()]
+    return [m for m in models if isinstance(m, str) and ":" in m]
+
+
+def unbilled_spec(spec: dict) -> bool:
+    """True when nothing in the run is billed: every model is a `fake:` model (scripted
+    participants call none). Such runs are exempt from `budget.total_usd` (no `hard_usd`
+    needed, never refused, their nominal spend not counted toward the total)."""
+    return all(m.startswith("fake:") for m in spec_models(spec))
 
 
 def experiment_seeds(doc: dict) -> list[int]:

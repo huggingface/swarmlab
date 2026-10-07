@@ -12,13 +12,13 @@ CAP = """\
 name: cap
 seeds: [1, 2, 3]
 budget: {soft_usd: 0.04, hard_usd: 0.05, total_usd: 0.12}
-providers:
-  fake: {type: fake, params: {pricing: {"*": [10.0, 50.0, 1.0]}}}
+providers:  # `paid:` is a FakeProvider standing in for a billed provider (fake: arms are exempt)
+  paid: {type: fake, params: {pricing: {"*": [10.0, 50.0, 1.0]}}}
 options: {max_rounds: 2}
 arms:
   A:
     world: {type: flaggame}
-    participants: [{type: llm, count: 2, params: {model: "fake:reader", max_tokens: 64, max_calls: 2}}]
+    participants: [{type: llm, count: 2, params: {model: "paid:reader", max_tokens: 64, max_calls: 2}}]
     metrics: [belief.consensus]
 """
 
@@ -88,7 +88,8 @@ def test_soft_hard_gap_warning(tmp_path):
     res, _ = invoke("run", spec_file(tmp_path, total_usd=0), "--seed", 1, "--out", tmp_path / "r",
                     "--yes")
     assert res.exit_code == 0, res.output
-    assert "warning: arm=A: hard_usd - soft_usd = $0.0100 is less than one round" in res.stdout
+    assert ("warning: arm=A: hard_usd - soft_usd = $0.0100 is less than twice one round's "
+            "estimated worst case") in res.stdout
     assert "caps: no total cap" in res.stdout
     res, _ = invoke("run", spec_file(tmp_path, total_usd=0, soft_usd=0.04, hard_usd=1.0), "--seed", 1,
                     "--out", tmp_path / "r2", "--yes")

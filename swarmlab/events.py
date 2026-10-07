@@ -277,7 +277,7 @@ class ClaimEvent(Event):
 class RunEndedEvent(Event):
     type: Literal["run_ended"] = "run_ended"
     reason: Literal["terminal", "max_rounds", "soft_budget", "hard_ceiling", "hard_ceiling_probes",
-                    "error"]
+                    "total_budget", "error"]
 
 
 _ALL = (

@@ -269,7 +269,8 @@ def test_bootstrap_end_to_end_with_stubs(tmp_path):
     assert "uv pip install --system -q vllm==0.30.0" in calls
     # runs synced to the bucket, complete enough to load locally
     runs = bucket / "runs" / "t1"
-    assert sorted(p.name for p in runs.iterdir()) == ["boot__scripted__s1", "boot__scripted__s2"]
+    assert sorted(p.name for p in runs.iterdir()) == [  # run dirs + the experiment ledger
+        "boot.ledger.jsonl", "boot__scripted__s1", "boot__scripted__s2"]
     r = Run.load(runs / "boot__scripted__s1")
     assert r.status == "ended" and r.meta["git_commit"] == COMMIT
     manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())

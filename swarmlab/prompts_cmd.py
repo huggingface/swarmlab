@@ -10,8 +10,10 @@ plus the JSON-protocol section under `tool_protocol: json`) and `LLMAgent.round_
 
 Decisions:
 
-- The view is the round-1 view: no outcomes, and nothing pushed (pushed items exist only from
-  round 2). Evaluator-only `private` data is stripped as in a run; it is not shown.
+- The view is the round-1 view: the world is reset and then `world.begin_round(1)` is called,
+  exactly as the runner does before round 1's observations, so round-dependent observations
+  (dynamics, schedules) are what agents see in round 1; no outcomes, and nothing pushed (pushed
+  items exist only from round 2). Later rounds are not previewed. Evaluator-only `private` data is stripped as in a run; it is not shown.
 - The tools are the executor's schemas for that agent (`RoundExecutor.schemas`), i.e. what the
   provider receives under the native protocol.
 - A participant without these rendering methods (scripted participants) is listed with
@@ -65,11 +67,13 @@ def _text(message: Any) -> str:
     return "\n".join(out)
 
 
-def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
-    """One dict per participant group: agent, type, count, model, system, user, tools."""
+def group_views(exp: Experiment, seed: int = 0) -> list[tuple[int, int, Any, Any, View]]:
+    """`(first agent index, count, agent id, bound participant, round-1 view)` per participant
+    group, built exactly as the runner builds them (also used by `swarmlab preflight`)."""
     agents = [agent_id(i) for i in range(len(exp.participants))]
     world = copy.deepcopy(exp.world)
     world.reset(derive(seed, "world"), list(agents))
+    world.begin_round(1)  # as the runner does before any round-1 observation
     board = copy.deepcopy(exp.medium)
     commit = exp.options.get("commit", "round_end")
     board.commit_mode = commit
@@ -85,10 +89,19 @@ def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
     out = []
     for first, count in participant_groups(exp):
         a = agents[first]
-        p = bound[a]
         obs = world.observe(a).model_copy(update={"private": {}})
         view = View(round=1, agent=a, observation=obs, outcomes=[], pushed=[],
                     tools=ex.schemas(a), description=world.description())
+        out.append((first, count, a, bound[a], view))
+    return out
+
+
+def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
+    """One dict per participant group: agent, type, count, model, system, user, tools."""
+    agents = [agent_id(i) for i in range(len(exp.participants))]
+    names = [role_name(p) for p in exp.participants]
+    out = []
+    for first, count, a, p, view in group_views(exp, seed):
         spec = p.spec()
         row: dict[str, Any] = {
             "group": len(out) + 1, "agent": str(a), "agents": [str(x) for x in
