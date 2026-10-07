@@ -50,9 +50,12 @@ Decisions where the contract is silent:
   exits 1 before anything runs. A failed run does not stop the others; the exit code is then 1
   (2 if every failure was a SpecError).
 - Total cap (`budget.total_usd`, top level): `run` prints the per-run caps of every arm and the
-  total cap before anything runs, and warns per arm when `hard_usd - soft_usd` is less than one
+  total cap before anything runs, plus one `existing:` line per run dir that already exists with
+  its actual ledger spend (resumed spend included), rounds and per-round cost (not the spec's
+  caps), and how much of the total those runs already used, and warns per arm when `hard_usd - soft_usd` is less than one
   round of the estimate (`usd_per_round`). Before starting each run it checks
   `budget.total_cap_refusal(spend of the runs ran or found so far, the arm's hard_usd, total)`;
+  a found run's spend is its `run.json` ledger, so spend added by `swarmlab resume` counts;
   on a refusal that run and every later one get outcome `capped`, the JSON gets
   `capped: {reason, total_usd, spent, skipped: [run ids]}` and the exit code is 1.
 - `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server) are documented in
@@ -340,21 +343,53 @@ def _table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _existing_runs(exps: dict[str, Experiment], seeds: list[int], max_rounds: int | None,
+                   out: Path) -> dict[str, list[tuple[int, str, Run]]]:
+    """Per arm: (seed, "same" | "different", run) for each run dir that already exists."""
+    found: dict[str, list[tuple[int, str, Run]]] = {}
+    for a, exp in exps.items():
+        for sd in seeds:
+            try:
+                state, run = exp.existing(sd, max_rounds, out)
+            except Exception:  # noqa: BLE001, S112 - an unreadable dir is reported by the run itself
+                continue
+            if run is not None:
+                found.setdefault(a, []).append((sd, state, run))
+    return found
+
+
 def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_runs: int,
-               n_seeds: int, total_cap: float) -> list[str]:
-    """The planned per-run caps, the experiment's total cap, and soft/hard gap warnings."""
+               n_seeds: int, total_cap: float,
+               existing: dict[str, list[tuple[int, str, Run]]] | None = None) -> list[str]:
+    """The planned per-run caps, the actual spend of runs that already exist, the experiment's
+    total cap, and soft/hard gap warnings."""
     def money(v: float) -> str:
         return f"${v:g}" if v > 0 else "off"
 
+    existing = existing or {}
     lines = []
+    already = 0.0
     for a, exp in exps.items():
         b = exp.budget
         lines.append(f"caps: arm={a} per run soft={money(b.soft_usd)} hard={money(b.hard_usd)} "
                      f"measurement={money(b.measurement_usd)} x {n_seeds} seed(s)")
+        for sd, state, r in existing.get(a, []):
+            spent = ledger_total(r.spend)
+            rounds = int(r.meta.get("last_round") or 0)
+            per = f", ${spent / rounds:.4f}/round" if rounds else ""
+            what = ("same spec: skipped, its spend counts toward the total" if state == "same"
+                    else "different spec: fails unless --rerun")
+            if state == "same":
+                already += spent
+            lines.append(f"  existing: arm={a} seed={sd} spent ${spent:.4f} actual over "
+                         f"{rounds} round(s){per} (end={r.end_reason}; {what})")
     hard_sum = sum(e.budget.hard_usd for e in exps.values()) * n_seeds
     if total_cap > 0:
         line = (f"caps: total ${total_cap:g} for the {n_runs} run(s) (budget.total_usd); a run "
                 "starts only if spend so far + its hard_usd fits")
+        if already > 0:
+            line += (f"; existing runs already spent ${already:.4f} (resumed spend included), "
+                     f"${max(0.0, total_cap - already):.4f} left")
         if hard_sum > total_cap:
             line += (f"; hard ceilings sum to ${hard_sum:g}, so later runs may be skipped if "
                      "earlier ones spend near their ceilings")
@@ -441,7 +476,8 @@ def run(
         if _only_fake(ests.values()):
             _say("  (fake: models only: prices are nominal, nothing is billed)", as_json)
     if budgeted:
-        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap):
+        existing = _existing_runs(exps, seeds, max_rounds, out) if not rerun else {}
+        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap, existing):
             _say(line, as_json)
     if budgeted and not yes:
         _confirm(f"Start {n_runs} run(s), worst case ${total:.4f}?")
@@ -655,6 +691,11 @@ def resume(
                 changes["hard_usd"] = round(ledger_total(spend) + add_budget, 9)
         _say(f"resume {r.id}: {_spend_text(spend)} so far; " + _budget_text(
             {k: v for k, v in {**current, **changes}.items() if k != "total_usd"}), as_json)
+        if float(current.get("total_usd") or 0) > 0:
+            _say(f"note: resume does not check the experiment's total cap "
+                 f"(${float(current['total_usd']):g}, budget.total_usd); this run's spend after "
+                 "the resume (its ledger) counts toward it when `swarmlab run` decides whether "
+                 "to start further runs", as_json)
         budget = Budget(**{**current, **changes}) if changes else None
         data = summary(r.resume(budget=budget))
         data["budget"] = (budget or Budget(**current)).model_dump(mode="json")

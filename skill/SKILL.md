@@ -37,19 +37,30 @@ Size it to the budget first. Put the user's total in the spec as `budget: {total
 level): `swarmlab run` then never starts a run that could push the experiment past T.
 
 - **Total under $2: the short checklist.** A separate smoke run and a second-agent review would
-  eat a large share of the money, so:
+  eat a large share of the money, and one round's worst-case estimate can be a fifth of the
+  total, so size the caps from measured spend, not from the estimate:
   1. `swarmlab doctor SPEC.yaml` and `swarmlab validate SPEC.yaml` (items 1-2 below).
-  2. Dry run with `fake:reader` (item 3; free).
+  2. Dry run with `fake:reader` (item 3; free): checks the metrics and the replay.
   3. Prompt review without a second agent: `swarmlab prompts SPEC.yaml --arm A > A.txt` for
      every arm, then `diff A.txt B.txt` -> only the manipulated text differs, no correctness
      hints, every needed tool named.
-  4. Smoke = the first real arm itself, at N <= 6 agents, with `hard_usd` <= 30% of the total
-     and `soft_usd` at least one round below it (`swarmlab run` warns when they are closer):
-     `swarmlab run SPEC.yaml --arm FIRST --seed S` -> `end=max_rounds`. That run is kept as
-     the arm's data, not repeated. A `hard_ceiling` end: `swarmlab resume RUN_DIR
-     --add-budget D` if the total allows, else cut rounds.
-  5. `swarmlab estimate SPEC.yaml` for the remaining arms, approval, `swarmlab run SPEC.yaml`
-     (the finished smoke run is skipped), then `swarmlab report runs/ --out report.md`.
+  4. Caps go in each arm's own `budget:` (`arms.A.budget: {soft_usd: 0, hard_usd: X}`), not the
+     top level: budgets are part of the spec hash, so changing a top-level cap later would make
+     the finished first arm look like a different run. Keep only `total_usd: T` at the top.
+  5. First real arm = smoke = data, at N <= 6 agents, with `hard_usd` = 50% of the total and no
+     soft cap (`soft_usd: 0`: a soft cap at this size stops the run a round early):
+     `swarmlab run SPEC.yaml --arm FIRST --seed S` -> `end=max_rounds`. Note its actual spend
+     (`spend=$X` on the status line, `spend_usd` under `--json`) and X / rounds = its measured
+     per-round cost. The run is kept as the arm's data, not repeated.
+  6. Set the second arm's `hard_usd` from that measurement: about 1.5 x the first arm's actual
+     `spend_usd` (same model and N, one variable changed), and no more than T minus that spend;
+     `soft_usd: 0`. `swarmlab run SPEC.yaml` then skips the finished first arm and prints an
+     `existing:` line with its actual spend and per-round cost; `total_usd` counts that spend
+     (including anything added by `resume`) before starting the second arm.
+  7. A `hard_ceiling` end (round in flight discarded) or `hard_ceiling_probes` (last round kept,
+     some probes skipped): `swarmlab resume RUN_DIR --add-budget D` if T minus the spend so far
+     allows (resume itself does not check `total_usd`), else report the rounds you have.
+  8. `swarmlab report runs/ --out report.md`; it lists skipped probes per arm.
 - **Total of $2 or more: the full checklist below**, all eleven items.
 
 Do these in order. Each item is done when its check holds; a failing check is fixed before the

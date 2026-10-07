@@ -164,7 +164,9 @@ def test_report_sets_simulated_runs_apart_and_out_is_quiet(tmp_path):
 def test_skill_checklist_scales_to_the_budget():
     text = (REPO / "skill" / "SKILL.md").read_text()
     short = text.split("**Total under $2: the short checklist.**")[1].split("**Total of $2 or more")[0]
-    assert "N <= 6" in short and "30% of the total" in short
+    assert "N <= 6" in short and "50% of the total" in short and "`soft_usd: 0`" in short
+    # the second arm's caps come from the first arm's measured spend, caps live per arm
+    assert "spend_usd" in short and "arms.A.budget" in short and "existing:" in short
     assert "swarmlab prompts SPEC.yaml --arm A" in short and "diff A.txt B.txt" in short
     assert "second agent" not in short.replace("without a second agent", "")
     assert "total_usd" in text and "all eleven items" in text

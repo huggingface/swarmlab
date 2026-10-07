@@ -93,3 +93,33 @@ def test_soft_hard_gap_warning(tmp_path):
     res, _ = invoke("run", spec_file(tmp_path, total_usd=0, soft_usd=0.04, hard_usd=1.0), "--seed", 1,
                     "--out", tmp_path / "r2", "--yes")
     assert res.exit_code == 0 and "warning:" not in res.stdout
+
+
+RESUMED = CAP.replace("seeds: [1, 2, 3]", "seeds: [1, 2]").replace(
+    "budget: {soft_usd: 0.04, hard_usd: 0.05, total_usd: 0.12}",
+    "budget: {soft_usd: 0.02, hard_usd: 0.05, total_usd: 0.1}").replace(
+    "options: {max_rounds: 2}", "options: {max_rounds: 4}")
+
+
+def test_total_counts_spend_added_by_a_manual_resume(tmp_path):
+    """A run resumed by hand is skipped by `run`; its ledger (resumed spend included) counts."""
+    spec = tmp_path / "cap.yaml"
+    spec.write_text(RESUMED)
+    out = tmp_path / "runs"
+    res, data = invoke("run", spec, "--out", out, "--seed", 1, "--arm", "A", "--yes", "--json")
+    assert res.exit_code == 0, res.output
+    before = data["spend_usd"]
+    assert data["end_reason"] == "soft_budget" and before + 0.05 <= 0.1  # s2 would still fit
+    res, data = invoke("resume", out / "cap__A__s1", "--add-budget", 0.05, "--json")
+    assert res.exit_code == 0, res.output
+    after = data["spend_usd"]
+    assert after > before and after + 0.05 > 0.1  # now it does not
+    assert "resume does not check the experiment's total cap" in res.stderr
+    res, data = invoke("run", spec, "--out", out, "--yes", "--json")
+    assert res.exit_code == 1, res.output
+    assert [r["outcome"] for r in data["runs"]] == ["skipped", "capped"]
+    assert data["capped"]["spent"] == pytest.approx(after)
+    # the caps lines show the existing run's actual spend, not the spec caps
+    assert (f"existing: arm=A seed=1 spent ${after:.4f} actual over "
+            f"{data['runs'][0]['last_round']} round(s)") in res.stderr
+    assert f"existing runs already spent ${after:.4f} (resumed spend included)" in res.stderr
