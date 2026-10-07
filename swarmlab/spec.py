@@ -44,7 +44,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    field_validator,
+    model_serializer,
+)
 
 from ._io import atomic_write_bytes
 
@@ -100,6 +108,16 @@ class RunOptions(BaseModel):
     max_calls_per_turn: int = 20
     snapshot_every: int = 1
     concurrency: int = 32
+    # M3a §2 paired runs: repeat i > 0 re-derives the agent streams (see runner docstring).
+    # Omitted from dumps when 0, so ordinary runs keep their spec and spec hash.
+    repeat: int = Field(default=0, ge=0)
+
+    @model_serializer(mode="wrap")
+    def _drop_default_repeat(self, handler: SerializerFunctionWrapHandler) -> dict:
+        data = handler(self)
+        if data.get("repeat") == 0:
+            data.pop("repeat")
+        return data
 
 
 class RunSpec(BaseModel):
