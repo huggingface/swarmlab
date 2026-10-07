@@ -5,7 +5,17 @@ import os
 import time
 from pathlib import Path
 
-from swarmlab import Board, Experiment, Participant, TurnUsage
+from swarmlab import (
+    Board,
+    Experiment,
+    Outcome,
+    Participant,
+    TurnUsage,
+    World,
+    text_observation,
+    tool,
+)
+from swarmlab.metrics.base import Metric
 from swarmlab.participants import EvidenceAggregator
 from swarmlab.world.flaggame import FlagGame
 
@@ -274,3 +284,92 @@ class ImageFlagGame(FlagGame):
 
         obs = super().observe(agent)
         return obs.model_copy(update={"parts": [*obs.parts, Part(type="image", image_png_b64=PNG_B64)]})
+
+
+# ---- field-notes fixtures: a tiny custom world (sites), its fake script and metric ---------------
+
+
+class SiteWorld(World):
+    """Agents pick one of four sites per round; the score counts picks per site."""
+
+    SITES = ("A", "B", "C", "D")
+
+    def reset(self, rng, agents):
+        self.picks = {s: 0 for s in self.SITES}
+        self.last: dict[str, str] = {}
+        self.round = 0
+
+    def begin_round(self, round):
+        self.round = round
+
+    def observe(self, agent):
+        return text_observation(f"Sweep {self.round}. Sites: {' '.join(self.SITES)}. "
+                                f"Picks so far: {self.picks}")
+
+    @tool("choose_site", "Pick a site for this round.", {"site": "string"})
+    def choose_site(self, agent, site: str) -> Outcome:
+        if site not in self.picks:
+            return Outcome(accepted=False, feedback={"error": "unknown_site"})
+        self.picks[site] += 1
+        self.last[str(agent)] = site
+        return Outcome(accepted=True, feedback={"site": site, "crowd": self.picks[site]})
+
+    def score(self):
+        return dict(self.picks)
+
+    def render_state(self):
+        return {"picks": dict(self.picks), "round": self.round,
+                "last_choice": [{"agent": a, "site": s} for a, s in sorted(self.last.items())]}
+
+
+def site_script(request, rng):
+    """fake:tests.helpers:site_script: pick a site (once per turn), then end_turn."""
+    from swarmlab.providers.fake import _assistant_calls
+
+    names = {t.name for t in request.tools}
+    if not names:
+        return _resp(request, '{"candidate": "A"}')
+    last_user = max((i for i, m in enumerate(request.messages) if m.role == "user"), default=-1)
+    done = [n for m in request.messages[last_user + 1:] for n, _ in _assistant_calls(m)]
+    if "choose_site" in names and "choose_site" not in done:
+        site = "ABCDX"[rng.randrange(5)]  # X: refused by the world
+        return _resp(request, calls=[("choose_site", {"site": site})], finish="tool_use")
+    return _resp(request, calls=[("end_turn", {})])
+
+
+class CrowdMetric(Metric):
+    """sites.max_share: the most-picked site's share of all picks so far."""
+
+    entry_point = None
+    name = "sites.max_share"
+
+    def __init__(self) -> None:
+        self.picks: dict[str, int] = {}
+
+    def update(self, event):
+        if getattr(event, "type", None) == "action_committed" and event.accepted:
+            site = event.feedback.get("site")
+            self.picks[site] = self.picks.get(site, 0) + 1
+
+    def value(self):
+        n = sum(self.picks.values())
+        return (max(self.picks.values()) / n if n else None), n
+
+
+class Crasher(Participant):
+    """A participant whose turn raises (an errored turn)."""
+
+    async def turn(self, view, tools):
+        raise RuntimeError(f"provider said no in round {view.round}\nsecond line")
+
+
+def site_experiment(name: str = "sites", n_llm: int = 3, crash: bool = True) -> Experiment:
+    from swarmlab.participants import LLMAgent
+    from swarmlab.providers.fake import FakeProvider
+
+    parts = [LLMAgent(model="fake:tests.helpers:site_script")] * n_llm
+    if crash:
+        parts.append(Crasher())
+    return Experiment(name=name, world=SiteWorld(), participants=parts,
+                      medium=Board(topology="broadcast"), metrics=[CrowdMetric()],
+                      providers={"fake": FakeProvider(pricing=TEST_PRICING)})

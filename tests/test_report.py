@@ -36,9 +36,16 @@ def test_report_reproduces_the_m2_report(tmp_path):
 
 
 def since_m2(text: str) -> str:
-    """The report without the rows added after the M2 note was written."""
-    out, drop_blank, health = [], False, False
+    """The report without the rows and sections added after the M2 note was written."""
+    out, drop_blank, health, traj, dropped = [], False, False, False, False
     for line in text.splitlines(keepends=True):
+        if line.startswith("## "):  # sections added later: protocol health, coloring
+            dropped = line.startswith(("## Protocol health", "## Coloring"))
+            traj = line.startswith("## Trajectories")
+        if dropped:
+            continue
+        if traj and line.startswith("| ") and "." in line.split(" | ")[0]:
+            continue  # every other logged metric (full dotted name), added later
         health = health or line.startswith("## Tool protocol health")
         if health and line.startswith("|---"):  # max_tokens, rejected tool calls appended later
             line = line.replace("---|", "", 2)
@@ -199,3 +206,50 @@ def test_init_starter_describes_gossip_as_one_partner(tmp_path):
     text = (tmp_path / "demo.yaml").read_text()
     assert "one random partner per round by default (k=1)" in text
     assert "a few neighbours" not in text
+
+
+def test_protocol_health_and_metrics_for_a_custom_world(tmp_path):
+    """Any world gets the protocol-health section and every logged metric; world-specific
+    sections appear only for their world type."""
+    from .helpers import site_experiment
+
+    out = tmp_path / "runs"
+    site_experiment().run(seed=1, max_rounds=3, out=out)
+    text = build_report(out, include_fake=True)
+    for section in ("## Trajectories (mean over seeds)", "## Tool protocol health",
+                    "## Protocol health"):
+        assert section in text
+    for section in ("## Where the swarm went", "## Probe vs world belief", "## Coloring"):
+        assert section not in text
+    traj = text.split("## Trajectories")[1].split("## ")[0]
+    assert "| sites.max_share | " in traj and "| accuracy |" not in traj  # not a fixed list
+    health = text.split("## Protocol health")[1]
+    assert "| turn end kinds | end_turn 9, error 3 |" in health
+    assert ("| turns errored | 3 of 12; first: `sites__s1` r1 a003: RuntimeError: provider said "
+            "no in round 1 |") in health
+    assert "| finish reasons (responses) | tool_use 18 |" in health
+    assert "| model calls per turn, swarm (mean / max) | 1.50 / 2 |" in health
+    assert "| latency s, uncached (median / p90 / max) | 0.00 / 0.00 / 0.00 |" in health
+    assert "| retries (responses retried / extra attempts) | 0 / 0 |" in health
+    assert "| tool calls rejected / answered | 0 / 18 |" in health
+    assert "world actions not accepted / committed | 1 / 9 (unknown_site 1) |" in health
+    assert "| probes skipped | no probes |" in health
+    assert "| cost per round, swarm + measurement (mean / max) | $0." in health
+
+    # a coloring run in the same dir adds the coloring section, still no Flag Game sections
+    Experiment.from_yaml(REPO / "examples" / "coloring_s0.yaml", "row_major").run_all(
+        [1], max_rounds=2, out=out)
+    text = build_report(out, include_fake=True)
+    assert "## Coloring (final grid)" in text and "coloring-s0__row_major__s1" in text
+    assert "| coloring.coverage |" in text and "## Where the swarm went" not in text
+
+
+def test_first_error_line_and_percentile():
+    from swarmlab.report import first_error_line, pct
+
+    tb = ("Traceback (most recent call last):\n  File \"x.py\", line 1, in f\n    boom()\n"
+          "ValueError: bad thing\nmore detail\n")
+    assert first_error_line(tb) == "ValueError: bad thing"
+    assert first_error_line("HTTP 400: chat_template_kwargs\nbody") == "HTTP 400: chat_template_kwargs"
+    assert first_error_line(None) == "(no error text)"
+    assert pct([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 90) == 9 and pct([], 90) is None

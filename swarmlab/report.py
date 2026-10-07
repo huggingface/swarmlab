@@ -13,11 +13,23 @@ Decisions:
   arm, else `?`).
 - Per-round columns span rounds 1..max(last committed round) over the runs (10 for M2), and the
   summary's read rate averages rounds 2..that maximum.
-- Sections: summary, trajectories (belief and read-rate metrics, `n/a` where a metric is not
-  logged; plus `post_rate`, the share of the round's turns that posted, computed from the
-  events so it is there whether or not `comm.post_rate` was logged), reading behaviour and tool-protocol health for every world; "where the swarm went"
-  and "probe vs world belief" only when some run has committed `guess` actions (FlagGame-style
-  worlds; truth and rival come from rebuilding the world, since `verify()` is not persisted).
+- Sections: summary, trajectories (the belief and read-rate rows `accuracy`, `consensus`,
+  `entropy`, `read_rate` when some run logs them, `n/a` where a run does not; then every other
+  logged metric under its full dotted name, so a custom world's metrics show up; plus
+  `post_rate`, the share of the round's turns that posted, computed from the events so it is
+  there whether or not `comm.post_rate` was logged), reading behaviour, tool-protocol health and
+  protocol health for every world; "where the swarm went" and "probe vs world belief" only when
+  a run's world is a FlagGame (or subclass) or some run has committed `guess` actions (truth and
+  rival come from rebuilding the world, since `verify()` is not persisted); "Coloring (final
+  grid)" (the recorded `score()` per run) only when a run's world is a ColoringGrid.
+- Protocol health (per arm, any world; the first thing to check after a paid run): turn end
+  kinds, turns errored with the first error (for a traceback: the first line of its final
+  exception), finish reasons of all inference responses, responses and cache hits, retries
+  (responses with `attempts > 1` and the extra attempts), latency of uncached responses (median,
+  nearest-rank p90, max), swarm model calls per turn (turns without a call count as 0), cost per
+  committed round (uncached responses, swarm + measurement), tool calls rejected/answered with
+  the rejection reasons (the part of `error` before `:`), world actions not accepted/committed
+  with the feedback `error`, probes skipped by reason.
 - Probe vs world belief: a skipped probe (`parsed.skipped`: no probe context, a budget, a
   provider error) is left out of that round's probe columns rather than counted as no answer,
   and each arm's table is followed by a `Probes skipped:` line with the counts by reason.
@@ -87,8 +99,14 @@ def scan(run):
          "read_turns": Counter(), "agents_read": set(), "agents": set(), "yields": Counter(),
          "finish": Counter(), "err": 0, "cached": 0, "nresp": 0, "posts": Counter(), "t0": None,
          "t1": None, "turn_n": Counter(), "length": 0, "max_tokens": 0, "posters": defaultdict(set),
-         "tool_returns": 0, "rejected_calls": 0}
+         "tool_returns": 0, "rejected_calls": 0,
+         # protocol health (any world)
+         "resp_finish": Counter(), "attempts": 0, "retried": 0, "latency": [],
+         "calls_per_turn": Counter(), "cost_by_round": Counter(), "reject_errors": Counter(),
+         "probe_skips": Counter(), "probes": 0, "errors": [], "metric_series": defaultdict(dict),
+         "committed": 0, "not_accepted": Counter()}
     cur = {}
+    turn_keys = []
     last_round = 0
     for ev in run.events_all:
         t, r, a = ev.type, ev.round, ev.agent
@@ -98,10 +116,12 @@ def scan(run):
             d["t1"] = ev.ts
         elif t == "turn_ended":
             d["turns"][r] += 1
+            turn_keys.append((r, a))
             d["agents"].add(a)
             d["yields"][ev.yield_kind] += 1
             if ev.yield_kind == "error" or getattr(ev, "error", None):
                 d["err"] += 1
+                d["errors"].append((r, a, first_error_line(getattr(ev, "error", None))))
             for fr in (ev.usage or {}).get("finish_reasons", []) if isinstance(ev.usage, dict) else []:
                 d["finish"][fr] += 1
         elif t == "tool_returned":
@@ -109,6 +129,8 @@ def scan(run):
             if res.get("error") != "cap":  # the capping call is counted by the `cap` yield kind
                 d["tool_returns"] += 1
                 d["rejected_calls"] += not res.get("ok", True)
+                if not res.get("ok", True):
+                    d["reject_errors"][str(res.get("error") or "?").split(":")[0][:40]] += 1
         elif t == "read":
             d["reads"][r] += 1
             d["read_deliv"][r] += len(ev.delivery_ids)
@@ -124,16 +146,149 @@ def scan(run):
                 d["length"] += 1
             elif fr == "max_tokens":  # Anthropic
                 d["max_tokens"] += 1
+            d["resp_finish"][fr or "?"] += 1
+            n_att = getattr(ev, "attempts", 1) or 1
+            d["attempts"] += n_att
+            d["retried"] += n_att > 1
+            if not getattr(ev, "cached", False):
+                d["latency"].append(float(getattr(ev, "latency_s", 0.0) or 0.0))
+                d["cost_by_round"][r] += float(getattr(ev, "cost_usd", 0.0) or 0.0)
+        elif t == "inference_attempt":
+            if getattr(ev, "category", "swarm") == "swarm":
+                d["calls_per_turn"][(r, a)] += 1
+        elif t == "probe":
+            d["probes"] += 1
+            parsed = getattr(ev, "parsed", None)
+            if isinstance(parsed, dict) and "skipped" in parsed:
+                d["probe_skips"][str(parsed["skipped"])] += 1
+        elif t == "metric":
+            d["metric_series"][ev.name][r] = ev.value
         elif t == "action_committed":
             act = ev.action if isinstance(ev.action, dict) else dict(ev.action)
             if act.get("name") == "guess" and ev.accepted:
                 cur[str(a)] = act["args"]["candidate"]
+            d["committed"] += 1
+            if not ev.accepted:
+                fb = ev.feedback if isinstance(ev.feedback, dict) else {}
+                d["not_accepted"][str(fb.get("error") or "?").split(":")[0][:40]] += 1
         elif t == "round_committed":
             d["guess_by_round"][r] = dict(cur)
             last_round = r
     d["last_round"] = last_round
+    d["turn_keys"] = turn_keys
     d["wall"] = (d["t1"] - d["t0"]) if d["t0"] and d["t1"] else None
     return d
+
+
+def first_error_line(text) -> str:
+    """The line of a turn error worth quoting: for a traceback, the first line of its final
+    exception (`RuntimeError: ...`); else the first non-empty line."""
+    raw = str(text or "").splitlines()
+    frames = [i for i, ln in enumerate(raw) if ln.startswith("  File ")]
+    tail = raw[frames[-1] + 1:] if frames else raw
+    line = next((ln.strip() for ln in tail if ln.strip() and (not frames or not ln[0].isspace())),
+                None)
+    if line is None:
+        line = next((ln.strip() for ln in raw if ln.strip()), "(no error text)")
+    return line if len(line) <= 200 else line[:199] + "…"
+
+
+def pct(xs, q):
+    """Nearest-rank percentile of `xs` (None when empty)."""
+    xs = sorted(xs)
+    if not xs:
+        return None
+    return xs[min(len(xs) - 1, max(0, -(-len(xs) * q // 100) - 1))]
+
+
+def counts(c: Counter) -> str:
+    return ", ".join(f"{k} {v}" for k, v in sorted(c.items(), key=lambda kv: (-kv[1], str(kv[0])))) or "none"
+
+
+def health_rows(rs) -> list[list]:
+    """The per-arm protocol-health table (any world): what to check first after a paid run."""
+    ds = [d for _, d in rs]
+    turns = sum(sum(d["turns"].values()) for d in ds)
+    yields, finish, rej, skips, refused = Counter(), Counter(), Counter(), Counter(), Counter()
+    for d in ds:
+        refused.update(d["not_accepted"])
+        yields.update(d["yields"])
+        finish.update(d["resp_finish"])
+        rej.update(d["reject_errors"])
+        skips.update(d["probe_skips"])
+    nresp = sum(d["nresp"] for d in ds)
+    lat = [x for d in ds for x in d["latency"]]
+    # model calls per turn: every turn counts, also those that made no call
+    cpt = [d["calls_per_turn"].get((r, a), 0) for d in ds for r, a in d["turn_keys"]]
+    cost = [d["cost_by_round"].get(k, 0.0) for d in ds for k in range(1, d["last_round"] + 1)]
+    errs = [(run.id, *e) for run, d in rs for e in d["errors"]]
+    answered = sum(d["tool_returns"] for d in ds)
+    rejected = sum(d["rejected_calls"] for d in ds)
+    nprobe = sum(d["probes"] for d in ds)
+    err_text = str(len(errs)) + (f" of {turns}" if turns else "")
+    if errs:
+        rid, r, a, line = errs[0]
+        err_text += f"; first: `{rid}` r{r} {a}: {line}"
+    rows = [
+        ["runs / turns", f"{len(rs)} / {turns}"],
+        ["turn end kinds", counts(yields)],
+        ["turns errored", err_text],
+        ["finish reasons (responses)", counts(finish)],
+        ["inference responses, probes included (all / cache hits)", f"{nresp} / {sum(d['cached'] for d in ds)}"],
+        ["retries (responses retried / extra attempts)",
+         f"{sum(d['retried'] for d in ds)} / {sum(d['attempts'] for d in ds) - nresp}"],
+        ["latency s, uncached (median / p90 / max)",
+         " / ".join(f(x, 2) for x in (st.median(lat) if lat else None, pct(lat, 90),
+                                      max(lat) if lat else None))],
+        ["model calls per turn, swarm (mean / max)", f"{f(mean(cpt), 2)} / {max(cpt) if cpt else NA}"],
+        ["cost per round, swarm + measurement (mean / max)",
+         f"${f(mean(cost))} / ${f(max(cost) if cost else None)}"],
+        ["tool calls rejected / answered",
+         f"{rejected} / {answered}" + (f" ({counts(rej)})" if rej else "")],
+        ["world actions not accepted / committed",
+         f"{sum(refused.values())} / {sum(d['committed'] for d in ds)}"
+         + (f" ({counts(refused)})" if refused else "")],
+        ["probes skipped", (f"{sum(skips.values())} of {nprobe} ({counts(skips)})" if skips else
+                            ("none" if nprobe else "no probes"))],
+    ]
+    return rows
+
+
+TRAJECTORY_ROWS = [("accuracy", "belief.accuracy"), ("consensus", "belief.consensus"),
+                   ("entropy", "belief.entropy"), ("read_rate", "comm.read_rate")]
+COLORING_KEYS = ("coverage", "correct", "wrong", "unpainted", "paints", "useful_paints",
+                 "duplicate_paints", "wrong_paints", "overwritten_paints", "wasted_paints")
+
+
+def world_kind(run) -> str:
+    """`flaggame`, `coloring` (built-ins and their subclasses) or `other`."""
+    from .registry import resolve
+    from .world.coloring import ColoringGrid
+    from .world.flaggame import FlagGame
+
+    try:
+        cls = resolve(run.spec.world.type, "swarmlab.worlds")
+    except Exception:  # noqa: BLE001 - a custom world that does not import here
+        return "other"
+    if isinstance(cls, type) and issubclass(cls, FlagGame):
+        return "flaggame"
+    if isinstance(cls, type) and issubclass(cls, ColoringGrid):
+        return "coloring"
+    return "other"
+
+
+def coloring_section(arms) -> list[str]:
+    """Final grid score per run (ColoringGrid `score()` as recorded in run.json)."""
+    rows = []
+    for arm, rs in sorted(arms.items()):
+        for run, d in rs:
+            if world_kind(run) != "coloring":
+                continue
+            sc = run.score or {}
+            rows.append([run.id, d["last_round"]] +
+                        [f(sc.get(k)) if isinstance(sc.get(k), float) else sc.get(k, NA)
+                         for k in COLORING_KEYS])
+    return ["## Coloring (final grid)", ""] + table(["run", "rounds", *COLORING_KEYS], rows) + [""]
 
 
 def truth_info(run, agents):
@@ -206,7 +361,9 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
         arms[f"{arm} (simulated)" if fake else arm].append((run, scan(run)))
     last = [d["last_round"] for rs in arms.values() for _, d in rs]
     R = range(1, max([*last, 1]) + 1)
-    flag = any(d["guess_by_round"].get(d["last_round"]) for rs in arms.values() for _, d in rs)
+    kinds = {world_kind(run) for rs in arms.values() for run, _ in rs}
+    flag = "flaggame" in kinds or any(d["guess_by_round"].get(d["last_round"])
+                                      for rs in arms.values() for _, d in rs)
     L = [f"# {title}", "", f"Runs dir: `{runs_dir}`; skipped (not ended / unreadable): {', '.join(skipped) or 'none'}", ""]
     if simulated:
         how = ("included below as `<arm> (simulated)`" if include_fake else
@@ -238,13 +395,16 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
     L += spend_lines([r for rs in arms.values() for r, _ in rs if r.dir.name not in simulated],
                      len(simulated))
 
-    # trajectories
+    # trajectories: the belief and read-rate rows (when any run logs them), then every other
+    # logged metric under its full name, then post_rate (from the events)
+    logged = {n for rs in arms.values() for _, d in rs for n in d["metric_series"]}
+    fixed = [(lab, n) for lab, n in TRAJECTORY_ROWS if n in logged]
+    others = sorted(logged - {n for _, n in TRAJECTORY_ROWS})
     L += ["## Trajectories (mean over seeds)", ""]
     for arm, rs in sorted(arms.items()):
         rows = []
-        for lab, n in [("accuracy", "belief.accuracy"), ("consensus", "belief.consensus"),
-                       ("entropy", "belief.entropy"), ("read_rate", "comm.read_rate")]:
-            ss = [mseries(r, n) for r, _ in rs]
+        for lab, n in [*fixed, *((n, n) for n in others)]:
+            ss = [d["metric_series"].get(n, {}) for _, d in rs]
             rows.append([lab] + [f(mean([s.get(k) for s in ss]), 2) for k in R])
         rows.append(["post_rate"] + [f(mean([len(d["posters"][k]) / d["turns"][k]
                                               for _, d in rs if d["turns"][k]]), 2) for k in R])
@@ -342,6 +502,14 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
                      f"{sum(d['rejected_calls'] for _, d in rs)}/{sum(d['tool_returns'] for _, d in rs)}"])
     L += table(["arm", "yield kinds", "finish reasons (turn usage)", "length (responses)", "errored turns",
                 "cache hits/responses", "max_tokens (responses)", "rejected tool calls"], rows) + [""]
+
+    # protocol health, per arm, for any world
+    L += ["## Protocol health", ""]
+    for arm, rs in sorted(arms.items()):
+        L += [f"**{arm}**", ""] + table(["measure", "value"], health_rows(rs)) + [""]
+
+    if "coloring" in kinds:
+        L += coloring_section(arms)
     return "\n".join(L)
 
 
