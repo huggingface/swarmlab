@@ -109,11 +109,10 @@ next item.
    skipped) means raise the budget or cut rounds; `swarmlab resume RUN_DIR --add-budget D`
    continues the same run with D more dollars (`--budget-hard X` sets the run's
    total, spend so far and discarded rounds included).
-6. **Estimate.** `swarmlab estimate SPEC.yaml --prompt-growth TOKENS --calls-per-turn C` -> total
-   for every arm x seed. Take the growth and calls per turn from the smoke run's `inference` table
-   (`swarmlab export RUN_DIR`); without them the worst case (each group's `max_calls`, else the
-   runner cap) overstates real spend 4-6x. The user approves
-   the total before launch.
+6. **Estimate.** `swarmlab estimate SPEC.yaml --from runs/SMOKE_RUN_ID` -> total for every arm
+   x seed, priced with the smoke run's measured calls per turn, prompt-token growth per round,
+   completion tokens and probe cost; without `--from` the worst case (each group's `max_calls`,
+   else the runner cap) overstates real spend 4-6x. The user approves the total before launch.
 7. **Launch.** Local: `swarmlab run SPEC.yaml` (every arm x seed; asks before spending; already
    finished runs are skipped). Self-hosted model on HF Jobs (spec models `vllm:<model>`):
    `swarmlab job run SPEC.yaml --model ORG/MODEL` prints the plan and estimate; add `--launch`

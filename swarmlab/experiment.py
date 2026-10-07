@@ -70,7 +70,14 @@ Decisions where the contract is silent:
   `total_usd_flat` accompanies `total_usd` when `seeds` is given. `usd_per_round` is
   `usd_flat / max_rounds` (the CLI compares it with the gap between `soft_usd` and `hard_usd`).
   `calls_per_turn_used` lists the distinct calls per turn actually priced (`calls_per_turn`
-  capped by each model-backed participant's `max_calls`).
+  capped by each model-backed participant's `max_calls`). `usd_per_round_max` is the last
+  round's cost (growth included).
+- Measured estimates (field notes item 5): `Run.measured()` reads a finished run's figures (mean
+  model calls per model-backed turn, prompt tokens per call fitted as a line over rounds,
+  completion tokens per call, measurement spend per answered probe call); `estimate` takes
+  them as `calls_per_turn`, `prompt_tokens` (the line's round-1 value), `prompt_growth` (its
+  slope, >= 0), `completion_tokens` (floats are fine) and `probe_call_usd` (a probe call's
+  price instead of the token formula).
 - `run_all` honours `budget.total_usd` (experiment-wide): before each run it would start,
   `admit(seed, out)` checks the experiment ledger `<out>/<name>.ledger.jsonl` (spend of every
   run of the experiment under `out`, from any process or invocation, plus the headroom of runs
@@ -188,9 +195,10 @@ class Experiment(BaseModel):
         """Providers by prefix: the overrides plus every preset resolved so far."""
         return {**self._resolved, **(self.providers or {})}
 
-    def estimate(self, seed: int, max_rounds: int, calls_per_turn: int = 2,
-                 prompt_tokens: int = 3000, completion_tokens: int = 300,
-                 seeds: list[int] | None = None, prompt_growth: int = 0) -> dict:
+    def estimate(self, seed: int, max_rounds: int, calls_per_turn: float = 2,
+                 prompt_tokens: float = 3000, completion_tokens: float = 300,
+                 seeds: list[int] | None = None, prompt_growth: float = 0,
+                 probe_call_usd: float | None = None) -> dict:
         rounds = range(1, max_rounds + 1)
         # sum over rounds of the prompt tokens of one call per round (flat and growth-adjusted)
         flat_tokens = prompt_tokens * max_rounds
@@ -202,7 +210,8 @@ class Experiment(BaseModel):
         probe_calls = 0
         measurement = 0.0
         measurement_flat = 0.0
-        cpts: set[int] = set()
+        cpts: set[float] = set()
+        last_round_extra = 0.0  # growth adds this much to the last round over a flat round
         for p in self.participants:
             model = participant_model(p)
             if model is None:
@@ -214,6 +223,7 @@ class Experiment(BaseModel):
             cpt = min(calls_per_turn, own) if isinstance(own, int) and own > 0 else calls_per_turn
             cpts.add(cpt)
             calls += cpt * max_rounds
+            last_round_extra += cpt * prompt_growth * (max_rounds - 1) * p_in / 1e6
             out_usd = completion_tokens * p_out * max_rounds
             by_model[model] = by_model.get(model, 0.0) + cpt * (grown_tokens * p_in + out_usd) / 1e6
             by_model_flat[model] = (by_model_flat.get(model, 0.0)
@@ -223,6 +233,10 @@ class Experiment(BaseModel):
                     every = max(1, probe.every)
                     probed = [r for r in rounds if r % every == 0]
                     probe_calls += len(probed)
+                    if probe_call_usd is not None:  # measured in a finished run
+                        measurement += probe_call_usd * len(probed)
+                        measurement_flat += probe_call_usd * len(probed)
+                        continue
                     tokens = sum(prompt_tokens + prompt_growth * (r - 1) for r in probed)
                     measurement += (tokens * p_in + completion_tokens * p_out * len(probed)) / 1e6
                     measurement_flat += (prompt_tokens * p_in
@@ -237,6 +251,7 @@ class Experiment(BaseModel):
             "usd_flat": sum(by_model_flat.values()) + measurement_flat,
         }
         out["usd_per_round"] = out["usd_flat"] / max(1, max_rounds)  # one round, no growth
+        out["usd_per_round_max"] = out["usd_per_round"] + last_round_extra  # the last round
         out["calls_per_turn_used"] = sorted(cpts)  # after each participant's own max_calls
         if seeds is not None:
             out["runs"] = len(seeds)
@@ -668,6 +683,50 @@ class Run:
             out["fork_round"] = meta.get("fork_round")
         return out
 
+    def measured(self) -> dict[str, Any]:
+        """Per-call figures measured in this run, for `Experiment.estimate` (module doc):
+        `calls_per_turn`, `prompt_tokens`, `prompt_growth`, `completion_tokens`,
+        `probe_call_usd` (None without answered probes), plus `run_id`, `rounds`, `turns`,
+        `calls`, `per_round` (`[(round, mean prompt tokens per call)]`). Raises `ValueError`
+        when the run made no swarm model call."""
+        from .ids import agent_id
+        from .spec import spec_models
+
+        spec = self.meta.get("spec") or {}
+        model_agents = {str(agent_id(i)) for i, p in enumerate(spec.get("participants") or [])
+                        if spec_models({"participants": [p]})}
+        turns = calls = 0
+        prompt = completion = 0
+        by_round: dict[int, list[int]] = {}
+        probes = 0
+        for ev in self.events_all:
+            if ev.type == "turn_ended" and str(ev.agent) in model_agents:
+                usage = ev.usage or {}
+                n = int(usage.get("inference_calls") or 0)
+                turns += 1
+                calls += n
+                prompt += int(usage.get("prompt_tokens") or 0)
+                completion += int(usage.get("completion_tokens") or 0)
+                if n:
+                    row = by_round.setdefault(ev.round, [0, 0])
+                    row[0] += int(usage.get("prompt_tokens") or 0)
+                    row[1] += n
+            elif ev.type == "probe" and "skipped" not in (ev.parsed or {}):
+                probes += 1
+        if not calls:
+            raise ValueError(f"{self.id} made no swarm model call; nothing to measure")
+        points = sorted((r, p / n) for r, (p, n) in by_round.items())
+        intercept, slope = _fit_line([(r - 1, y) for r, y in points])
+        if slope < 0:  # a shrinking context (windowed memory): price it flat at the mean
+            intercept, slope = sum(y for _, y in points) / len(points), 0.0
+        measurement = float(self.spend.get("measurement") or 0)
+        return {"run_id": self.id, "rounds": int(self.meta.get("last_round") or 0),
+                "turns": turns, "calls": calls, "calls_per_turn": calls / max(1, turns),
+                "prompt_tokens": max(0.0, intercept), "prompt_growth": slope,
+                "completion_tokens": completion / calls,
+                "probe_call_usd": measurement / probes if probes else None,
+                "per_round": [(r, round(y, 1)) for r, y in points]}
+
     def turn_health(self) -> dict[str, Any]:
         """`turns_total`, `turns_errored`, and `first_error` / `health: "degraded"` when present
         (from run.json; counted from the log for run dirs written before these fields existed)."""
@@ -690,6 +749,18 @@ class Run:
         from .export import export_run
 
         return export_run(self.dir, out)
+
+
+def _fit_line(points: list[tuple[float, float]]) -> tuple[float, float]:
+    """Least-squares (intercept, slope) through `(x, y)` points; slope 0 for a single x."""
+    n = len(points)
+    mx = sum(x for x, _ in points) / n
+    my = sum(y for _, y in points) / n
+    sxx = sum((x - mx) ** 2 for x, _ in points)
+    if sxx == 0:
+        return my, 0.0
+    slope = sum((x - mx) * (y - my) for x, y in points) / sxx
+    return my - slope * mx, slope
 
 
 def self_hosted_prefixes(providers: dict) -> list[str]:

@@ -77,8 +77,15 @@ Decisions where the contract is silent:
 - Total cap (`budget.total_usd`, top level): `run` prints the per-run caps of every arm and the
   total cap before anything runs, plus one `existing:` line per run dir that already exists with
   its actual ledger spend (resumed spend included), rounds and per-round cost (not the spec's
-  caps), and how much of the total those runs already used, and warns per arm when `hard_usd - soft_usd` is less than one
-  round of the estimate (`usd_per_round`). Before starting each run it checks
+  caps), and how much of the total those runs already used, and warns per arm when `hard_usd -
+  soft_usd` is too small for one round: when a finished run of the same arm exists under `--out`
+  (newest by mtime), the bound is that run's measured cost of the last round
+  (`_estimate(measured=Run.measured())["usd_per_round_max"]`, and the warning names the run);
+  otherwise it is 2 x the worst-case `usd_per_round`.
+- `estimate --from RUN_DIR` prices every selected arm with `Run(RUN_DIR).measured()` (calls per
+  turn, a prompt-token line over rounds, completion tokens, probe cost; see
+  swarmlab/experiment.py) instead of the worst case, and prints the measured figures;
+  `--calls-per-turn` / `--prompt-growth` are refused with it. Before starting each run it checks
   `budget.total_cap_refusal(spend of the runs ran or found so far, the arm's hard_usd, total)`;
   a found run's spend is its `run.json` ledger, so spend added by `swarmlab resume` counts;
   on a refusal that run and every later one get outcome `capped`, the JSON gets
@@ -242,10 +249,21 @@ def _fail(e: BaseException, code: int, as_json: bool) -> None:
 
 
 def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
-              calls_per_turn: int | None = None, prompt_growth: int = 0) -> dict[str, Any]:
+              calls_per_turn: int | None = None, prompt_growth: int = 0,
+              measured: dict[str, Any] | None = None) -> dict[str, Any]:
     rounds = max_rounds if max_rounds is not None else exp.options.get("max_rounds")
     if rounds is None:
         raise SpecError("no max_rounds in options; pass --max-rounds")
+    if measured is not None:
+        est = exp.estimate(seed, int(rounds), calls_per_turn=measured["calls_per_turn"],
+                           prompt_tokens=measured["prompt_tokens"],
+                           completion_tokens=measured["completion_tokens"],
+                           prompt_growth=measured["prompt_growth"],
+                           probe_call_usd=measured["probe_call_usd"])
+        used = est["calls_per_turn_used"] or [measured["calls_per_turn"]]
+        return {**est, "calls_per_turn": used[0] if len(used) == 1 else used,
+                "calls_per_turn_source": f"measured in {measured['run_id']}",
+                "measured": measured}
     cap = int(exp.options.get("max_calls_per_turn",
                               RunOptions.model_fields["max_calls_per_turn"].default))
     requested = calls_per_turn if calls_per_turn is not None else cap
@@ -259,9 +277,13 @@ def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
             "calls_per_turn_source": source}
 
 
+def _num(v: Any) -> str:
+    return f"{v:.3g}" if isinstance(v, float) else str(v)
+
+
 def _cpt_text(est: dict[str, Any]) -> str:
     cpt = est["calls_per_turn"]
-    n = f"{min(cpt)}-{max(cpt)}" if isinstance(cpt, list) else str(cpt)
+    n = f"{_num(min(cpt))}-{_num(max(cpt))}" if isinstance(cpt, list) else _num(cpt)
     return f"{n} calls/turn ({est.get('calls_per_turn_source', '')})"
 
 
@@ -414,7 +436,8 @@ def _existing_runs(exps: dict[str, Experiment], seeds: list[int], max_rounds: in
 def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_runs: int,
                n_seeds: int, total_cap: float,
                existing: dict[str, list[tuple[int, str, Run]]] | None = None,
-               out: Path | None = None) -> list[str]:
+               out: Path | None = None,
+               measured: dict[str, dict[str, Any]] | None = None) -> list[str]:
     """The planned per-run caps, the actual spend of runs that already exist, the experiment's
     total cap, and soft/hard gap warnings."""
     def money(v: float) -> str:
@@ -460,14 +483,26 @@ def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_r
         lines.append("caps: no total cap (budget.total_usd: 0)"
                      + (f"; hard ceilings sum to ${hard_sum:g}" if hard_sum > 0 else ""))
     for a, exp in exps.items():
-        b, per_round = exp.budget, float(ests[a].get("usd_per_round") or 0)
-        if b.soft_usd > 0 and b.hard_usd > 0 and b.hard_usd - b.soft_usd < per_round:
+        b = exp.budget
+        if not (b.soft_usd > 0 and b.hard_usd > 0):
+            continue
+        gap = b.hard_usd - b.soft_usd
+        m = (measured or {}).get(a)
+        if m is not None:  # a finished run of this arm: its measured last-round cost
+            per_round = float(m["usd_per_round_max"])
+            limit, what = per_round, (f"one round's cost ${per_round:.4f} as measured in "
+                                      f"{m['measured']['run_id']}")
+        else:
+            per_round = float(ests[a].get("usd_per_round") or 0)
+            limit, what = 2 * per_round, (f"twice one round's estimated worst case "
+                                          f"(2 x ${per_round:.4f}; no finished run of this arm "
+                                          "to measure)")
+        if gap < limit:
             lines.append(
-                f"warning: arm={a}: hard_usd - soft_usd = ${b.hard_usd - b.soft_usd:.4f} is less "
-                f"than one round's estimated worst case ${per_round:.4f}. soft_usd is checked "
-                "only between rounds, so a round can start below soft_usd, reach hard_usd "
-                "mid-round and be discarded (its spend still counts). Leave at least one round "
-                "between them (hard_usd >= soft_usd + one round).")
+                f"warning: arm={a}: hard_usd - soft_usd = ${gap:.4f} is less than {what}. "
+                "soft_usd is checked only between rounds, so a round can start below soft_usd, "
+                "reach hard_usd mid-round and be discarded (its spend still counts). Leave at "
+                "least one round between them (hard_usd >= soft_usd + one round).")
     return lines
 
 
@@ -543,7 +578,12 @@ def run(
             _say("  (fake: models only: prices are nominal, nothing is billed)", as_json)
     if budgeted:
         existing = _existing_runs(exps, seeds, max_rounds, out) if not rerun else {}
-        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap, existing, out):
+        measured: dict[str, dict[str, Any]] = {}
+        for a, exp in exps.items():
+            m = _measured_run(exp, out) if exp.budget.soft_usd > 0 and exp.budget.hard_usd > 0 else None
+            if m is not None:
+                measured[a] = _estimate(exp, seeds[0], max_rounds, measured=m)
+        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap, existing, out, measured):
             _say(line, as_json)
     if budgeted and not yes:
         _confirm(f"Start {n_runs} run(s), worst case ${total:.4f}?")
@@ -661,6 +701,34 @@ def run(
         raise typer.Exit(code)
 
 
+def _measured_text(m: dict[str, Any]) -> str:
+    probe = (f", ${m['probe_call_usd']:.5f} per probe call" if m["probe_call_usd"] is not None
+             else "")
+    return (f"measured in {m['run_id']} ({m['rounds']} rounds, {m['calls']} calls over "
+            f"{m['turns']} model turns): {m['calls_per_turn']:.2f} calls/turn, prompt tokens per "
+            f"call {m['prompt_tokens']:.0f} + {m['prompt_growth']:.0f}/round, "
+            f"{m['completion_tokens']:.0f} completion tokens per call{probe}")
+
+
+def _measured_run(exp: Experiment, out: Path) -> dict[str, Any] | None:
+    """Measured figures of the newest finished run of this experiment's arm under `out`."""
+    found = []
+    for p in Path(out).glob("*/run.json"):
+        try:
+            meta = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if (meta.get("experiment") == exp.name and meta.get("arm") == exp.arm
+                and meta.get("status") == "ended" and int(meta.get("last_round") or 0) >= 1):
+            found.append((p.stat().st_mtime, p.parent))
+    for _, d in sorted(found, reverse=True):
+        try:
+            return Run(d).measured()
+        except (ValueError, OSError):
+            continue
+    return None
+
+
 def _estimate_table(ests: dict[str, dict[str, Any]], n_seeds: int, growth: bool) -> str:
     head = ["arm", "model agents", "rounds", "calls/turn", "calls/run", "probe calls", "per run",
             "seeds", "total"]
@@ -669,8 +737,9 @@ def _estimate_table(ests: dict[str, dict[str, Any]], n_seeds: int, growth: bool)
     body = []
     for a, e in ests.items():
         cpt = e["calls_per_turn"]
-        cpt = f"{min(cpt)}-{max(cpt)}" if isinstance(cpt, list) else str(cpt)
-        row = [a, str(e["llm_agents"]), str(e["rounds"]), cpt, str(e["calls"]), str(e["probe_calls"]),
+        cpt = f"{_num(min(cpt))}-{_num(max(cpt))}" if isinstance(cpt, list) else _num(cpt)
+        row = [a, str(e["llm_agents"]), str(e["rounds"]), cpt, _num(e["calls"]),
+               str(e["probe_calls"]),
                _usd(e["usd_flat"]), str(n_seeds), _usd(e["usd_flat"] * n_seeds)]
         if growth:
             row += [_usd(e["usd"]), _usd(e["usd"] * n_seeds)]
@@ -696,26 +765,42 @@ def estimate(
         "--prompt-growth", metavar="TOKENS_PER_ROUND",
         help="Prompt tokens added per round (full-memory context growth); round r is priced at "
              "prompt_tokens + growth * (r - 1).")] = 0,
+    from_run: Annotated[Path | None, typer.Option(
+        "--from", metavar="RUN_DIR",
+        help="Price with a finished run's measured calls per turn, prompt tokens per round "
+             "(a line fitted through its rounds), completion tokens and probe cost.")] = None,
     as_json: JsonOpt = False,
 ) -> None:
     """Print a rough worst-case dollar estimate: every arm x every seed, or the arm/seed you pick
-    (no run, no provider call)."""
+    (no run, no provider call). With --from RUN_DIR: an estimate from that run's measurements."""
 
     def go() -> dict[str, Any]:
         if prompt_growth < 0:
             raise SpecError("--prompt-growth must be >= 0")
+        measured = None
+        if from_run is not None:
+            if calls_per_turn is not None or prompt_growth:
+                raise SpecError("--from takes calls per turn and prompt growth from the run; "
+                                "drop --calls-per-turn / --prompt-growth")
+            try:
+                measured = Run(from_run).measured()
+            except (FileNotFoundError, ValueError) as e:
+                raise SpecError(f"--from {from_run}: {e}") from e
         doc = load_experiment_yaml(spec)
         if arm is not None and arm not in doc["arms"]:
             raise SpecError(f"{spec}: unknown arm {arm!r}; available: {sorted(doc['arms'])}")
         arms = [arm] if arm is not None else list(doc["arms"])
         seeds = [seed] if seed is not None else experiment_seeds(doc)
-        ests = {a: _estimate(_build(spec, a), seeds[0], max_rounds, calls_per_turn, prompt_growth)
-                for a in arms}
+        ests = {a: _estimate(_build(spec, a), seeds[0], max_rounds, calls_per_turn, prompt_growth,
+                             measured) for a in arms}
+        note = _measured_text(measured) if measured else None
         if seed is not None and len(arms) == 1:  # the single-run form: one estimate dict
             est = ests[arms[0]]
             if as_json:
                 return est
             text = _estimate_line(est)[len("estimate: "):]
+            if note:
+                text += "\n" + note
             if prompt_growth > 0:
                 text += (f"\nflat (no growth): ${est['usd_flat']:.4f}; with prompt growth "
                          f"{prompt_growth} tokens/round: ${est['usd']:.4f}")
@@ -729,11 +814,14 @@ def estimate(
         if as_json:
             return data
         sources = sorted({e["calls_per_turn_source"] for e in ests.values()})
-        lines = [_estimate_table(ests, len(seeds), prompt_growth > 0),
+        growth = prompt_growth > 0 or bool(measured and measured["prompt_growth"] > 0)
+        lines = [_estimate_table(ests, len(seeds), growth),
                  f"calls/turn from: {'; '.join(sources)}",
                  f"estimate total: ${total_flat:.4f} worst case over {n_runs} run(s)"]
         if prompt_growth > 0:
             lines.append(f"with prompt growth {prompt_growth} tokens/round: ${total:.4f} worst case")
+        if note:
+            lines += [note, f"with the measured prompt growth: ${total:.4f}"]
         ceiling = sum(float(e["budget"].get("hard_usd") or 0) for e in ests.values()) * len(seeds)
         if ceiling > 0:
             lines.append(f"hard ceilings sum to ${ceiling:.2f}")

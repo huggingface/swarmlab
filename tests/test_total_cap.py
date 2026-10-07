@@ -88,7 +88,8 @@ def test_soft_hard_gap_warning(tmp_path):
     res, _ = invoke("run", spec_file(tmp_path, total_usd=0), "--seed", 1, "--out", tmp_path / "r",
                     "--yes")
     assert res.exit_code == 0, res.output
-    assert "warning: arm=A: hard_usd - soft_usd = $0.0100 is less than one round" in res.stdout
+    assert ("warning: arm=A: hard_usd - soft_usd = $0.0100 is less than twice one round's "
+            "estimated worst case") in res.stdout
     assert "caps: no total cap" in res.stdout
     res, _ = invoke("run", spec_file(tmp_path, total_usd=0, soft_usd=0.04, hard_usd=1.0), "--seed", 1,
                     "--out", tmp_path / "r2", "--yes")
