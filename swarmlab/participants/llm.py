@@ -216,6 +216,7 @@ def report_schema(fields: list[str] | tuple[str, ...]) -> str:
     body = ",".join(f'"{f}":"{_FIELD_PLACEHOLDERS.get(f, "<" + f + ">")}"' for f in fields)
     return REPORT_SCHEMA_PREFIX + "{" + body + "}"
 RESULTS_PREFIX = "[tool results]"
+REPORT_KEY_ALIASES = ("country", "answer", "guess", "flag", "prediction", "decision", "candidate")
 
 JSON_PROTOCOL_TEXT = (
     "Tool protocol: tools are not available as native function calls. To act, reply with only a "
@@ -951,6 +952,18 @@ class LLMAgent(Participant):
         lower = {str(k).lower(): v for k, v in obj.items()}
         key = self.report_fields[0]
         answer = lower.get(key.lower())
+        if answer is None:
+            # Models drift to synonyms for the answer key ("answer", "guess", ...); accept them,
+            # then fall back to the only string value if there is exactly one. Observed in the
+            # M6 manager arms: members replied {"answer": "Germany"} and every report was lost.
+            for alias in REPORT_KEY_ALIASES:
+                if alias != key.lower() and alias in lower:
+                    answer = lower[alias]
+                    break
+            else:
+                strings = [v for v in lower.values() if isinstance(v, str) and v.strip()]
+                if len(strings) == 1 and len(lower) == 1:
+                    answer = strings[0]
         if isinstance(answer, (int, float)) and not isinstance(answer, bool):
             answer = str(answer)
         if not isinstance(answer, str) or not answer.strip():
