@@ -1299,7 +1299,8 @@ def prompts_cmd(
 ) -> None:
     """Render the system prompt and round-1 user message for one agent per participant group.
 
-    No model is called; use it for the second-agent review of what each arm sees."""
+    The preview is round 1 (the world is reset and begin_round(1) is called, as in a run). No
+    model is called; use it for the second-agent review of what each arm sees."""
     from .prompts_cmd import prompts_text, render_prompts
 
     def go() -> dict[str, Any]:

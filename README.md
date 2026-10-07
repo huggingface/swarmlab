@@ -217,7 +217,7 @@ participants:
       model: "anthropic:claude-haiku-4-5"
       system_prompt_append: "A shared message board exists: `read_board` shows what other agents have posted."
 ```
-The round message (round number, observation, last round's outcomes, deliveries) is fixed by the agent and the world. Check what each arm actually sends, with no model call, and diff two arms:
+The round message (round number, observation, last round's outcomes, deliveries) is fixed by the agent and the world. Check what each arm actually sends, with no model call, and diff two arms (the preview is round 1: the world is reset and `begin_round(1)` is called before the observation, exactly as in a run; later rounds are not shown):
 ```
 swarmlab prompts exp.yaml --arm default > default.txt
 swarmlab prompts exp.yaml --arm board > board.txt
