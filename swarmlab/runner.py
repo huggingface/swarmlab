@@ -190,7 +190,7 @@ from .medium.registry import Registry, commit_world
 from .metrics.base import Metric
 from .metrics.base import get as get_metric
 from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
-from .providers.base import ChatMessage, ChatRequest
+from .providers.base import ChatMessage, ChatRequest, ProviderError
 from .rng import derive
 from .scheduler import SeededShuffle
 from .snapshot import SnapshotManifest, SnapshotStore
@@ -892,6 +892,11 @@ class Runner:
             self._probe_hard_ceiling = True
             return {"probe": probe.name, "question_hash": q_hash, "raw_hash": "",
                     "parsed": {"skipped": "hard_ceiling"}, "ok": False, "cost_usd": cost}
+        except ProviderError as e:
+            # A probe call that exhausted its retries must not abort the round: log and move on.
+            return {"probe": probe.name, "question_hash": q_hash, "raw_hash": "",
+                    "parsed": {"skipped": "provider_error", "error": str(e)[:200]},
+                    "ok": False, "cost_usd": cost}
         return {"probe": probe.name, "question_hash": q_hash, "raw_hash": self.blobs.put_text(raw),
                 "parsed": _jsonable(parsed), "ok": ok, "cost_usd": cost}
 
