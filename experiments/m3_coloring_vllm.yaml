@@ -4,24 +4,27 @@ name: m3-coloring-qwen9b
 seeds: [1]
 options: { max_rounds: 20, commit: round_end }
 budget: { soft_usd: 0, hard_usd: 0, measurement_usd: 0 }
+# max_calls: 4 (model calls per turn) on every arm: the world applies one paint per agent per
+# round (paints_per_round: 1), so a few calls (look, paint, end) are enough, and it stops a turn
+# from spinning up to the runner's 20-call cap.
 arms:
   s0:
     world: { type: coloring, params: { height: 8, width: 8, palette: 4 } }
     medium: { topology: { type: broadcast } }
     participants:
-      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 1024, memory: window, window_rounds: 3, extra: { chat_template_kwargs: { enable_thinking: false } } } }
+      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 1024, max_calls: 4, memory: window, window_rounds: 3, extra: { chat_template_kwargs: { enable_thinking: false } } } }
     metrics: [coloring.coverage, coloring.duplicate_paints, coloring.wrong_paints, coloring.parallel_efficiency, comm.read_rate, comm.posts_per_round]
   claims-advisory:
     world: { type: coloring, params: { height: 8, width: 8, palette: 4 } }
     medium: { topology: { type: broadcast }, registry: true, claim_policy: advisory }
     participants:
-      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 1024, memory: window, window_rounds: 3, extra: { chat_template_kwargs: { enable_thinking: false } },
+      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 1024, max_calls: 4, memory: window, window_rounds: 3, extra: { chat_template_kwargs: { enable_thinking: false } },
           system_prompt_append: "A shared registry exists: call registry_acquire on key \"cell:x,y\" before painting a cell so others know it is taken." } }
     metrics: [coloring.coverage, coloring.duplicate_paints, coloring.wrong_paints, coloring.parallel_efficiency, claims.violations, claims.held, comm.read_rate]
   claims-enforced:
     world: { type: coloring, params: { height: 8, width: 8, palette: 4 } }
     medium: { topology: { type: broadcast }, registry: true, claim_policy: enforced }
     participants:
-      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 1024, memory: window, window_rounds: 3, extra: { chat_template_kwargs: { enable_thinking: false } },
+      - { type: llm, count: 16, params: { model: "vllm:Qwen/Qwen3.5-9B", max_tokens: 1024, max_calls: 4, memory: window, window_rounds: 3, extra: { chat_template_kwargs: { enable_thinking: false } },
           system_prompt_append: "A shared registry exists: you must call registry_acquire on key \"cell:x,y\" and hold it before painting that cell; paints on cells you do not hold are rejected." } }
     metrics: [coloring.coverage, coloring.duplicate_paints, coloring.wrong_paints, coloring.parallel_efficiency, claims.violations, claims.held, comm.read_rate]
