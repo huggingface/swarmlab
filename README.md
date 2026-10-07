@@ -1,6 +1,6 @@
 # swarmlab
 
-A scientific testbed for finding the primitives that make heterogeneous groups of LLM agents collaborate well or badly. An experiment is a **World** (the task), a set of **Participants**, a **Medium** (a board with a topology and visibility policies) and **Metrics**; the framework handles tool dispatch, ordering, recording, budgets, snapshots, replay, resume and fork, so a scientist changes the hypothesis without touching the execution machinery. Status: M1b (LLM agents on Anthropic, the HF router or any OpenAI-compatible endpoint; probes; budgets).
+A scientific testbed for finding the primitives that make heterogeneous groups of LLM agents collaborate well or badly. An experiment is a **World** (the task), a set of **Participants**, a **Medium** (a board with a topology and visibility policies) and **Metrics**; the framework handles tool dispatch, ordering, recording, budgets, snapshots, replay, resume and fork, so a scientist changes the hypothesis without touching the execution machinery. Status (2026-10-07): everything in `docs/DESIGN.md` is built except the image variant of the Flag Game; see "What exists" and "Known issues" below.
 
 ## Quickstart
 
@@ -23,6 +23,21 @@ demo__gossip__s1     ran      max_rounds  accuracy=0.875, n_guessed=8, truth=G  
 ...
 ```
 `--arm A` and `--seed N` narrow it; `--json` prints one JSON object. `demo.py` is the same experiment in Python (`python demo.py`).
+
+## What exists
+
+- **Worlds**: `flaggame` (belief dynamics: hidden flag, one crop per agent, `guess` action; text crops only), `coloring` (allocation: a grid to paint, with claims and a registry). New worlds subclass `World` (example 3).
+- **Topologies** (`medium: {topology: ...}`): `broadcast`, `gossip`, `groups`, `tree` (coordinators over worker groups, `params: {groups: 3}`).
+- **Policies**: `delay` (messages arrive k rounds late) and your own `Policy` subclasses (example 2). **Registry** with `advisory` or `enforced` claim policies for the coloring task.
+- **Participants**: scripted (`evidence_aggregator`, `enumerator`, `silent`, `row_major_painter`, `queue_painter`, `random_painter`) and `llm` (`LLMAgent`: memory window, `context_limit_tokens` with `drop_oldest`/`summarize`/`fail_turn` overflow, prompt params, `max_calls`, `extra` passthrough).
+- **Providers** (model id prefix): `anthropic`, `hf` (HF router), `openai`, `vllm` (self-hosted, normally via `job run`), `fake` (`fake:reader`, `fake:painter`: deterministic, no network).
+- **Probes**: `belief` (each agent's own model answers "which candidate?" every round, out of band, billed to `measurement_usd`).
+- **Interventions** (`interventions:` in a spec, triggered by `at_round`, `every` or a metric `when`): `inject_post`, `delay_delivery`, `mute`, `kill_agents`, `patch_private`, `reconfigure`. **Paired runs** from round 0: `Experiment.pair(...)` with unchanged-pair controls.
+- **Metrics**: `belief.consensus`, `belief.accuracy`, `belief.polarization`, `belief.entropy` (from world guesses, or from probes with `params: {source: "probe:belief"}`); `comm.read_rate`, `comm.posts_per_round`, `comm.hops`; `coloring.coverage`, `coloring.duplicate_paints`, `coloring.wrong_paints`, `coloring.parallel_efficiency`; `claims.violations`, `claims.held`.
+- **Roles** (`roles:` plus `role:` per participant group): built-ins `worker`, `coordinator`, `reviewer`, `skeptic`, `scribe`; each can restrict tools, channels, registry access and world actions, add prompt text, or override the model.
+- **Run control**: replay (checks metrics and score from the log), resume, fork at a round (optionally with an edited spec), budgets (soft, hard, measurement, experiment total), per-call timeout and retry.
+- **Export and publish**: Parquet tables, pi-format sessions and raw logs; private Hub dataset per experiment; static `view.html`; `fetch-published` restores a run.
+- **Jobs**: `swarmlab job run|status|logs|fetch` runs a spec on HF Jobs with vLLM serving the model in the same job (validated at N=256, 83 min, $3.45).
 
 ## Examples
 
@@ -119,18 +134,19 @@ Note that the default prompt already lists every tool the world and board offer 
 ## CLI
 
 ```
-swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S]
-swarmlab init [NAME] [--dir D]            swarmlab validate SPEC
+swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S] [--refresh]
+swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC
 swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [--rerun]
-swarmlab estimate SPEC [--arm A] [--seed N] [--prompt-growth G] [--calls-per-turn C]
+swarmlab estimate SPEC [--arm A] [--seed N] [--max-rounds R] [--prompt-growth G] [--calls-per-turn C]
 swarmlab replay RUN_DIR
-swarmlab resume RUN_DIR [--budget-hard X | --add-budget D]   swarmlab fork RUN_DIR --at 4 [--spec edited.yaml]
+swarmlab resume RUN_DIR [--budget-hard X | --add-budget D | --budget-soft X | --budget-measurement X]
+swarmlab fork RUN_DIR --at 4 [--spec edited.yaml] [--arm A] [--max-rounds R] [--out DIR]
 swarmlab view RUN_DIR [--publish OWNER/REPO]
-swarmlab prompts SPEC --arm A            swarmlab report RUNS_DIR [--out report.md] [--include-fake]
+swarmlab prompts SPEC --arm A [--seed N]  swarmlab report RUNS_DIR [--out report.md] [--stdout] [--include-fake] [--title T]
 swarmlab export RUN_DIR [--out DIR]
 swarmlab publish RUNS_DIR_OR_RUN [--repo OWNER/REPO] [--public] [--tag T]
-swarmlab fetch-published OWNER/REPO RUN_ID [--out runs/]
-swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 2h] [--launch]
+swarmlab fetch-published OWNER/REPO RUN_ID [--out runs/] [--force]
+swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 2h] [--per-round S] [--launch]
 swarmlab job status JOB_ID    swarmlab job logs JOB_ID [--follow]    swarmlab job fetch RUN_ID [--out runs/]
 ```
 `swarmlab job ...` runs a spec whose models are `vllm:<model>` in an HF Job with vLLM serving the model in the same job, and brings run dirs back from the bucket; `job run` only prints the `hf jobs run` command and the estimate unless `--launch` (docs/handoff/WP8.md).
@@ -164,6 +180,10 @@ runs/<run_id>/
 ```
 Run ids are `<experiment>__s<seed>` from Python, `<experiment>__<arm>__s<seed>` from YAML, plus `__f<round>_<n>` for a fork.
 
+## Known issues
+
+`docs/notes/known-issues.md` lists open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `comm.posts_per_round` being swarm-wide, `validate` rejecting `vllm:` specs, role and paired-run gaps, and no grid panel in the viewer.
+
 ## Docs
 
-`docs/DESIGN.md` (why), `docs/INTERFACE.md`, `docs/INTERFACE-M1b.md` and `docs/INTERFACE-M4.md` (the binding contracts), `docs/handoff/` (per work package notes), `AGENTS.md` (rules for agents working in this repo). Development: `uv run pytest -q` and `uv run ruff check swarmlab tests examples tools`.
+`docs/DESIGN.md` (why), `docs/INTERFACE.md`, `INTERFACE-M1b.md`, `INTERFACE-M3a.md`, `INTERFACE-M3c.md` and `INTERFACE-M4.md` (the binding contracts), `docs/handoff/INDEX.md` (per work package notes), `docs/notes/` (run reports), `AGENTS.md` (rules for agents working in this repo). Development: `uv run pytest -q` and `uv run ruff check swarmlab tests examples tools`.

@@ -1,8 +1,9 @@
 # Working in this repo
 
-- `docs/INTERFACE.md` is the binding contract for M1a. Implement exactly the names, signatures, and semantics it defines. Anything it leaves open is your choice; document it in the module docstring.
+- `docs/INTERFACE.md` (M1a) and its extensions `INTERFACE-M1b.md`, `INTERFACE-M3a.md`, `INTERFACE-M3c.md`, `INTERFACE-M4.md` are the binding contracts. Implement exactly the names, signatures, and semantics they define. Anything it leaves open is your choice; document it in the module docstring.
 - `docs/DESIGN.md` explains why. Read the sections relevant to your work package before coding.
 - Python 3.12, pydantic v2, asyncio. No global `random`; use `swarmlab.rng.derive`.
+- `docs/handoff/INDEX.md` says what each work package built; `docs/notes/known-issues.md` lists open problems.
 - Tests live in `tests/`; run them with `UV_PROJECT_ENVIRONMENT="$AM_LOCAL/envs/swarmlab" uv run pytest`.
 - Commits: plain messages, no `Co-Authored-By` or attribution trailers, do not change git user config.
 - Do not edit files owned by another work package; stub what you need and note the stub in your handoff.

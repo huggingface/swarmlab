@@ -1,6 +1,6 @@
 # swarmlab: design
 
-Working name `swarmlab` (internal; rename before publishing, candidates checked on 2026-10-05 are in `research/`). Status: design settled 2026-10-06 after a structured review of 79 decisions, including two rounds of independent review; nothing implemented. This is the first of many iterations: fundamentals are fixed here, details are filled in from experience. Background digests in `research/`.
+Working name `swarmlab` (internal; rename before publishing, candidates checked on 2026-10-05 are in `research/`). Status (2026-10-07): built through M4 plus M3a/b/c (interventions, paired runs, context limit, registry and claim policies, ColoringGrid, roles, tree hierarchy, export and publish, HF Jobs with vLLM); 528 tests on main. What remains: the image variant of the Flag Game, plus the v2 items and the open problems in `docs/notes/known-issues.md`. Design settled 2026-10-06 after a structured review of 79 decisions, including two rounds of independent review; the text below is the design as decided, not rewritten per milestone, so a few details differ from the code (see the notes column of the status table). This is the first of many iterations: fundamentals are fixed here, details are filled in from experience. Background digests in `research/`.
 
 ## Purpose
 
@@ -203,6 +203,30 @@ swarmlab view RUN                swarmlab publish EXPERIMENT
 ```
 Setup commands (implemented): `swarmlab doctor [SPEC...]` (environment, keys, reachability, git), `swarmlab models [--provider P] [--tools] [--search S]` (catalog with prices, so no price is typed by hand), `swarmlab init NAME` (starter YAML + Python), and `swarmlab run spec.yaml` with no `--arm`/`--seed` runs every arm x seed, skipping runs already on disk, after printing the estimate and asking before spending. A fresh clone reaches a running experiment with `swarmlab doctor`, `swarmlab init demo`, `swarmlab run demo.yaml`.
 All commands take `--json`. A skill and `AGENTS.md` ship in the repo and install into Claude Code, Codex, and OpenCode skill directories, encoding the workflow: spec, dry run with scripted agents, smoke at N=3, second-agent review of readiness and of the exact prompts each arm sees, budget reservation, launch, status, analyze, view, publish, resume or fork instead of rerun.
+
+## Status by component
+
+Abbreviations: **tests** = the unit and acceptance tests in `tests/`; **M2** = Flag Game N=16/64 on Haiku 4.5 and Qwen3.5-9B (`docs/notes/m2-*`); **N=256** = the self-hosted Qwen3.5-9B job (`docs/notes/m3-scale-2026-10-07.md`); **paired/mixed** = `docs/notes/m3-paired-and-mixed-2026-10-07.md`; **dogfood** = a fresh agent running an experiment from the docs (`docs/notes/dogfood-*`).
+
+| component | implemented in | validated by | notes |
+|---|---|---|---|
+| 1 Experiment spec, YAML, CLI | `spec.py`, `experiment.py`, `cli.py`, `templates/` | tests (spec, api, cli, init, total_cap); dogfood | CLI is `validate run estimate replay resume fork view models doctor init export publish fetch-published report prompts job`. The design's `dryrun`, `smoke`, `status`, `metrics` commands and `resume --at` do not exist: a dry run is an arm with scripted or `fake:` agents, status is printed by `run` and `job status` |
+| 2 Runner, scheduler, executor | `runner.py`, `scheduler.py`, `executor.py` | acceptance 1-3 (determinism, recovery, fork); N=256 | phase-commit default; `commit: immediate` supported but impractical on slow providers |
+| 3 Event log, snapshots, recovery | `events.py`, `blobs.py`, `snapshot.py`, `export.py`, `publish.py` | tests (events, recovery, export, publish); N=256 (197-260 MB run dirs replay and export) | Parquet export has 13 table families plus pi-format sessions |
+| 4 World: FlagGame | `world/flaggame.py` | tests; M2; N=256 | text variant only; the image variant is not built |
+| 4 World: ColoringGrid | `world/coloring.py` | tests (coloring); S0 example with scripted and fake-LLM painters | not run with real models; viewer has no grid panel |
+| 5 Medium: board, topologies, policies | `medium/board.py`, `medium/topology.py` | tests; M2; N=256 | broadcast, gossip, groups, tree; delay policy; custom `Policy` classes |
+| 5 Medium: registry, claim policies | `medium/registry.py`, `registry.py` | tests (registry, coloring); S0 example | advisory and enforced claims |
+| 6 Participants: scripted | `participants/scripted.py` | tests; M2 baseline | evidence aggregator, enumerator, silent, painters |
+| 6 Participants: LLMAgent | `participants/llm.py`, `prompts/` | acceptance 4-5; M2; N=256; dogfood | context limit (drop_oldest, summarize, fail_turn), `system_prompt_append`; harness-agent participants are v2 |
+| 6 Roles, hierarchy | `roles.py`, `medium/topology.py` (Tree) | tests (roles, tree_topology); `hierarchy_flaggame.yaml` on fake models | estimate ignores a role's model override |
+| 7 Providers | `providers/` (anthropic, openai_compat for hf/openai/vllm, fake), `inference.py`, `budget.py` | tests (providers, budget, infer); M2 (Haiku, router); vLLM report; N=256 | model prices come from the catalog; json tool protocol fails on Haiku |
+| 8 Interventions, paired runs | `interventions.py`, `Experiment.pair` | tests (interventions, pair); paired/mixed | six built-in interventions; no memory rewrite |
+| 9 Probes | `probes.py` | acceptance 5; M2; N=256 | `belief` probe answered by the agent's own model |
+| 10 Metrics | `metrics/` | tests (metrics); M2; N=256 | belief (consensus, accuracy, polarization, entropy), comm (read_rate, posts_per_round, hops), coloring and claims; experiment-level estimators (best@k, E(N), influence beyond `PairedResult.effect`) are not built |
+| 11 Observatory | `viewer/`, `view.py` | tests (viewer); N=256 | static `view.html` per run, publishable; no live status page |
+| 12 Manager | `budget.py`, `jobs/`, `publish.py` | tests (budget, jobs, publish); N=256 job ($3.45); dogfood | soft, hard, measurement and experiment-total budgets; HF Jobs with co-located vLLM; no persistent launch ledger beyond `runs/jobs.jsonl` |
+| 13 CLI and skill | `cli.py`, `skill/SKILL.md`, `AGENTS.md` | tests (cli); dogfood | first-real-run checklist is the tested workflow |
 
 ## Integrity
 Agent identity is assigned by the harness. Hidden data lives outside the agents' reach. No agent-visible field carries correctness. Reward hacking is measured, not blocked, unless the spec says otherwise.
