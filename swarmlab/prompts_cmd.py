@@ -6,7 +6,9 @@ them in YAML) the first agent of the group is shown: the world is built from the
 with the run's seed exactly as the runner does (`derive(seed, "world")`, agents `a000...`), the
 participant is bound (`derive(seed, "agent", a)`), the agent's round-1 observation is taken, and
 the participant's own rendering is used: `LLMAgent._render_system(view)` (the Jinja template,
-plus the JSON-protocol section under `tool_protocol: json`) and `LLMAgent.round_message(view)`.
+plus the JSON-protocol section under `tool_protocol: json`) and `LLMAgent.turn_message(view)` (M6:
+the round message plus the `report_json` schema line, or the `memory="received"` construction;
+`round_message` for a participant without `turn_message`).
 
 Decisions:
 
@@ -114,7 +116,7 @@ def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
             "user_parts": None, "note": None,
         }
         render = getattr(p, "_render_system", None)
-        round_message = getattr(p, "round_message", None)
+        round_message = getattr(p, "turn_message", None) or getattr(p, "round_message", None)
         if callable(render) and callable(round_message):
             row["system"] = render(view)
             msg = round_message(view)

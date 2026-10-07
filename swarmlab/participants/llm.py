@@ -4,7 +4,7 @@
 temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker",
 extra=None, text_tool_fallback=False, context_limit_tokens=None, overflow="drop_oldest",
 summary_model=None, system_prompt_append=None, memory_messages=8, report_json=False,
-report_fields=None)`, entry point `llm`.
+report_fields=None, answers_kept=None)`, entry point `llm`.
 
 **max_tokens** defaults to 2048 (was 1024). In the 2026-10-06 smoke, Qwen3.5-9B with thinking on
 spent the whole 1024-token budget reasoning (`finish_reason="length"`, empty text, no tool call)
@@ -100,7 +100,9 @@ the runner's `prepare_probe` hook before probes; an item is added only when its
 `(eligible_round, delivery_id)` is newer than every item ingested so far (so re-pushed items are
 not duplicated), and only the last `memory_messages` are kept. Author ids are not shown (pushed
 items carry none). Own answers are the accepted `guess` arguments (and, under `report_json`
-without a `guess` tool, the reported answer), the last `max(1, memory_messages)` kept. State
+without a `guess` tool, the reported answer), the last `answers_kept` kept (default
+`max(1, memory_messages)`; set it apart when the transcript holds one round of N-1 reports but
+the agent should remember more of its own decisions, as in the broadcast arms). State
 (`received`, `received_upto`, `own_answers`, `last_observation`) is plain data in the snapshot.
 Pair it with `delivery: push`, `push_consume: true` (swarmlab/medium/board.py) so each item is
 pushed once and the newest win. `prepare_probe(view_for)` ingests pending items and, for an agent
@@ -175,6 +177,7 @@ spec hash) only when set: `overflow` and `summary_model` only together with a li
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import logging
 import math
@@ -443,6 +446,7 @@ class LLMAgent(Participant):
         memory_messages: int = 8,
         report_json: bool = False,
         report_fields: list[str] | None = None,
+        answers_kept: int | None = None,
     ) -> None:
         if memory not in MEMORY_MODES:
             raise ValueError(f"memory must be one of {MEMORY_MODES}, got {memory!r}")
@@ -492,6 +496,11 @@ class LLMAgent(Participant):
         # ---- M6 §3-§4: params only when set, so existing spec hashes stay ----
         if memory_messages == 8 and memory != "received":
             params.pop("memory_messages", None)
+        if answers_kept is None:
+            params.pop("answers_kept", None)
+        elif isinstance(answers_kept, bool) or not isinstance(answers_kept, int) or answers_kept < 1:
+            raise ValueError("answers_kept must be an integer >= 1 or None")
+        self.answers_kept = answers_kept
         if not report_json:
             params.pop("report_json", None)
         if report_fields is None:
@@ -571,7 +580,8 @@ class LLMAgent(Participant):
     def _note_answer(self, name: str, args: dict, ok: bool) -> None:
         if name == "guess" and ok and args:
             value = next(iter(args.values()))
-            self.own_answers = (self.own_answers + [str(value)])[-max(1, self.memory_messages):]
+            keep = getattr(self, "answers_kept", None) or max(1, self.memory_messages)
+            self.own_answers = (self.own_answers + [str(value)])[-keep:]
 
     def _note_read(self, name: str, result: Any) -> None:
         if self.memory == "received" and name == "read_board" and isinstance(result, dict):
@@ -732,6 +742,21 @@ class LLMAgent(Participant):
             parts.append(Part(type="text", text="\n".join(lines)))
         return ChatMessage(role="user", content=parts)
 
+    def turn_message(self, view: View) -> ChatMessage:
+        """The user message a turn on `view` starts with (`swarmlab prompts` shows it): the
+        round message (plus the `report_json` schema line), or under `memory="received"` the
+        constructed message (state is not changed: pushed items are ingested into a copy)."""
+        if self.memory == "received":
+            probe = copy.copy(self)
+            probe.received = list(self.received)
+            probe.ingest(list(view.pushed))
+            probe.last_observation = [p.model_dump(mode="json") for p in view.observation.parts]
+            return probe._received_message()
+        msg = self.round_message(view)
+        if self.report_json:  # M6 §4: the schema line ends every turn's message
+            msg.content.append(Part(type="text", text=report_schema(self.report_fields)))
+        return msg
+
     def _append(self, msg: ChatMessage) -> None:
         self.rounds[-1]["messages"].append(msg.model_dump(mode="json"))
 
@@ -751,10 +776,7 @@ class LLMAgent(Participant):
             self._append(self._received_message())
         else:
             self.rounds.append({"round": view.round, "messages": []})
-            msg = self.round_message(view)
-            if self.report_json:  # M6 §4: the schema line ends every turn's message
-                msg.content.append(Part(type="text", text=report_schema(self.report_fields)))
-            self._append(msg)
+            self._append(self.turn_message(view))
         usage = LLMTurnUsage()
         self._overflow_events = []
         if self.report_json:
