@@ -63,7 +63,11 @@ Decisions where the contract is silent:
   (1-based) is priced with `prompt_tokens + prompt_growth * (r - 1)` prompt tokens (a probe
   after round r likewise). `usd`, `by_model` and `measurement_usd` use the growth-adjusted
   tokens; `usd_flat` is the same estimate with growth 0 (equal to `usd` when growth is 0), and
-  `total_usd_flat` accompanies `total_usd` when `seeds` is given.
+  `total_usd_flat` accompanies `total_usd` when `seeds` is given. `usd_per_round` is
+  `usd_flat / max_rounds` (the CLI compares it with the gap between `soft_usd` and `hard_usd`).
+- `run_all` honours `budget.total_usd` (experiment-wide; see `budget.total_cap_refusal`): before
+  each run it would start, the spend of the runs already returned plus this arm's `hard_usd` must
+  fit, else it stops and warns (`TotalBudgetWarning`, naming the skipped seeds).
 - `Run.summary()` is the CLI's run summary: run_dir, run_id, arm, seed, spec_hash, status,
   end_reason, last_round, score, metrics (last value per name), spend (+ parent_run/fork_round
   for a fork; + `self_hosted`: the model prefixes served self-hosted, e.g. `["vllm"]`, only when
@@ -71,12 +75,14 @@ Decisions where the contract is silent:
 """
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from .budget import TotalBudgetWarning, ledger_total, total_cap_refusal
 from .events import Event, EventLog, logical_view
 from .ids import run_id as make_run_id
 from .interventions import build_intervention, check_names
@@ -205,6 +211,7 @@ class Experiment(BaseModel):
             "prompt_tokens": prompt_tokens, "prompt_growth": prompt_growth,
             "usd_flat": sum(by_model_flat.values()) + measurement_flat,
         }
+        out["usd_per_round"] = out["usd_flat"] / max(1, max_rounds)  # one round, no growth
         if seeds is not None:
             out["runs"] = len(seeds)
             out["total_usd"] = out["usd"] * len(seeds)
@@ -268,8 +275,14 @@ class Experiment(BaseModel):
                 skip_existing: bool = True, rerun: bool = False, **run_options: Any) -> list[Run]:
         """Run this arm once per seed, in order; returns the runs (skipped ones included)."""
         runs: list[Run] = []
-        for seed in seeds:
+        for i, seed in enumerate(seeds):
             state, found = self.existing(seed, max_rounds, out, **run_options)
+            why = total_cap_refusal(sum(ledger_total(r.spend) for r in runs), self.budget.hard_usd,
+                                    self.budget.total_usd)
+            if why and (rerun or state != "same" or not skip_existing):
+                warnings.warn(TotalBudgetWarning(f"total cap: {why}; skipped seeds {seeds[i:]}"),
+                              stacklevel=2)
+                break
             if rerun and state != "new":
                 runs.append(self.run(seed, max_rounds, out=out, **run_options,
                                      run_dir=self.rerun_dir(out, self.run_id(seed))))

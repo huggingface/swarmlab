@@ -20,6 +20,10 @@ Decisions where the contract is silent:
   concurrent calls finish (the `budget` event is logical). `spent` and `reserved` are float views.
   `calls` counts dispatched provider calls (cache hits are not calls).
 - `Gate.provider_calls` counts dispatches through this gate instance; `replay()` asserts it is 0.
+- `Budget.total_usd` (experiment-wide) is not the gate's business: `total_cap_refusal(spent,
+  next_hard, total)` is the check `swarmlab run` and `Experiment.run_all` make before starting
+  each run (spent = ledger swarm + measurement of the runs already done or found on disk). A
+  refusal stops the sequence; `run_all` reports it as a `TotalBudgetWarning`.
 """
 from __future__ import annotations
 
@@ -56,6 +60,33 @@ class SoftBudgetReached(BudgetExceeded):
 
 class MeasurementBudgetReached(BudgetExceeded):
     """The measurement budget would be exceeded; probes stop, the swarm continues."""
+
+
+class TotalBudgetWarning(UserWarning):
+    """`Experiment.run_all` stopped before a run because the experiment's total cap was reached."""
+
+
+def total_cap_refusal(spent: float, next_hard: float, total: float) -> str | None:
+    """Why the next run may not start under the experiment-wide `total` cap, or None if it may.
+
+    A run can spend up to its `hard_usd`, so it starts only when `spent + next_hard <= total`;
+    without a per-run ceiling (`next_hard <= 0`) the cap cannot be guaranteed and is refused.
+    `total <= 0` means no total cap."""
+    if total <= 0:
+        return None
+    if next_hard <= 0:
+        return (f"total_usd ${total:g} needs a per-run hard_usd to bound the next run "
+                "(hard_usd is 0)")
+    if to_nano(spent) + to_nano(next_hard) > to_nano(total):
+        return (f"spent ${spent:.4f} + next run's hard_usd ${next_hard:g} = "
+                f"${spent + next_hard:.4f} > total_usd ${total:g}")
+    return None
+
+
+def ledger_total(spend: Mapping | None) -> float:
+    """Swarm + measurement spend of a run's ledger dict (`Run.spend`, `run.json["ledger"]`)."""
+    spend = spend or {}
+    return float(spend.get("swarm") or 0) + float(spend.get("measurement") or 0)
 
 
 class Ledger(Persistable):

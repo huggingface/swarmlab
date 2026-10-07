@@ -39,6 +39,12 @@ Decisions where the contract is silent:
   command asks for confirmation on stderr unless `--yes`; declining (or no TTY to answer)
   exits 1 before anything runs. A failed run does not stop the others; the exit code is then 1
   (2 if every failure was a SpecError).
+- Total cap (`budget.total_usd`, top level): `run` prints the per-run caps of every arm and the
+  total cap before anything runs, and warns per arm when `hard_usd - soft_usd` is less than one
+  round of the estimate (`usd_per_round`). Before starting each run it checks
+  `budget.total_cap_refusal(spend of the runs ran or found so far, the arm's hard_usd, total)`;
+  on a refusal that run and every later one get outcome `capped`, the JSON gets
+  `capped: {reason, total_usd, spent, skipped: [run ids]}` and the exit code is 1.
 - `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server) are documented in
   `swarmlab/jobs/` and docs/handoff/WP8.md. `job run` only prints unless `--launch`.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
@@ -54,6 +60,7 @@ from typing import Annotated, Any
 
 import typer
 
+from .budget import ledger_total, total_cap_refusal
 from .experiment import Experiment, Run
 from .spec import Budget, RunOptions, SpecError, experiment_seeds, load_experiment_yaml
 
@@ -234,6 +241,40 @@ def _table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_runs: int,
+               n_seeds: int, total_cap: float) -> list[str]:
+    """The planned per-run caps, the experiment's total cap, and soft/hard gap warnings."""
+    def money(v: float) -> str:
+        return f"${v:g}" if v > 0 else "off"
+
+    lines = []
+    for a, exp in exps.items():
+        b = exp.budget
+        lines.append(f"caps: arm={a} per run soft={money(b.soft_usd)} hard={money(b.hard_usd)} "
+                     f"measurement={money(b.measurement_usd)} x {n_seeds} seed(s)")
+    hard_sum = sum(e.budget.hard_usd for e in exps.values()) * n_seeds
+    if total_cap > 0:
+        line = (f"caps: total ${total_cap:g} for the {n_runs} run(s) (budget.total_usd); a run "
+                "starts only if spend so far + its hard_usd fits")
+        if hard_sum > total_cap:
+            line += (f"; hard ceilings sum to ${hard_sum:g}, so later runs may be skipped if "
+                     "earlier ones spend near their ceilings")
+        lines.append(line)
+    else:
+        lines.append("caps: no total cap (budget.total_usd: 0)"
+                     + (f"; hard ceilings sum to ${hard_sum:g}" if hard_sum > 0 else ""))
+    for a, exp in exps.items():
+        b, per_round = exp.budget, float(ests[a].get("usd_per_round") or 0)
+        if b.soft_usd > 0 and b.hard_usd > 0 and b.hard_usd - b.soft_usd < per_round:
+            lines.append(
+                f"warning: arm={a}: hard_usd - soft_usd = ${b.hard_usd - b.soft_usd:.4f} is less "
+                f"than one round's estimated worst case ${per_round:.4f}. soft_usd is checked "
+                "only between rounds, so a round can start below soft_usd, reach hard_usd "
+                "mid-round and be discarded (its spend still counts). Leave at least one round "
+                "between them (hard_usd >= soft_usd + one round).")
+    return lines
+
+
 def _confirm(prompt: str) -> None:
     try:
         ok = typer.confirm(prompt, default=False, err=True)
@@ -268,6 +309,12 @@ def run(
             if max_rounds is None and "max_rounds" not in exp.options:
                 raise SpecError(f"{spec}: arm {a!r}: no max_rounds in options; pass --max-rounds")
         ests = {a: _estimate(exp, seeds[0], max_rounds) for a, exp in exps.items()}
+        total_cap = float(doc["budget"].get("total_usd") or 0)
+        if total_cap > 0:
+            unbounded = [a for a, e in exps.items() if e.budget.hard_usd <= 0]
+            if unbounded:
+                raise SpecError(f"{spec}: budget.total_usd ${total_cap:g} needs hard_usd > 0 on "
+                                f"every arm that runs; arms without one: {unbounded}")
     except SpecError as e:
         _fail(e, 2, as_json)
     except Exception as e:  # noqa: BLE001
@@ -285,38 +332,62 @@ def run(
                  + (f"; hard ceilings sum to ${ceiling:.2f}" if ceiling > 0 else ""), as_json)
         if _only_fake(ests.values()):
             _say("  (fake: models only: prices are nominal, nothing is billed)", as_json)
+    if budgeted:
+        for line in _cap_lines(exps, ests, n_runs, len(seeds), total_cap):
+            _say(line, as_json)
     if budgeted and not yes:
         _confirm(f"Start {n_runs} run(s), worst case ${total:.4f}?")
 
     rows: list[dict[str, Any]] = []
-    for a in arms:
+    capped: dict[str, Any] | None = None
+    for a, sd in [(a, sd) for a in arms for sd in seeds]:
         exp = exps[a]
-        for sd in seeds:
-            rid = exp.run_id(sd)
-            try:
-                state, found = exp.existing(sd, max_rounds, out)
-                if state == "same" and not rerun and found is not None:
-                    _say(f"{rid}: exists, skipping ({found.dir})", as_json)
-                    rows.append({**found.summary(), "outcome": "skipped"})
-                    continue
-                if state == "different" and not rerun:
-                    raise FileExistsError(
-                        f"{out / rid} holds a run of a different configuration (spec_hash "
-                        "differs); pass --rerun or another --out")
-                target = Experiment.rerun_dir(out, rid) if state != "new" else None
-                if not single:
-                    _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
-                r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
-                rows.append({**r.summary(), "outcome": "ran"})
-            except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
-                msg = f"{type(e).__name__}: {e}"
-                print(f"error: {rid}: {msg}", file=sys.stderr)
-                rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "failed",
-                             "error": msg, "spec_error": isinstance(e, SpecError)})
+        rid = exp.run_id(sd)
+        if capped is not None:
+            capped["skipped"].append(rid)
+            rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"})
+            continue
+        try:
+            state, found = exp.existing(sd, max_rounds, out)
+            if state == "same" and not rerun and found is not None:
+                _say(f"{rid}: exists, skipping ({found.dir})", as_json)
+                rows.append({**found.summary(), "outcome": "skipped"})
+                continue
+            spent = sum(ledger_total(r.get("spend")) for r in rows)
+            why = total_cap_refusal(spent, exp.budget.hard_usd, total_cap)
+            if why:
+                capped = {"reason": why, "total_usd": total_cap, "spent": spent,
+                          "skipped": [rid]}
+                _say(f"total cap: not starting {rid}: {why}", as_json)
+                rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"})
+                continue
+            if state == "different" and not rerun:
+                raise FileExistsError(
+                    f"{out / rid} holds a run of a different configuration (spec_hash "
+                    "differs); pass --rerun or another --out")
+            target = Experiment.rerun_dir(out, rid) if state != "new" else None
+            if not single:
+                _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
+            r = exp.run(seed=sd, max_rounds=max_rounds, out=out, run_dir=target)
+            rows.append({**r.summary(), "outcome": "ran"})
+        except Exception as e:  # noqa: BLE001 - one failed run does not stop the others
+            msg = f"{type(e).__name__}: {e}"
+            print(f"error: {rid}: {msg}", file=sys.stderr)
+            rows.append({"run_id": rid, "arm": a, "seed": sd, "outcome": "failed",
+                         "error": msg, "spec_error": isinstance(e, SpecError)})
     failed = [r for r in rows if r["outcome"] == "failed"]
     code = 0 if not failed else (2 if all(r["spec_error"] for r in failed) else 1)
+    if capped is not None:
+        code = code or 1
+        print(f"error: total cap ${total_cap:g} reached; skipped {len(capped['skipped'])} "
+              f"run(s): {', '.join(capped['skipped'])} ({capped['reason']})", file=sys.stderr)
     if single:
         r = rows[0]
+        if r["outcome"] == "capped":
+            if as_json:
+                typer.echo(json.dumps({"ok": False, "error": f"total cap: {capped['reason']}",
+                                       "exit_code": code, "capped": capped}))
+            raise typer.Exit(code)
         if failed:
             if as_json:
                 typer.echo(json.dumps({"ok": False, "error": r["error"], "exit_code": code}))
@@ -329,8 +400,10 @@ def run(
     for r in rows:
         r.pop("spec_error", None)
     if as_json:
-        typer.echo(json.dumps({"ok": not failed, "exit_code": code, "runs": rows,
-                               "estimate": {"arms": ests, "total_usd": total, "runs": n_runs}},
+        typer.echo(json.dumps({"ok": not failed and capped is None, "exit_code": code,
+                               "runs": rows, "capped": capped,
+                               "estimate": {"arms": ests, "total_usd": total, "runs": n_runs,
+                                            "total_cap_usd": total_cap}},
                               default=str))
     else:
         typer.echo(_table(rows))
