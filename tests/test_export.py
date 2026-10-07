@@ -258,3 +258,49 @@ def test_report_reconciles_spend_with_the_ledger(tmp_path):
     assert f"${total:.3f}" in line and f"${export.discarded_spend(run.dir):.3f}" in line
     # these runs use fake: models, so the report sets them apart and counts none of their spend
     assert "over the 0 real run(s): $0.000; 1 simulated" in build_report(tmp_path / "runs")
+
+
+def _users(msgs: list[dict]) -> list[str]:
+    return [_flat(m["content"]).split("\n")[0] for m in msgs if m["role"] == "user"]
+
+
+def test_unreadable_request_blob_does_not_duplicate_rounds(llm_run, tmp_path):
+    """Field notes item 9: a request blob that cannot be read (EIO on a bucket mount, or gone)
+    used to reset the overlap, so the next request was emitted in full: a second `Round 1.`
+    marker with round-2 content under it. Rounds stay in order and nothing is repeated."""
+    import shutil
+
+    d = tmp_path / "copy"
+    shutil.copytree(llm_run.dir, d)
+    reqs = [e for e in _events(d) if e["type"] == "inference_attempt"
+            and e["agent"] == "a000" and e["category"] == "swarm"]
+    lost = next(e for e in reqs if e["round"] == 2)
+    (d / "blobs" / lost["request_hash"][:2] / lost["request_hash"]).unlink()
+    out = export.export_run(d, tmp_path / "export")
+    for f in sorted((out / "sessions").glob("*.jsonl")):
+        assert validate_file(f) == [], f  # includes: round markers strictly increasing
+    msgs = _session(out, "a000")
+    assert _users(msgs) == ["Round 1.", "Round 2.", "Round 3."]
+    full = _session(llm_run.export(tmp_path / "full"), "a000")
+    # the same conversation as with every blob present, in the same order
+    assert [m["role"] for m in msgs] == [m["role"] for m in full]
+    assert [_flat(m["content"]) if m["role"] != "assistant" else m["content"] for m in msgs] == \
+        [_flat(m["content"]) if m["role"] != "assistant" else m["content"] for m in full]
+
+
+def test_validator_rejects_a_repeated_round_marker():
+    from .pi_session import validate_lines
+
+    head = json.dumps({"type": "session", "version": 3, "id": "r/a000",
+                       "timestamp": "2026-10-07T00:00:00.000Z", "cwd": "runs/r", "harness": "swarmlab"})
+
+    def user(i, text, parent):
+        return json.dumps({"type": "message", "id": f"e{i}", "parentId": parent,
+                           "timestamp": "2026-10-07T00:00:00.000Z",
+                           "message": {"role": "user", "timestamp": 0,
+                                       "content": [{"type": "text", "text": text}]}})
+
+    ok = [head, user(1, "Round 1.\nx", None), user(2, "Round 2.\ny", "e1")]
+    assert validate_lines(ok) == []
+    bad = [*ok, user(3, "Round 1.\nz", "e2")]
+    assert any("round marker 'Round 1.' after 'Round 2.'" in e for e in validate_lines(bad))

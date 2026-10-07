@@ -57,6 +57,12 @@ Decisions where the contract is silent:
     holds (window memory drops it; no snapshot) is rebuilt from its `tool_returned` event, so
     every `toolCall` has a `toolResult`. Probe (`measurement`) calls are not part of the
     agent's conversation and are left out (they are in `tables/probes` and `inference`).
+    A request blob that cannot be read (deleted, or an I/O error on a bucket mount) adds
+    nothing and leaves the overlap reference at the last readable request, so the next request
+    contributes only what is new (before this, it was emitted in full: a second `Round 1.` with
+    later rounds under it); its response is emitted where the next readable request places the
+    assistant message (or right after it, when window memory dropped it). With window memory the
+    lost round's user message cannot be recovered and is missing from the session.
   - pi `usage.cost` holds the logged `cost_usd` in `total` only (the run does not split cost
     by token kind); `api` is `anthropic-messages` for Anthropic and `openai-completions`
     otherwise.
@@ -603,6 +609,11 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
     first = True
     pending: dict[str, tuple[dict, dict | None] | None] = {}
     cursor: dict[int, int] = defaultdict(int)
+    # responses whose request blob could not be read: their assistant message is emitted where
+    # the next readable request places it (after the user message of its round), not before
+    deferred: list[tuple[dict, dict, dict]] = []
+    unseen = 0  # responses emitted since the last readable request (their assistant messages
+    #             open that request's new segment and are skipped there)
 
     def flush(ts: float | None) -> None:
         for cid, pair in list(pending.items()):
@@ -614,11 +625,39 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
                                                   "executed"}, sort_keys=True), ts)
         pending.clear()
 
+    def answer(att: dict, resp_ev: dict, resp: dict) -> None:
+        nonlocal unseen
+        flush(att.get("ts"))
+        provider = str(resp.get("provider") or att.get("provider") or "")
+        rcalls = list(resp.get("tool_calls") or [])
+        sess.assistant(str(resp.get("text") or ""), rcalls,
+                       provider=provider, model=str(resp.get("model") or att.get("model") or ""),
+                       api="anthropic-messages" if provider == "anthropic" else "openai-completions",
+                       usage=_usage(resp_ev.get("usage") or resp.get("usage"),
+                                    resp_ev.get("cost_usd")),
+                       finish=resp.get("finish_reason"), ts=resp_ev.get("ts"))
+        unseen += 1
+        rnd = int(att.get("round") or 0)
+        evs = tool_events.get(rnd, [])
+        for c in rcalls:
+            if set(c.get("args") or {}) == {"_raw"}:
+                pending[str(c.get("call_id"))] = None
+            elif cursor[rnd] < len(evs):
+                pending[str(c.get("call_id"))] = evs[cursor[rnd]]
+                cursor[rnd] += 1
+
     def emit(msgs: list[dict], ts: float | None) -> None:
+        nonlocal unseen
+        skip, unseen = unseen, 0
         for m in msgs:
             role = m["role"]
             if role == "assistant":
-                continue  # emitted from the response blob, with usage
+                if skip:
+                    skip -= 1  # already emitted from its response blob, with usage
+                elif deferred:
+                    answer(*deferred.pop(0))
+                    unseen = 0  # it is in this segment, not in the next request's
+                continue
             if role == "tool":
                 cid = str(m.get("tool_call_id"))
                 pending.pop(cid, None)
@@ -628,7 +667,12 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
                 sess.user(m["content"], ts)
 
     for att, resp_ev in calls:
-        req = blobs.json(att.get("request_hash")) or {}
+        req = blobs.json(att.get("request_hash"))
+        resp = blobs.json((resp_ev or {}).get("response_hash"))
+        if req is None:  # unreadable request blob: keep `prev`, so nothing is emitted twice
+            if resp_ev is not None and resp is not None:
+                deferred.append((att, resp_ev, resp))
+            continue
         msgs = [_norm(m) for m in req.get("messages") or []]
         ts = att.get("ts")
         if first:
@@ -638,31 +682,18 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
         body = [m for m in msgs if m["role"] != "system"]
         emit(body[_overlap(prev, body):], ts)
         prev = body
-        resp = blobs.json((resp_ev or {}).get("response_hash"))
+        while deferred:  # the request did not hold them (window memory): keep them, in order
+            answer(*deferred.pop(0))
         if resp_ev is None or resp is None:
             continue  # no response (provider error or aborted)
-        flush(ts)
-        provider = str(resp.get("provider") or att.get("provider") or "")
-        rcalls = list(resp.get("tool_calls") or [])
-        sess.assistant(str(resp.get("text") or ""), rcalls,
-                       provider=provider, model=str(resp.get("model") or att.get("model") or ""),
-                       api="anthropic-messages" if provider == "anthropic" else "openai-completions",
-                       usage=_usage(resp_ev.get("usage") or resp.get("usage"),
-                                    resp_ev.get("cost_usd")),
-                       finish=resp.get("finish_reason"), ts=resp_ev.get("ts"))
-        rnd = int(att.get("round") or 0)
-        evs = tool_events.get(rnd, [])
-        for c in rcalls:
-            if set(c.get("args") or {}) == {"_raw"}:
-                pending[str(c.get("call_id"))] = None
-            elif cursor[rnd] < len(evs):
-                pending[str(c.get("call_id"))] = evs[cursor[rnd]]
-                cursor[rnd] += 1
+        answer(att, resp_ev, resp)
     if tail is not None:
         body = [_norm(m) for m in tail if m.get("role") != "system"]
         j = _overlap(prev, body)
         if j or not prev:  # memory extends the last request (else: an aborted last round)
             emit(body[j:], end_ts)
+    while deferred:
+        answer(*deferred.pop(0))
     flush(end_ts)
 
 

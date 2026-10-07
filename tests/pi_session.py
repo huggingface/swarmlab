@@ -10,12 +10,15 @@ string `cwd`, non-empty `harness`); every later line is an entry with `type`, un
 AgentMessage whose role-specific required fields have the documented types; content blocks are
 `text` / `thinking` / `image` / `toolCall` where allowed; assistant `usage` has the full Usage
 shape and `stopReason` is a terminal value; every `toolResult.toolCallId` answers an earlier
-`toolCall` of the same session.
+`toolCall` of the same session; swarmlab round markers (a user message whose text starts with
+`Round <n>.`) are strictly increasing within a session (a repeated or earlier marker means a
+conversation was emitted twice).
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from pathlib import Path
 
 STOP_REASONS = {"stop", "length", "toolUse", "error", "aborted", "deferred"}  # not "pending"
@@ -147,6 +150,7 @@ def validate_lines(lines: list[str]) -> list[str]:
         errs.append("header.harness must name the harness")
     ids: set[str] = set()
     calls: set[str] = set()
+    last_round = 0
     for n, raw in enumerate(lines[1:], start=2):
         where = f"line {n}"
         try:
@@ -165,7 +169,23 @@ def validate_lines(lines: list[str]) -> list[str]:
         ids.add(e.get("id"))
         if e.get("type") == "message":
             _message(e.get("message"), where, errs, calls)
+            r = _round_marker(e.get("message"))
+            if r is not None:
+                if r <= last_round:
+                    errs.append(f"{where}: round marker 'Round {r}.' after 'Round {last_round}.'")
+                last_round = max(last_round, r)
     return errs
+
+
+def _round_marker(m) -> int | None:
+    """n of a user message whose text starts with `Round <n>.`, else None."""
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return None
+    c = m.get("content")
+    if isinstance(c, list):
+        c = next((b.get("text") for b in c if isinstance(b, dict) and b.get("type") == "text"), "")
+    hit = re.match(r"Round (\d+)\.", c or "")
+    return int(hit.group(1)) if hit else None
 
 
 def validate_file(path: Path | str) -> list[str]:
