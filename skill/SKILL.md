@@ -145,7 +145,9 @@ next item.
   `swarmlab fork RUN_DIR --at R --spec edited.yaml`. Both reuse the inference cache, so the
   shared prefix costs nothing.
 - **Re-running a finished run is a skip.** `swarmlab run` skips run dirs with the same spec hash;
-  `--rerun` writes `RUN_ID__rN` beside it when you need a repeat.
+  `--rerun` writes `RUN_ID__rN` beside it when you need a repeat. After a spec edit the hash
+  differs and `run` refuses that run (both hashes in the error, outcome `failed`): `--rerun`
+  (new `__rN` dir) or `--out` elsewhere; nothing is overwritten.
 - **Replay before you trust a run.** `swarmlab replay RUN_DIR` recomputes metrics and score from
   the log with zero provider calls and exits 1 on any mismatch.
 - **Analyse from exports.** `swarmlab export RUN_DIR` writes `export/tables/<family>.parquet`
