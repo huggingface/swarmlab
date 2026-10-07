@@ -31,6 +31,8 @@ Decisions where the contract is silent:
   `claim` (`ClaimEvent`, one per world action on a claimable resource when the registry is on);
   see swarmlab/medium/registry.py.
 - M3c: `turn_started` gained `role` (the agent's role name, None without one).
+- M6: `round_started` gained `live` (the live agents), written only when the scheduler's `order`
+  is not a permutation of them (OneSpeaker); absent, `order` is the live list as before.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
 """
@@ -42,7 +44,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_serializer
 
 from ._io import atomic_write_bytes
 
@@ -72,6 +74,20 @@ class RunStartedEvent(Event):
 class RoundStartedEvent(Event):
     type: Literal["round_started"] = "round_started"
     order: list[str]
+    live: list[str] | None = None  # M6: the live agents, only when `order` does not list them all
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_live(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("live", 0) is None:
+            data.pop("live")
+        return data
+
+    @property
+    def live_agents(self) -> list[str]:
+        """The round's live agents: `live` when logged, else `order` (every scheduler before M6
+        lists every live agent)."""
+        return list(self.live) if self.live is not None else list(self.order)
 
 
 class TurnStartedEvent(Event):

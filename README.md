@@ -152,13 +152,20 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `arms.NAME.metrics`: `[{type: NAME, params: {...}}, ...]` (optional): metrics logged every round (`swarmlab metrics` lists them)
   - `arms.NAME.probes`: `[{type: NAME, params: {...}}, ...]` (optional): probes asked after every commit, e.g. `[belief]`
   - `arms.NAME.interventions`: `[{type: NAME, params: {...}}, ...]` (optional): interventions (`inject_post`, `mute`, ...) for this arm
-  - `arms.NAME.options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat}` (optional): run options for this arm, merged over the top-level `options`
+  - `arms.NAME.options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat, scheduler, rounds_per_agent, stop_when}` (optional): run options for this arm, merged over the top-level `options`
     - `arms.NAME.options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
     - `arms.NAME.options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
     - `arms.NAME.options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
     - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
     - `arms.NAME.options.concurrency`: `int` (default `32`): concurrent turns
     - `arms.NAME.options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
+    - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
+    - `arms.NAME.options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
+    - `arms.NAME.options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
+      - `arms.NAME.options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
+      - `arms.NAME.options.stop_when.op`: `>= | > | <= | < | ==` (default `>=`): comparison: `>=`, `>`, `<=`, `<` or `==`
+      - `arms.NAME.options.stop_when.value`: `float` (required): threshold the metric is compared with
+      - `arms.NAME.options.stop_when.consecutive`: `int` (default `1`): evaluations in a row the comparison must hold
   - `arms.NAME.budget`: `{soft_usd, hard_usd, measurement_usd}` (optional): per-run caps for this arm, merged over the top-level `budget` (no `total_usd`)
     - `arms.NAME.budget.soft_usd`: `float` (default `0.0`): end the run at the next round boundary once agent spend reaches this (0: off)
     - `arms.NAME.budget.hard_usd`: `float` (default `0.0`): absolute ceiling on agent + probe spend for the run: reached mid-round, the round is discarded (end `hard_ceiling`); reached by the probes after the commit, the round is kept (end `hard_ceiling_probes`) (0: off)
@@ -179,13 +186,20 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `budget.hard_usd`: `float` (default `0.0`): absolute ceiling on agent + probe spend for the run: reached mid-round, the round is discarded (end `hard_ceiling`); reached by the probes after the commit, the round is kept (end `hard_ceiling_probes`) (0: off)
   - `budget.measurement_usd`: `float` (default `0.0`): cap on probe spend (0: off)
   - `budget.total_usd`: `float` (default `0.0`): top level only: cap on the whole experiment's spend (all arms x seeds, finished and resumed runs included) (0: off)
-- `options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat}` (optional): run options for every arm (each arm's `options` is merged over them)
+- `options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat, scheduler, rounds_per_agent, stop_when}` (optional): run options for every arm (each arm's `options` is merged over them)
   - `options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
   - `options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
   - `options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
   - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
   - `options.concurrency`: `int` (default `32`): concurrent turns
   - `options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
+  - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
+  - `options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
+  - `options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
+    - `options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
+    - `options.stop_when.op`: `>= | > | <= | < | ==` (default `>=`): comparison: `>=`, `>`, `<=`, `<` or `==`
+    - `options.stop_when.value`: `float` (required): threshold the metric is compared with
+    - `options.stop_when.consecutive`: `int` (default `1`): evaluations in a row the comparison must hold
 - `providers`: `{NAME: {type: NAME, params: {...}}}` (optional): provider overrides by model prefix, e.g. `hf: {type: openai_compat, params: {name: hf, timeout_s: 60}}`
 - `seeds`: `[int, ...]` (optional): seeds `swarmlab run` runs per arm (empty: `[0]`)
 - `interventions`: `[{type: NAME, params: {...}}, ...]` (optional): interventions for every arm (an arm's own list is appended)

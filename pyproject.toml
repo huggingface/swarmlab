@@ -66,6 +66,10 @@ llm = "swarmlab.participants.llm:LLMAgent"
 "claims.violations" = "swarmlab.metrics.coloring:ClaimViolations"
 "claims.held" = "swarmlab.metrics.coloring:ClaimsHeld"
 
+[project.entry-points."swarmlab.schedulers"]
+seeded_shuffle = "swarmlab.scheduler:SeededShuffle"
+one_speaker = "swarmlab.scheduler:OneSpeaker"
+
 [project.entry-points."swarmlab.probes"]
 belief = "swarmlab.probes:BeliefProbe"
 

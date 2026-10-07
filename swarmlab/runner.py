@@ -10,7 +10,10 @@ Per-run state is built from deep copies of the experiment's world, medium (board
 one deep copy of each participant prototype per agent (agent i is `agent_id(i)`), so an
 `Experiment` can be run many times. Participants are bound with `derive(seed, "agent", agent)`,
 the world is reset with `derive(seed, "world")`, metrics that `needs_truth()` get
-`set_truth(world.verify())`. The scheduler is always `SeededShuffle` in M1a.
+`set_truth(world.verify())`. The scheduler is `options.scheduler` (M6, swarmlab/scheduler.py;
+`SeededShuffle` when unset). Probes ask every live agent, also those a scheduler left out of the
+round's order (OneSpeaker): the order first, then the rest in agent order. A scheduler with
+`listeners` (OneSpeaker) and a `gossip` topology must agree (`k == listeners`), else ValueError.
 
 Round `r` (phase-commit, `commit == "round_end"`):
 
@@ -217,13 +220,14 @@ from .interventions import (
     replay_world_op,
 )
 from .medium.registry import Registry, commit_world
+from .medium.topology import Gossip
 from .metrics.base import METRICS_REV, Metric
 from .metrics.base import get as get_metric
 from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
 from .providers.base import ChatMessage, ChatRequest, ProviderError
 from .rng import derive
 from .roles import agent_roles, bind_roles
-from .scheduler import SeededShuffle
+from .scheduler import build_scheduler
 from .snapshot import SnapshotManifest, SnapshotStore
 from .spec import (
     Budget,
@@ -502,7 +506,12 @@ class Runner:
         self.world = copy.deepcopy(exp.world)
         self.board = copy.deepcopy(exp.medium)
         self.board.commit_mode = self.options.commit
-        self.scheduler = SeededShuffle()
+        self.scheduler = build_scheduler(self.options.scheduler)  # M6: SeededShuffle by default
+        listeners = getattr(self.scheduler, "listeners", None)
+        topo = getattr(self.board, "topology", None)
+        if listeners is not None and isinstance(topo, Gossip) and topo.k != listeners:
+            raise ValueError(f"scheduler listeners={listeners} but gossip k={topo.k}: the gossip "
+                             "partner draw gives the listeners, so they must match")
         self.metrics: list[Metric] = [build_metric(m) for m in exp.metrics]
         for m in self.metrics:
             m.use_rev(self.metrics_rev)
@@ -924,8 +933,8 @@ class Runner:
                 continue
             if ev.type == "round_committed":
                 last_committed = ev.round
-            if ev.type == "round_started" and sorted(ev.order) != sorted(self._metric_agents):
-                self.live_agents = [AgentId(a) for a in ev.order]
+            if ev.type == "round_started" and sorted(ev.live_agents) != sorted(self._metric_agents):
+                self.live_agents = [AgentId(a) for a in ev.live_agents]
                 self._set_agents()
             if ev.type == "intervention" and replay_world_op(self.world, ev):  # M3a
                 self._set_truth()
@@ -989,7 +998,9 @@ class Runner:
             if r % max(1, probe.every) or self._probes_stopped:
                 continue
             targets: list[AgentId] = []
-            for a in order:
+            # every live agent: the round's order first, then (M6, OneSpeaker) the agents that
+            # did not act this round, in agent order
+            for a in [*order, *(x for x in self.live_agents if x not in order)]:
                 if a not in self.live_agents:
                     continue
                 if not callable(getattr(self.participants[a], "probe_context", None)):
@@ -1151,7 +1162,8 @@ class Runner:
         if self.live_agents != getattr(self, "_metric_agents", None):
             self._set_agents()
         order = self.scheduler.order(r, list(self.live_agents), derive(seed, "schedule", r))
-        self._append(RoundStartedEvent, r, order=list(order))
+        live = None if sorted(order) == sorted(self.live_agents) else list(self.live_agents)
+        self._append(RoundStartedEvent, r, order=list(order), live=live)  # M6: live when partial
         ex = RoundExecutor(
             run=self.run_id, round=r, world=self.world, board=self.board, blobs=self.blobs,
             agents=list(self.live_agents), commit=self.options.commit,

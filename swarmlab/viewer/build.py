@@ -170,7 +170,8 @@ def collect(run_dir: Path | str) -> dict:
     world, verified_truth = _world(run_dir, meta, blobs)
     score = meta.get("score") or {}
     truth = score.get("truth", verified_truth)
-    agents = sorted({a for e in events if e["type"] == "round_started" for a in e["order"]})
+    agents = sorted({a for e in events if e["type"] == "round_started"
+                     for a in (e.get("live") or e["order"])})
     spec = meta.get("spec", {})
     return {
         "version": 1,

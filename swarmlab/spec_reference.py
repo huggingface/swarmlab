@@ -38,6 +38,7 @@ from .spec import (
     ParticipantGroup,
     PluginSpec,
     RunOptions,
+    StopWhen,
 )
 
 START = "<!-- spec-reference:start -->"
@@ -118,6 +119,19 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
         "snapshot_every": "write a snapshot every N rounds",
         "concurrency": "concurrent turns",
         "repeat": "paired-run repeat index (0: a plain run)",
+        "scheduler": "turn order per round: `seeded_shuffle` (default, every live agent) or "
+                     "`one_speaker` (one random live agent per round; pair with `gossip` k=1 and "
+                     "`commit: immediate` for the Flag Game paper's pairwise protocol)",
+        "rounds_per_agent": "sugar: `max_rounds = rounds_per_agent x number of agents`",
+        "stop_when": "`{metric, op, value, consecutive}`: end the run (`stop_condition`) when "
+                     "the metric compares true at `consecutive` evaluations in a row (probe "
+                     "rounds when the run has probes, else every round)",
+    },
+    StopWhen: {
+        "metric": "a logged metric name, e.g. `belief.consensus@probe:belief`",
+        "op": "comparison: `>=`, `>`, `<=`, `<` or `==`",
+        "value": "threshold the metric is compared with",
+        "consecutive": "evaluations in a row the comparison must hold",
     },
     Role: {
         "name": "set from the key under `roles:`",

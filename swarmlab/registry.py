@@ -27,6 +27,7 @@ GROUPS = (
     "swarmlab.participants",
     "swarmlab.metrics",
     "swarmlab.claim_policies",
+    "swarmlab.schedulers",
 )
 
 

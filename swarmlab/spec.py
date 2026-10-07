@@ -61,6 +61,12 @@ Decisions where the contract is silent:
   `spec_hash`, so changing the total cap does not make finished runs look different. Arms that
   bill nothing (`unbilled_spec`: only `fake:` models and scripted participants) are exempt: they
   need no `hard_usd` and their nominal spend does not count toward the total.
+- M6 (docs/INTERFACE-M6.md §2, §5): `RunOptions.scheduler` (plugin spec, `None` = SeededShuffle),
+  `rounds_per_agent` and `stop_when` (`StopWhen`) are left out of serialised options while None,
+  so earlier spec hashes are unchanged. `rounds_per_agent` is sugar resolved when the run spec is
+  built (`resolve_rounds`): `max_rounds = rounds_per_agent * number of participants`, winning over
+  a `max_rounds` in the YAML options (both are kept in the spec); an explicit `max_rounds`
+  override (CLI `--max-rounds`, `arm_to_runspec(..., max_rounds=...)`) wins over it.
 """
 from __future__ import annotations
 
@@ -153,6 +159,24 @@ class MediumSpec(BaseModel):
         return [_coerce_plugin(x) for x in v] if isinstance(v, (list, tuple)) else v
 
 
+class StopWhen(BaseModel):
+    """M6 §5 `options.stop_when`: end the run with reason `stop_condition` once the logged
+    `metric` compares true (`op` against `value`) at `consecutive` evaluations in a row.
+    Evaluations are the probe rounds when the run has probes, else every round (the runner)."""
+
+    model_config = ConfigDict(extra="forbid")
+    metric: str
+    op: Literal[">=", ">", "<=", "<", "=="] = ">="
+    value: float
+    consecutive: int = Field(default=1, ge=1)
+
+    def holds(self, x: Any) -> bool:
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return False
+        return {">=": x >= self.value, ">": x > self.value, "<=": x <= self.value,
+                "<": x < self.value, "==": x == self.value}[self.op]
+
+
 class RunOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     seed: int
@@ -164,13 +188,36 @@ class RunOptions(BaseModel):
     # M3a §2 paired runs: repeat i > 0 re-derives the agent streams (see runner docstring).
     # Omitted from dumps when 0, so ordinary runs keep their spec and spec hash.
     repeat: int = Field(default=0, ge=0)
+    # M6 (docs/INTERFACE-M6.md §2, §5); each omitted from dumps while None.
+    scheduler: PluginSpec | None = None  # None = SeededShuffle (swarmlab/scheduler.py)
+    rounds_per_agent: int | None = Field(default=None, ge=1)  # max_rounds = this x agents
+    stop_when: StopWhen | None = None
+
+    @field_validator("scheduler", mode="before")
+    @classmethod
+    def _scheduler(cls, v: Any) -> Any:
+        return _coerce_plugin(v)
 
     @model_serializer(mode="wrap")
     def _drop_default_repeat(self, handler: SerializerFunctionWrapHandler) -> dict:
         data = handler(self)
         if data.get("repeat") == 0:
             data.pop("repeat")
+        for key in ("scheduler", "rounds_per_agent", "stop_when"):
+            if data.get(key, 0) is None:
+                data.pop(key)
         return data
+
+
+def resolve_rounds(options: dict, n_agents: int) -> dict:
+    """M6: `options` with `max_rounds = rounds_per_agent * n_agents` when `rounds_per_agent` is
+    set (it wins over a `max_rounds` in the same options); unchanged otherwise."""
+    rpa = options.get("rounds_per_agent")
+    if rpa is None:
+        return dict(options)
+    if isinstance(rpa, bool) or not isinstance(rpa, int) or rpa < 1:
+        raise SpecError(f"options.rounds_per_agent must be an integer >= 1, got {rpa!r}")
+    return {**options, "max_rounds": rpa * n_agents}
 
 
 class RunSpec(BaseModel):
@@ -400,12 +447,16 @@ def arm_to_runspec(doc: dict, arm: str, seed: int, **option_overrides: Any) -> R
     unknown = set(overrides) - _OPTION_FIELDS
     if unknown:
         raise SpecError(f"unknown run options {sorted(unknown)}")
-    options = {**norm["options"], **a["options"], "seed": seed, **overrides}
     participants = [
         PluginSpec(type=g["type"], params=g["params"])
         for g in a["participants"]
         for _ in range(g["count"])
     ]
+    options = {**norm["options"], **a["options"], "seed": seed}
+    if "max_rounds" not in overrides or "rounds_per_agent" in overrides:
+        options = resolve_rounds({**options, **overrides}, len(participants))
+    else:
+        options = {**options, **overrides}
     roles, participant_roles = _arm_roles(norm, a)
     try:
         return RunSpec(

@@ -35,6 +35,10 @@ Decisions where the contract is silent:
   model an `UnknownModelPricing` there, not at call time. The resolved providers are cached on the
   experiment (`resolved_providers()`) and shared by its runs, so a provider's `calls` counter
   sees every run of the experiment. Providers are never deep-copied or pickled.
+- M6: `estimate` scales each participant's turns by the scheduler's `turns_per_round(n) / n`
+  (`options.scheduler`; 1 for SeededShuffle, 1/n for OneSpeaker) and caps calls per turn by a
+  participant's `calls_per_turn_cap` (LLMAgent: `max_calls`, or 2 under `report_json`) when it
+  has one, else its `max_calls`.
 - `estimate(seed, max_rounds, calls_per_turn=2, prompt_tokens=3000, completion_tokens=300)`:
   `agents * max_rounds * calls_per_turn` calls per model-backed participant, each priced at
   `prompt_tokens * p_in + completion_tokens * p_out`; participants without a model cost 0. Returns
@@ -121,6 +125,7 @@ from .providers.base import Provider, split_model
 from .registry import add_import_dir, build
 from .roles import Role, assign, role_name, roles_from_spec, spec_roles
 from .runner import Runner
+from .scheduler import build_scheduler
 from .spec import (
     Budget,
     MediumSpec,
@@ -131,6 +136,7 @@ from .spec import (
     arm_to_runspec,
     dump_experiment_yaml,
     load_experiment_yaml,
+    resolve_rounds,
     runspec_to_doc,
     spec_hash,
     unbilled_spec,
@@ -212,6 +218,11 @@ class Experiment(BaseModel):
         measurement_flat = 0.0
         cpts: set[float] = set()
         last_round_extra = 0.0  # growth adds this much to the last round over a flat round
+        # M6: a scheduler may run fewer turns per round than agents (OneSpeaker: one); each
+        # agent then takes `share` of the rounds' turns in expectation
+        n_agents = len(self.participants)
+        sched = build_scheduler(self.options.get("scheduler"))
+        share = sched.turns_per_round(n_agents) / n_agents if n_agents else 0.0
         for p in self.participants:
             model = participant_model(p)
             if model is None:
@@ -219,15 +230,16 @@ class Experiment(BaseModel):
             llm += 1
             provider, mid = self.provider_for(model)
             p_in, p_out, _ = provider.model_pricing(mid)
-            own = getattr(p, "max_calls", None)
+            own = getattr(p, "calls_per_turn_cap", getattr(p, "max_calls", None))
             cpt = min(calls_per_turn, own) if isinstance(own, int) and own > 0 else calls_per_turn
             cpts.add(cpt)
-            calls += cpt * max_rounds
-            last_round_extra += cpt * prompt_growth * (max_rounds - 1) * p_in / 1e6
+            calls += cpt * max_rounds * share
+            last_round_extra += cpt * share * prompt_growth * (max_rounds - 1) * p_in / 1e6
             out_usd = completion_tokens * p_out * max_rounds
-            by_model[model] = by_model.get(model, 0.0) + cpt * (grown_tokens * p_in + out_usd) / 1e6
+            by_model[model] = (by_model.get(model, 0.0)
+                               + share * cpt * (grown_tokens * p_in + out_usd) / 1e6)
             by_model_flat[model] = (by_model_flat.get(model, 0.0)
-                                    + cpt * (flat_tokens * p_in + out_usd) / 1e6)
+                                    + share * cpt * (flat_tokens * p_in + out_usd) / 1e6)
             if callable(getattr(p, "probe_context", None)):
                 for probe in self.probes:
                     every = max(1, probe.every)
@@ -263,6 +275,7 @@ class Experiment(BaseModel):
     def _options(self, seed: int, max_rounds: int | None, **kw: Any) -> RunOptions:
         merged = {k: v for k, v in self.options.items() if k != "seed"}
         merged.update({k: v for k, v in kw.items() if v is not None})
+        merged = resolve_rounds(merged, len(self.participants))  # M6: rounds_per_agent
         if max_rounds is not None:
             merged["max_rounds"] = max_rounds
         if "max_rounds" not in merged:
@@ -453,6 +466,8 @@ class Experiment(BaseModel):
             raise SpecError(f"unknown arm {arm!r}; available: {sorted(doc['arms'])}")
         options = {**doc["options"], **doc["arms"][arm]["options"]}
         options.pop("seed", None)
+        n_agents = sum(g["count"] for g in doc["arms"][arm]["participants"])
+        options = resolve_rounds(options, n_agents)  # M6: rounds_per_agent -> max_rounds
         spec = arm_to_runspec(doc, arm, seed=0, max_rounds=options.get("max_rounds", 1))
         import_dir = add_import_dir(Path(path).resolve().parent)  # module:Class next to the YAML
         exp = cls.from_spec(spec)
