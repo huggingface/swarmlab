@@ -113,7 +113,7 @@ def test_four_runs_in_flight_far_under_the_cap(tmp_path):
     _row(led, "x__s11", "x__s11@1", 0.5, "running", 3.0, host="elsewhere")
     state = led.state()
     assert {f.run_id for f in state.in_flight} == {"x__s1", "x__s2", "x__s3", "x__s11"}
-    assert state.spent == pytest.approx(0.05 + 3 * 0.01 + 1.5)
+    assert state.spent == pytest.approx(0.05 + 3 * 0.5)
     assert state.reserved == pytest.approx(3 * 2.99 + 2.5)
 
 
@@ -138,9 +138,11 @@ def test_backfilled_unfinished_run_dir_does_not_reserve(tmp_path):
     with this process's pid: it must not count as in flight."""
     led = ExperimentLedger(tmp_path, "x")
     led.backfill({"run_id": "x__s1", "started_at": "1", "status": "running",
-                  "ledger": {"swarm": 0.3}, "budget": {"hard_usd": 2.0}, "spec": {}})
+                  "ledger": {"swarm": 0.3}, "budget": {"hard_usd": 2.0},
+                  "spec": {"participants": [{"params": {"model": "hf:some/model"}}]}})
     state = led.state()
     assert state.in_flight == () and state.spent == pytest.approx(0.3)
+    assert led.rows()[0]["status"] == "interrupted"
 
 
 PARALLEL4 = (SPEC.replace("seeds: [1, 2, 3]", "seeds: [1, 2, 3, 4]")
@@ -223,7 +225,7 @@ def test_run_waits_for_a_run_in_another_process(tmp_path, monkeypatch):
     t = threading.Thread(target=other_process, args=("led__C__s9",))
     t.start()
     time.sleep(0.05)
-    res, data = invoke("run", spec, "--arm", "A", "--seed", 1, "--out", out, "--yes", "--json")
+    res, _ = invoke("run", spec, "--arm", "A", "--seed", 1, "--out", out, "--yes", "--json")
     t.join()
     assert res.exit_code == 0, res.output
     assert "waiting" in res.stderr and "led__C__s9" in res.stderr

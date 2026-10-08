@@ -180,10 +180,12 @@ modality uses it to refuse text-grid readers without `image_text_hint` (a `Value
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import random
 import shutil
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -191,6 +193,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import budget as budget_mod
 from ._io import atomic_write_bytes
 from .blobs import BlobStore
 from .budget import ExperimentLedger, Gate, HardCeilingReached, Ledger, MeasurementBudgetReached
@@ -424,6 +427,9 @@ class Runner:
         self.started_at: str = (f"{time.time():.6f}" if meta is None
                                 else meta.get("started_at") or "legacy")
         self._aborted_score: Any = None
+        self._ledger_lock = threading.Lock()
+        self._ledger_last: tuple[str, float] | None = None  # (status, monotonic time) of last row
+        self._ledger_spec_hash: str | None = None
         self.status = "running"
         self.end_reason: str | None = None
         self.last_round = 0
@@ -482,11 +488,46 @@ class Runner:
         return ExperimentLedger(self.dir.parent, self.spec.experiment)
 
     def _ledger_row(self, status: str, spec_hash_: str | None = None) -> None:
-        """Append this run's spend so far to `<out>/<experiment>.ledger.jsonl`."""
-        extra = {"simulated": True} if self.unbilled else {}
-        self.experiment_ledger.record(
-            self.run_id, f"{self.run_id}@{self.started_at}", self.ledger.spent_total, status,
-            hard=self.budget.hard_usd, spec_hash=spec_hash_ or spec_hash(self.spec), **extra)
+        """Append this run's spend so far to `<out>/<experiment>.ledger.jsonl`: on a status
+        change, or as a heartbeat when the last row is `budget.HEARTBEAT_S` old (swarmlab/budget.py
+        module doc), so a run writes a handful of rows rather than one per commit."""
+        with self._ledger_lock:
+            now = time.monotonic()
+            last = self._ledger_last
+            if last is not None and last[0] == status and now - last[1] < budget_mod.HEARTBEAT_S:
+                return
+            if spec_hash_ is not None:
+                self._ledger_spec_hash = spec_hash_
+            elif self._ledger_spec_hash is None:
+                self._ledger_spec_hash = spec_hash(self.spec)
+            extra = {"simulated": True} if self.unbilled else {}
+            self.experiment_ledger.record(
+                self.run_id, f"{self.run_id}@{self.started_at}", self.ledger.spent_total, status,
+                hard=self.budget.hard_usd, spec_hash=self._ledger_spec_hash, **extra)
+            self._ledger_last = (status, now)
+
+    def _start_heartbeat(self) -> None:
+        """A daemon thread that keeps the `running` row fresh during long rounds."""
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(max(budget_mod.HEARTBEAT_S, 1.0)):
+                if self.status != "running" or getattr(self, "ledger", None) is None:
+                    continue
+                with contextlib.suppress(Exception):  # a missed heartbeat only ages the row
+                    self._ledger_row("running")
+
+        thread = threading.Thread(target=beat, name=f"ledger-heartbeat-{self.run_id}",
+                                  daemon=True)
+        thread.start()
+        self._heartbeat = (stop, thread)
+
+    def _stop_heartbeat(self) -> None:
+        hb = getattr(self, "_heartbeat", None)
+        if hb is not None:
+            hb[0].set()
+            hb[1].join()
+            self._heartbeat = None
 
     @property
     def unbilled(self) -> bool:
@@ -695,8 +736,10 @@ class Runner:
                 start = self.parent.at_round + 1
             self._write_meta()  # before run_started: the dir is always resumable or removable
             self._run_started(start - 1)
+            self._start_heartbeat()
             _run_coro(self._loop(start))
         finally:
+            self._stop_heartbeat()
             self.log.close()
             self._ledger_interrupted()
         return self
@@ -733,8 +776,10 @@ class Runner:
                              new=budget.model_dump(mode="json"))
                 self.log.sync()
                 self._write_meta()
+            self._start_heartbeat()
             _run_coro(self._loop(start))
         finally:
+            self._stop_heartbeat()
             self.log.close()
             self._ledger_interrupted()
         return self

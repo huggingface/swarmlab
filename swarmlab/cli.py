@@ -65,12 +65,19 @@ Decisions where the contract is silent:
   `--out`) share one `total_usd`. Each run is started only after `Experiment.admit(seed, out)`:
   ledger spend + headroom reserved by runs in flight + its `hard_usd` <= total (it then gets an
   `admitted` row in the same locked step); found run dirs without a ledger row are backfilled.
+  A run refused only because of headroom held by runs in flight (`Admission.wait`) waits for
+  them: it prints `total cap: waiting to start RUN: ...` (naming each run in flight and its
+  headroom; again when that set changes) and retries when one of this process's runs ends or
+  every `budget.ADMIT_POLL_S`. A final refusal (spend + its `hard_usd` > total) prints
+  `total cap: not starting RUN: ...` with the same list and gives that run outcome `capped`;
+  the runs after it are still checked one by one (a smaller `hard_usd` may fit). Any capped run
+  makes the exit code 1; the JSON `capped` holds the first refusal (`reason`, `spent`,
+  `in_flight`) and every skipped run id.
   The runner also stops a run with `total_budget` at a round boundary once the ledger spend
   reaches the total. `run --parallel N` runs up to N runs at once as threads of this process
   (each thread builds its own `Experiment` from the YAML, so providers and plugin prototypes are
-  not shared, and runs its own asyncio loop); the rows come back in plan order. After the first
-  refusal no further billed run starts (outcome `capped`), as in the sequential case; runs of
-  unbilled arms (only `fake:` models) still run.
+  not shared, and runs its own asyncio loop); the rows come back in plan order. Runs of unbilled
+  arms (only `fake:` models) are never capped.
 - Arms that bill nothing (only `fake:` models and scripted participants; `Experiment.unbilled()`)
   are exempt from `budget.total_usd`: they need no `hard_usd`, are always admitted, and their
   nominal spend is not counted (field notes item 4).
@@ -118,6 +125,7 @@ from typing import Annotated, Any
 
 import typer
 
+from . import budget as budget_mod
 from .budget import ExperimentLedger, ledger_total
 from .experiment import Experiment, Run, participant_model
 from .spec import Budget, RunOptions, SpecError, experiment_seeds, load_experiment_yaml
@@ -473,12 +481,13 @@ def _cap_lines(exps: dict[str, Experiment], ests: dict[str, dict[str, Any]], n_r
         lines.append(line)
         if out is not None:
             led = ExperimentLedger(out, next(iter(exps.values())).name)
-            spent, reserved = led.totals()
+            st = led.state()
             if led.path.exists():
-                lines.append(f"caps: experiment ledger {led.path}: ${spent:.4f} spent so far by "
-                             "every run of this experiment under this --out (all invocations "
-                             "and processes)" + (f", ${reserved:.4f} reserved by runs in flight"
-                                                 if reserved > 0 else ""))
+                lines.append(f"caps: experiment ledger {led.path}: ${st.spent:.4f} spent so far "
+                             "by every run of this experiment under this --out (all invocations "
+                             "and processes)" + (f", ${st.reserved:.4f} reserved by runs in "
+                                                 f"flight: {st.describe_in_flight()}"
+                                                 if st.in_flight else ""))
     else:
         lines.append("caps: no total cap (budget.total_usd: 0)"
                      + (f"; hard ceilings sum to ${hard_sum:g}" if hard_sum > 0 else ""))
@@ -593,15 +602,22 @@ def run(
     plan = [(a, sd) for a in arms for sd in seeds]
     state_lock = threading.Lock()
     capped_box: dict[str, Any] = {}
+    run_done = threading.Condition()  # notified whenever a run of this process finishes
+
+    def wait_for_headroom(_seconds: float) -> None:
+        with run_done:
+            run_done.wait(timeout=budget_mod.ADMIT_POLL_S)
 
     def attempt(a: str, sd: int, exp: Experiment) -> dict[str, Any]:
         """One run of the plan: skip, cap, fail or run it (thread-safe: `--parallel`)."""
+        try:
+            return _attempt(a, sd, exp)
+        finally:
+            with run_done:
+                run_done.notify_all()
+
+    def _attempt(a: str, sd: int, exp: Experiment) -> dict[str, Any]:
         rid = exp.run_id(sd)
-        free = exp.unbilled()  # fake: arms are never capped (they bill nothing)
-        with state_lock:
-            if capped_box and not free:
-                capped_box["skipped"].append(rid)
-                return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
         admitted = False
         led = exp.experiment_ledger(out)
         try:
@@ -619,17 +635,20 @@ def run(
                     f"{found.meta.get('spec_hash') if found else '?'}, this spec's "
                     f"{exp.spec_hash(sd, max_rounds)}); pass --rerun (writes {rid}__r<N>) or "
                     "another --out")
-            with state_lock:  # the admission and the capped flag move together
-                if capped_box and not free:
+            adm = exp.admit_or_wait(
+                sd, out, sleep=wait_for_headroom,
+                on_wait=lambda w: _say(f"total cap: waiting to start {rid}: {w.refusal}", as_json))
+            if adm.refusal:
+                with state_lock:
+                    if not capped_box:
+                        capped_box.update(reason=adm.refusal, total_usd=total_cap,
+                                          spent=adm.checked,
+                                          in_flight=[f.to_dict() for f in adm.in_flight],
+                                          skipped=[])
                     capped_box["skipped"].append(rid)
-                    return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
-                why, spent = exp.admit(sd, out)
-                if why:
-                    capped_box.update(reason=why, total_usd=total_cap, spent=spent,
-                                      skipped=[rid])
-                    _say(f"total cap: not starting {rid}: {why}", as_json)
-                    return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
-                admitted = total_cap > 0
+                _say(f"total cap: not starting {rid}: {adm.refusal}", as_json)
+                return {"run_id": rid, "arm": a, "seed": sd, "outcome": "capped"}
+            admitted = total_cap > 0 and not exp.unbilled()
             target = Experiment.rerun_dir(out, rid) if state != "new" else None
             if not single:
                 _say(f"{rid}: running" + (f" into {target}" if target else ""), as_json)
