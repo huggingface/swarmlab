@@ -55,7 +55,10 @@ Decisions where the contract is silent:
   (atomically, with the new `admitted` row included) once more than half of 200+ rows are
   superseded. `lock` reopens the file when a rewrite replaced it while it waited.
 - A run dir found without a ledger row is backfilled (`backfill`); a `running` run.json there
-  (a killed process) is recorded `interrupted`. The runner ends a run with `total_budget` at a
+  (a killed process) is recorded `interrupted`. A live run appends its row before it replaces
+  its run.json, and `backfill` checks for the key again under the lock, so a run dir that
+  another thread or process is writing is never backfilled (it would release that run's
+  headroom while it runs). The runner ends a run with `total_budget` at a
   round boundary when the ledger's spend (its own included) reaches `total_usd`
   (swarmlab/runner.py). Rows with `simulated: true` (runs on `fake:` models only: nominal
   prices, nothing billed) are ignored. Delete the file to forget past spend.
@@ -360,11 +363,16 @@ class ExperimentLedger:
         if status in IN_FLIGHT_STATUSES:
             extra["backfilled_status"] = status
             status = "interrupted"
-        self.record(meta["run_id"], key, ledger_total(meta.get("ledger")), status,
-                    hard=float((meta.get("budget") or {}).get("hard_usd") or 0),
-                    spec_hash=meta.get("spec_hash"), backfilled=True, **extra)
+        line = self._row(meta["run_id"], key, ledger_total(meta.get("ledger")), status,
+                         float((meta.get("budget") or {}).get("hard_usd") or 0),
+                         meta.get("spec_hash"), backfilled=True, **extra)
         if keys is not None:
             keys.add(key)
+        with self.lock() as f:
+            # re-checked under the lock: `keys` may predate the run's own first row
+            if key in {r["key"] for r in self.rows()}:
+                return False
+            self._append(f, line)
         return True
 
     def backfill_dir(self, out: Path | str) -> int:

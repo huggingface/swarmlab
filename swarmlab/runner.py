@@ -73,8 +73,8 @@ run's ledger) >= `total_usd` -> `run_ended(total_budget)`, all checked at the ro
 
 Experiment ledger (swarmlab/budget.py `ExperimentLedger`): a `run.json` write appends a row (run
 id, instance key `<run_id>@<started_at>`, spec hash, spend so far, status, hard_usd, pid, host,
-time) to `<run dir's parent>/<experiment>.ledger.jsonl` when the status changed or the last row is
-`budget.HEARTBEAT_S` (60 s) old; a daemon thread writes the same heartbeat during long rounds; a
+time) to `<run dir's parent>/<experiment>.ledger.jsonl`, before run.json itself is replaced, when
+the status changed or the last row is `budget.HEARTBEAT_S` (60 s) old; a daemon thread writes the same heartbeat during long rounds; a
 live/resume call that leaves without ending appends a final `interrupted` row. A run that bills nothing (only `fake:`
 models, `spec.unbilled_spec`) writes rows with `simulated: true`, which the ledger does not
 count, and is never stopped with `total_budget`. `run.json["started_at"]` is set when
@@ -481,8 +481,11 @@ class Runner:
             data["import_dir"] = self.import_dir
         data["started_at"] = self.started_at
         text = json.dumps(data, indent=2, sort_keys=True) + "\n"
-        atomic_write_bytes(self.dir / "run.json", text.encode())
+        # ledger row first: a run.json that another thread or process can see always has its
+        # instance's row already, so `ExperimentLedger.backfill` never takes a live run for a
+        # killed one (it would record it `interrupted` and release its headroom)
         self._ledger_row(self.status, data["spec_hash"])
+        atomic_write_bytes(self.dir / "run.json", text.encode())
 
     @property
     def experiment_ledger(self) -> ExperimentLedger:

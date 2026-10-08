@@ -194,6 +194,13 @@ background thread during long rounds), not one per commit (the grid's ledger had
 the file to the latest row per key and per run id once more than half of 200+ rows are
 superseded (atomic rename; `lock` reopens a replaced file). Tests:
 `tests/test_ledger_admission.py`.
+Follow-up (branch `ledger-flake`, 2026-10-08): `test_parallel_runs_wait_for_headroom...` failed
+now and then. Each `admit` backfills run dirs without a ledger row, from a key list read outside
+the lock, while a run wrote its run.json before its first ledger row; a `--parallel` thread
+could so backfill a live run as `interrupted`, releasing its headroom (one run too many
+admitted, three rows for one key). A run now appends its row before replacing run.json, and
+`backfill` re-checks the key under the lock. `run --parallel` also no longer misses a run that
+ends between an admission check and the wait (it waited a full `ADMIT_POLL_S`).
 - `estimate --from RUN_DIR` prices a spec with `Run.measured()`; `Experiment.estimate` takes
   float figures and `probe_call_usd`.
 

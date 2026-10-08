@@ -603,10 +603,21 @@ def run(
     state_lock = threading.Lock()
     capped_box: dict[str, Any] = {}
     run_done = threading.Condition()  # notified whenever a run of this process finishes
+    finished = [0]  # runs of this process finished so far (under run_done)
 
-    def wait_for_headroom(_seconds: float) -> None:
+    def headroom_waiter() -> Callable[[float], None]:
+        """A `sleep` for `admit_or_wait` that returns when a run of this process finished since
+        the previous admission check, even one that finished before the wait began."""
         with run_done:
-            run_done.wait(timeout=budget_mod.ADMIT_POLL_S)
+            seen = [finished[0]]
+
+        def wait(_seconds: float) -> None:
+            with run_done:
+                if finished[0] == seen[0]:
+                    run_done.wait(timeout=budget_mod.ADMIT_POLL_S)
+                seen[0] = finished[0]
+
+        return wait
 
     def attempt(a: str, sd: int, exp: Experiment) -> dict[str, Any]:
         """One run of the plan: skip, cap, fail or run it (thread-safe: `--parallel`)."""
@@ -614,6 +625,7 @@ def run(
             return _attempt(a, sd, exp)
         finally:
             with run_done:
+                finished[0] += 1
                 run_done.notify_all()
 
     def _attempt(a: str, sd: int, exp: Experiment) -> dict[str, Any]:
@@ -636,7 +648,7 @@ def run(
                     f"{exp.spec_hash(sd, max_rounds)}); pass --rerun (writes {rid}__r<N>) or "
                     "another --out")
             adm = exp.admit_or_wait(
-                sd, out, sleep=wait_for_headroom,
+                sd, out, sleep=headroom_waiter(),
                 on_wait=lambda w: _say(f"total cap: waiting to start {rid}: {w.refusal}", as_json))
             if adm.refusal:
                 with state_lock:

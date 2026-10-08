@@ -145,6 +145,21 @@ def test_backfilled_unfinished_run_dir_does_not_reserve(tmp_path):
     assert led.rows()[0]["status"] == "interrupted"
 
 
+def test_backfill_never_takes_a_live_run_for_a_killed_one(tmp_path):
+    """`--parallel`: another thread's `admit` lists the keys, then a run appends its first
+    `running` row and writes its run.json. Backfilling that run.json from the stale key list
+    recorded it `interrupted`, releasing its headroom while it ran (one run too many admitted,
+    three rows for one key): the key is checked again under the lock."""
+    led = ExperimentLedger(tmp_path, "x")
+    keys = {r["key"] for r in led.rows()}  # listed before the run's first row
+    led.record("x__s1", "x__s1@1", 0.0, "running", hard=1.0)
+    meta = {"run_id": "x__s1", "started_at": "1", "status": "running",
+            "ledger": {"swarm": 0.0}, "budget": {"hard_usd": 1.0}}
+    assert led.backfill(meta, keys) is False
+    assert [r["status"] for r in led.rows()] == ["running"]
+    assert [f.run_id for f in led.state().in_flight] == ["x__s1"]
+
+
 PARALLEL4 = (SPEC.replace("seeds: [1, 2, 3]", "seeds: [1, 2, 3, 4]")
              .replace("budget: {hard_usd: 0.05, total_usd: 0.12}",
                       "budget: {hard_usd: 1.0, total_usd: 3.0}")
