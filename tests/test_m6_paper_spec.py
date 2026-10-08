@@ -101,7 +101,7 @@ def test_estimate_prices_the_grid():
         assert ests[f"manager-{n}"]["calls"] == 10 * (n + 1) * 2
     for e in ests.values():
         assert e["usd_flat"] <= e["budget"]["hard_usd"]
-    assert data["total_usd_flat"] < 10
+    assert data["total_usd_flat"] < 40  # ten seeds x about $3.7 flat worst case per seed
 
 
 def test_scheduler_builds_for_pairwise():
