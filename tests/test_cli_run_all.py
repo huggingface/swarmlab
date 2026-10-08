@@ -108,10 +108,10 @@ def test_fake_spend_is_labelled_simulated(tmp_path):
     assert ") (simulated)" in res.stdout.splitlines()[0]
 
 
-def test_readme_sample_labels_simulated_spend():
+def test_getting_started_sample_labels_simulated_spend():
     from pathlib import Path
 
-    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    readme = (Path(__file__).resolve().parent.parent / "docs" / "guide" / "getting-started.md").read_text()
     sample = readme.split("and ends with a table:")[1].split("```")[1]
     rows = [line for line in sample.splitlines() if line.startswith("demo__")]
     assert rows and all(line.endswith("(simulated)") for line in rows)

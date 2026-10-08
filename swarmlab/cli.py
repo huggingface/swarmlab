@@ -108,8 +108,8 @@ Decisions where the contract is silent:
   `budget`, `probes`, ...) plus `total_usd`.
 - `metrics` lists every registered metric (`swarmlab.metrics` entry points) with its class's
   `description`.
-- `spec-reference` prints README.md's "Spec reference" section (every YAML key, its shape and
-  default; swarmlab/spec_reference.py); `--readme README.md` rewrites that section in place.
+- `spec-reference` prints the spec reference (docs/guide/spec-reference.md) (every YAML key, its shape and
+  default; swarmlab/spec_reference.py); `--readme docs/guide/spec-reference.md` rewrites that block in place.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
   `doctor.py`) and in `init`'s help.
 """
@@ -1403,7 +1403,7 @@ def metrics_cmd(as_json: JsonOpt = False) -> None:
 @app.command("spec-reference")
 def spec_reference_cmd(
     readme: Annotated[Path | None, typer.Option(
-        "--readme", help="Rewrite the generated block of this README in place instead of "
+        "--readme", help="Rewrite the generated block of this Markdown file in place instead of "
                          "printing.")] = None,
 ) -> None:
     """Print every experiment YAML key with its shape and default (generated from the models)."""

@@ -1,53 +1,72 @@
 # swarmlab
 
-A scientific testbed for finding the primitives that make heterogeneous groups of LLM agents collaborate well or badly. An experiment is a **World** (the task), a set of **Participants**, a **Medium** (a board with a topology and visibility policies) and **Metrics**; the framework handles tool dispatch, ordering, recording, budgets, snapshots, replay, resume and fork, so a scientist changes the hypothesis without touching the execution machinery. Status (2026-10-07): everything in `docs/DESIGN.md` is built except the image variant of the Flag Game; see "What exists" and "Known issues" below.
+<p align="center">
+  <b>A scientific testbed for collaboration primitives in heterogeneous LLM-agent swarms</b>
+</p>
 
-## Quickstart
+<p align="center">
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-blue"></a>
+  <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-blue">
+  <a href="docs/README.md"><img alt="Docs" src="https://img.shields.io/badge/docs-guide-green"></a>
+</p>
 
-```
+## Overview
+
+When many LLM agents work on one problem, does the group find the truth, herd onto a wrong answer, split into camps, or never agree? The answer depends less on the model than on the **collaboration primitives** around it: who hears whom, when messages arrive, what roles agents play, what they remember. swarmlab exists to find the primitives that matter, one controlled experiment at a time.
+
+An experiment has four parts:
+
+- **World**: the task, with a ground truth the agents cannot see (for example, a hidden flag where each agent holds one crop).
+- **Participants**: LLM agents from any provider, scripted baselines, or a mix of both.
+- **Medium**: the message board, meaning its topology, delivery rules and visibility policies.
+- **Metrics**: what gets measured every round, such as consensus, accuracy, polarization or read rate.
+
+The framework handles everything else: tool dispatch, turn order, logging, budgets, snapshots, replay, resume and fork. To test a new hypothesis, you change one line of YAML and leave the execution code alone.
+
+## Highlights
+
+- **Tasks with a ground truth.** The [Flag Game](https://arxiv.org/abs/2609.19124) tests belief dynamics and Coloring tests allocation. You can add your own `World` in about 15 lines.
+- **Communication is the variable you change.** Pick a topology (`broadcast`, `gossip`, `groups`, `star`, `tree`), add delay or custom visibility policies, use a claim registry, and assign roles such as manager, skeptic or reviewer.
+- **Mixed swarms.** Use Anthropic, Hugging Face Inference Providers, OpenAI, self-hosted vLLM or deterministic fake models, and mix them within one arm.
+- **Built-in measurement.** Belief consensus, accuracy, polarization and entropy; out-of-band belief probes; communication metrics; interventions in the middle of a run; paired runs.
+- **Reproducible.** Every event is logged. Replay re-derives the score from the log, and you can resume a run or fork it at any round with an edited spec.
+- **No surprise bills.** Estimates and a preflight check come before you spend anything. Each run has soft and hard caps, and a ledger enforces one cap across the whole experiment.
+- **Scales on HF Jobs.** vLLM serves the model inside the same job. A 256-agent swarm ran in 83 minutes for $3.45.
+- **Easy to share.** Export Parquet tables and pi-format agent traces, publish them as a Hub dataset, and open a static replay page for any run.
+- **Agent-friendly.** Every command takes `--json`, and a [skill](skill/SKILL.md) teaches Claude Code, Codex or OpenCode the tested experiment workflow.
+
+## Installation
+
+```bash
 git clone https://github.com/cmpatino/swarmlab && cd swarmlab
-uv sync --extra dev --extra anthropic     # or: pip install -e .[anthropic]
-uv run swarmlab doctor                    # Python, extras, API keys, provider reachability, git
+uv sync --extra anthropic --extra hub    # or: pip install -e ".[anthropic,hub]"
+uv run swarmlab doctor                   # checks Python, extras, API keys, provider reachability
+```
 
-mkdir ~/demo-exp && cd ~/demo-exp         # experiments live outside the repo checkout
+The extras are `anthropic` (the Anthropic provider), `hub` (publishing to the Hugging Face Hub) and `dev` (tests and linting).
+
+## Quick Start
+
+### Run the starter experiment (free)
+
+```bash
+mkdir ~/demo-exp && cd ~/demo-exp                   # experiments live outside the checkout
 uv run --project ~/swarmlab swarmlab init demo      # writes demo.yaml and demo.py
 uv run --project ~/swarmlab swarmlab run demo.yaml  # every arm x every seed -> ./runs/<run_id>/
 uv run --project ~/swarmlab swarmlab view runs/demo__gossip__s1   # writes the replay page view.html
 ```
-(`~/swarmlab` is wherever you cloned the repo. Alternatively `pip install -e ~/swarmlab[anthropic]` into the project's own environment and call `swarmlab` directly.) `uv run --project ~/swarmlab` uses the checkout's own environment, `~/swarmlab/.venv`, and creates it there on first use from whatever directory you run it in (checked with uv 0.12: the environment belongs to the project, not to the working directory; `.venv/` is git-ignored). To keep the environment out of the checkout, e.g. a read-only or shared clone, set `UV_PROJECT_ENVIRONMENT=/path/to/env` for every `uv` call (`uv sync` and `uv run`). Work from a project directory outside the checkout: `run` writes `runs/` under the current directory, and inside the swarmlab checkout it refuses unless you pass `--out`, so runs never end up in the repo. `swarmlab validate demo.yaml` prints each arm's agents, models, caps, probes and metrics. The starter compares a broadcast board with a gossip board on the Flag Game, with 8 LLM agents per arm on the deterministic fake model `fake:reader`: no keys, no network, nothing billed. `run` prints the worst-case estimate per arm and in total, runs each arm with each seed in `seeds:`, skips runs whose directory already holds the same spec (`--rerun` writes `runs/<run_id>__r2`), and ends with a table:
+
+The starter compares a broadcast board with a gossip board on the Flag Game, using 8 agents per arm on the deterministic `fake:reader` model. It needs no API keys and no network, and nothing is billed.
 
 ```
 run                  outcome  end         score                                 spend
 demo__broadcast__s1  ran      max_rounds  accuracy=1, n_guessed=8, truth=G      $0.2577 (simulated)
-demo__broadcast__s2  ran      max_rounds  accuracy=1, n_guessed=8, truth=H      $0.2577 (simulated)
 demo__gossip__s1     ran      max_rounds  accuracy=0.625, n_guessed=8, truth=G  $0.2383 (simulated)
 ...
 ```
-`(simulated)` marks runs on `fake:` models only: the spend is computed from a nominal price table and nothing is billed.
-`--arm A` and `--seed N` narrow it; `--json` prints one JSON object.
 
-**Existing run dirs.** A run id is only `<experiment>__<arm>__s<seed>`, so `run` compares the spec hash of what it would run with `runs/<run_id>/run.json`. Same hash: the run is skipped (`exists, skipping`; its spend still counts toward `total_usd`). Different hash (you changed the arm's spec, a cap, the model, a prompt): `run` refuses that run with `FileExistsError` naming both hashes (the dir's and the spec's) and the run's outcome is `failed` (exit 1; other runs still go ahead). Then either pass `--rerun`, which writes the new run beside the old one as `runs/<run_id>__r2` (`__r3`, ... the first free N; also for same-hash repeats), or `--out other/` to start a separate set of run dirs. Nothing is ever overwritten. `budget.total_usd` and `seeds:` are not part of the hash. `demo.py` is the same experiment in Python (`python demo.py`).
+### Write an experiment in Python
 
-## What exists
-
-- **Worlds**: `flaggame` (belief dynamics: hidden flag, one crop per agent, `guess` action; text or image crops, see [Flag Game modalities](#flag-game-modalities); optional blind agents, see [Flag Game protocols](#flag-game-protocols)), `coloring` (allocation: a grid to paint, with claims and a registry). New worlds subclass `World` (example 3).
-- **Topologies** (`medium: {topology: ...}`): `broadcast`, `gossip`, `groups`, `star` (members reach only the center, the center reaches everyone, `params: {center: a000}`), `tree` (coordinators over worker groups, `params: {groups: 3}`). See [Flag Game protocols](#flag-game-protocols).
-- **Policies**: `delay` (messages arrive k rounds late) and your own `Policy` subclasses (example 2). **Registry** with `advisory` or `enforced` claim policies for the coloring task.
-- **Participants**: scripted (`evidence_aggregator`, `enumerator`, `silent`, `row_major_painter`, `queue_painter`, `random_painter`) and `llm` (`LLMAgent`: memory window, `context_limit_tokens` with `drop_oldest`/`summarize`/`fail_turn` overflow, prompt params, `max_calls`, `extra` passthrough).
-- **Providers** (model id prefix): `anthropic`, `hf` (HF router), `openai`, `vllm` (self-hosted, normally via `job run`), `fake` (`fake:reader`, `fake:painter`: deterministic, no network).
-- **Probes**: `belief` (each agent's own model answers "which candidate?" every round, out of band, billed to `measurement_usd`).
-- **Interventions** (`interventions:` in a spec, triggered by `at_round`, `every` or a metric `when`): `inject_post`, `delay_delivery`, `mute`, `kill_agents`, `patch_private`, `reconfigure`. **Paired runs** from round 0: `Experiment.pair(...)` with unchanged-pair controls.
-- **Metrics**: `belief.consensus`, `belief.accuracy`, `belief.polarization`, `belief.entropy` (from world guesses, or from probes with `params: {source: "probe:belief"}`); `comm.read_rate`, `comm.post_rate` (share of turns with a post), `comm.posts_per_round` (posts per agent per round), `comm.posts_total` (swarm-wide posts per round), `comm.hops`; `coloring.coverage`, `coloring.duplicate_paints`, `coloring.wrong_paints`, `coloring.parallel_efficiency`; `claims.violations`, `claims.held`. `swarmlab metrics` lists them all with one-line descriptions.
-- **Roles** (`roles:` plus `role:` per participant group): built-ins `worker`, `coordinator`, `reviewer`, `skeptic`, `scribe`, `manager`; each can restrict tools, channels, registry access and world actions, add prompt text, or override the model.
-- **Run control**: replay (checks metrics and score from the log), resume, fork at a round (optionally with an edited spec), budgets (soft, hard, measurement, experiment total), per-call timeout and retry.
-- **Export and publish**: Parquet tables, pi-format sessions and raw logs; private Hub dataset per experiment; static `view.html`; `fetch-published` restores a run.
-- **Jobs**: `swarmlab job run|status|logs|fetch` runs a spec on HF Jobs with vLLM serving the model in the same job (validated at N=256, 83 min, $3.45).
-
-## Examples
-
-Runnable copies live in `examples/`; each writes to `runs/<run_id>/`.
-
-**1. Run an existing task with built-in agents and communication** (`examples/01_run_existing.py`)
 ```python
 from swarmlab import Experiment, Board, Budget
 from swarmlab.worlds import FlagGame
@@ -59,32 +78,31 @@ exp = Experiment(
     participants=[EvidenceAggregator()] * 16,
     medium=Board(topology="gossip"),
     metrics=["belief.consensus", "belief.accuracy", "comm.read_rate"],
-    budget=Budget(soft_usd=0, hard_usd=0),      # scripted agents spend nothing
+    budget=Budget(soft_usd=0, hard_usd=0),
 )
 run = exp.run(seed=3, max_rounds=20)
-run.score                         # final evaluator-side score
 run.metrics["belief.consensus"]   # [(round, value, denominator), ...]
-run.events                        # the logical event trajectory
-run.view()                        # builds and returns runs/<id>/view.html
-run.fork(at_round=4).run()        # live fork; Run.load(path) replays from disk
-runs = exp.run_all([1, 2, 3], max_rounds=20)   # several seeds; skips runs already on disk
-[r.summary() for r in runs]       # run id, end reason, score, metrics, spend
+run.fork(at_round=4).run()        # same history up to round 4, then diverge
 ```
 
-**2. Change one mechanism, here message visibility** (`examples/02_change_visibility.py`)
+### Change one mechanism
+
+Here, a custom visibility policy hides every message from odd-numbered agents:
+
 ```python
 from swarmlab import Policy
 
 class OddAgentsSeeNothing(Policy):
     def apply(self, reader, post, round):
         if int(reader[1:]) % 2:
-            return None                      # withhold
-        return round + 1, post.text          # available next round, unchanged
+            return None                      # withhold the message
+        return round + 1, post.text          # deliver it next round, unchanged
 
 exp = Experiment(..., medium=Board(topology="broadcast", policies=[OddAgentsSeeNothing()]))
 ```
 
-**3. A new task with the smallest World interface** (`examples/03_new_world.py`)
+### Add a new task
+
 ```python
 from swarmlab import World, Outcome, text_observation, tool
 
@@ -100,252 +118,55 @@ class Counter(World):
     def score(self):
         return {"total": self.total}
 ```
-To use it from YAML, save it as `myworld.py` next to the spec and write `world: {type: "myworld:Counter"}` (participants, metrics and probes take `module:Class` the same way). Every command that loads a spec (and `Experiment.from_yaml`) puts the spec's directory at the front of `sys.path` first, so no `PYTHONPATH` is needed; `run.json` records that directory, so `replay`, `resume`, `fork` and `view` of the run dir find the module from any working directory.
 
-**4. LLM agents with a belief probe** (`examples/04_llm_flaggame.py`): `LLMAgent(model="fake:reader")` on the Flag Game with `BeliefProbe()`; set `MODEL = "anthropic:claude-haiku-4-5"` for a real run.
-
-## Writing a world
-
-- Required: `reset(rng, agents)`, `observe(agent)`, `score()` and at least one `@tool` action returning an `Outcome` (example 3). A world in your own module is used from YAML as `world: {type: "mymodule:MyWorld", params: {...}}`.
-- State in ordinary attributes is snapshotted every round (a pickle of the instance's attributes minus `params` and `_`-prefixed ones), so resume, replay and fork need no world code.
-- Optional hooks (defaults in `swarmlab/world/base.py`): `description()` (task text for prompts), `validate` and `commit` (refusals and conflict rules), `begin_round(round)`, `terminal()`, `my_status`/`collective_status`, `verify()` (evaluator-only truth for metrics, see [Analysis patterns](#analysis-patterns)), `claim_key`, `killed_at`, and `render_state()`.
-- `Outcome.feedback` reaches the agent and the `actions` table: put there what you will analyse per decision, never correctness.
-- `render_state() -> dict | None` fills the "World state" panel of `view.html`: the builder restores a fresh world from each round's snapshot and shows what it returns. A `grid` (list of equal-length rows) is drawn as coloured cells with `palette` (cell value -> CSS colour; other 2-D lists are drawn too when `palette` is given), a list of flat dicts as a table, other values as key/value rows. `coloring` returns its current and target grids; FlagGame returns None (it has its own panel).
-
-## Flag Game modalities
-
-`FlagGame(modality="text")` (the default) shows the candidates and the agent's crop as grids of colour letters in one text part. `FlagGame(modality="image", cell_px=12)` shows them as PNG images instead: one text part naming the candidates in order ("Candidates A, B, ... are shown as images in that order"; no label is drawn inside an image, the order is the labelling), one image per candidate, the text `Your crop:` and the crop image at the same scale (`cell_px` pixels per cell, colours from `swarmlab/colors.py`, the palette `view.html` uses too). Same seed, same world: candidates, truth and crops do not depend on the modality, so a text arm and an image arm are paired by seed. `image_text_hint=True` adds each grid as text after its image, an ablation condition; scripted participants and the `fake:reader` script read only the text grids and refuse image mode without it (a `ValueError` when the run starts). In YAML: `world: {type: flaggame, params: {modality: image}}`; text-mode specs keep their spec hash. **Image mode needs a vision model**: `anthropic:claude-haiku-4-5` accepts images; Qwen3.5-9B served with vLLM's `--language-model-only` does not (the provider answers HTTP 400); Qwen VL variants on the HF router or on vLLM do. `swarmlab preflight` sends the round-1 images and reports a rejection as `model rejects image input`. An image costs about `max(100, w*h/750)` prompt tokens (100 for a default 144x96 flag), so a round message is about 730 tokens larger than in text mode and full memory keeps every round's images; `swarmlab estimate` does not model images, so pass `--prompt-growth 730` or price from a finished run with `--from`. Exports show an image as `[image: PNG 144×96]` in sessions, and the `inference` table keeps image requests by hash (`sha256:...`, blob in `raw/blobs/`). `experiments/m5_flag_image.yaml` compares the two modalities on Haiku at N=8.
-
-## Flag Game protocols
-
-The Flag Game paper ([physicsintelligence.org/research/flag-game](https://physicsintelligence.org/research/flag-game)) compares three communication protocols; each is a spec, not code. **Broadcast** (everyone sees everyone's report each round): `medium: {topology: {type: broadcast}}`. **Gossip** (pairwise, one speaker and one listener): `medium: {topology: {type: gossip, params: {k: 1}}}`; each round every agent's posts reach one partner drawn afresh from the round's seeded rng (directed, not a matching: a listener may hear several speakers in a round). **Manager** (a blind manager who never sees a crop): `world: {type: flaggame, params: {blind_agents: 1}}` (a000 gets no crop and no `guess` tool; its observation says "You have no crop of your own; rely on what others report."), `medium: {topology: {type: star, params: {center: a000}}}` (members' posts reach only a000, a000's posts reach every member) and `participants: [{type: llm, role: manager, params: ...}, {type: llm, count: 15, params: ...}]` (the built-in `manager` role: may not act, posts one summary per round of which candidate the evidence supports and why). `blind_agents` takes an int (the first n agents) or a list of ids; blind agents are left out of `score()["accuracy"]` and of every `belief.*` denominator (`World.excluded_from_belief()`), `verify()["crops"]` omits them, and `blind_may_guess: true` gives them the `guess` tool back (they are still not scored). A blind agent gets its own task text (`World.description_for`). N counts every agent, the manager included. `experiments/m6_flag_vlm.yaml` runs the three protocols at N = 4, 16 and 128 on Gemma 4 in image mode; top-level `x-` keys in a spec are ignored, so shared YAML anchors (`x-memory: &memory {memory: window, window_rounds: 3}`) can live there.
-
-## Flag Game paper replication
-
-`experiments/m6_flag_paper.yaml` (docs/INTERFACE-M6.md, docs/handoff/WP17.md) runs the paper's setup as specified (docs/notes/flag-game-paper-setup.md): the 28 real stripe-and-triangle flags (`world: {type: flaggame, params: {flags: real, candidates: names, canvas: [24, 16], crop: [6, 4], modality: image}}`; candidates are country names only, "Allowed countries: [...]"), agents that answer only with JSON `{"country", "reason"}` (`LLMAgent(report_json=True)`; the harness records the answer as a guess and posts it) and remember the last H=8 messages they received with their crop re-shown every call (`memory: received`, with `medium: {delivery: push, push_consume: true}`). **Pairwise** is `options: {scheduler: one_speaker, commit: immediate, rounds_per_agent: 10, stop_when: {metric: "belief.consensus@probe:belief", op: ">=", value: 1.0, consecutive: 5}}` with `gossip` k=1 (one speaker and one listener per round) and a belief probe every N rounds; **broadcast** and **manager** are 10 synchronous rounds (the manager is a blind `a000` with `blind_may_guess` and an acting `manager` role). `belief.state` classifies each round as correct consensus, wrong consensus, polarized or fragmented (thresholds 0.85 / 0.25) and `swarmlab report` adds the paper's terminal-state shares per arm.
-
-## Switching to real models
-
-- **Model ids** are `provider:model[:served_by]`: `anthropic:claude-haiku-4-5`, `hf:Qwen/Qwen3.5-9B:deepinfra` (the HF router, pinned to DeepInfra; without `:served_by` the router picks), `openai:<model>`, `vllm:<model>` (with a `providers:` base url). Put it in `model:` of each `llm` participant group.
-- **Keys** come from the environment: `ANTHROPIC_API_KEY` (or `ANTHROPIC_KEY`), `HF_TOKEN`, `OPENAI_API_KEY`. `swarmlab doctor demo.yaml` checks the keys and extras that spec needs and that the endpoints answer.
-- **Prices** are never typed by hand. `swarmlab models [--provider hf|anthropic] [--tools] [--search qwen]` lists models, who serves them, tool support and USD per million tokens. `hf` prices come from the router listing (cached 24 h in `~/.cache/swarmlab/catalog.json`); a bare `hf:Org/Model` is priced at its most expensive listed provider. The price used is written into the run spec. To override, or for a model the catalog does not price, add `providers: {hf: {type: openai_compat, params: {name: hf, pricing: {"Org/Model:prov": [in, out, cached]}}}}`.
-- **Timeouts**: each provider call attempt is cut off after `timeout_s` (default 90 s) and timeouts, connection errors, 429 and 5xx are retried up to `max_retries` times (default 2) with jittered 1/2/4 s backoff; the budget reservation is held across retries. A phase-commit round waits for its slowest call, so tighten these for slow-tailed routers: `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 60, max_retries: 3}}}` (`type: anthropic` takes the same two params).
-- Each `inference_response` event records `attempts`; a call that still fails after its retries raises `ProviderError`.
-- **Preflight before spending**: `swarmlab preflight spec.yaml --arm A` sends ONE real request per LLM participant group through the real provider, with the arm's exact `model`, `max_tokens`, `temperature` and `extra`, its system prompt, the tools a run offers (world tools plus `post`, `read_board`, `end_turn`) and a one-line user message. It prints the worst case of those requests first (nothing is sent above `--max-usd`, default $0.05), then per group the model, latency, finish reason, whether a tool call parsed, reasoning tokens if the provider reports them, and on failure the provider's HTTP error text; exit 1 if any group fails or parses no tool call. A provider that rejects a body field otherwise shows up only as a run in which every turn errored.
-- **Errored runs are loud**: `run.json` and every run summary carry `turns_total` and `turns_errored` (turns that ended with an exception, e.g. a provider error) and the first error's message. When more than half the turns of a run errored, `run.json["health"]` is `"degraded"`, the CLI prints `WARNING: <run>: 36/36 turns errored (first error: ProviderError: hf: HTTP 400: ...)`, the `run` table shows the run as `errored` and `swarmlab run` exits 1. The end reason is unchanged (such a run still ends `max_rounds`, at $0).
-- **Reasoning controls differ by provider.** `extra` is merged into the request body as is, so it must use the serving provider's field names. vLLM, SGLang and DeepInfra serve Qwen3 with `extra: {chat_template_kwargs: {enable_thinking: false}}`; Cerebras rejects `chat_template_kwargs` with HTTP 400 and wants `extra: {reasoning_effort: "none"}`. `Qwen/Qwen3.8-27B` on Cerebras (`hf:Qwen/Qwen3.8-27B:cerebras`) reasons by default (`reasoning_effort` defaults to `high`; accepted values `none`, `low`, `medium`, `high`), and Cerebras asks clients not to send Qwen-native fields (`disable_reasoning`, `enable_thinking`, `thinking_budget`) for it. The HF router documents `reasoning_effort` as a standard chat-completion field whose support and default depend on the provider and model. Run `preflight` after changing `extra`.
-- **Budgets** (USD, per run): `soft_usd` ends the run at the next round boundary once agent spend reaches it; `hard_usd` is an absolute ceiling on agent + probe spend (reached during the agents' turns, the round in flight is discarded and the run ends `hard_ceiling`; reached by the belief probes, which run after the round has committed, the round is kept, the unanswered probes are logged as skipped and the run ends `hard_ceiling_probes`; either way its spend still counts, and `swarmlab resume RUN --budget-hard X` continues: X is the run's new total including everything already spent, or `--add-budget D` allows D more from the current spend; `resume` prints the spend so far); `measurement_usd` caps probes. A skipped probe (budget, provider error, scripted agent) is left out of the probe-sourced metrics' denominators, not counted as "none"; status lines show `probes_skipped=N (reason n)` and `swarmlab report` a `Probes skipped:` line per arm. 0 means "not enforced", so set `hard_usd` before using a paid model. These caps are per run and can be set in the top-level `budget:` and per arm (`arms.A.budget: {hard_usd: 0.5}`, merged over the top-level one, so arms can get different caps); `total_usd` (top-level `budget:` only) caps the whole experiment, across every `swarmlab run` invocation and process that writes to the same `--out`: every run appends its spend to `<out>/<experiment>.ledger.jsonl` (run id, spec hash, spend, status, time, pid, host) at each status change and at most once a minute while running, and `swarmlab run` (and `Experiment.run_all`) starts a run only if the ledger's spend plus the headroom of runs still in flight (their `hard_usd` minus what they spent; a run is in flight while its process is alive, or, for another host, while its last row is under 10 minutes old) plus its own `hard_usd` fits under `total_usd`. A run that would fit once the runs in flight end waits for them (`total cap: waiting to start ...`, naming each run in flight and its headroom); one that cannot fit even then is skipped (outcome `capped`, the message names the runs in flight too) and the runs after it are still checked (`run_all` stops instead, since its later seeds have the same `hard_usd`). A running run also ends with `total_budget` at the next round boundary once the ledger's spend reaches `total_usd` (resumable like `soft_budget`). Spend added by a manual `swarmlab resume` lands in the ledger too (resume itself does not check `total_usd` before starting). Run dirs from before the ledger existed are added to it when `run` finds them; delete the file to forget past spend. `swarmlab run --parallel N` runs up to N runs at once (threads in one process, each with its own experiment, providers and event loop) under the same cap. Arms that bill nothing (every model a `fake:` model, the rest scripted participants, e.g. dry runs) are exempt from `total_usd`: they need no `hard_usd`, are never refused, and their nominal spend does not count toward the total. `run` prints every arm's caps and the total cap before starting, an `existing:` line per run that already exists with its actual spend and per-round cost (not the spec's caps), and warns when `hard_usd - soft_usd` is too small for one round (the soft budget is checked between rounds, so a round can start under it, hit the hard ceiling and be discarded): when a finished run of the same arm exists under `--out`, the bound is that run's measured cost of a last round, and the warning says which run it measured; otherwise it is twice the worst-case cost of one round. When any budget is non-zero `run` asks before starting (`--yes` skips the question); `swarmlab estimate spec.yaml` prints the estimate alone (every arm x seed; `--arm`/`--seed` narrow it, `--prompt-growth TOKENS` models a context that grows each round under full memory; calls per turn default to the runner cap `max_calls_per_turn`, capped by each group's own `max_calls`, `--calls-per-turn C` assumes C instead, and the output states the value used). The worst case overstates real spend several times; `swarmlab estimate spec.yaml --from runs/RUN_ID` prices the spec with that finished run's measurements instead: its model calls per turn, its prompt tokens per call as a line fitted through its rounds (start and growth per round), its completion tokens per call and its probe cost per call.
-
-## Spec reference
-
-<!-- spec-reference:start -->
-Every key of an experiment YAML, generated from the pydantic models (`swarmlab spec-reference` prints this list). Unknown keys are errors. Wherever the shape is `{type: NAME, params: {...}}` the value is a plugin: `{type: NAME, params: {...}}`, or the bare string `NAME` for `{type: NAME, params: {}}`.
-
-- `name`: `str` (required): experiment name; run ids are `<name>__<arm>__s<seed>`
-- `arms`: `{NAME: {world, participants, medium, metrics, probes, interventions, options, budget, roles}}` (required): the conditions, by arm name; each arm is a full setup (see `arms.<arm>`)
-  - `arms.NAME.world`: `{type: NAME, params: {...}}` (required): the task, e.g. `{type: flaggame, params: {n_candidates: 8}}` or `flaggame`
-  - `arms.NAME.participants`: `[{type, count, params, role}, ...]` (required): participant groups, in agent order
-    - `arms.NAME.participants[].type`: `str` (required): participant type: `llm`, `evidence_aggregator`, `enumerator`, `silent`, ...
-    - `arms.NAME.participants[].count`: `int` (default `1`): number of agents in this group (>= 1)
-    - `arms.NAME.participants[].params`: `{...}` (optional): constructor params, e.g. `{model: "anthropic:claude-haiku-4-5", max_tokens: 1024}` for `llm`
-    - `arms.NAME.participants[].role`: `str | null` (optional): role name (declared in `roles`, or a built-in: worker, coordinator, reviewer, skeptic, scribe, manager)
-  - `arms.NAME.medium`: `{topology, delivery, push_limit, policies, channels, registry, claim_policy, push_consume}` (default: see keys): the message board: topology, policies, registry
-    - `arms.NAME.medium.topology`: `{type: NAME, params: {...}}` (default `broadcast`): who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per agent per round), `groups`, `star` (params `{center: a000}`: members reach only the center, the center reaches all), `tree`; e.g. `{type: gossip, params: {k: 2}}`
-    - `arms.NAME.medium.delivery`: `pull | push` (default `pull`): `pull` (agents call `read_board`) or `push` (deliveries come with the turn)
-    - `arms.NAME.medium.push_limit`: `int` (default `20`): most items pushed per turn under `delivery: push`
-    - `arms.NAME.medium.policies`: `[{type: NAME, params: {...}}, ...]` (optional): visibility policies applied in order, e.g. `[{type: delay, params: {rounds: 1}}]`
-    - `arms.NAME.medium.channels`: `[str, ...]` (default `[main]`): board channels
-    - `arms.NAME.medium.registry`: `bool` (default `false`): turn on the claim registry tools
-    - `arms.NAME.medium.claim_policy`: `{type: NAME, params: {...}}` (default `advisory`): `advisory` or `enforced` (registry claims checked against world actions)
-    - `arms.NAME.medium.push_consume`: `bool` (default `false`): with `delivery: push`: show the newest `push_limit` unread items and mark every pushed-up-to item read, so each item is pushed once
-  - `arms.NAME.metrics`: `[{type: NAME, params: {...}}, ...]` (optional): metrics logged every round (`swarmlab metrics` lists them)
-  - `arms.NAME.probes`: `[{type: NAME, params: {...}}, ...]` (optional): probes asked after every commit, e.g. `[belief]`
-  - `arms.NAME.interventions`: `[{type: NAME, params: {...}}, ...]` (optional): interventions (`inject_post`, `mute`, ...) for this arm
-  - `arms.NAME.options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat, scheduler, rounds_per_agent, stop_when}` (optional): run options for this arm, merged over the top-level `options`
-    - `arms.NAME.options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
-    - `arms.NAME.options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
-    - `arms.NAME.options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
-    - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
-    - `arms.NAME.options.concurrency`: `int` (default `32`): concurrent turns
-    - `arms.NAME.options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
-    - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
-    - `arms.NAME.options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
-    - `arms.NAME.options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
-      - `arms.NAME.options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
-      - `arms.NAME.options.stop_when.op`: `>= | > | <= | < | ==` (default `>=`): comparison: `>=`, `>`, `<=`, `<` or `==`
-      - `arms.NAME.options.stop_when.value`: `float` (required): threshold the metric is compared with
-      - `arms.NAME.options.stop_when.consecutive`: `int` (default `1`): evaluations in a row the comparison must hold
-  - `arms.NAME.budget`: `{soft_usd, hard_usd, measurement_usd}` (optional): per-run caps for this arm, merged over the top-level `budget` (no `total_usd`)
-    - `arms.NAME.budget.soft_usd`: `float` (default `0.0`): end the run at the next round boundary once agent spend reaches this (0: off)
-    - `arms.NAME.budget.hard_usd`: `float` (default `0.0`): absolute ceiling on agent + probe spend for the run: reached mid-round, the round is discarded (end `hard_ceiling`); reached by the probes after the commit, the round is kept (end `hard_ceiling_probes`) (0: off)
-    - `arms.NAME.budget.measurement_usd`: `float` (default `0.0`): cap on probe spend (0: off)
-  - `arms.NAME.roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations for this arm, merged over the top-level `roles`
-    - `arms.NAME.roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
-    - `arms.NAME.roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
-    - `arms.NAME.roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
-    - `arms.NAME.roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
-    - `arms.NAME.roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
-    - `arms.NAME.roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`
-    - `arms.NAME.roles.NAME.may_act`: `bool` (default `true`): may use the world's action tools
-    - `arms.NAME.roles.NAME.model`: `str | null` (optional): overrides the participant's model (`prefix:id`)
-    - `arms.NAME.roles.NAME.budget`: `{...} | null` (optional): per-turn overrides: `{max_calls, max_tokens}`
-    - `arms.NAME.roles.NAME.post_fields`: `{...} | null` (optional): allowed post fields and values: `{field: [values]}`
-- `budget`: `{soft_usd, hard_usd, measurement_usd, total_usd}` (default: see keys): per-run caps in USD (each arm's `budget` is merged over it) plus `total_usd`, the cap for the whole experiment
-  - `budget.soft_usd`: `float` (default `0.0`): end the run at the next round boundary once agent spend reaches this (0: off)
-  - `budget.hard_usd`: `float` (default `0.0`): absolute ceiling on agent + probe spend for the run: reached mid-round, the round is discarded (end `hard_ceiling`); reached by the probes after the commit, the round is kept (end `hard_ceiling_probes`) (0: off)
-  - `budget.measurement_usd`: `float` (default `0.0`): cap on probe spend (0: off)
-  - `budget.total_usd`: `float` (default `0.0`): top level only: cap on the whole experiment's spend (all arms x seeds, finished and resumed runs included) (0: off)
-- `options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat, scheduler, rounds_per_agent, stop_when}` (optional): run options for every arm (each arm's `options` is merged over them)
-  - `options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
-  - `options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
-  - `options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
-  - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
-  - `options.concurrency`: `int` (default `32`): concurrent turns
-  - `options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
-  - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
-  - `options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
-  - `options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
-    - `options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
-    - `options.stop_when.op`: `>= | > | <= | < | ==` (default `>=`): comparison: `>=`, `>`, `<=`, `<` or `==`
-    - `options.stop_when.value`: `float` (required): threshold the metric is compared with
-    - `options.stop_when.consecutive`: `int` (default `1`): evaluations in a row the comparison must hold
-- `providers`: `{NAME: {type: NAME, params: {...}}}` (optional): provider overrides by model prefix, e.g. `hf: {type: openai_compat, params: {name: hf, timeout_s: 60}}`
-- `seeds`: `[int, ...]` (optional): seeds `swarmlab run` runs per arm (empty: `[0]`)
-- `interventions`: `[{type: NAME, params: {...}}, ...]` (optional): interventions for every arm (an arm's own list is appended)
-- `roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations by name, for every arm (an arm's `roles` is merged per name)
-  - `roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
-  - `roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
-  - `roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
-  - `roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
-  - `roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
-  - `roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`
-  - `roles.NAME.may_act`: `bool` (default `true`): may use the world's action tools
-  - `roles.NAME.model`: `str | null` (optional): overrides the participant's model (`prefix:id`)
-  - `roles.NAME.budget`: `{...} | null` (optional): per-turn overrides: `{max_calls, max_tokens}`
-  - `roles.NAME.post_fields`: `{...} | null` (optional): allowed post fields and values: `{field: [values]}`
-
-Example: a gossip arm where each agent reaches one partner per round, with its own caps:
-
-```yaml
-arms:
-  gossip:
-    world: flaggame
-    participants:
-      - {type: llm, count: 6, params: {model: "anthropic:claude-haiku-4-5"}}
-    medium: {topology: {type: gossip, params: {k: 1}}}
-    budget: {soft_usd: 0, hard_usd: 0.5}
-```
-<!-- spec-reference:end -->
-
-A key in the wrong place or with the wrong shape is an error that names the key path and the shape expected there, e.g. `arms.gossip.medium.topology_params: unknown key 'topology_params'; arms.gossip.medium expects a mapping with keys topology, ...; topology is {type: NAME, params: {...}}, e.g. medium: {topology: {type: gossip, params: {k: 1}}}`.
-
-## Changing what agents are told
-
-An `llm` participant's system prompt is a Jinja2 template, rendered once per agent at its first turn; the default is `swarmlab/participants/prompts/default_system.j2` (who the agent is, the task description, how rounds and tools work, then the tool list). Two params change it, per participant group:
-
-- `system_prompt_append: "One more sentence."` adds plain text after the task section and before `Tools:`, leaving the rest of the default prompt as is. Use it for "one sentence differs" arms. It is recorded in the run spec only when set, so arms without it keep their spec hash.
-- `system_prompt: |` replaces the whole template (inline text, or `"file:prompts/mine.j2"`). Template variables: `agent` (id, e.g. `a003`), `role` (the `role` param, default `worker`), `description` (the world's task description, may be empty), `tools` (list with `.name`, `.description`, `.parameters`) and `system_prompt_append` (empty unless set; a custom template that does not use it gets the appended text at its end). Undefined variables are errors.
+### Switch to a real model
 
 ```yaml
 participants:
-  - type: llm
-    count: 6
-    params:
-      model: "anthropic:claude-haiku-4-5"
-      system_prompt_append: "A shared message board exists: `read_board` shows what other agents have posted."
-```
-The round message (round number, observation, last round's outcomes, deliveries) is fixed by the agent and the world. Check what each arm actually sends, with no model call, and diff two arms (the preview is round 1: the world is reset and `begin_round(1)` is called before the observation, exactly as in a run; later rounds are not shown):
-```
-swarmlab prompts exp.yaml --arm default > default.txt
-swarmlab prompts exp.yaml --arm board > board.txt
-diff default.txt board.txt      # should show only the manipulated sentence
-```
-Note that the default prompt already lists every tool the world and board offer (`read_board`, `post`, ...), so an "agents are told about the board" arm tests a nudge, not awareness.
-
-## CLI
-
-```
-swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S] [--refresh]
-swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC    swarmlab spec-reference    swarmlab metrics
-swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [--rerun] [--parallel N]
-swarmlab estimate SPEC [--arm A] [--seed N] [--max-rounds R] [--prompt-growth G] [--calls-per-turn C] [--from RUN_DIR]
-swarmlab preflight SPEC [--arm A] [--seed N] [--max-usd 0.05]
-swarmlab replay RUN_DIR
-swarmlab resume RUN_DIR [--budget-hard X | --add-budget D | --budget-soft X | --budget-measurement X]
-swarmlab fork RUN_DIR --at 4 [--spec edited.yaml] [--arm A] [--max-rounds R] [--out DIR]
-swarmlab view RUN_DIR [--publish OWNER/REPO]
-swarmlab prompts SPEC --arm A [--seed N]  swarmlab report RUNS_DIR [--out report.md] [--stdout] [--include-fake] [--title T]
-swarmlab export RUN_DIR [--out DIR] [--no-raw]
-swarmlab publish RUNS_DIR_OR_RUN [--repo OWNER/REPO] [--public] [--tag T] [--no-raw]
-swarmlab fetch-published OWNER/REPO RUN_ID [--out runs/] [--force]
-swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 2h] [--per-round S] [--launch]
-swarmlab job status JOB_ID    swarmlab job logs JOB_ID [--follow]    swarmlab job fetch RUN_ID [--out runs/]
-```
-`swarmlab job ...` runs a spec whose models are `vllm:<model>` in an HF Job with vLLM serving the model in the same job, and brings run dirs back from the bucket; `job run` only prints the `hf jobs run` command and the estimate unless `--launch` (docs/handoff/WP8.md).
-Every command takes `--json` and then prints one JSON object. Exit codes: 0 success, 2 invalid spec, 1 any other error (including a declined confirmation or a failed run).
-
-## Analysing results
-
-- `swarmlab prompts SPEC --arm A` prints the system prompt and round-1 user message of one agent per participant group, exactly as the model would receive them, without calling a model. Review them (ideally with a second agent) before spending.
-- `swarmlab report RUNS_DIR` writes a Markdown report over the finished runs: per-arm summary, the trajectory of every logged metric, reading behaviour and a protocol-health section for any world (turn end kinds, errored turns with the first error, finish reasons, retries, latency, calls per turn, cost per round, rejected tool calls and refused world actions, skipped probes); Flag Game sections (where the swarm went, terminal states as in the Flag Game paper, probe vs world belief) and a coloring section appear only for those worlds. Simulated runs (only `fake:` models, e.g. dry runs) are listed but left out of the tables and spend totals; `--include-fake` adds them as `<arm> (simulated)`. `--out report.md` writes the file and prints one line (`--stdout` also prints the report).
-- `swarmlab export RUN_DIR` (Python `Run.export(out)`) writes `RUN_DIR/export/`: `run.json` (identity, spec, score, spend, `spend_discarded_usd`, metric finals), `tables/<family>.parquet` (turns, tool_calls, posts, deliveries, reads, actions, inference, probes, metrics, interventions, rounds, run, other, and `discarded_inference`: the calls of rounds discarded at a hard ceiling, with `charged_usd`, so the ledger spend = non-cached `inference.cost_usd` + discarded spend; key columns `experiment, arm, seed, run, round, agent`; blob content inlined up to 64 KiB), `sessions/<agent>.jsonl` (one [pi-format](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md) session per agent with `harness: "swarmlab"`, so the Hub's agent-traces viewer renders each conversation) and `raw/` (the byte-identical log, snapshots and blobs).
-
-### Analysis patterns
-
-- **Metrics are per round**: the runner feeds a metric every logged event and logs `value()` once per committed round. A per-decision series (e.g. under `commit: immediate`) comes from the `actions` table, not from metrics.
-- **Put per-decision state you will analyse into `Outcome.feedback`**: it is logged in `action_committed` and lands, as JSON, in the `actions` table's `feedback` column next to `round`, `agent` and `action_args`. Agents see it too, so it must not reveal correctness.
-- **Agents' reasoning text** is in the pi-format sessions (`export/sessions/<agent>.jsonl`, one `assistant` message per model call with its text and tool calls); that is the intended source, not the event log.
-- **A metric that needs the truth** (what only `World.verify()` knows) returns `needs_truth() -> True`; the runner then calls `set_truth(world.verify())` before the first round. Mirrors `swarmlab/metrics/coloring.py`; use it as `metrics: ["mymetrics:BestSiteShare"]`:
-
-```python
-from swarmlab.metrics.base import Metric
-
-class BestSiteShare(Metric):
-    name = "sites.best_share"             # share of accepted picks on the best site
-    def __init__(self):
-        self.best, self.hits, self.n = None, 0, 0
-    def needs_truth(self):
-        return True                        # the runner calls set_truth(world.verify())
-    def set_truth(self, truth):
-        self.best = truth["best_site"]
-    def update(self, event):               # every logged event, in log order
-        if event.type == "action_committed" and event.accepted:
-            self.n += 1
-            self.hits += event.feedback.get("site") == self.best
-    def value(self):                       # once per round: (value, denominator)
-        return (self.hits / self.n if self.n else None), self.n
+  - {type: llm, count: 8, params: {model: "hf:google/gemma-4-26B-A4B-it:deepinfra"}}
+budget: {hard_usd: 0.50, total_usd: 5}
 ```
 
-## Publishing
-
-- `swarmlab publish runs/` (Python `Experiment.publish(runs_dir)`) exports what is needed and uploads every finished run to one **private** Hub dataset repo per experiment (`<you>/<experiment>`, or `--repo`): `runs/<run_id>/...`, `index.json`, and a dataset card with the arms' specs, a run table and the table schemas. Re-publishing uploads only changed files. A failed step (export, repo creation, upload) is printed and exits 1. `--public` makes the repo public and adds the `format:agent-traces` tag (the Hub's trace viewer renders public repos only); traces hold every prompt and reply, so read them first. Needs the `hub` extra and `HF_TOKEN`.
-- Raw copies read every blob, which is slow on a bucket-mounted runs dir (thousands of small files) and can hit `[Errno 5]`; an unreadable file fails the export rather than being skipped. There, `export --no-raw` / `publish --no-raw` write and upload tables and sessions only (`run.json` `export_raw: false`; `fetch-published` cannot rebuild such a run), or publish from a local copy of the runs dir.
-- `swarmlab view RUN_DIR --publish OWNER/REPO` uploads `view.html` next to the run and links it from the card.
-- `swarmlab fetch-published OWNER/REPO RUN_ID --out runs/` rebuilds the run directory from the published raw log, snapshots and blobs, so `replay`, `view`, `fork` and `Run.load` work on it.
-
-## Experimenter skill
-
-`skill/SKILL.md` teaches a coding agent the tested workflow, from `swarmlab doctor` to `swarmlab publish`, including the first-real-run checklist. Install it for Claude Code (`~/.claude/skills/swarmlab/SKILL.md`), Codex (`~/.agents/skills/swarmlab/SKILL.md`) or OpenCode (`~/.config/opencode/skills/swarmlab/SKILL.md`); the file has the copy command.
-
-## Run directory
-
+```bash
+swarmlab estimate exp.yaml     # worst-case spend for every arm and seed
+swarmlab preflight exp.yaml    # one real request per participant group, for a few cents
+swarmlab run exp.yaml
 ```
-runs/<run_id>/
-  run.json          run id, spec, spec hash, git commit, status, end reason, last round, score
-  events.jsonl      the event log; a round is committed once its round_committed line is written
-  discarded.jsonl   events dropped by crash recovery
-  blobs/            content-addressed delivered content and plugin state
-  snapshots/        <round:06d>.json manifests, one per round
-  artifacts/        spec.yaml, git.txt
-  view.html         the static replay page (after `view`)
-  export/           tables, pi sessions and raw copies (after `export` or `publish`)
+
+Read [Real models and budgets](docs/guide/real-models.md) before your first paid run. It covers model ids, keys, prices, timeouts and every budget cap.
+
+## Command Line Interface
+
+| command | what it does |
+|---|---|
+| `swarmlab doctor` | checks your environment, keys and providers |
+| `swarmlab init NAME` | writes a starter experiment |
+| `swarmlab validate SPEC` | shows each arm's agents, models, caps and metrics |
+| `swarmlab estimate SPEC` / `preflight SPEC` | prices a spec / sends one real request per group |
+| `swarmlab prompts SPEC --arm A` | prints exactly what the agents will see, with no model call |
+| `swarmlab run SPEC` | runs every arm x seed under your caps |
+| `swarmlab replay` / `resume` / `fork` RUN | re-derives, continues or branches a run |
+| `swarmlab view RUN` | builds the static replay page |
+| `swarmlab report RUNS` | writes a Markdown report across runs |
+| `swarmlab export` / `publish` | writes Parquet tables and agent traces, and uploads a private Hub dataset |
+| `swarmlab job run SPEC --model M` | runs a spec on HF Jobs with vLLM in the same job |
+
+Every command takes `--json`. The full flag list is in [CLI and run directory](docs/guide/cli.md).
+
+## Documentation
+
+The [documentation index](docs/README.md) links every page: [getting started](docs/guide/getting-started.md), [building experiments](docs/guide/building-experiments.md), [the Flag Game](docs/guide/flag-game.md), [real models and budgets](docs/guide/real-models.md), [spec reference](docs/guide/spec-reference.md), [CLI](docs/guide/cli.md) and [analysing and publishing](docs/guide/analysis.md). The design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md), and open problems are in [`docs/notes/known-issues.md`](docs/notes/known-issues.md).
+
+**Coding agents:** read [`AGENTS.md`](AGENTS.md) first. To run experiments, follow [`skill/SKILL.md`](skill/SKILL.md).
+
+## Development
+
+```bash
+uv sync --extra dev --extra anthropic
+uv run pytest -q
+uv run ruff check swarmlab tests examples tools
 ```
-Run ids are `<experiment>__s<seed>` from Python, `<experiment>__<arm>__s<seed>` from YAML, plus `__f<round>_<n>` for a fork.
 
-## Known issues
+## License
 
-`docs/notes/known-issues.md` lists open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `validate` rejecting `vllm:` specs, and role and paired-run gaps.
-
-## Docs
-
-`docs/DESIGN.md` (why), `docs/INTERFACE.md`, `INTERFACE-M1b.md`, `INTERFACE-M3a.md`, `INTERFACE-M3c.md` and `INTERFACE-M4.md` (the binding contracts), `docs/handoff/INDEX.md` (per work package notes), `docs/notes/` (run reports), `AGENTS.md` (rules for agents working in this repo). Development: `uv run pytest -q` and `uv run ruff check swarmlab tests examples tools`.
+Apache-2.0. See [LICENSE](LICENSE).
