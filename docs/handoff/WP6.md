@@ -170,6 +170,30 @@ resp = await tools.infer(request)                         # category="swarm"
 - `budget.total_usd` is enforced over `<out>/<experiment>.ledger.jsonl`
   (`budget.ExperimentLedger`), across processes and `run --parallel N`; new end reason
   `total_budget`. Arms on `fake:` models only are exempt.
+
+Follow-up (branch `ledger-fix`, 2026-10-08): the m6-flag-paper grid (`--parallel 4`,
+`total_usd: 10`) stopped after $1.47 of real spend ("spent $8.9105 + next run's hard_usd $3 ...
+($7.4407 of it reserved by runs still in flight)"), and the fill pass after $2.03 ($6.00
+reserved). Replaying the saved ledger (`tests/fixtures/m6-flag-paper.ledger.jsonl`) shows the
+arithmetic was right: two broadcast-128 runs ($3 hard) and one pairwise-128 run ($1.50) were in
+flight, so the stale-row and per-row-sum hypotheses do not hold. The defect was in `cli.py run`:
+the first refusal set `capped_box`, and every later billed run was marked `capped` without an
+admission check, so $0.05 runs were "refused" too and a refusal caused only by transient
+reservations was final. Now `Experiment.admit` returns a `budget.Admission`; a refusal with
+`wait` (spend + `hard_usd` fits once the runs in flight end) waits (`admit_or_wait`, woken when a
+run of this process ends or every `ADMIT_POLL_S`), a final refusal caps that run alone, and
+both messages list each run counted in flight with its headroom (`InFlight.describe`; JSON
+`capped.in_flight`). The ledger was hardened at the same time: in-flight state is the latest
+row per run id (a `failed` row or a new instance releases a stale one, which per-key state did
+not when the stale row carried this process's pid); rows from another host count as live for
+`STALE_S` (10 min) after their last heartbeat, not forever (a restarted container has a new
+hostname); a backfilled unfinished run dir is `interrupted`, not `running` under this pid;
+runs write one row per status change plus a heartbeat at most every 60 s (also from a
+background thread during long rounds), not one per commit (the grid's ledger had 14,898
+`running` rows for 58 runs, re-read at every round boundary and admission); `admit` compacts
+the file to the latest row per key and per run id once more than half of 200+ rows are
+superseded (atomic rename; `lock` reopens a replaced file). Tests:
+`tests/test_ledger_admission.py`.
 - `estimate --from RUN_DIR` prices a spec with `Run.measured()`; `Experiment.estimate` takes
   float figures and `probe_call_usd`.
 

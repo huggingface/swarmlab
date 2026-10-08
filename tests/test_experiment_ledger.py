@@ -58,10 +58,11 @@ def test_ledger_sums_latest_spend_per_run_instance(tmp_path):
                             "status": "running", "hard_usd": 0.05}).encode() + b"\n{torn")
     assert led.totals() == pytest.approx((0.07, 0.04))
     # admission: spend + reserved + hard must fit, and an admitted run reserves at once
-    why, checked = led.admit("x__s4", 0.05, 0.2)
-    assert why is None and checked == pytest.approx(0.11)
-    why, _ = led.admit("x__s5", 0.05, 0.2)
-    assert "> total_usd" in why and "reserved by runs still in flight" in why
+    adm = led.admit("x__s4", 0.05, 0.2)
+    assert adm.refusal is None and adm.checked == pytest.approx(0.11)
+    adm = led.admit("x__s5", 0.05, 0.2)
+    assert "> total_usd" in adm.refusal and adm.wait  # fits once the runs in flight end
+    assert "reserved by 2 run(s) still in flight: x__s2 $0.0400 (running, pid" in adm.refusal
     led.record("x__s4", "x__s4@admit", 0.0, "failed")  # releases the admitted reservation
     assert led.totals()[1] == pytest.approx(0.04)
 

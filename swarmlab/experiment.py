@@ -85,8 +85,10 @@ Decisions where the contract is silent:
 - `run_all` honours `budget.total_usd` (experiment-wide): before each run it would start,
   `admit(seed, out)` checks the experiment ledger `<out>/<name>.ledger.jsonl` (spend of every
   run of the experiment under `out`, from any process or invocation, plus the headroom of runs
-  still in flight, plus this arm's `hard_usd` must fit; `budget.ExperimentLedger`), else it stops
-  and warns (`TotalBudgetWarning`, naming the skipped seeds). Run dirs it finds are backfilled
+  still in flight, plus this arm's `hard_usd` must fit; `budget.ExperimentLedger`). A run refused
+  only for headroom held by runs in flight waits for them (`admit_or_wait`, polling every
+  `budget.ADMIT_POLL_S`); a final refusal stops and warns (`TotalBudgetWarning`, naming the
+  skipped seeds). Run dirs it finds are backfilled
   into the ledger when they have no row (written before the ledger existed).
 - `Run.summary()` is the CLI's run summary: run_dir, run_id, arm, seed, spec_hash, status,
   end_reason, last_round, score, metrics (last value per name), spend, `probes_skipped`
@@ -103,15 +105,17 @@ present: more than half of the turns ended `error`, see swarmlab/runner.py; + `s
 from __future__ import annotations
 
 import json
+import time
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
+from . import budget as budget_mod
 from ._io import atomic_write_bytes
-from .budget import ExperimentLedger, TotalBudgetWarning
+from .budget import Admission, ExperimentLedger, TotalBudgetWarning
 from .events import Event, EventLog, logical_view
 from .ids import run_id as make_run_id
 from .interventions import build_intervention, check_names
@@ -366,16 +370,34 @@ class Experiment(BaseModel):
         """Nothing this experiment calls is billed (only `fake:` models; `spec.unbilled_spec`)."""
         return unbilled_spec(self.to_spec(0, 1).model_dump(mode="json"))
 
-    def admit(self, seed: int, out: Path | str = "runs") -> tuple[str | None, float]:
+    def admit(self, seed: int, out: Path | str = "runs") -> Admission:
         """The `budget.total_usd` start check for the run of `seed` under `out` (see
-        `ExperimentLedger.admit`): (refusal or None, spend + reserved it was checked against).
-        An unbilled experiment (only `fake:` models) is always admitted."""
+        `ExperimentLedger.admit`): refusal (None when admitted), spend and reserved headroom it
+        was checked against, the runs counted in flight, and whether a refusal only has to wait
+        for them. An unbilled experiment (only `fake:` models) is always admitted."""
         total = self.budget.total_usd
         if total <= 0 or self.unbilled():
-            return None, 0.0
+            return Admission(None, 0.0, 0.0)
         led = self.experiment_ledger(out)
         led.backfill_dir(out)  # run dirs from before the ledger existed
         return led.admit(self.run_id(seed), self.budget.hard_usd, total)
+
+    def admit_or_wait(self, seed: int, out: Path | str = "runs",
+                      on_wait: Callable[[Admission], None] | None = None,
+                      sleep: Callable[[float], Any] = time.sleep) -> Admission:
+        """`admit`, retried every `budget.ADMIT_POLL_S` while the refusal only waits for runs
+        in flight (`Admission.wait`); `on_wait` is called with the first waiting answer and
+        whenever the runs in flight change. Returns the admission or the final refusal."""
+        seen: tuple[str, ...] | None = None
+        while True:
+            adm = self.admit(seed, out)
+            if not adm.wait:
+                return adm
+            ids = tuple(f.run_id for f in adm.in_flight)
+            if on_wait is not None and ids != seen:
+                on_wait(adm)
+            seen = ids
+            sleep(budget_mod.ADMIT_POLL_S)
 
     @staticmethod
     def rerun_dir(out: Path | str, run_id: str) -> Path:
@@ -400,8 +422,8 @@ class Experiment(BaseModel):
                 raise FileExistsError(
                     f"{found.dir} holds a run with a different spec_hash; pass rerun=True "
                     "(CLI: --rerun) or another out dir")
-            why, _ = self.admit(seed, out)
-            if why:
+            why = self.admit_or_wait(seed, out).refusal
+            if why:  # final: the later seeds have the same hard_usd
                 warnings.warn(TotalBudgetWarning(f"total cap: {why}; skipped seeds {seeds[i:]}"),
                               stacklevel=2)
                 break

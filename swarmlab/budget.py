@@ -22,26 +22,43 @@ Decisions where the contract is silent:
 - `Gate.provider_calls` counts dispatches through this gate instance; `replay()` asserts it is 0.
 - `Budget.total_usd` (experiment-wide) is not the gate's business: `total_cap_refusal(spent,
   next_hard, total)` is the check `swarmlab run` and `Experiment.run_all` make before starting
-  each run (spent = ledger swarm + measurement of the runs already done or found on disk). A
-  refusal stops the sequence; `run_all` reports it as a `TotalBudgetWarning`.
+  each run (spent = the experiment ledger's spend plus the headroom of runs in flight, below).
+  A run refused only for headroom held by runs in flight waits for them; a final refusal skips
+  that run (`swarmlab run` goes on with the next one, `run_all` stops: its later seeds have the
+  same `hard_usd`) and `run_all` reports it as a `TotalBudgetWarning`.
 - Experiment spend across processes (field notes item 3): `ExperimentLedger(out, experiment)` is
-  the append-only file `<out>/<experiment>.ledger.jsonl`. Every run appends a row each time it
-  writes `run.json` (each commit, its start and its end): `{ts, pid, host, run_id, key,
-  spec_hash, spend_usd, status, hard_usd}` where `spend_usd` is the run's ledger total so far
+  the append-only file `<out>/<experiment>.ledger.jsonl` of rows `{ts, pid, host, run_id, key,
+  spec_hash, spend_usd, status, hard_usd}`, where `spend_usd` is the run's ledger total so far
   and `key` identifies one run instance (`<run_id>@<started_at>`: a resume keeps it, a run dir
-  deleted and run again gets a new one, so spend already paid is never forgotten). The
-  experiment's spend is the sum over keys of each key's latest `spend_usd`, over every process
-  and invocation that wrote rows. Rows are appended under an exclusive `fcntl.flock` on the
-  file. `admit(run_id, ...)` is the start check, under the same lock: spent + the headroom of
-  runs in flight (`hard_usd - spend_usd` of rows whose latest status is `running`, or an
-  `admitted` row not yet followed by a row of that run id, written by a live pid; a row from
-  another host counts as live) + this run's `hard_usd` must fit under `total_usd`
-  (`total_cap_refusal`), and when it does an `admitted` row is appended at once, so concurrent
-  starts (`swarmlab run --parallel`, or two shells) cannot both take the same headroom. A run
-  whose process died keeps its spend but no longer reserves headroom. The runner ends a run
-  with `total_budget` at a round boundary when the ledger's spend (its own included) reaches
-  `total_usd` (swarmlab/runner.py). Rows with `simulated: true` (runs on `fake:` models only:
-  nominal prices, nothing billed) are ignored. Delete the file to forget past spend.
+  deleted and run again gets a new one, so spend already paid is never forgotten). A run writes
+  a row per state change (`running` at its start, `ended`, `interrupted`) and, while running, a
+  `running` heartbeat row at most every `HEARTBEAT_S` (60 s; at a commit, or from a background
+  thread during a long round), not one per commit. Rows are appended under an exclusive
+  `fcntl.flock` on the file.
+- The state (`ExperimentLedger.state`): the experiment's spend is the sum over keys of each key's
+  latest `spend_usd`, over every process and invocation that wrote rows. A run is in flight when
+  the latest row of its *run id* is `admitted` or `running` and its writer is live: the pid is
+  alive when the row is from this host, a row from another host is live for `STALE_S` (10 min)
+  after it was written (the heartbeat keeps it fresh). So a run's `ended`/`interrupted` row, the
+  `failed` row written for a run that could not start, or a newer instance of the same run id
+  release its reservation, and a process that died (or a host that went silent) reserves
+  nothing; its spend still counts. In flight it reserves `hard_usd - spend_usd` (>= 0).
+- Admission (`admit(run_id, hard, total)`, under the lock): spend + the headroom of the runs in
+  flight + this run's `hard_usd` must fit under `total_usd` (`total_cap_refusal`); when it does,
+  an `admitted` row is appended at once, so concurrent starts (`swarmlab run --parallel`, or two
+  shells) cannot both take the same headroom. A refusal names every run counted in flight and
+  its headroom; `Admission.wait` is true when spend + `hard_usd` alone fits, i.e. the run only
+  has to wait for runs in flight to end (callers then retry every `ADMIT_POLL_S` or when one of
+  their own runs ends), otherwise the refusal is final.
+- Compaction: `compacted(rows)` keeps the latest row per key (its spend) and the latest row per
+  run id (its in-flight state); `state` works on it, and `admit` rewrites the file to it
+  (atomically, with the new `admitted` row included) once more than half of 200+ rows are
+  superseded. `lock` reopens the file when a rewrite replaced it while it waited.
+- A run dir found without a ledger row is backfilled (`backfill`); a `running` run.json there
+  (a killed process) is recorded `interrupted`. The runner ends a run with `total_budget` at a
+  round boundary when the ledger's spend (its own included) reaches `total_usd`
+  (swarmlab/runner.py). Rows with `simulated: true` (runs on `fake:` models only: nominal
+  prices, nothing billed) are ignored. Delete the file to forget past spend.
 """
 from __future__ import annotations
 
@@ -53,6 +70,7 @@ import socket
 import time
 from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -114,6 +132,8 @@ def ledger_total(spend: Mapping | None) -> float:
 
 
 def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     if pid == os.getpid():
         return True
     try:
@@ -125,6 +145,72 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+HEARTBEAT_S = 60.0   # a running run writes a `running` row at most this often (and at least)
+STALE_S = 600.0      # a row from another host without a newer row for this long is not live
+ADMIT_POLL_S = 5.0   # how often a run waiting for headroom re-checks the ledger
+IN_FLIGHT_STATUSES = ("admitted", "running")
+
+
+@dataclass(frozen=True)
+class InFlight:
+    """A run counted as in flight: the latest row of its run id (module doc)."""
+
+    run_id: str
+    key: str
+    status: str
+    hard_usd: float
+    spend_usd: float
+    pid: int
+    host: str
+
+    @property
+    def reserved(self) -> float:
+        """Headroom it still holds: `hard_usd - spend_usd`, at least 0."""
+        return max(0, to_nano(self.hard_usd) - to_nano(self.spend_usd)) / NANO
+
+    def describe(self) -> str:
+        where = "" if self.host == socket.gethostname() else f" on {self.host}"
+        return f"{self.run_id} ${self.reserved:.4f} ({self.status}, pid {self.pid}{where})"
+
+    def to_dict(self) -> dict:
+        return {"run_id": self.run_id, "key": self.key, "status": self.status,
+                "hard_usd": self.hard_usd, "spend_usd": self.spend_usd,
+                "reserved_usd": self.reserved, "pid": self.pid, "host": self.host}
+
+
+@dataclass(frozen=True)
+class LedgerState:
+    """`spent`: latest `spend_usd` summed over run instances (keys); `in_flight`: the runs
+    whose headroom is reserved."""
+
+    spent: float
+    in_flight: tuple[InFlight, ...]
+
+    @property
+    def reserved(self) -> float:
+        return sum(to_nano(f.reserved) for f in self.in_flight) / NANO
+
+    def describe_in_flight(self) -> str:
+        return ", ".join(f.describe() for f in self.in_flight)
+
+
+@dataclass(frozen=True)
+class Admission:
+    """`ExperimentLedger.admit`'s answer. `wait`: refused only because of runs in flight
+    (spend + this run's `hard_usd` fits once they end), so retry when one ends."""
+
+    refusal: str | None
+    spent: float
+    reserved: float
+    in_flight: tuple[InFlight, ...] = ()
+    wait: bool = False
+
+    @property
+    def checked(self) -> float:
+        """Spend + reserved headroom the run was checked against."""
+        return self.spent + self.reserved
+
+
 class ExperimentLedger:
     """`<out>/<experiment>.ledger.jsonl`: the experiment's spend over every run (module doc)."""
 
@@ -133,13 +219,22 @@ class ExperimentLedger:
 
     @contextmanager
     def lock(self) -> Iterator[Any]:
+        """The file, open for append under an exclusive `flock`. If `compact` replaced the file
+        while this process waited for the lock, the new file is opened and locked instead."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a+b") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                yield f
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+        while True:
+            with open(self.path, "a+b") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    try:
+                        current = os.fstat(f.fileno()).st_ino == os.stat(self.path).st_ino
+                    except FileNotFoundError:
+                        current = False
+                    if current:
+                        yield f
+                        return
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
 
     @staticmethod
     def _append(f: Any, line: str) -> None:
@@ -163,49 +258,58 @@ class ExperimentLedger:
                 row = json.loads(line)
             except ValueError:  # a torn last line from a killed process
                 continue
-            if isinstance(row, dict) and "key" in row:
+            if isinstance(row, dict) and "key" in row and "run_id" in row:
                 out.append(row)
         return out
 
     @staticmethod
-    def _state(rows: list[dict]) -> tuple[dict[str, dict], dict[str, dict]]:
-        """(latest row per key, pending `admitted` row per run id)."""
-        latest: dict[str, dict] = {}
-        pending: dict[str, dict] = {}
-        for row in rows:
-            if row.get("status") == "admitted":
-                pending[row["run_id"]] = row
-                continue
-            pending.pop(row.get("run_id"), None)
-            latest[row["key"]] = row
-        return latest, pending
+    def compacted(rows: list[dict]) -> list[dict]:
+        """The rows that carry the state, in file order: the latest row per run instance (key),
+        which holds its spend, and the latest row per run id, which says whether it is in
+        flight. A superseded `admitted` row (spend 0) is dropped."""
+        latest_key: dict[str, int] = {}
+        latest_run: dict[str, int] = {}
+        for i, row in enumerate(rows):
+            latest_key[row["key"]] = i
+            latest_run[row["run_id"]] = i
+        keep = set(latest_run.values())
+        keep.update(i for i in latest_key.values() if rows[i].get("status") != "admitted")
+        return [rows[i] for i in sorted(keep)]
 
     @staticmethod
-    def _live(row: dict) -> bool:
-        if row.get("host") != socket.gethostname():
-            return True
-        return _pid_alive(int(row.get("pid") or 0))
+    def _live(row: dict, now: float) -> bool:
+        if row.get("host") == socket.gethostname():
+            return _pid_alive(int(row.get("pid") or 0))
+        return now - float(row.get("ts") or 0) <= STALE_S
+
+    def state(self, exclude: str | None = None, rows: list[dict] | None = None) -> LedgerState:
+        """Spend and runs in flight (module doc), leaving out run instance key or run id
+        `exclude` and simulated rows."""
+        rows = self.compacted(self.rows() if rows is None else rows)
+        latest_key: dict[str, dict] = {}
+        latest_run: dict[str, dict] = {}
+        for row in rows:
+            latest_key[row["key"]] = row
+            latest_run[row["run_id"]] = row
+        spent = sum(to_nano(float(r.get("spend_usd") or 0)) for k, r in latest_key.items()
+                    if exclude not in (k, r["run_id"]) and not r.get("simulated"))
+        now = time.time()
+        in_flight = tuple(
+            InFlight(rid, r["key"], r["status"], float(r.get("hard_usd") or 0),
+                     float(r.get("spend_usd") or 0), int(r.get("pid") or 0), str(r.get("host")))
+            for rid, r in latest_run.items()
+            if r.get("status") in IN_FLIGHT_STATUSES and not r.get("simulated")
+            and exclude not in (rid, r["key"]) and self._live(r, now))
+        return LedgerState(spent / NANO, in_flight)
 
     def totals(self, exclude: str | None = None, rows: list[dict] | None = None
                ) -> tuple[float, float]:
         """(spend, headroom reserved by runs in flight), leaving out key or run id `exclude`."""
-        latest, pending = self._state(self.rows() if rows is None else rows)
-        spent = 0
-        reserved = 0
-        for key, row in latest.items():
-            if exclude in (key, row.get("run_id")) or row.get("simulated"):
-                continue
-            spent += to_nano(float(row.get("spend_usd") or 0))
-            if row.get("status") == "running" and self._live(row):
-                reserved += max(0, to_nano(float(row.get("hard_usd") or 0))
-                                - to_nano(float(row.get("spend_usd") or 0)))
-        for run_id, row in pending.items():
-            if exclude != run_id and self._live(row):
-                reserved += to_nano(float(row.get("hard_usd") or 0))
-        return spent / NANO, reserved / NANO
+        st = self.state(exclude, rows)
+        return st.spent, st.reserved
 
     def spent(self, exclude: str | None = None) -> float:
-        return self.totals(exclude)[0]
+        return self.state(exclude).spent
 
     def run_ids(self) -> set[str]:
         return {r["run_id"] for r in self.rows()}
@@ -223,25 +327,51 @@ class ExperimentLedger:
         with self.lock() as f:
             self._append(f, line)
 
-    def backfill(self, meta: Mapping) -> bool:
+    def _rewrite(self, rows: list[dict]) -> None:
+        """Replace the file by `rows` (atomic rename; call under `lock`)."""
+        tmp = self.path.with_name(self.path.name + ".compact.tmp")
+        with open(tmp, "wb") as f:
+            f.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows).encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+
+    def compact(self) -> int:
+        """Rewrite the file keeping only `compacted` rows; returns how many rows were dropped."""
+        with self.lock():
+            rows = self.rows()
+            keep = self.compacted(rows)
+            if len(keep) < len(rows):
+                self._rewrite(keep)
+            return len(rows) - len(keep)
+
+    def backfill(self, meta: Mapping, keys: set[str] | None = None) -> bool:
         """Add a row for a run dir's `run.json` when the ledger has none for that run instance
-        (run dirs written before the ledger existed, or copied in); True if one was added."""
+        (run dirs written before the ledger existed, or copied in); True if one was added. A
+        run.json that is not `ended` (its process was killed) is recorded as `interrupted`:
+        a live run writes its own rows, so a backfilled one is never in flight."""
         from .spec import unbilled_spec
 
         key = f"{meta['run_id']}@{meta.get('started_at') or 'legacy'}"
-        if any(r["key"] == key for r in self.rows()):
+        if key in (keys if keys is not None else {r["key"] for r in self.rows()}):
             return False
         extra = {"simulated": True} if unbilled_spec(meta.get("spec") or {}) else {}
-        self.record(meta["run_id"], key, ledger_total(meta.get("ledger")),
-                    str(meta.get("status") or "ended"),
+        status = str(meta.get("status") or "ended")
+        if status in IN_FLIGHT_STATUSES:
+            extra["backfilled_status"] = status
+            status = "interrupted"
+        self.record(meta["run_id"], key, ledger_total(meta.get("ledger")), status,
                     hard=float((meta.get("budget") or {}).get("hard_usd") or 0),
                     spec_hash=meta.get("spec_hash"), backfilled=True, **extra)
+        if keys is not None:
+            keys.add(key)
         return True
 
     def backfill_dir(self, out: Path | str) -> int:
         """`backfill` every run dir directly under `out` whose `run.json` names this
         experiment; returns how many rows were added."""
         name = self.path.name.removesuffix(".ledger.jsonl")
+        keys = {r["key"] for r in self.rows()}
         added = 0
         for d in sorted(Path(out).glob("*/run.json")):
             try:
@@ -249,22 +379,33 @@ class ExperimentLedger:
             except (OSError, ValueError):
                 continue
             if meta.get("experiment") == name and "run_id" in meta:
-                added += self.backfill(meta)
+                added += self.backfill(meta, keys)
         return added
 
     def admit(self, run_id: str, hard: float, total: float, spec_hash: str | None = None
-              ) -> tuple[str | None, float]:
-        """The start check (module doc): (refusal or None, spend + reserved it was checked
-        against). An admitted run gets an `admitted` row in the same locked step."""
+              ) -> Admission:
+        """The start check (module doc). An admitted run gets an `admitted` row in the same
+        locked step. The file is compacted first when most of its rows are superseded."""
         with self.lock() as f:
-            spent, reserved = self.totals()
-            why = total_cap_refusal(spent + reserved, hard, total)
-            if why and reserved > 0:
-                why += f" (${reserved:.4f} of it reserved by runs still in flight)"
+            rows = self.rows()
+            keep = self.compacted(rows)
+            st = self.state(rows=keep)
+            why = total_cap_refusal(st.spent + st.reserved, hard, total)
+            wait = (why is not None and st.in_flight != ()
+                    and total_cap_refusal(st.spent, hard, total) is None)
+            if why and st.in_flight:
+                why += (f" (${st.reserved:.4f} of it reserved by {len(st.in_flight)} run(s) "
+                        f"still in flight: {st.describe_in_flight()})")
+            line = None
             if why is None:
-                self._append(f, self._row(run_id, f"{run_id}@admit", 0.0, "admitted", hard,
-                                          spec_hash))
-            return why, spent + reserved
+                line = self._row(run_id, f"{run_id}@admit", 0.0, "admitted", hard, spec_hash)
+            if len(rows) > 200 and len(keep) * 2 < len(rows):
+                # one atomic rewrite that already holds the new row: a process that opens the
+                # new file sees it; one waiting on the old file reopens (`lock`)
+                self._rewrite(keep + ([json.loads(line)] if line else []))
+            elif line:
+                self._append(f, line)
+            return Admission(why, st.spent, st.reserved, st.in_flight, wait)
 
 
 class Ledger(Persistable):

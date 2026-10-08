@@ -36,7 +36,10 @@ Project-level copies work too: `.claude/skills/swarmlab/`, `.agents/skills/swarm
 Size it to the budget first. Put the user's total in the spec as `budget: {total_usd: T}` (top
 level): `swarmlab run` then never starts a run that could push the experiment past T. The
 spend is shared through `runs/<experiment>.ledger.jsonl`, so separate invocations, parallel
-shells and `swarmlab run --parallel N` all count against the same T (same `--out`).
+shells and `swarmlab run --parallel N` all count against the same T (same `--out`). A run whose
+`hard_usd` fits only after runs in flight end waits for them (`total cap: waiting to start ...`);
+hard ceilings far above the real cost per run make runs wait, so size `hard_usd` from measured
+spend.
 
 - **Total under $2: the short checklist.** A separate smoke run and a second-agent review would
   eat a large share of the money, and one round's worst-case estimate can be a fifth of the
