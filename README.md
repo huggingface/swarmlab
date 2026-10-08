@@ -25,7 +25,7 @@ The framework handles everything else: tool dispatch, turn order, logging, budge
 
 ## Highlights
 
-- **Tasks with a ground truth.** The Flag Game tests belief dynamics and Coloring tests allocation. You can add your own `World` in about 15 lines.
+- **Tasks with a ground truth.** The [Flag Game](https://arxiv.org/abs/2609.19124) tests belief dynamics and Coloring tests allocation. You can add your own `World` in about 15 lines.
 - **Communication is the variable you change.** Pick a topology (`broadcast`, `gossip`, `groups`, `star`, `tree`), add delay or custom visibility policies, use a claim registry, and assign roles such as manager, skeptic or reviewer.
 - **Mixed swarms.** Use Anthropic, Hugging Face Inference Providers, OpenAI, self-hosted vLLM or deterministic fake models, and mix them within one arm.
 - **Built-in measurement.** Belief consensus, accuracy, polarization and entropy; out-of-band belief probes; communication metrics; interventions in the middle of a run; paired runs.
