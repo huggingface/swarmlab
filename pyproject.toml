@@ -25,6 +25,7 @@ swarmlab = "swarmlab.cli:app"
 [project.entry-points."swarmlab.worlds"]
 flaggame = "swarmlab.world.flaggame:FlagGame"
 coloring = "swarmlab.world.coloring:ColoringGrid"
+cascade = "swarmlab.world.cascade:CascadeWorld"
 
 [project.entry-points."swarmlab.claim_policies"]
 advisory = "swarmlab.medium.registry:Advisory"
@@ -48,6 +49,7 @@ row_major_painter = "swarmlab.participants.scripted:RowMajorPainter"
 queue_painter = "swarmlab.participants.scripted:QueuePainter"
 random_painter = "swarmlab.participants.scripted:RandomPainter"
 llm = "swarmlab.participants.llm:LLMAgent"
+cascade_worker = "swarmlab.participants.cascade:CascadeWorker"
 
 [project.entry-points."swarmlab.metrics"]
 "belief.accuracy" = "swarmlab.metrics.belief:Accuracy"
@@ -90,6 +92,7 @@ fake = "swarmlab.providers.fake:FakeProvider"
 [project.entry-points."swarmlab.fake_scripts"]
 flaggame_reader = "swarmlab.providers.fake:flaggame_reader"
 painter = "swarmlab.world.coloring:fake_painter"
+cascade_herder = "swarmlab.world.cascade:fake_herder"
 
 [build-system]
 requires = ["hatchling"]

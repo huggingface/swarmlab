@@ -1,0 +1,78 @@
+# Information cascade, the "grader" scenario of Free Systems' "Extraordinary multi-agent
+# delusions" (docs/guide/cascade.md). 20 one-shot workers act once each, in order W00..W19, in one
+# round; worker k sees the board posts of workers 0..k-1. Signals are 70% reliable; *_stress arms
+# force W00-W03's signals wrong. Truth: output_only. Arms are paired by seed (same signal draws).
+# Qwen3.8-27B with thinking off on DeepInfra (Cerebras was circuit-broken with HTTP 503 on
+# 2026-10-08). Measured: ~$0.01 per no-board run, ~$0.04-0.05 per board run.
+# *_dry arms run the same setup on the free scripted herder (fake:cascade_herder).
+name: cascade
+seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+budget: {total_usd: 15.0}   # covers the six real arms x 40 seeds plus in-flight headroom
+options:
+  max_rounds: 1
+  commit: immediate
+  scheduler: {type: "swarmlab.scheduler:Scheduler"}   # fixed order a000, a001, ...
+providers:
+  hf: {type: openai_compat, params: {name: hf, timeout_s: 90, max_retries: 3,
+                                     pricing: {"Qwen/Qwen3.8-27B:deepinfra": [0.20, 2.50, 0.20]}}}  # router listing, 2026-10-08
+
+x-qwen: &qwen
+  model: "hf:Qwen/Qwen3.8-27B:deepinfra"
+  max_tokens: 1024
+  extra: {chat_template_kwargs: {enable_thinking: false}}
+x-fake: &fake {model: "fake:cascade_herder"}
+x-board: &board {topology: broadcast, delivery: push, push_limit: 50}
+x-metrics: &metrics [belief.accuracy, belief.consensus]
+x-budget: &budget {soft_usd: 0, hard_usd: 0.5}
+x-stress: &stress {type: cascade, params: {truth: output_only, n_wrong_first: 4}}
+x-normal: &normal {type: cascade, params: {truth: output_only, n_wrong_first: 0}}
+
+arms:
+  noboard_stress:       # control: every worker sees the empty board
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen, show_board: false}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+  board_stress:         # the source's stress test
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+  board_normal:         # no forced errors
+    world: *normal
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+  board_quote_stress:   # board rule: quote your own probe result exactly
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen, board_rule: quote}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+  board_disclose_stress:  # each post carries the worker's committed interpretation
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen, disclose_belief: true}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+  board_reward_stress:  # pay tied to the commitments of W15-W19
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen, reward_last: 5, n_workers: 20}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+
+  noboard_stress_dry:
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *fake, show_board: false}}]
+    medium: *board
+    metrics: *metrics
+  board_stress_dry:
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *fake}}]
+    medium: *board
+    metrics: *metrics
