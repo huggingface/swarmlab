@@ -29,7 +29,7 @@ def arms():
 
 def test_validates_with_nine_arms():
     doc = load_experiment_yaml(SPEC)
-    assert doc["seeds"] == [1] and doc["budget"]["total_usd"] == 10
+    assert doc["seeds"] == list(range(1, 11)) and doc["budget"]["total_usd"] == 15
     assert list(doc["arms"]) == [f"{p}-{n}" for p in ("pairwise", "broadcast", "manager") for n in NS]
     hard = sum(a["budget"]["hard_usd"] for a in doc["arms"].values())
     assert hard <= doc["budget"]["total_usd"]
