@@ -16,6 +16,7 @@ from swarmlab.spec import load_experiment_yaml
 from swarmlab.view import View
 from swarmlab.world.cascade import (
     ACCEPTED,
+    BOARD_HEADERS,
     EMPTY_BOARD,
     INSTRUCTION,
     INSTRUCTION_DISCLOSED,
@@ -23,6 +24,8 @@ from swarmlab.world.cascade import (
     QUOTE_RULE,
     READS,
     REJECTED,
+    SUBMIT_FORMAT,
+    TOOL_BOARD_LINE,
     CascadeWorld,
 )
 
@@ -171,3 +174,77 @@ def test_disclose_tags_the_post(tmp_path):
     spec.write_text(yaml.safe_dump({**doc, "arms": {"d": arm}}))
     run = Experiment.from_yaml(spec, "d").run(seed=3, out=tmp_path / "runs")
     assert posts(run)[0].startswith("W00 [committed: reads_transcript]: ")
+
+
+def test_board_header_variants():
+    v = view("a007", ["W00: one"])
+    assert BOARD_HEADERS["agents"] in worker(board_header="agents").round_message(v).content
+    assert BOARD_HEADERS["humans"] in worker(board_header="humans").round_message(v).content
+    assert "BOARD (custom):" in worker(board_header="BOARD (custom):").round_message(v).content
+    assert EMPTY_BOARD in worker("a000", board_header="humans").round_message(view("a000", [])).content
+
+
+def test_tool_channel_moves_the_board_and_the_answer_format():
+    v = view("a007", ["W00: one"])
+    text = worker(board_channel="tool").round_message(v).content
+    assert TOOL_BOARD_LINE in text and "W00: one" not in text
+    assert text.endswith(SUBMIT_FORMAT)
+    with pytest.raises(ValueError):
+        worker(board_channel="carrier pigeon")
+
+
+def script_submit(request, rng):
+    """Submit with a missing field first, then a valid submit (the retry follows a tool result)."""
+    from swarmlab.providers.base import text_of
+
+    from .helpers import _resp
+
+    retry = any(m.role == "tool" and "could not be used" in text_of(m.content) for m in request.messages)
+    args = {"board_post": "my probe said so", "interpretation": "reads_transcript"}
+    return _resp(request, calls=[("submit", args if retry else {"board_post": "oops"})])
+
+
+def tool_arm_spec(tmp_path, model: str) -> Path:
+    import yaml
+
+    doc = load_experiment_yaml(SPEC)
+    arm = doc["arms"]["board_tool_stress_dry"]
+    arm["participants"][0]["params"]["model"] = model
+    spec = tmp_path / "spec.yaml"
+    spec.write_text(yaml.safe_dump({**doc, "arms": {"t": arm}}))
+    return spec
+
+
+def requests_of(run, agent: str) -> list[dict]:
+    d = Path(run.dir)
+    events = [json.loads(line) for line in (d / "events.jsonl").read_text().splitlines()]
+    hashes = [e["request_hash"] for e in events if e["type"] == "inference_attempt" and e["agent"] == agent]
+    return [json.loads((d / "blobs" / h[:2] / h).read_text()) for h in hashes]
+
+
+def test_tool_channel_prefills_read_board_and_forces_submit(tmp_path):
+    run = Experiment.from_yaml(tool_arm_spec(tmp_path, "fake:tests.test_cascade:script_submit"),
+                               "t").run(seed=3, out=tmp_path / "runs")
+    assert len(commits(run)) == 20 and posts(run)[0] == "W00: my probe said so"
+    first, retry = requests_of(run, "a005")
+    roles = [m["role"] for m in first["messages"]]
+    assert roles == ["system", "user", "assistant", "tool"]
+    call, result = first["messages"][2]["tool_calls"][0], first["messages"][3]
+    assert call["name"] == "read_board" and result["tool_call_id"] == call["call_id"]
+    assert result["content"].startswith("SHARED WORKER BOARD (posts by earlier workers")
+    assert "W04: my probe said so" in result["content"]
+    assert [t["name"] for t in first["tools"]] == ["read_board", "submit"]
+    assert first["extra"]["tool_choice"] == {"type": "function", "function": {"name": "submit"}}
+    assert [m["role"] for m in retry["messages"]][4:] == ["assistant", "tool"]  # bad submit + its result
+
+
+def test_tool_channel_board_text_matches_the_user_channel(tmp_path):
+    tool_run = Experiment.from_yaml(tool_arm_spec(tmp_path, "fake:cascade_herder"), "t").run(
+        seed=3, out=tmp_path / "runs")
+    user_run = Experiment.from_yaml(SPEC, "board_stress_dry").run(seed=3, out=tmp_path / "runs")
+    board = requests_of(tool_run, "a007")[0]["messages"][3]["content"]
+    user = requests_of(user_run, "a007")[0]["messages"][1]["content"]
+    user = user if isinstance(user, str) else "".join(p["text"] for p in user)
+    assert board in user  # same posts, same header: only the channel differs
+    assert [a["feedback"]["interpretation"] for a in commits(tool_run)] == \
+        [a["feedback"]["interpretation"] for a in commits(user_run)]

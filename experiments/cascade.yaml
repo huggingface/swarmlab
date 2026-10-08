@@ -3,12 +3,13 @@
 # round; worker k sees the board posts of workers 0..k-1. Signals are 70% reliable; *_stress arms
 # force W00-W03's signals wrong. Truth: output_only. Arms are paired by seed (same signal draws).
 # Qwen3.8-27B with thinking off on DeepInfra (Cerebras was circuit-broken with HTTP 503 on
-# 2026-10-08). Measured: ~$0.01 per no-board run, ~$0.04-0.05 per board run.
+# 2026-10-08). Measured: ~$0.01 per no-board run, ~$0.04-0.05 per board run, ~$0.08 per
+# board_tool_stress run.
 # *_dry arms run the same setup on the free scripted herder (fake:cascade_herder).
 name: cascade
 seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
         21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
-budget: {total_usd: 15.0}   # covers the six real arms x 40 seeds plus in-flight headroom
+budget: {total_usd: 25.0}   # covers the nine real arms x 40 seeds plus in-flight headroom
 options:
   max_rounds: 1
   commit: immediate
@@ -65,6 +66,24 @@ arms:
     medium: *board
     metrics: *metrics
     budget: *budget
+  board_agents_stress:  # board header: posts by the other AI agents
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen, board_header: agents}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+  board_humans_stress:  # board header: posts by the human workers
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen, board_header: humans}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
+  board_tool_stress:    # board as a pre-filled read_board result; answer through a forced submit call
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *qwen, board_channel: tool, max_tokens: 2048}}]
+    medium: *board
+    metrics: *metrics
+    budget: *budget
 
   noboard_stress_dry:
     world: *stress
@@ -74,5 +93,10 @@ arms:
   board_stress_dry:
     world: *stress
     participants: [{type: cascade_worker, count: 20, params: {<<: *fake}}]
+    medium: *board
+    metrics: *metrics
+  board_tool_stress_dry:
+    world: *stress
+    participants: [{type: cascade_worker, count: 20, params: {<<: *fake, board_channel: tool}}]
     medium: *board
     metrics: *metrics

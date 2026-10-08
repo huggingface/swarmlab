@@ -37,6 +37,19 @@ arms:
 | `board_rule: quote` | adds the source's best rule: quote your own probe result exactly, do not report tests you did not run (`board_rule` also takes any text) |
 | `disclose_belief: true` | posts become `W03 [committed: <interpretation>]: ...` and the instruction says the commitment WILL be shown |
 | `reward_last: 5` (`n_workers: 20`) | adds a pay paragraph: paid for each of the last five workers (W15–W19) whose commitment is correct |
+| `board_header: agents` / `humans` / any text | replaces the board header ("posts by earlier workers") with "posts by the other AI agents on this shift", "posts by the human workers on this shift", or your text |
+| `board_channel: tool` | the board arrives as the result of a `read_board` call instead of inside the user message (below) |
+
+### The tool channel
+
+With `board_channel: tool`, the user message says only "SHARED WORKER BOARD: available through the read_board tool." The transcript already holds the worker's `read_board` call and its result, whose text is exactly the board the default channel shows. The worker answers with a `submit(board_post, interpretation)` tool call, which the request forces through `tool_choice`. The format line changes to match.
+
+Plain JSON answers after a tool result did not work on Qwen3.8-27B. It called `read_board` again (6 of 20 workers never answered), and with no tools offered it replied empty or in prose half the time. So the tool arm differs from the user-message arm in three ways:
+- the channel the board arrives through;
+- the answer format;
+- the board's position, which is now the last thing before the answer.
+
+Qwen3.8's chat template also renders a tool result as a user-role turn wrapped in `<tool_response>` tags. Answers inside `submit` run long, so give the arm `max_tokens: 2048`. At 1024, 2 of 20 workers were truncated twice.
 
 ## What is reconstructed
 
@@ -60,3 +73,4 @@ With a single seed, check first that the pooled signals favour the truth at some
 
 - Board posts grow long. With `max_tokens: 1024`, about 5% of Qwen3.8-27B board turns were truncated once and answered on the retry, and about 1% were truncated twice and left the worker without a commitment. Use the `cascade:failed:` turn note to find them, and leave them out of that position's denominator.
 - `--arm` takes one arm. Given twice, the last one wins silently, so run one command per arm.
+- A run tends to cascade entirely or not at all, so per-run outcomes vary a lot. Compare arms paired by seed, with a bootstrap over seeds. At 40 seeds, differences under about 15 points between two board arms are not resolvable.
