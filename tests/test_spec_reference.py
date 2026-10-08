@@ -1,4 +1,4 @@
-"""`swarmlab spec-reference`, README's generated section, and readable shape errors."""
+"""`swarmlab spec-reference`, the spec-reference page's generated section, and readable shape errors."""
 from pathlib import Path
 
 import pytest
@@ -8,7 +8,7 @@ from swarmlab.cli import app
 from swarmlab.spec import SpecError, validate_experiment_doc
 from swarmlab.spec_reference import DESCRIPTIONS, readme_section, spec_reference
 
-README = Path(__file__).resolve().parent.parent / "README.md"
+README = Path(__file__).resolve().parent.parent / "docs" / "guide" / "spec-reference.md"
 runner = CliRunner()
 
 

@@ -4,9 +4,9 @@ The reference is generated from the pydantic models in `swarmlab/spec.py` (`Expe
 `ArmDoc`, `MediumSpec`, `ParticipantGroup`, `PluginSpec`, `Budget`, `RunOptions`) and
 `swarmlab/roles.py` (`Role`): every key, its shape and its default come from the models; the
 one-line meaning of each key comes from `DESCRIPTIONS` below (a test checks that every model
-field has one). README.md's "Spec reference" section is this output verbatim between the
+field has one). docs/guide/spec-reference.md is this output verbatim between the
 `<!-- spec-reference:start -->` / `<!-- spec-reference:end -->` markers (a test checks they agree;
-regenerate with `swarmlab spec-reference --readme README.md`).
+regenerate with `swarmlab spec-reference --readme docs/guide/spec-reference.md`).
 
 `explain_validation_error(err)` turns a pydantic `ValidationError` raised on an experiment
 document into one line per problem, each naming the key path and the shape that key expects
@@ -240,7 +240,7 @@ def _lines(model: type[BaseModel], prefix: str, depth: int,
 
 
 def spec_reference() -> str:
-    """The Markdown body of README.md's "Spec reference" section."""
+    """The Markdown body of docs/guide/spec-reference.md's generated block."""
     lines = [
         ("Every key of an experiment YAML, generated from the pydantic models "
          "(`swarmlab spec-reference` prints this list). Unknown keys are errors. Wherever the "

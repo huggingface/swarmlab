@@ -256,17 +256,17 @@ def test_first_error_line_and_percentile():
 
 
 def test_readme_truth_metric_example_runs(tmp_path):
-    """The README's `verify()`-based metric sample works as written (field notes item 10)."""
+    """The analysis guide's `verify()`-based metric sample works as written (field notes item 10)."""
     import re
 
     from .helpers import site_experiment
 
-    readme = (REPO / "README.md").read_text()
+    readme = (REPO / "docs" / "guide" / "analysis.md").read_text()
     section = readme.split("### Analysis patterns")[1].split("\n## ")[0]
     code = re.search(r"```python\n(.*?)```", section, re.DOTALL).group(1)
     assert len(code.strip().splitlines()) <= 17
     ns: dict = {}
-    exec(compile(code, "README.md", "exec"), ns)  # noqa: S102 - our own README sample
+    exec(compile(code, "analysis.md", "exec"), ns)  # noqa: S102 - our own docs sample
     exp = site_experiment(crash=False)
     exp.metrics.append(ns["BestSiteShare"]())
     run = exp.run(seed=2, max_rounds=3, out=tmp_path)
