@@ -71,10 +71,11 @@ the experiment's spend (`<out>/<experiment>.ledger.jsonl` over every other run i
 run's ledger) >= `total_usd` -> `run_ended(total_budget)`, all checked at the round boundary
 (also before round 1). `total_budget` is resumable like `soft_budget`.
 
-Experiment ledger (swarmlab/budget.py `ExperimentLedger`): every `run.json` write also appends a
-row (run id, instance key `<run_id>@<started_at>`, spec hash, spend so far, status, hard_usd,
-pid, host, time) to `<run dir's parent>/<experiment>.ledger.jsonl`; a live/resume call that
-leaves without ending appends a final `interrupted` row. A run that bills nothing (only `fake:`
+Experiment ledger (swarmlab/budget.py `ExperimentLedger`): a `run.json` write appends a row (run
+id, instance key `<run_id>@<started_at>`, spec hash, spend so far, status, hard_usd, pid, host,
+time) to `<run dir's parent>/<experiment>.ledger.jsonl` when the status changed or the last row is
+`budget.HEARTBEAT_S` (60 s) old; a daemon thread writes the same heartbeat during long rounds; a
+live/resume call that leaves without ending appends a final `interrupted` row. A run that bills nothing (only `fake:`
 models, `spec.unbilled_spec`) writes rows with `simulated: true`, which the ledger does not
 count, and is never stopped with `total_budget`. `run.json["started_at"]` is set when
 the run first starts and kept by resume.
