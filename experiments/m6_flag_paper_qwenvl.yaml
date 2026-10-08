@@ -1,0 +1,196 @@
+# Copy of m6_flag_paper.yaml with the model swapped to Qwen3-VL-30B-A3B-Instruct (Novita) and per-arm caps tripled.
+# M6: faithful replication of the Flag Game paper (Pavlova & Tanaka, arXiv 2609.19124) on an open
+# VLM. Contract: docs/INTERFACE-M6.md; paper setup: docs/notes/flag-game-paper-setup.md; handoff:
+# docs/handoff/WP17.md. NOT LAUNCHED: needs the user's approval of the estimate first
+# (`swarmlab estimate experiments/m6_flag_paper.yaml`). The WP16 sibling, m6_flag_vlm.yaml, runs
+# the same three protocols on synthetic flags with tool-using agents; keep both.
+#
+# World (every arm): the 28 real stripe-and-triangle flags (swarmlab/world/flags_real.py) on the
+# paper's 24x16 canvas, 6x4 crops at a uniformly random position per agent (25 px per cell, so a
+# crop is a 150x100 PNG, re-shown every call), name-only candidates ("Allowed countries: [...]",
+# no candidate images), no status tools (collective_status would leak the swarm's counts).
+#
+# Agents: Gemma 4 26B-A4B (instruction-tuned) on DeepInfra through the HF router, temperature 0.2,
+# JSON answers only (report_json: {"country", "reason"}, the paper's m=3), tool_protocol json (no
+# tools reach the API; the harness turns each answer into guess + post), memory "received".
+#
+# pairwise-N  the paper's asynchronous pairwise protocol: OneSpeaker (one random speaker per
+#             round), gossip k=1 (one random listener), immediate commit; each agent remembers
+#             the last H=8 messages it received; Tmax = kappa*N with kappa = rounds_per_agent = 10
+#             (the paper does not state kappa); every agent is probed every N rounds (one t/N
+#             step) with the m=1 schema; the run stops after 5 consecutive probes at 100%
+#             consensus. Max tokens 200.
+# broadcast-N the paper's synchronous broadcast: every agent answers every round (round_end) and
+#             then sees the other N-1 current answers (push, newest N-1, each pushed once); it
+#             remembers its own past decisions (answers_kept 8). 10 rounds, probed every round.
+#             Max tokens 250.
+# manager-N   N observers with crops plus one blind manager a000 (FlagGame blind_agents: 1,
+#             blind_may_guess: true, the `manager` role made to act and to answer in JSON): the
+#             star topology sends every observer's report to a000 only and a000's decision to
+#             every observer, whose shared memory it becomes (H=8). 10 rounds, no probes: the
+#             endpoint is the manager's decision (`swarmlab report` "Terminal states"). Under
+#             round_end the manager decides on the previous round's reports. Max tokens 250.
+#
+# Budgets (docs/handoff/WP17.md has the arithmetic): hard_usd per arm is about 2x the realistic
+# per-run cost (prompt ~1,000 tokens with the image, completion <= max_tokens), well above
+# `swarmlab estimate`'s flat 3,000-token worst case only for the small arms; total_usd 10 caps
+# the experiment (the paper-scale N=128 broadcast arm is ~$1.5).
+name: m6-flag-paper-qwenvl
+seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+options: { commit: round_end, max_rounds: 10 }
+budget: { soft_usd: 0, hard_usd: 0.5, measurement_usd: 0, total_usd: 0 }
+# DeepInfra's HF-router price for Gemma 4 26B-A4B (2026-10-07 listing: $0.07 / $0.34 per million
+# prompt / completion tokens), pinned so validate/estimate/prompts work offline and the estimate
+# does not move under a listing change.
+providers:
+  hf: { type: openai_compat, params: { name: hf, pricing: { "Qwen/Qwen3-VL-30B-A3B-Instruct:novita": [0.20, 0.70, 0.20] } } }
+
+x-model: &model "hf:Qwen/Qwen3-VL-30B-A3B-Instruct:novita"
+x-world: &world
+  type: flaggame
+  params:
+    flags: real
+    candidates: names
+    modality: image
+    canvas: [24, 16]
+    crop: [6, 4]
+    status_tools: []
+x-manager-world: &manager_world
+  type: flaggame
+  params:
+    flags: real
+    candidates: names
+    modality: image
+    canvas: [24, 16]
+    crop: [6, 4]
+    status_tools: []
+    blind_agents: 1
+    blind_may_guess: true
+x-pairwise-llm: &pairwise_llm
+  model: *model
+  temperature: 0.2
+  max_tokens: 200
+  tool_protocol: json
+  report_json: true
+  memory: received
+  memory_messages: 8
+x-broadcast-llm: &broadcast_llm
+  model: *model
+  temperature: 0.2
+  max_tokens: 250
+  tool_protocol: json
+  report_json: true
+  memory: received
+  answers_kept: 8
+x-probe-question: &probe_q 'Output JSON exactly: {"country":"<one allowed country>"}'
+x-metrics: &metrics
+  - belief.state
+  - belief.accuracy
+  - belief.consensus
+  - { type: belief.state, params: { source: "probe:belief" } }
+  - { type: belief.accuracy, params: { source: "probe:belief" } }
+  - { type: belief.consensus, params: { source: "probe:belief" } }
+x-world-metrics: &world_metrics [belief.state, belief.accuracy, belief.consensus]
+x-pairwise-options: &pairwise_options
+  scheduler: one_speaker
+  commit: immediate
+  rounds_per_agent: 10
+  stop_when: { metric: "belief.consensus@probe:belief", op: ">=", value: 1.0, consecutive: 5 }
+x-round-options: &round_options { commit: round_end, max_rounds: 10 }
+x-b-pairwise-4: &b_pairwise_4 { hard_usd: 0.15 }
+x-b-pairwise-16: &b_pairwise_16 { hard_usd: 0.60 }
+x-b-pairwise-128: &b_pairwise_128 { hard_usd: 4.50 }
+x-b-broadcast-4: &b_broadcast_4 { hard_usd: 0.15 }
+x-b-broadcast-16: &b_broadcast_16 { hard_usd: 0.75 }
+x-b-broadcast-128: &b_broadcast_128 { hard_usd: 9.00 }
+x-b-manager-4: &b_manager_4 { hard_usd: 0.15 }
+x-b-manager-16: &b_manager_16 { hard_usd: 0.45 }
+x-b-manager-128: &b_manager_128 { hard_usd: 4.50 }
+
+roles:
+  manager:
+    may_act: true
+    prompt_append: >-
+      You are the manager. You have no crop of your own. The other players' answers (a country
+      and a one-sentence reason) reach only you, and your decision is the only answer they hear
+      from anyone. Each time, decide which allowed country their answers best support.
+
+arms:
+  pairwise-4:
+    world: *world
+    medium: { topology: { type: gossip, params: { k: 1 } }, delivery: push, push_limit: 8, push_consume: true }
+    participants: [ { type: llm, count: 4, params: *pairwise_llm } ]
+    probes: [ { type: belief, params: { every: 4, question: *probe_q } } ]
+    metrics: *metrics
+    options: *pairwise_options
+    budget: *b_pairwise_4
+  pairwise-16:
+    world: *world
+    medium: { topology: { type: gossip, params: { k: 1 } }, delivery: push, push_limit: 8, push_consume: true }
+    participants: [ { type: llm, count: 16, params: *pairwise_llm } ]
+    probes: [ { type: belief, params: { every: 16, question: *probe_q } } ]
+    metrics: *metrics
+    options: *pairwise_options
+    budget: *b_pairwise_16
+  pairwise-128:
+    world: *world
+    medium: { topology: { type: gossip, params: { k: 1 } }, delivery: push, push_limit: 8, push_consume: true }
+    participants: [ { type: llm, count: 128, params: *pairwise_llm } ]
+    probes: [ { type: belief, params: { every: 128, question: *probe_q } } ]
+    metrics: *metrics
+    options: *pairwise_options
+    budget: *b_pairwise_128
+  broadcast-4:
+    world: *world
+    medium: { topology: broadcast, delivery: push, push_limit: 3, push_consume: true }
+    participants:
+      - { type: llm, count: 4, params: { <<: *broadcast_llm, memory_messages: 3 } }
+    probes: [ { type: belief, params: { every: 1, question: *probe_q } } ]
+    metrics: *metrics
+    options: *round_options
+    budget: *b_broadcast_4
+  broadcast-16:
+    world: *world
+    medium: { topology: broadcast, delivery: push, push_limit: 15, push_consume: true }
+    participants:
+      - { type: llm, count: 16, params: { <<: *broadcast_llm, memory_messages: 15 } }
+    probes: [ { type: belief, params: { every: 1, question: *probe_q } } ]
+    metrics: *metrics
+    options: *round_options
+    budget: *b_broadcast_16
+  broadcast-128:
+    world: *world
+    medium: { topology: broadcast, delivery: push, push_limit: 127, push_consume: true }
+    participants:
+      - { type: llm, count: 128, params: { <<: *broadcast_llm, memory_messages: 127 } }
+    probes: [ { type: belief, params: { every: 1, question: *probe_q } } ]
+    metrics: *metrics
+    options: *round_options
+    budget: *b_broadcast_128
+  manager-4:
+    world: *manager_world
+    medium: { topology: { type: star, params: { center: a000 } }, delivery: push, push_limit: 4, push_consume: true }
+    participants:
+      - { type: llm, role: manager, params: { <<: *broadcast_llm, memory_messages: 4 } }
+      - { type: llm, count: 4, params: { <<: *broadcast_llm, memory_messages: 8 } }
+    metrics: *world_metrics
+    options: *round_options
+    budget: *b_manager_4
+  manager-16:
+    world: *manager_world
+    medium: { topology: { type: star, params: { center: a000 } }, delivery: push, push_limit: 16, push_consume: true }
+    participants:
+      - { type: llm, role: manager, params: { <<: *broadcast_llm, memory_messages: 16 } }
+      - { type: llm, count: 16, params: { <<: *broadcast_llm, memory_messages: 8 } }
+    metrics: *world_metrics
+    options: *round_options
+    budget: *b_manager_16
+  manager-128:
+    world: *manager_world
+    medium: { topology: { type: star, params: { center: a000 } }, delivery: push, push_limit: 128, push_consume: true }
+    participants:
+      - { type: llm, role: manager, params: { <<: *broadcast_llm, memory_messages: 128 } }
+      - { type: llm, count: 128, params: { <<: *broadcast_llm, memory_messages: 8 } }
+    metrics: *world_metrics
+    options: *round_options
+    budget: *b_manager_128

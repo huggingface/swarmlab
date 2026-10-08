@@ -27,3 +27,4 @@ Last checked against main on 2026-10-07. Items fixed since the first version (pe
 - Paired runs: `PairedResult` is not re-exported from `swarmlab` (import from `swarmlab.experiment`).
 - Registry: the viewer shows registry state as lists (tool results and actions); the `ColoringGrid` panel (`World.render_state`) draws the grids but not who holds which claim.
 - `LLMAgent` `summary_model` (context-limit summaries) is not priced by `Experiment.estimate`.
+- `swarmlab preflight` assumes native tool calling: for arms with `tool_protocol: json` / `report_json` it reports "NO tool call parsed" on a valid JSON reply (observed with Qwen3-VL on the m6 real-flag spec). It should send the arm's actual round-1 message and judge the reply by the arm's protocol.
