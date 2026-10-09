@@ -33,7 +33,8 @@ class Plugin:
     """Records constructor kwargs so `spec()` can serialise the instance for hashing and rebuild.
 
     Subclasses either call `super().__init__(**kwargs)` or rely on `__init_subclass__` wrapping,
-    which captures the bound arguments of the subclass's own `__init__` automatically.
+    which captures the bound arguments of the subclass's own `__init__` automatically. A `**name`
+    parameter's keys are merged into `params` (not nested under `name`), so `build` round-trips.
     `entry_point` is the name under the plugin's entry-point group; None means `module:Class`.
     It is honoured only when defined on the class itself, so a subclass of a registered plugin
     serialises as its own `module:Class`, never as its parent (INTERFACE §3).
@@ -48,12 +49,15 @@ class Plugin:
         if init is None:
             return
         sig = inspect.signature(init)
+        var_kw = next((p.name for p in sig.parameters.values() if p.kind is p.VAR_KEYWORD), None)
 
         def wrapped(self: Plugin, *args: Any, **kwargs: Any) -> None:
             bound = sig.bind(self, *args, **kwargs)
             bound.apply_defaults()
             params = dict(bound.arguments)
             params.pop("self", None)
+            if var_kw is not None:
+                params.update(params.pop(var_kw))
             # keep the outermost (most derived) constructor's params
             if not hasattr(self, "params"):
                 self.params = params
