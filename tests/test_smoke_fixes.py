@@ -1,4 +1,4 @@
-"""Fixes from the 2026-10-06 real-provider smoke (docs/notes/m1b-smoke-2026-10-06.md):
+"""Fixes from the 2026-10-06 real-provider smoke:
 LLMAgent `extra` passthrough, `max_tokens` default, `length` notes, opt-in text tool fallback,
 tolerant BeliefProbe parsing with candidate names from the context, and request shaping."""
 import json

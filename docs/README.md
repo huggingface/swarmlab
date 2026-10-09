@@ -25,9 +25,8 @@ The [project README](../README.md) is the overview. These pages are the referenc
 - [`DESIGN.md`](DESIGN.md): why the framework is shaped the way it is.
 - [`INTERFACE.md`](INTERFACE.md) and its extensions [`M1b`](INTERFACE-M1b.md), [`M3a`](INTERFACE-M3a.md), [`M3c`](INTERFACE-M3c.md), [`M4`](INTERFACE-M4.md), [`M5`](INTERFACE-M5.md), [`M6`](INTERFACE-M6.md): the binding contracts.
 - [`handoff/INDEX.md`](handoff/INDEX.md): what each work package built.
+- [`flag-game-paper-setup.md`](flag-game-paper-setup.md): the Flag Game paper's exact setup, which `INTERFACE-M6.md` implements.
 
-## Results and notes
+## Known issues
 
-- [`notes/known-issues.md`](notes/known-issues.md): open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `validate` rejecting `vllm:` specs, and role and paired-run gaps.
-- [`notes/m6-results-2026-10-08.md`](notes/m6-results-2026-10-08.md): latest results (Flag Game paper replication on Gemma 4).
-- [`notes/`](notes/): every run report and smoke note, dated.
+- [`known-issues.md`](known-issues.md): open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `validate` rejecting `vllm:` specs, and role and paired-run gaps.
