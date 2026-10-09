@@ -1,9 +1,8 @@
-"""M4 acceptance 3: `swarmlab report` reproduces the M2 report; `swarmlab prompts` renders the
-exact prompts of each participant group without a model call."""
+"""M4 acceptance 3: `swarmlab report` over finished runs; `swarmlab prompts` renders the exact
+prompts of each participant group without a model call."""
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -20,45 +19,7 @@ from swarmlab.report import build_report
 from .helpers import Chatter, llm_agent_experiment
 
 REPO = Path(__file__).resolve().parent.parent
-M2_RUNS = Path(os.environ.get("AM_LOCAL", "/nonexistent")) / "runs" / "m2"
-M2_NOTE = REPO / "docs" / "notes" / "m2-phase1-report-2026-10-06.md"
 cli = CliRunner()
-
-
-@pytest.mark.skipif(not (M2_RUNS / "m2-flaggame__bc-haiku__s1").is_dir(),
-                    reason="archived M2 runs not on this machine")
-def test_report_reproduces_the_m2_report(tmp_path):
-    out = tmp_path / "report.md"
-    res = cli.invoke(app, ["report", str(M2_RUNS), "--out", str(out),
-                           "--title", "M2 phase-1 Flag Game report"])
-    assert res.exit_code == 0, res.output
-    assert since_m2(out.read_text()) == M2_NOTE.read_text()
-
-
-def since_m2(text: str) -> str:
-    """The report without the rows and sections added after the M2 note was written."""
-    out, drop_blank, health, traj, dropped = [], False, False, False, False
-    for line in text.splitlines(keepends=True):
-        if line.startswith("## "):  # sections added later: protocol health, coloring
-            dropped = line.startswith(("## Protocol health", "## Coloring", "## Terminal states"))
-            traj = line.startswith("## Trajectories")
-        if dropped:
-            continue
-        if traj and line.startswith("| ") and "." in line.split(" | ")[0]:
-            continue  # every other logged metric (full dotted name), added later
-        health = health or line.startswith("## Tool protocol health")
-        if health and line.startswith("|---"):  # max_tokens, rejected tool calls appended later
-            line = line.replace("---|", "", 2)
-        elif health and line.startswith("|"):
-            line = line.rstrip("\n").rstrip(" |").rsplit(" | ", 2)[0] + " |\n"
-        if line.startswith(("| post_rate |", "Probes skipped:")):
-            drop_blank = line.startswith("Probes skipped:")
-            continue
-        if drop_blank and line == "\n":
-            drop_blank = False
-            continue
-        out.append(line)
-    return "".join(out)
 
 
 @pytest.fixture(scope="module")

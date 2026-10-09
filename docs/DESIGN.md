@@ -1,6 +1,6 @@
 # swarmlab: design
 
-Working name `swarmlab` (internal; rename before publishing, candidates checked on 2026-10-05 are in `research/`). Status (2026-10-07): built through M4 plus M3a/b/c (interventions, paired runs, context limit, registry and claim policies, ColoringGrid, roles, tree hierarchy, export and publish, HF Jobs with vLLM); 528 tests on main. What remains: the image variant of the Flag Game, plus the v2 items and the open problems in `docs/notes/known-issues.md`. Design settled 2026-10-06 after a structured review of 79 decisions, including two rounds of independent review; the text below is the design as decided, not rewritten per milestone, so a few details differ from the code (see the notes column of the status table). This is the first of many iterations: fundamentals are fixed here, details are filled in from experience. Background digests in `research/`.
+Working name `swarmlab` (internal; rename before publishing, candidates checked on 2026-10-05 are in `research/`). Status (2026-10-07): built through M4 plus M3a/b/c (interventions, paired runs, context limit, registry and claim policies, ColoringGrid, roles, tree hierarchy, export and publish, HF Jobs with vLLM); 528 tests on main. What remains: the image variant of the Flag Game, plus the v2 items and the open problems in `docs/known-issues.md`. Design settled 2026-10-06 after a structured review of 79 decisions, including two rounds of independent review; the text below is the design as decided, not rewritten per milestone, so a few details differ from the code (see the notes column of the status table). This is the first of many iterations: fundamentals are fixed here, details are filled in from experience. Background digests in `research/`.
 
 ## Purpose
 
@@ -206,7 +206,7 @@ All commands take `--json`. A skill and `AGENTS.md` ship in the repo and install
 
 ## Status by component
 
-Abbreviations: **tests** = the unit and acceptance tests in `tests/`; **M2** = Flag Game N=16/64 on Haiku 4.5 and Qwen3.5-9B (`docs/notes/m2-*`); **N=256** = the self-hosted Qwen3.5-9B job (`docs/notes/m3-scale-2026-10-07.md`); **paired/mixed** = `docs/notes/m3-paired-and-mixed-2026-10-07.md`; **dogfood** = a fresh agent running an experiment from the docs (`docs/notes/dogfood-*`).
+Abbreviations: **tests** = the unit and acceptance tests in `tests/`; **M2** = Flag Game N=16/64 on Haiku 4.5 and Qwen3.5-9B; **N=256** = the self-hosted Qwen3.5-9B job; **paired/mixed** = the paired Haiku run and the mixed Haiku+Qwen swarm; **dogfood** = a fresh agent running an experiment from the docs.
 
 | component | implemented in | validated by | notes |
 |---|---|---|---|

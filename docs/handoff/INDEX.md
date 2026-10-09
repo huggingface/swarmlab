@@ -1,6 +1,6 @@
 # Handoff index
 
-One line per work package. Contracts are in `docs/INTERFACE*.md`; run notes in `docs/notes/`; open problems in `docs/notes/known-issues.md`. There are no separate fix handoffs: the fix rounds (dogfood fixes, estimate/budget fixes, probe-error handling, report and export fixes) are recorded in the git log and in `docs/notes/dogfood-2026-10-07.md` and `dogfood-boardcue-report-2026-10-07.md`.
+One line per work package. Contracts are in `docs/INTERFACE*.md`; open problems in `docs/known-issues.md`. There are no separate fix handoffs: the fix rounds (dogfood fixes, estimate/budget fixes, probe-error handling, report and export fixes) are recorded in the git log.
 
 | WP | milestone | covers |
 |---|---|---|
