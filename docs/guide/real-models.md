@@ -1,6 +1,6 @@
 # Real models and budgets
 
-Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap and refusals. Read this before the first run that spends money. Back to the [docs index](../README.md).
+Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
 
 ## Switching to real models
 
@@ -28,3 +28,29 @@ Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget c
 - **Re-sending refused requests.** `refusal_retries: N` on an `llm` participant (default 0, today's behaviour) drops a refused response and re-sends the same messages, up to N times per turn. The dropped response is not kept in memory, and its partial tool calls are not executed. This works in the normal tool loop and under `report_json`. Re-sends do not count toward `max_calls`, but each one is a paid model call that `swarmlab estimate` does not include. Once the N re-sends are used up, a refusal is handled as with 0: the turn usually ends `no_tool`.
 - **Why re-sends need a new cache key.** The record/replay cache is keyed on the request hash, so re-sending an identical request would only return the cached refusal. Each re-send therefore sets `ChatRequest.attempt` (1, 2, ...). It is part of the request hash, but no provider ever receives it. The attempt numbers follow from the logged responses, so replay and resume rebuild the same requests and hit the cache without calling a provider. Do not set `seed` to vary a request: providers that honour `seed` would sample differently.
 - **Never use Anthropic's `fallbacks` in an experiment.** The server-side `fallbacks` option (beta) re-runs a refused request on another model inside the same API call and returns that model's answer. The client-side refusal-fallback middleware does the same. The run still records the model the arm asked for, so the arm silently mixes models and every comparison between models is corrupted. Do not put `fallbacks` in `extra`. To compare a model that refuses with one that does not, run them as separate arms and report their refusal counts.
+
+## Reasoning traces
+
+- **Getting summaries on Claude.** With thinking on (the default on Claude Opus 5.5, Sonnet 5.5, Haiku 5.5 and the Fable models), the API returns `thinking` blocks with empty text unless asked: the default display is `"omitted"`. Ask for readable summaries in the participant's `extra`:
+  ```yaml
+  params:
+    model: anthropic:claude-opus-5-5
+    extra: {thinking: {type: adaptive, display: summarized}, output_config: {effort: low}}
+  ```
+  The display setting costs nothing extra. Thinking is billed the same whether it is shown or hidden; only what comes back changes.
+- **The raw chain of thought is never available** from Anthropic: `summarized` gives a summary, and `omitted` gives nothing readable. `usage.reasoning_tokens` counts the tokens of the raw reasoning, not of the summary. `completion_tokens` includes them. Runs made before this field was filled show 0.
+- **What is recorded.** Each response stores the following, and all of it is in the response blob and the record/replay cache, so replay and resume reproduce it:
+  - `reasoning`: the thinking text, `""` when hidden.
+  - `reasoning_kind`: `summary`, `omitted`, or `text` for OpenAI-compatible servers.
+  - `reasoning_redacted`: the count of `redacted_thinking` blocks.
+  - For Claude, `provider_content`: the response's content blocks in order, thinking signatures included.
+- **Where to read it.**
+  - `swarmlab export` writes `reasoning`, `reasoning_kind` and `reasoning_redacted` columns in the `inference` table. The text is inlined up to 64 KB; longer text is given as the `sha256:` hash of the response blob, which is kept in `raw/blobs/`.
+  - Sessions (`sessions/<agent>.jsonl`) carry it as pi `thinking` blocks.
+  - `view.html` has a "Model calls" panel with each call's reasoning for the selected agent and round.
+- **Thinking goes back to Claude in tool loops.** `LLMAgent` keeps each response's thinking blocks with its assistant messages and sends them back unchanged, as the API asks when thinking is on. Without them, requests are accepted, but the model loses its reasoning from earlier in the turn. On Opus 5.5, its notes between tool calls also live in thinking blocks.
+  - On models that keep earlier thinking in context (preserved thinking: Opus 5.5, Sonnet 5.5, Fable 5.1), the blocks sent back count toward later requests' input tokens.
+  - Thinking blocks are bound to the exact history before them. When memory is trimmed from the front (`memory: window`, or a context-limit overflow), the agent drops every kept thinking block. Otherwise the API would reject the request on accounts that enforce this check.
+  - The system prompt and tools must stay fixed within a run (they are in the built-in worlds).
+  - Runs made before this change sent no thinking back, so Claude runs with thinking on are not directly comparable across the change.
+- **OpenAI-compatible servers** (vLLM, SGLang, DeepInfra and others serving Qwen or DeepSeek with thinking on) return the model's reasoning text in `message.reasoning_content` or `message.reasoning`. It is recorded as `reasoning` with kind `text`, which for open models is usually the full chain of thought. It is never sent back: chat templates drop earlier turns' reasoning, and some servers reject it. Turning thinking off (`chat_template_kwargs` or `reasoning_effort`, see above) leaves it empty.

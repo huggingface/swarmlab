@@ -33,6 +33,8 @@ Decisions where the contract is silent:
   `ChatRequest.attempt` raised (`LLMAgent(refusal_retries=N)`), which is a different hash and so
   a different cache entry; replay and resume reproduce the same attempts from the log's
   requests, so they hit the cache and never call a provider.
+- **Reasoning** (`ChatResponse.reasoning`, `provider_content`, ...) is part of the stored
+  response JSON, so cache hits, replay and resume return it unchanged.
 - Concurrent identical requests may both miss and both call the provider (no in-flight dedupe);
   the later write wins the cache file, which is harmless for a deterministic provider.
 """

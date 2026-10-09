@@ -145,6 +145,22 @@ protocol a reply with native tool calls is executed as such instead and ends the
 protocol no tools go through the API and the JSON answer is the only path. `report_json` and
 `report_fields` are in `params` only when set.
 
+**Reasoning** (thinking blocks). An assistant message keeps the response's `provider_content`
+(Anthropic content blocks with thinking and signatures, set only when the response carried
+thinking), so the adapter sends the thinking back unchanged in later requests, as the API asks
+for tool loops with thinking on (the model reads its earlier reasoning; without the blocks the
+request is accepted but that reasoning is lost). The blocks are bound to the exact history
+before them, and a request that replays one after that history changed is rejected (preserved
+thinking, enforced for accounts created on or after 2026-08-31). So whenever memory is trimmed
+from the front (`window` dropping a round, a context-limit `drop_oldest`/`summarize` overflow)
+every kept `provider_content` is removed first; removing all thinking is always accepted, and
+the turns after the trim produce new blocks on the new history. `full` memory is append-only
+and keeps all of them; `received` memory starts each turn afresh, so blocks live within a
+turn. The stripping is a pure function of the memory, so replay and resume rebuild the same
+requests. A message without reasoning has no `provider_content` key, so requests and memory
+are unchanged for models that do not think. The system prompt and the tool list must not change
+within a run for the blocks to stay valid (both are fixed in the built-in worlds).
+
 **Probing.** `probe_context()` returns `[system] + memory` as fresh `ChatMessage` objects (callers
 cannot mutate the agent's memory through them); `model_request_defaults()` returns `model,
 temperature, max_tokens, thinking_budget, extra`.
@@ -700,6 +716,9 @@ class LLMAgent(Participant):
         while len(self.rounds) > 1 and est + reserve > limit:
             dropped.append(self.rounds.pop(0))
             est = self._estimate_tokens(self._request(tools_offered))
+        if dropped:
+            self._drop_reasoning()
+            est = self._estimate_tokens(self._request(tools_offered))
         record["dropped_rounds"] = sum(1 for e in dropped if not e.get("summary"))
         if self.overflow == "summarize" and dropped:
             note = await self._summarize(dropped, tools)
@@ -783,6 +802,19 @@ class LLMAgent(Participant):
     def _append(self, msg: ChatMessage) -> None:
         self.rounds[-1]["messages"].append(msg.model_dump(mode="json"))
 
+    @staticmethod
+    def _assistant(resp: Any, tool_calls: list[ToolCall] | None = None) -> ChatMessage:
+        """The assistant message for `resp`, with its `provider_content` (thinking blocks) kept."""
+        return ChatMessage(role="assistant", content=resp.text or "", tool_calls=tool_calls,
+                           provider_content=resp.provider_content)
+
+    def _drop_reasoning(self) -> None:
+        """Remove every kept `provider_content` from memory: thinking blocks are bound to the
+        history before them, so once that history is trimmed none of them may be sent again."""
+        for entry in self.rounds:
+            for m in entry["messages"]:
+                m.pop("provider_content", None)
+
     def _request(self, tools: list[ToolSchema], attempt: int = 0) -> ChatRequest:
         return ChatRequest(messages=self.probe_context(), tools=tools, attempt=attempt,
                            tool_protocol=self.tool_protocol, **self.model_request_defaults())
@@ -800,7 +832,10 @@ class LLMAgent(Participant):
         if self.system is None:
             self.system = self._render_system(view)
         if self.memory == "window":
-            self.rounds = self.rounds[-(self.window_rounds - 1):] if self.window_rounds > 1 else []
+            kept = self.rounds[-(self.window_rounds - 1):] if self.window_rounds > 1 else []
+            if len(kept) < len(self.rounds):
+                self._drop_reasoning()
+            self.rounds = kept
         if self.memory == "received":  # M6 §3: no history across turns, one constructed message
             self.ingest(list(view.pushed))
             self.last_observation = [p.model_dump(mode="json") for p in view.observation.parts]
@@ -834,7 +869,7 @@ class LLMAgent(Participant):
                     text_calls = (parse_text_tool_calls(resp.text, view.tools)
                                   if self.text_tool_fallback and resp.text else [])
                     if resp.text:
-                        self._append(ChatMessage(role="assistant", content=resp.text))
+                        self._append(self._assistant(resp))
                     if not text_calls:
                         break
                     log.info("%s round %s: text_tool_fallback parsed %d call(s): %s", self.agent,
@@ -845,11 +880,10 @@ class LLMAgent(Participant):
                     if ended:
                         break
                     continue
-                self._append(ChatMessage(role="assistant", content=resp.text,
-                                         tool_calls=resp.tool_calls))
+                self._append(self._assistant(resp, resp.tool_calls))
                 n, ended = await self._run_native(resp.tool_calls, tools)
             else:
-                self._append(ChatMessage(role="assistant", content=resp.text))
+                self._append(self._assistant(resp))
                 try:
                     calls = parse_tool_json(resp.text)
                 except ToolJsonError as e:
@@ -930,12 +964,12 @@ class LLMAgent(Participant):
                 continue
             resend = 0
             if self.tool_protocol == "native" and resp.tool_calls:  # the model used tools itself
-                self._append(ChatMessage(role="assistant", content=resp.text, tool_calls=resp.tool_calls))
+                self._append(self._assistant(resp, resp.tool_calls))
                 n, _ = await self._run_native(resp.tool_calls, tools)
                 usage.calls = executed + n
                 usage.notes.append("report_json:native_tools")
                 return usage
-            self._append(ChatMessage(role="assistant", content=resp.text or ""))
+            self._append(self._assistant(resp))
             report, error = self._parse_report(resp.text or "")
             results: list[dict] = []
             if report is not None:

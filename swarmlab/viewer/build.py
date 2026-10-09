@@ -27,6 +27,13 @@ Decisions where the contract is silent:
   state is None are left out, and a world that returns None for every round (FlagGame, which
   has its own panel; any world without the hook), cannot be imported, or fails to restore gives
   None and no panel. States are passed through `json` (non-JSON values become strings).
+- `calls` (`[{round, agent, call_id, category, model, finish, cached, refusal, text,
+  reasoning, reasoning_kind, reasoning_redacted}]`): every model call of a committed round, from
+  the operational `inference_attempt`/`inference_response` events and the response blobs, for
+  the page's "Model calls" panel (the selected agent's calls this round, probes included).
+  `text` is clipped to MAX_CALL_TEXT_CHARS and `reasoning` to MAX_REASONING_CHARS (the full
+  text is in the blob and in the export's `inference.reasoning`); a call whose response blob is
+  missing has null text and reasoning; an errored call has its `error:<type>` finish.
 - The colour-letter table (`COLOURS` in the page) is `swarmlab.colors.PALETTE_HEX`, the palette
   the FlagGame image renderer uses; it is injected before the title and data so neither can
   inject a palette.
@@ -47,6 +54,8 @@ TEMPLATE = Path(__file__).with_name("template.html")
 MAX_ARG_CHARS = 400
 MAX_SUMMARY_CHARS = 160
 MAX_CONTENT_CHARS = 2000
+MAX_CALL_TEXT_CHARS = 2000
+MAX_REASONING_CHARS = 20000
 
 
 def _clip(s: str, n: int) -> str:
@@ -107,6 +116,36 @@ def _events(run_dir: Path, blobs: BlobStore) -> tuple[list[dict], int]:
             e["content"] = None if content is None else _clip(content, MAX_CONTENT_CHARS)
         out.append(e)
     return out, last
+
+
+def _calls(run_dir: Path, blobs: BlobStore, last: int) -> list[dict]:
+    """Model calls of committed rounds with their reasoning (module doc)."""
+    attempts: dict[str, dict] = {}
+    out: list[dict] = []
+    for ev in EventLog(run_dir / "events.jsonl"):
+        if ev.round > last:
+            continue
+        if ev.type == "inference_attempt":
+            attempts[ev.call_id] = {"category": ev.category, "model": ev.model}
+        elif ev.type == "inference_response":
+            att = attempts.pop(ev.call_id, {})
+            try:
+                resp = json.loads(blobs.get(ev.response_hash)) if ev.response_hash else {}
+            except Exception:  # noqa: BLE001 - a missing blob should not break the page
+                resp = {}
+            reasoning = resp.get("reasoning")
+            out.append({
+                "round": ev.round, "agent": ev.agent, "call_id": ev.call_id,
+                "category": att.get("category"), "model": att.get("model") or resp.get("model"),
+                "finish": ev.finish_reason, "cached": ev.cached,
+                "refusal": getattr(ev, "refusal_category", None),
+                "text": None if "text" not in resp else _clip(resp.get("text") or "", MAX_CALL_TEXT_CHARS),
+                "tools": [c.get("name") for c in resp.get("tool_calls") or []],
+                "reasoning": None if reasoning is None else _clip(reasoning, MAX_REASONING_CHARS),
+                "reasoning_kind": resp.get("reasoning_kind"),
+                "reasoning_redacted": int(resp.get("reasoning_redacted") or 0),
+            })
+    return out
 
 
 def _world(run_dir: Path, meta: dict, blobs: BlobStore) -> tuple[dict | None, str | None]:
@@ -195,6 +234,7 @@ def collect(run_dir: Path | str) -> dict:
         "world_states": _world_states(run_dir, meta, blobs, last),
         "truth": truth if isinstance(truth, str) else None,
         "events": events,
+        "calls": _calls(run_dir, blobs, last),
     }
 
 

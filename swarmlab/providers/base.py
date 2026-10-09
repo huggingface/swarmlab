@@ -39,6 +39,18 @@ Decisions where the contract is silent:
   `finish_reason == "refusal"`. `ChatRequest.attempt` (default 0) is a cache key for re-sending a
   refused request: it is in `request_bytes`/`request_hash` only when non-zero (so every hash
   from before the field existed is unchanged), and no adapter sends it to a provider.
+- Reasoning (additive, docs/INTERFACE-M1b.md §1 amendment): `ChatResponse.reasoning` is the
+  model's reasoning text as returned (None when the response carried none), `reasoning_kind`
+  says what it is (`"summary"`: Anthropic thinking blocks with text, `display: "summarized"`;
+  `"omitted"`: thinking blocks whose text is empty, Anthropic's default display, reasoning
+  `""`; `"text"`: an OpenAI-compatible server's `reasoning_content`/`reasoning`), and
+  `reasoning_redacted` counts Anthropic `redacted_thinking` blocks. `provider_content` is the
+  assistant content exactly as an adapter must send it back (Anthropic content blocks, in
+  order, thinking signatures included), set only when the response carried thinking blocks;
+  `LLMAgent` copies it onto the assistant `ChatMessage.provider_content`, which the adapter
+  that produced it sends verbatim in place of text + tool calls. `ChatMessage` leaves
+  `provider_content` out of its JSON when None, so a request without reasoning hashes exactly
+  as before.
 """
 from __future__ import annotations
 
@@ -51,7 +63,7 @@ import random
 import struct
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_serializer
 
 from ..base import Plugin
 from ..spec import canonical_json
@@ -92,6 +104,14 @@ class ChatMessage(BaseModel):
     content: list[Part] | str
     tool_calls: list[ToolCall] | None = None  # assistant messages
     tool_call_id: str | None = None  # tool messages
+    provider_content: list[dict] | None = None  # assistant: provider blocks to send back as is
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_provider_content(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("provider_content", 0) is None:
+            data.pop("provider_content")  # so requests without reasoning hash as before
+        return data
 
 
 class ChatRequest(BaseModel):
@@ -129,6 +149,10 @@ class ChatResponse(BaseModel):
     attempts: int = 1  # provider attempts this response took (1 = no retry)
     retried_after_timeout: bool = False  # at least one failed attempt was a timeout
     refusal: Refusal | None = None  # set iff finish_reason == "refusal"
+    reasoning: str | None = None  # reasoning text as returned; "" when hidden (kind "omitted")
+    reasoning_kind: Literal["summary", "omitted", "text"] | None = None
+    reasoning_redacted: int = 0  # Anthropic redacted_thinking blocks
+    provider_content: list[dict] | None = None  # content to send back (Anthropic, with thinking)
 
 
 def split_model(model: str) -> tuple[str, str]:

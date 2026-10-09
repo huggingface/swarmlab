@@ -313,7 +313,7 @@ swarmlab run spec.yaml [--arm A] [--seed N] [--max-rounds N] [--out runs/] [--ye
 
 ## 17. Viewer (minimal)
 
-`viewer.build(run_dir) -> view.html`: self-contained page with a round slider; per round the Flag Game candidate grids and each agent's current guess, the board as committed, each agent's inbox with delivered content and read marks, and the per-agent event list. Built from the log and snapshots only. Vanilla JS, no external requests.
+`viewer.build(run_dir) -> view.html`: self-contained page with a round slider; per round the Flag Game candidate grids and each agent's current guess, the board as committed, each agent's inbox with delivered content and read marks, and the per-agent event list. Built from the log and snapshots only. Vanilla JS, no external requests. (Reasoning, additive) A "Model calls" panel lists the selected agent's model calls of the round with finish reason and reasoning, read from the operational inference events and the response blobs.
 
 ## 18. Acceptance tests
 
