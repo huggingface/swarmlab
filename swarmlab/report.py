@@ -1,7 +1,6 @@
 """`swarmlab report RUNS_DIR [--out FILE] [--title T]`: a Markdown report over finished runs.
 
-Generalised from `tools/m2_report.py` (the M2 phase-1 Flag Game report). Read-only over the runs
-dir.
+Generalised from the M2 phase-1 Flag Game report script. Read-only over the runs dir.
 
 Decisions:
 
