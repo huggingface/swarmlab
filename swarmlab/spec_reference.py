@@ -92,7 +92,9 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
     MediumSpec: {
         "topology": "who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per "
                     "agent per round), `groups`, `star` (params `{center: a000}`: members reach only the "
-                    "center, the center reaches all), `tree`; e.g. "
+                    "center, the center reaches all), `tree`, `rooms` (params `{rooms: {red: [a000, a001], "
+                    "blue: [a001, a002]}}`: named rooms, an agent may be in several or none; a post "
+                    "reaches only its room); e.g. "
                     "`{type: gossip, params: {k: 2}}`",
         "delivery": "`pull` (agents call `read_board`) or `push` (deliveries come with the turn)",
         "push_limit": "most items pushed per turn under `delivery: push`",

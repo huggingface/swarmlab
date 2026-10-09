@@ -36,6 +36,7 @@ gossip = "swarmlab.medium.topology:Gossip"
 groups = "swarmlab.medium.topology:Groups"
 star = "swarmlab.medium.topology:Star"
 tree = "swarmlab.medium.topology:Tree"
+rooms = "swarmlab.medium.topology:Rooms"
 
 [project.entry-points."swarmlab.policies"]
 delay = "swarmlab.medium.board:DelayPolicy"

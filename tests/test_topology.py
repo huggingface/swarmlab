@@ -87,4 +87,4 @@ def test_specs_and_registry():
     assert Broadcast().spec() == {"type": "broadcast", "params": {}}
     assert Gossip().spec() == {"type": "gossip", "params": {"k": 1}}
     assert Groups(size=4).spec() == {"type": "groups", "params": {"size": 4}}
-    assert set(TOPOLOGIES) == {"broadcast", "gossip", "groups", "star", "tree"}
+    assert set(TOPOLOGIES) == {"broadcast", "gossip", "groups", "star", "tree", "rooms"}

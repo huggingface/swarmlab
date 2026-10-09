@@ -40,6 +40,19 @@ Decisions where the contract is silent:
   The layout is a cache, never snapshotted (the topology is a pure function of params and the
   agent list). `channel_permissions(agent)` returns `(read, write)` channel lists, intersected
   with the agent's role by `bind_roles`.
+- `Rooms(rooms={name: [agents]})`: named rooms with fixed membership. Each room is a board
+  channel (added by `bind_roles`, like Tree's); an agent may be in several rooms or in none.
+  `channel_permissions(agent)` = the rooms it is in, for both read and write, so with or without
+  a role an agent can only read and post in its rooms (a role can narrow this further, never
+  widen it), and an agent in no room has no board tools. `recipients(post)` = the live members of
+  the post's room minus the author, so a member of two rooms reaches only the room it posts on:
+  information crosses rooms only when a shared member repeats it. `default_channel(agent)` is the
+  agent's room when it is in exactly one, else None, and the executor rejects `post` without a
+  channel from an agent in several rooms (`bad args` naming its rooms) rather than picking one.
+  A post on a channel that is not a room goes to the author's default room, or to nobody. Room
+  names are any non-empty strings; each room lists at least one agent, each agent at most once;
+  `reset_agents` rejects members that are not agents of the run. Pure function of params; no
+  snapshot.
 """
 from __future__ import annotations
 
@@ -240,10 +253,58 @@ class Tree(Topology):
         return [a for a in agents if a != post.agent and a in members]
 
 
+class Rooms(Topology):
+    """Named rooms with fixed membership; an agent may be in several rooms or in none."""
+
+    entry_point: ClassVar[str | None] = "rooms"
+    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "rooms")
+
+    def __init__(self, rooms: dict[str, list[AgentId]]) -> None:
+        if not isinstance(rooms, dict) or not rooms:
+            raise TypeError(f"Rooms rooms must be a non-empty mapping of room -> agents, got {rooms!r}")
+        self.rooms: dict[str, list[AgentId]] = {}
+        for name, members in rooms.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"room names must be non-empty strings, got {name!r}")
+            if isinstance(members, str) or not isinstance(members, (list, tuple)) or not members:
+                raise ValueError(f"room {name!r} must list at least one agent, got {members!r}")
+            if len(set(members)) != len(members):
+                raise ValueError(f"room {name!r} lists an agent twice")
+            self.rooms[name] = [AgentId(a) for a in members]
+
+    def reset_agents(self, agents: list[AgentId]) -> None:
+        """Check that every member is one of the run's agents."""
+        unknown = sorted({a for m in self.rooms.values() for a in m} - set(agents))
+        if unknown:
+            raise ValueError(f"Rooms members {unknown} are not agents of this run")
+
+    def channels(self) -> list[str]:
+        return list(self.rooms)
+
+    def channel_members(self, channel: str) -> list[AgentId]:
+        return list(self.rooms.get(channel, []))
+
+    def channel_permissions(self, agent: AgentId) -> tuple[list[str], list[str]]:
+        chans = [c for c, members in self.rooms.items() if agent in members]
+        return list(chans), list(chans)
+
+    def default_channel(self, agent: AgentId) -> str | None:
+        chans = self.channel_permissions(agent)[1]
+        return chans[0] if len(chans) == 1 else None
+
+    def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
+        channel = post.channel if post.channel in self.rooms else self.default_channel(post.agent)
+        if channel is None:
+            return []
+        members = set(self.rooms[channel])
+        return [a for a in agents if a != post.agent and a in members]
+
+
 TOPOLOGIES: dict[str, type[Topology]] = {
     "broadcast": Broadcast,
     "gossip": Gossip,
     "groups": Groups,
     "star": Star,
     "tree": Tree,
+    "rooms": Rooms,
 }

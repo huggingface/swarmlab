@@ -19,9 +19,9 @@ the images; `FlagGame.check_participants` refuses it otherwise). Within one turn
 last `user` message that is not a json-protocol `[tool results]` message):
 
 1. If `read_board` is offered and has not been called this turn: call `post` with
-   `"crop:\\n<rows>"` (on `main`, or with no channel when the `post` schema's channel enum does
-   not offer `main`) first if `post` is offered and the conversation shows no earlier `post` of a
-   crop, then `read_board(limit=200)`.
+   `"crop:\\n<rows>"` (on `main`, or on the first channel of the `post` schema's channel enum
+   when it does not offer `main`: a Tree agent's own group, a Rooms agent's first room) first if
+   `post` is offered and the conversation shows no earlier `post` of a crop, then `read_board(limit=200)`.
 2. Otherwise: collect every distinct crop in the conversation (any `crop:` block of lowercase rows,
    in any message text or tool result, JSON-escaped newlines included; this covers the
    observation's "Your crop:" and crops read from the board), take the candidates from the latest
@@ -166,11 +166,12 @@ def flaggame_reader(request: ChatRequest, rng: random.Random) -> ChatResponse:
         posted = any(name == "post" and "crop:" in str(args.get("text", ""))
                      for m in msgs for name, args in _assistant_calls(m))
         if "post" in tools and not posted and own_crop:
-            # post to `main` when offered, else to the executor's default channel (M3c: a Tree
-            # topology offers only group channels)
+            # post to `main` when offered, else to the first offered channel (M3c: a Tree
+            # topology offers only group channels, own group first; a Rooms agent in several
+            # rooms must name one)
             enum = next((t.parameters.get("properties", {}).get("channel", {}).get("enum")
                          for t in request.tools if t.name == "post"), None)
-            where = {"channel": "main"} if enum is None or "main" in enum else {}
+            where = {"channel": "main" if enum is None or "main" in enum else enum[0]}
             calls.append(("post", {**where, "text": "crop:\n" + "\n".join(own_crop)}))
         calls.append(("read_board", {"limit": 200}))
         return _response(request, rng, calls)
