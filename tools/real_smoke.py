@@ -37,8 +37,9 @@ or the summed worst-case estimate reaches $1.00.
 
 - `gemma-image` (WP16): N=4, 3 rounds, `hf:google/gemma-4-26B-A4B-it:deepinfra` (HF_TOKEN) on
   `FlagGame(modality="image")`, broadcast, `max_calls=5`, `Budget(soft_usd=0.40, hard_usd=0.50,
-  measurement_usd=0.10)`. The model of `experiments/m6_flag_vlm.yaml`. Pricing is the router's
-  listed DeepInfra price on 2026-10-07, input 0.07 / output 0.34 USD per M tokens (listing
+  measurement_usd=0.10)`. The model of `m6_flag_vlm.yaml` (bucket
+  `hf://buckets/cmpatino/swarmlab-experiments`). Pricing is the router's listed DeepInfra price
+  on 2026-10-07, input 0.07 / output 0.34 USD per M tokens (listing
   `input_modalities: [text, image]`, `supports_tools: true`), cached priced at the input price:
   (0.07, 0.34, 0.07).
 - `gemma-manager` (WP16): the same model, N=4, 3 rounds, image mode, the Flag Game paper's
