@@ -25,6 +25,7 @@ swarmlab = "swarmlab.cli:app"
 [project.entry-points."swarmlab.worlds"]
 flaggame = "swarmlab.world.flaggame:FlagGame"
 coloring = "swarmlab.world.coloring:ColoringGrid"
+hidden_sites = "swarmlab.world.hidden_sites:HiddenSites"
 
 [project.entry-points."swarmlab.claim_policies"]
 advisory = "swarmlab.medium.registry:Advisory"
@@ -66,6 +67,10 @@ llm = "swarmlab.participants.llm:LLMAgent"
 "coloring.parallel_efficiency" = "swarmlab.metrics.coloring:ParallelEfficiency"
 "claims.violations" = "swarmlab.metrics.coloring:ClaimViolations"
 "claims.held" = "swarmlab.metrics.coloring:ClaimsHeld"
+"hidden.expected_W" = "swarmlab.world.hidden_sites:ExpectedW"
+"hidden.expected_cum" = "swarmlab.world.hidden_sites:ExpectedCum"
+"hidden.actual_points" = "swarmlab.world.hidden_sites:ActualPoints"
+"hidden.actual_cum" = "swarmlab.world.hidden_sites:ActualCum"
 
 [project.entry-points."swarmlab.schedulers"]
 seeded_shuffle = "swarmlab.scheduler:SeededShuffle"
@@ -90,6 +95,7 @@ fake = "swarmlab.providers.fake:FakeProvider"
 [project.entry-points."swarmlab.fake_scripts"]
 flaggame_reader = "swarmlab.providers.fake:flaggame_reader"
 painter = "swarmlab.world.coloring:fake_painter"
+hidden_chooser = "swarmlab.world.hidden_sites:fake_chooser"
 
 [build-system]
 requires = ["hatchling"]

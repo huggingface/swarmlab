@@ -1,0 +1,51 @@
+# Hidden Sites (swarmlab/world/hidden_sites.py, docs/guide/hidden-sites.md): 12 agents, 8 sites
+# A..H whose success probabilities are a seeded permutation of {.60 .35 .25 .15 .10 .06 .03 .01}.
+# Every round each site offers one discovery; each agent holding a site attempts once at the end
+# of the round and a site scores one team point when at least one attempt succeeds. Agents see
+# only their own position and attempts and the team's points. Same seed -> same hidden assignment
+# and the same coin for every possible attempt in both arms (matched arms).
+#   swarmlab validate examples/hidden_sites.yaml
+#   swarmlab run examples/hidden_sites.yaml --yes        # both arms x every seed (free)
+#
+# Both arms run the free scripted model `fake:hidden_chooser` (allocation 2,2,2,2,1,1,1,1; one
+# rejected second choice per agent in round 1). For an LLM arm, swap the participant params, e.g.
+#
+#   participants:
+#     - type: llm
+#       count: 12
+#       params:
+#         model: "hf:Qwen/Qwen3.8-27B:ovhcloud"
+#         max_tokens: 1024
+#         max_calls: 8
+#         memory: window
+#         window_rounds: 6
+#         extra: {reasoning_effort: none}
+#         # treatment arm only, one sentence:
+#         system_prompt_append: "Communicate with your teammates to avoid overcrowding sites, where additional agents contribute less to the team."
+#
+# Cost: 12 LLM agents, 20 rounds, 6-round window cost about $5.40 per run on Qwen3.8-27B via
+# OVHcloud (2026-10-08/09), mostly prompt tokens: agents post long tallies of who is where.
+# Set budget soft_usd/hard_usd per arm (about 5.50 / 6.00) and a total_usd for all runs.
+name: hidden-sites
+seeds: [1, 2]
+budget: {soft_usd: 0, hard_usd: 2.0}   # fake pricing (1, 5, 0.1) per M tokens
+options: {max_rounds: 20, commit: immediate}
+arms:
+  team:
+    world: {type: hidden_sites, params: {rounds: 20}}
+    participants:
+      - {type: llm, count: 12, params: {model: "fake:hidden_chooser", max_tokens: 256}}
+    medium: {topology: broadcast}
+    metrics: &metrics [hidden.expected_W, hidden.expected_cum, hidden.actual_points,
+                       hidden.actual_cum, comm.read_rate, comm.posts_per_round]
+  reminder:
+    world: {type: hidden_sites, params: {rounds: 20}}
+    participants:
+      - type: llm
+        count: 12
+        params:
+          model: "fake:hidden_chooser"
+          max_tokens: 256
+          system_prompt_append: "Communicate with your teammates to avoid overcrowding sites, where additional agents contribute less to the team."
+    medium: {topology: broadcast}
+    metrics: *metrics
