@@ -42,6 +42,9 @@ Mapping:
   JSON; a non-JSON string becomes `{"_raw": <string>}` and `finish_reason = "bad_tool_args"`.
   Usage from `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`,
   `completion_tokens_details.reasoning_tokens`. `served_by` = the `x-inference-provider` header.
+  `finish_reason == "content_filter"` (the server's safety filter declined) becomes
+  `"refusal"` with `ChatResponse.refusal = Refusal()` (no category: the API gives none), so
+  refusals read the same across providers. `ChatRequest.attempt` is never sent.
 - Timeouts and retries (see `base.py`): each attempt is bounded by `timeout_s` (httpx timeout and
   an `asyncio.timeout` around the attempt). `httpx.TimeoutException`, the attempt deadline,
   other `httpx.TransportError`s, HTTP 429 and 5xx are retried up to `max_retries` times with
@@ -69,6 +72,7 @@ from .base import (
     ChatResponse,
     Provider,
     ProviderError,
+    Refusal,
     Usage,
     model_id,
     parse_json_args,
@@ -147,7 +151,10 @@ def parse_completion(data: dict) -> tuple[str, list[ToolCall], Usage, str]:
         cached_prompt_tokens=int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
         reasoning_tokens=int((u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
     )
-    finish = "bad_tool_args" if bad else str(choice.get("finish_reason") or "")
+    stop = str(choice.get("finish_reason") or "")
+    if stop == "content_filter":
+        stop = "refusal"
+    finish = stop if stop == "refusal" else "bad_tool_args" if bad else stop
     return msg.get("content") or "", calls, usage, finish
 
 
@@ -223,6 +230,7 @@ class OpenAICompatProvider(Provider):
             or (self.name if self.self_hosted else None),
             latency_s=time.monotonic() - start, finish_reason=finish,
             attempts=attempt + 1, retried_after_timeout=timed_out,
+            refusal=Refusal() if finish == "refusal" else None,
         )
 
 

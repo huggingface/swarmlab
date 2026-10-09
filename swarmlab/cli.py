@@ -56,6 +56,10 @@ Decisions where the contract is silent:
   `first_error`) keeps its end reason, but every command that prints its summary first prints
   `WARNING: <run>: E/T turns errored (first error: <line>)` on stderr, `run` gives it outcome
   `errored` in the table and JSON, and `run` exits 1.
+- Refused runs: a run with `turns_refused > 0` (turns whose final model response was a
+  refusal; `run.json` and the summary carry `turns_refused` and `refusal_categories`) gets
+  `WARNING: <run>: R/T turns refused (<category> n, ...)` on stderr from the same commands. It
+  changes neither the outcome nor the exit code.
 - `preflight SPEC [--arm A] [--max-usd 0.05]` (swarmlab/preflight.py): one real request per LLM
   participant group with the arm's exact model settings and tools; prints the worst-case cost
   first and refuses above `--max-usd`; exit 1 on any failure.
@@ -229,10 +233,23 @@ def health_warning(data: dict[str, Any]) -> str | None:
             "arm's settings and shows the provider's error")
 
 
+def refusal_warning(data: dict[str, Any]) -> str | None:
+    """`WARNING: 3/36 turns refused (cyber 3)` for a run with refused turns."""
+    refused = data.get("turns_refused") or 0
+    if not refused:
+        return None
+    cats = data.get("refusal_categories") or {}
+    by_cat = ", ".join(f"{k} {v}" for k, v in sorted(cats.items(), key=lambda kv: (-kv[1], kv[0])))
+    return (f"WARNING: {data.get('run_id', 'run')}: {refused}/{data.get('turns_total')} turns "
+            f"refused ({by_cat or '?'}); a refused turn ends without the model's action, so the "
+            "run's results leave out what the model declined. Refusals tend to repeat for the "
+            "same request; see 'Refusals' in docs/guide/real-models.md (`refusal_retries`)")
+
+
 def _warn_health(data: dict[str, Any]) -> None:
-    line = health_warning(data)
-    if line:
-        print(line, file=sys.stderr, flush=True)
+    for line in (health_warning(data), refusal_warning(data)):
+        if line:
+            print(line, file=sys.stderr, flush=True)
 
 
 def _execute(fn: Callable[[], dict[str, Any]], as_json: bool) -> None:

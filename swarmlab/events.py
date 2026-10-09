@@ -34,6 +34,8 @@ Decisions where the contract is silent:
 - M6: `metric` gained `label` (a string, e.g. `belief.state`'s class), omitted when None.
 - M6: `round_started` gained `live` (the live agents), written only when the scheduler's `order`
   is not a permutation of them (OneSpeaker); absent, `order` is the live list as before.
+- Refusals: `inference_response` gained `refusal_category` (the response's
+  `Refusal.category` when `finish_reason == "refusal"`), omitted when None.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
 """
@@ -132,6 +134,14 @@ class InferenceResponseEvent(Event):
     finish_reason: str = ""
     cached: bool = False
     attempts: int = 1  # provider attempts (retries + 1); 1 on cache hits
+    refusal_category: str | None = None  # a refusal's category; omitted when None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_refusal(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("refusal_category", 0) is None:
+            data.pop("refusal_category")
+        return data
 
 
 class TurnEndedEvent(Event):

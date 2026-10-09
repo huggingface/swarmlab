@@ -37,7 +37,9 @@ Decisions:
   nearest-rank p90, max), swarm model calls per turn (turns without a call count as 0), cost per
   committed round (uncached responses, swarm + measurement), tool calls rejected/answered with
   the rejection reasons (the part of `error` before `:`), world actions not accepted/committed
-  with the feedback `error`, probes skipped by reason.
+  with the feedback `error`, probes skipped by reason, turns refused (final model response a
+  refusal, `runner.refusal_of_turn`) and refused responses (probes included; cache hits count,
+  as in finish reasons), each by category (`none` when the provider named none).
 - Probe vs world belief: a skipped probe (`parsed.skipped`: no probe context, a budget, a
   provider error) is left out of that round's probe columns rather than counted as no answer,
   and each arm's table is followed by a `Probes skipped:` line with the counts by reason.
@@ -68,6 +70,7 @@ from .budget import ledger_total
 from .experiment import Experiment, Run
 from .export import discarded_spend
 from .rng import derive
+from .runner import refusal_of_turn
 
 DEFAULT_TITLE = "swarmlab report"
 
@@ -112,7 +115,8 @@ def scan(run):
          "resp_finish": Counter(), "attempts": 0, "retried": 0, "latency": [],
          "calls_per_turn": Counter(), "cost_by_round": Counter(), "reject_errors": Counter(),
          "probe_skips": Counter(), "probes": 0, "errors": [], "metric_series": defaultdict(dict),
-         "committed": 0, "not_accepted": Counter()}
+         "committed": 0, "not_accepted": Counter(), "turn_refusals": Counter(),
+         "resp_refusals": Counter()}
     cur = {}
     turn_keys = []
     last_round = 0
@@ -132,6 +136,9 @@ def scan(run):
                 d["errors"].append((r, a, first_error_line(getattr(ev, "error", None))))
             for fr in (ev.usage or {}).get("finish_reasons", []) if isinstance(ev.usage, dict) else []:
                 d["finish"][fr] += 1
+            category = refusal_of_turn(ev.usage)
+            if category is not None:
+                d["turn_refusals"][category] += 1
         elif t == "tool_returned":
             res = ev.result if isinstance(ev.result, dict) else {}
             if res.get("error") != "cap":  # the capping call is counted by the `cap` yield kind
@@ -155,6 +162,8 @@ def scan(run):
             elif fr == "max_tokens":  # Anthropic
                 d["max_tokens"] += 1
             d["resp_finish"][fr or "?"] += 1
+            if fr == "refusal":
+                d["resp_refusals"][getattr(ev, "refusal_category", None) or "none"] += 1
             n_att = getattr(ev, "attempts", 1) or 1
             d["attempts"] += n_att
             d["retried"] += n_att > 1
@@ -220,7 +229,10 @@ def health_rows(rs) -> list[list]:
     ds = [d for _, d in rs]
     turns = sum(sum(d["turns"].values()) for d in ds)
     yields, finish, rej, skips, refused = Counter(), Counter(), Counter(), Counter(), Counter()
+    turn_ref, resp_ref = Counter(), Counter()
     for d in ds:
+        turn_ref.update(d["turn_refusals"])
+        resp_ref.update(d["resp_refusals"])
         refused.update(d["not_accepted"])
         yields.update(d["yields"])
         finish.update(d["resp_finish"])
@@ -243,6 +255,10 @@ def health_rows(rs) -> list[list]:
         ["runs / turns", f"{len(rs)} / {turns}"],
         ["turn end kinds", counts(yields)],
         ["turns errored", err_text],
+        ["turns refused", (f"{sum(turn_ref.values())} of {turns} ({counts(turn_ref)})"
+                           if turn_ref else "0")],
+        ["refused responses, probes included", (f"{sum(resp_ref.values())} ({counts(resp_ref)})"
+                                                if resp_ref else "0")],
         ["finish reasons (responses)", counts(finish)],
         ["inference responses, probes included (all / cache hits)", f"{nresp} / {sum(d['cached'] for d in ds)}"],
         ["retries (responses retried / extra attempts)",

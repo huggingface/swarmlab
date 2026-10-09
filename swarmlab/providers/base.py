@@ -33,6 +33,12 @@ Decisions where the contract is silent:
   `.attempts`. Both knobs are constructor kwargs of the real providers, so they are part of the
   provider spec (YAML `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 60,
   max_retries: 3}}}`).
+- Refusals (additive, docs/INTERFACE-M1b.md §1 amendment): a safety decline is a successful
+  response with `finish_reason == "refusal"` and `ChatResponse.refusal = Refusal(category,
+  explanation)` (both may be None). Adapters set the two together, so `refusal is not None` iff
+  `finish_reason == "refusal"`. `ChatRequest.attempt` (default 0) is a cache key for re-sending a
+  refused request: it is in `request_bytes`/`request_hash` only when non-zero (so every hash
+  from before the field existed is unchanged), and no adapter sends it to a provider.
 """
 from __future__ import annotations
 
@@ -99,6 +105,14 @@ class ChatRequest(BaseModel):
     seed: int | None = None
     thinking_budget: int | None = None
     extra: dict = {}
+    attempt: int = 0  # re-send number after refusals: in the request hash when > 0, never sent
+
+
+class Refusal(BaseModel):
+    """Why a provider declined (Anthropic `stop_details`; None fields when it did not say)."""
+
+    category: str | None = None  # e.g. "cyber", "bio", "frontier_llm", "reasoning_extraction"
+    explanation: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -114,6 +128,7 @@ class ChatResponse(BaseModel):
     cached: bool = False
     attempts: int = 1  # provider attempts this response took (1 = no retry)
     retried_after_timeout: bool = False  # at least one failed attempt was a timeout
+    refusal: Refusal | None = None  # set iff finish_reason == "refusal"
 
 
 def split_model(model: str) -> tuple[str, str]:
@@ -128,7 +143,10 @@ def model_id(request: ChatRequest) -> str:
 
 
 def request_bytes(request: ChatRequest) -> bytes:
-    return canonical_json(request.model_dump(mode="json")).encode()
+    data = request.model_dump(mode="json")
+    if not data.get("attempt"):  # attempt 0 is left out, so pre-`attempt` hashes still hold
+        data.pop("attempt", None)
+    return canonical_json(data).encode()
 
 
 def request_hash(request: ChatRequest) -> str:

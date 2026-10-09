@@ -4,7 +4,7 @@
 temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker",
 extra=None, text_tool_fallback=False, context_limit_tokens=None, overflow="drop_oldest",
 summary_model=None, system_prompt_append=None, memory_messages=8, report_json=False,
-report_fields=None, answers_kept=None)`, entry point `llm`.
+report_fields=None, answers_kept=None, refusal_retries=0)`, entry point `llm`.
 
 **max_tokens** defaults to 2048 (was 1024). In the 2026-10-06 smoke, Qwen3.5-9B with thinking on
 spent the whole 1024-token budget reasoning (`finish_reason="length"`, empty text, no tool call)
@@ -27,8 +27,24 @@ message, since there are no provider tool-call ids). Each trigger is logged (log
 `swarmlab.participants.llm`) and noted in the turn.
 
 **Turn notes.** `turn()` returns an `LLMTurnUsage` (a `TurnUsage` with `finish_reasons`, one per
-model call, and `notes`, e.g. `"length"` when a response hit `max_tokens` and
-`"text_tool_fallback:<n>"`); the runner puts it into `turn_ended.usage`.
+model call, and `notes`, e.g. `"length"` when a response hit `max_tokens`,
+`"text_tool_fallback:<n>"` and `"refusal:<category>"`, one per refused response, `none` when
+the provider named no category); the runner puts it into `turn_ended.usage`.
+
+**refusal_retries** (int, default 0; in `params` only when non-zero, so existing spec hashes
+hold). A refused response (`finish_reason == "refusal"`, e.g. an Anthropic safety classifier;
+docs/guide/real-models.md "Refusals") is always noted in the turn. With `refusal_retries=N > 0`,
+a refused response is dropped instead of handled: its text and any (possibly partial) tool calls
+are neither appended to memory nor executed, and the same messages are re-sent with
+`ChatRequest.attempt` set to 1, 2, ... (the re-send number for these messages), so each re-send
+is a new request hash and the record/replay cache cannot hand back the stored refusal. A turn
+makes at most N re-sends in total, in the native/json loop and under `report_json` alike; they
+do not count toward `max_calls` or the `report_json` answer-plus-retry budget (but they are model
+calls: `swarmlab estimate` does not include them). Once the N are used up a refusal is handled
+exactly as with the default 0 (the text kept, the turn usually ending `no_tool`). The attempt
+numbers are a pure function of the turn's responses, so replay and resume re-create the same
+requests and hit the cache. Anthropic re-runs of a refused request mostly refuse again, so
+expect a small gain; the notes and `turns_refused` are the record either way.
 
 **System prompt.** A Jinja2 template rendered once, at the agent's first turn, with `agent`,
 `role`, `description` (`View.description`, i.e. `World.description()`) and `tools`
@@ -448,6 +464,7 @@ class LLMAgent(Participant):
         report_json: bool = False,
         report_fields: list[str] | None = None,
         answers_kept: int | None = None,
+        refusal_retries: int = 0,
     ) -> None:
         if memory not in MEMORY_MODES:
             raise ValueError(f"memory must be one of {MEMORY_MODES}, got {memory!r}")
@@ -462,6 +479,8 @@ class LLMAgent(Participant):
             raise ValueError("window_rounds must be >= 1")
         if max_calls is not None and max_calls < 1:
             raise ValueError("max_calls must be >= 1 or None")
+        if isinstance(refusal_retries, bool) or not isinstance(refusal_retries, int) or refusal_retries < 0:
+            raise ValueError("refusal_retries must be an integer >= 0")
         self.model = model
         self.system_prompt = system_prompt
         self.memory = memory
@@ -506,6 +525,9 @@ class LLMAgent(Participant):
             params.pop("report_json", None)
         if report_fields is None:
             params.pop("report_fields", None)
+        if not refusal_retries:  # in params (and the spec hash) only when set
+            params.pop("refusal_retries", None)
+        self.refusal_retries = refusal_retries
         self.memory_messages = memory_messages
         self.report_json = bool(report_json)
         self.report_fields = fields
@@ -761,9 +783,18 @@ class LLMAgent(Participant):
     def _append(self, msg: ChatMessage) -> None:
         self.rounds[-1]["messages"].append(msg.model_dump(mode="json"))
 
-    def _request(self, tools: list[ToolSchema]) -> ChatRequest:
-        return ChatRequest(messages=self.probe_context(), tools=tools,
+    def _request(self, tools: list[ToolSchema], attempt: int = 0) -> ChatRequest:
+        return ChatRequest(messages=self.probe_context(), tools=tools, attempt=attempt,
                            tool_protocol=self.tool_protocol, **self.model_request_defaults())
+
+    def _resend_refused(self, resp: Any, usage: LLMTurnUsage, resent: int) -> bool:
+        """Note a refused response in the turn; True when it is to be dropped and the same
+        messages re-sent (`resent` re-sends made this turn, fewer than `refusal_retries`)."""
+        if resp.finish_reason != "refusal":
+            return False
+        category = resp.refusal.category if resp.refusal is not None else None
+        usage.notes.append(f"refusal:{category or 'none'}")
+        return resent < getattr(self, "refusal_retries", 0)
 
     async def turn(self, view: View, tools: AgentTools) -> LLMTurnUsage:
         if self.system is None:
@@ -785,13 +816,19 @@ class LLMAgent(Participant):
         executed = 0
         model_calls = 0
         retried = False
+        resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
         while self.max_calls is None or model_calls < self.max_calls:
             await self._enforce_context_limit(view.tools, tools)  # M3a §3 context limit
-            resp = await tools.infer(self._request(view.tools))
-            model_calls += 1
+            resp = await tools.infer(self._request(view.tools, resend))
             usage.finish_reasons.append(resp.finish_reason)
             if resp.finish_reason == "length" and "length" not in usage.notes:
                 usage.notes.append("length")  # ran out of max_tokens (often mid-reasoning)
+            if self._resend_refused(resp, usage, resent):
+                resent += 1
+                resend += 1
+                continue
+            resend = 0
+            model_calls += 1
             if self.tool_protocol == "native":
                 if not resp.tool_calls:
                     text_calls = (parse_text_tool_calls(resp.text, view.tools)
@@ -879,12 +916,19 @@ class LLMAgent(Participant):
         offered = {t.name: t for t in view.tools}
         attempts = self.calls_per_turn_cap or 2
         executed = 0
-        for attempt in range(attempts):
+        call = 0
+        resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
+        while call < attempts:
             await self._enforce_context_limit(view.tools, tools)
-            resp = await tools.infer(self._request(view.tools))
+            resp = await tools.infer(self._request(view.tools, resend))
             usage.finish_reasons.append(resp.finish_reason)
             if resp.finish_reason == "length" and "length" not in usage.notes:
                 usage.notes.append("length")
+            if self._resend_refused(resp, usage, resent):
+                resent += 1
+                resend += 1
+                continue
+            resend = 0
             if self.tool_protocol == "native" and resp.tool_calls:  # the model used tools itself
                 self._append(ChatMessage(role="assistant", content=resp.text, tool_calls=resp.tool_calls))
                 n, _ = await self._run_native(resp.tool_calls, tools)
@@ -920,11 +964,12 @@ class LLMAgent(Participant):
                                                  + json.dumps(results, sort_keys=True)))
                     usage.calls = executed
                     return usage
-            usage.notes.append(f"report_json:retry:{error}"[:120] if attempt + 1 < attempts
+            usage.notes.append(f"report_json:retry:{error}"[:120] if call + 1 < attempts
                                else f"report_json:failed:{error}"[:120])
             self._append(ChatMessage(role="user", content=(
                 f"Your reply could not be used: {error}. Answer with only the JSON object. "
                 + report_schema(self.report_fields))))
+            call += 1
         usage.calls = executed
         return usage
 

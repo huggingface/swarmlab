@@ -27,6 +27,13 @@ Mapping (ChatRequest -> `messages.create` kwargs):
 - Response: `text` = the text blocks joined; `tool_calls` from `tool_use` blocks (an input that
   arrives as a string is parsed with `json.loads`; non-JSON -> `{"_raw": ...}` and
   `finish_reason = "bad_tool_args"`); otherwise `finish_reason` = `stop_reason`.
+- Refusals (`parse_refusal`): `stop_reason == "refusal"` (a safety classifier declined; HTTP 200)
+  gives `finish_reason = "refusal"` (it wins over `bad_tool_args`: the content may be a partial
+  reply cut off mid-stream) and `ChatResponse.refusal = Refusal(category, explanation)` from
+  `stop_details`. The API fills `stop_details` only on refusals and may leave it null even then,
+  so it is read only when `stop_reason == "refusal"`, and a null one gives `Refusal()` (both
+  fields None). `ChatRequest.attempt` is never sent. The server-side `fallbacks` option is not
+  used (passed through `extra` it would silently serve the request from another model).
   `usage.prompt_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`,
   `cached_prompt_tokens = cache_read_input_tokens`, `completion_tokens = output_tokens`.
   `served_by` is None.
@@ -58,6 +65,7 @@ from .base import (
     PricingRow,
     Provider,
     ProviderError,
+    Refusal,
     Usage,
     model_id,
     parse_json_args,
@@ -156,8 +164,21 @@ def parse_message(message: Any) -> tuple[str, list[ToolCall], Usage, str]:
         completion_tokens=int(_get(u, "output_tokens", 0) or 0),
         cached_prompt_tokens=cache_read,
     )
-    finish = "bad_tool_args" if bad else str(_get(message, "stop_reason", "") or "")
+    stop = str(_get(message, "stop_reason", "") or "")
+    finish = stop if stop == "refusal" else "bad_tool_args" if bad else stop
     return "".join(texts), calls, usage, finish
+
+
+def parse_refusal(message: Any) -> Refusal | None:
+    """`Refusal` from `stop_details` when `stop_reason == "refusal"`, else None (module doc)."""
+    if _get(message, "stop_reason") != "refusal":
+        return None
+    details = _get(message, "stop_details")
+    if details is None:
+        return Refusal()
+    category, explanation = _get(details, "category"), _get(details, "explanation")
+    return Refusal(category=None if category is None else str(category),
+                   explanation=None if explanation is None else str(explanation))
 
 
 class AnthropicProvider(Provider):
@@ -221,5 +242,5 @@ class AnthropicProvider(Provider):
             text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage),
             provider=self.name, model=model_id(request), served_by=None,
             latency_s=time.monotonic() - start, finish_reason=finish,
-            attempts=attempt + 1, retried_after_timeout=timed_out,
+            attempts=attempt + 1, retried_after_timeout=timed_out, refusal=parse_refusal(message),
         )

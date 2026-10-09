@@ -91,6 +91,10 @@ Decisions where the contract is silent:
   `run.json["spend_discarded_usd"]` is their sum. The ledger (`spend`) includes what hard-ceiling
   aborts charged, so `spend` minus the logged `inference.cost_usd` is about
   `spend_discarded_usd`, not 0. `EXPORT_SCHEMA` 2 added this table.
+- **Refusals.** `inference.refusal_category` is the `inference_response` event's
+  `refusal_category` (null unless the response was a refusal that named a category; a refusal
+  is `finish_reason == "refusal"`). `EXPORT_SCHEMA` 3 added the column (appended last, so the
+  earlier columns keep their positions).
 - `EXPORT_SCHEMA` is recorded in `run.json["export_schema"]`; outputs are deterministic for a
   given run directory and code version (no export timestamp), so re-publishing an unchanged run
   uploads nothing.
@@ -114,7 +118,7 @@ import pyarrow.parquet as pq
 
 from .world.render import image_label
 
-EXPORT_SCHEMA = "swarmlab-export/2"
+EXPORT_SCHEMA = "swarmlab-export/3"
 INLINE_LIMIT = 64 * 1024
 IMAGE_MARK = b'"type":"image"'  # an image Part in a canonical-JSON request blob
 FULL_BLOBS_LIMIT = 500 * 1024 * 1024
@@ -148,7 +152,8 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
                          ("served_by", _S), ("request_hash", _S), ("response_hash", _S),
                          *_USAGE, ("cost_usd", _F), ("reserved_usd", _F), ("latency_s", _F),
                          ("finish_reason", _S), ("cached", _B), ("attempts", _I),
-                         ("request", _S), ("response", _S), ("response_seq", _I)),
+                         ("request", _S), ("response", _S), ("response_seq", _I),
+                         ("refusal_category", _S)),
     "probes": _schema(("probe", _S), ("ok", _B), ("candidate", _S), ("parsed", _S),
                       ("cost_usd", _F), ("question_hash", _S), ("question", _S),
                       ("raw_hash", _S), ("raw", _S)),
@@ -374,6 +379,7 @@ def build_tables(events: list[dict], meta: dict, blobs: _Blobs) -> dict[str, lis
                        cost_usd=ev.get("cost_usd"), latency_s=ev.get("latency_s"),
                        served_by=ev.get("served_by"), finish_reason=ev.get("finish_reason"),
                        cached=ev.get("cached"), attempts=ev.get("attempts", 1),
+                       refusal_category=ev.get("refusal_category"),
                        response=blobs.inline(ev.get("response_hash")),
                        response_seq=ev.get("seq"), **{k: usage.get(k) for k, _ in _USAGE})
         elif t == "probe":
