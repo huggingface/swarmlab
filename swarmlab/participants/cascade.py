@@ -35,8 +35,7 @@ replied empty or in prose without JSON. A reply that is not a usable `submit` ca
 result naming the problem (or, for a text reply, a user message) and one more try. Qwen3.8's chat
 template renders a tool result as a user-role turn wrapped in `<tool_response>` tags, so for that
 model the channel difference is those tags plus the worker's own preceding tool call. Answers
-written inside `submit` arguments run long; `experiments/cascade.yaml` gives this arm
-`max_tokens: 2048`.
+written inside `submit` arguments run long; give this arm `max_tokens: 2048`.
 
 After a usable answer
 ---------------------

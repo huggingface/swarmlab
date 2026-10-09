@@ -2,7 +2,7 @@
 
 The `cascade` world runs the "grader" scenario from Free Systems' [Extraordinary multi-agent delusions](https://freesystems.substack.com/p/extraordinary-multi-agent-delusions): an information cascade on a shared board. Workers act one at a time. Each holds one noisy private signal about a hidden binary fact and reads the board posts of the workers before it. The question is whether early wrong signals spread through the board even when later workers' own evidence points the other way.
 
-`experiments/cascade.yaml` is the reference spec. Results so far: [notes/cascade-qwen-2026-10-08.md](../notes/cascade-qwen-2026-10-08.md).
+Results so far: [notes/cascade-qwen-2026-10-08.md](../notes/cascade-qwen-2026-10-08.md).
 
 ## The scenario
 

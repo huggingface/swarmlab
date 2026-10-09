@@ -10,7 +10,7 @@ whether early wrong signals spread through the board.
 Use it with the `cascade_worker` participant (swarmlab/participants/cascade.py), which renders the
 source's prompt verbatim, under one round with `commit: immediate` and the base scheduler
 (`options.scheduler: {type: "swarmlab.scheduler:Scheduler"}`, order a000, a001, ...), so worker k
-sees the posts of workers 0..k-1. `experiments/cascade.yaml` is the reference spec.
+sees the posts of workers 0..k-1. docs/guide/cascade.md shows the spec.
 
 Signals
 -------

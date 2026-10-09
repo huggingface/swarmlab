@@ -1,4 +1,4 @@
-"""The `cascade` world, the `cascade_worker` participant and experiments/cascade.yaml."""
+"""The `cascade` world and the `cascade_worker` participant."""
 from __future__ import annotations
 
 import json
@@ -6,13 +6,13 @@ import random
 from pathlib import Path
 
 import pytest
+import yaml
 
 from swarmlab import Experiment
 from swarmlab.ids import AgentId
 from swarmlab.participants.cascade import CascadeWorker, parse_reply
 from swarmlab.registry import resolve
 from swarmlab.rng import derive
-from swarmlab.spec import load_experiment_yaml
 from swarmlab.view import View
 from swarmlab.world.cascade import (
     ACCEPTED,
@@ -29,8 +29,26 @@ from swarmlab.world.cascade import (
     CascadeWorld,
 )
 
-SPEC = Path(__file__).resolve().parents[1] / "experiments" / "cascade.yaml"
 AGENTS = [AgentId(f"a{i:03d}") for i in range(20)]
+
+
+def dry_spec(tmp_path, arm: str, **params) -> Path:
+    """A one-arm spec of 20 workers at `n_wrong_first: 4` (default model `fake:cascade_herder`)."""
+    params = {"model": "fake:cascade_herder", **params}
+    doc = {
+        "name": "cascade",
+        "options": {"max_rounds": 1, "commit": "immediate",
+                    "scheduler": {"type": "swarmlab.scheduler:Scheduler"}},
+        "arms": {arm: {
+            "world": {"type": "cascade", "params": {"truth": "output_only", "n_wrong_first": 4}},
+            "participants": [{"type": "cascade_worker", "count": 20, "params": params}],
+            "medium": {"topology": "broadcast", "delivery": "push", "push_limit": 50},
+            "metrics": ["belief.accuracy", "belief.consensus"],
+        }},
+    }
+    spec = tmp_path / f"{arm}.yaml"
+    spec.write_text(yaml.safe_dump(doc))
+    return spec
 
 
 def world(**params) -> CascadeWorld:
@@ -136,13 +154,6 @@ def test_parse_reply(text, expected):
     assert parse_reply(text)[0] == expected
 
 
-def test_spec_arms_build():
-    doc = load_experiment_yaml(SPEC)
-    assert doc["seeds"] == list(range(1, 41))
-    for arm in doc["arms"]:
-        Experiment.from_yaml(SPEC, arm)
-
-
 def commits(run) -> list[dict]:
     events = [json.loads(line) for line in (Path(run.dir) / "events.jsonl").read_text().splitlines()]
     return [e for e in events if e["type"] == "action_committed" and e["accepted"]]
@@ -154,25 +165,21 @@ def posts(run) -> list[str]:
 
 
 def test_dry_board_run_cascades_and_no_board_follows_signals(tmp_path):
-    board = Experiment.from_yaml(SPEC, "board_stress_dry").run(seed=3, out=tmp_path)
+    board = Experiment.from_yaml(dry_spec(tmp_path, "board"), "board").run(seed=3, out=tmp_path)
     acts = commits(board)
     assert len(acts) == 20 and [a["agent"] for a in acts] == [str(a) for a in AGENTS]
     assert {a["feedback"]["interpretation"] for a in acts} == {READS}  # the herders cascade
     texts = posts(board)
     assert texts[0].startswith("W00: My probe came back REJECTED.") and len(texts) == 20
-    alone = Experiment.from_yaml(SPEC, "noboard_stress_dry").run(seed=3, out=tmp_path)
+    alone = Experiment.from_yaml(dry_spec(tmp_path, "noboard", show_board=False), "noboard").run(
+        seed=3, out=tmp_path)
     assert all(a["feedback"]["follows_signal"] for a in commits(alone))
     assert board.score["accuracy"] == 0 and alone.score["accuracy"] > 0
 
 
 def test_disclose_tags_the_post(tmp_path):
-    doc = load_experiment_yaml(SPEC)
-    arm = doc["arms"]["board_stress_dry"]
-    arm["participants"][0]["params"]["disclose_belief"] = True
-    spec = tmp_path / "spec.yaml"
-    import yaml
-    spec.write_text(yaml.safe_dump({**doc, "arms": {"d": arm}}))
-    run = Experiment.from_yaml(spec, "d").run(seed=3, out=tmp_path / "runs")
+    run = Experiment.from_yaml(dry_spec(tmp_path, "d", disclose_belief=True), "d").run(
+        seed=3, out=tmp_path / "runs")
     assert posts(run)[0].startswith("W00 [committed: reads_transcript]: ")
 
 
@@ -205,14 +212,7 @@ def script_submit(request, rng):
 
 
 def tool_arm_spec(tmp_path, model: str) -> Path:
-    import yaml
-
-    doc = load_experiment_yaml(SPEC)
-    arm = doc["arms"]["board_tool_stress_dry"]
-    arm["participants"][0]["params"]["model"] = model
-    spec = tmp_path / "spec.yaml"
-    spec.write_text(yaml.safe_dump({**doc, "arms": {"t": arm}}))
-    return spec
+    return dry_spec(tmp_path, "t", model=model, board_channel="tool")
 
 
 def requests_of(run, agent: str) -> list[dict]:
@@ -241,7 +241,7 @@ def test_tool_channel_prefills_read_board_and_forces_submit(tmp_path):
 def test_tool_channel_board_text_matches_the_user_channel(tmp_path):
     tool_run = Experiment.from_yaml(tool_arm_spec(tmp_path, "fake:cascade_herder"), "t").run(
         seed=3, out=tmp_path / "runs")
-    user_run = Experiment.from_yaml(SPEC, "board_stress_dry").run(seed=3, out=tmp_path / "runs")
+    user_run = Experiment.from_yaml(dry_spec(tmp_path, "u"), "u").run(seed=3, out=tmp_path / "runs")
     board = requests_of(tool_run, "a007")[0]["messages"][3]["content"]
     user = requests_of(user_run, "a007")[0]["messages"][1]["content"]
     user = user if isinstance(user, str) else "".join(p["text"] for p in user)
