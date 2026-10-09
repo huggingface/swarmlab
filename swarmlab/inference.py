@@ -27,6 +27,14 @@ Decisions where the contract is silent:
   the provider semaphore, so the reservation is taken once and released once whatever the number
   of attempts. `inference_response.attempts` records the attempts (from `ChatResponse.attempts`,
   or `ProviderError.attempts` on failure).
+- **Refusals** are ordinary responses: cached like any other, so re-sending the same request
+  returns the same refusal. `inference_response.refusal_category` carries the response's
+  `Refusal.category` (hit or miss). A caller that wants a fresh answer re-sends with
+  `ChatRequest.attempt` raised (`LLMAgent(refusal_retries=N)`), which is a different hash and so
+  a different cache entry; replay and resume reproduce the same attempts from the log's
+  requests, so they hit the cache and never call a provider.
+- **Reasoning** (`ChatResponse.reasoning`, `provider_content`, ...) is part of the stored
+  response JSON, so cache hits, replay and resume return it unchanged.
 - Concurrent identical requests may both miss and both call the provider (no in-flight dedupe);
   the later write wins the cache file, which is harmless for a deterministic provider.
 """
@@ -43,6 +51,10 @@ from .blobs import BlobStore
 from .budget import Gate
 from .events import Event, InferenceAttemptEvent, InferenceResponseEvent
 from .providers.base import ChatRequest, ChatResponse, request_bytes, request_hash
+
+
+def _category(resp: ChatResponse) -> str | None:
+    return resp.refusal.category if resp.refusal is not None else None
 
 
 class InferenceCache:
@@ -116,7 +128,8 @@ class Inference:
                 run=self.run_id, round=round, agent=agent, call_id=call_id,
                 response_hash=self.blobs.put(hit.model_dump_json().encode()),
                 usage=hit.usage.model_dump(), cost_usd=0.0, latency_s=0.0,
-                served_by=hit.served_by, finish_reason=hit.finish_reason, cached=True))
+                served_by=hit.served_by, finish_reason=hit.finish_reason, cached=True,
+                refusal_category=_category(hit)))
             return hit.model_copy(update={"cached": True, "cost_usd": 0.0}), hit
         async with self.gate.admit(request, category) as res:
             self.log(InferenceAttemptEvent(run=self.run_id, round=round, agent=agent, call_id=call_id,
@@ -140,6 +153,6 @@ class Inference:
             run=self.run_id, round=round, agent=agent, call_id=call_id, response_hash=sha,
             usage=resp.usage.model_dump(), cost_usd=resp.cost_usd, latency_s=resp.latency_s,
             served_by=resp.served_by, finish_reason=resp.finish_reason, cached=False,
-            attempts=resp.attempts))
+            attempts=resp.attempts, refusal_category=_category(resp)))
         self.cache.put(h, resp, round)
         return resp, resp

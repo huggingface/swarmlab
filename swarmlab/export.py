@@ -76,6 +76,12 @@ Decisions where the contract is silent:
     later rounds under it); its response is emitted where the next readable request places the
     assistant message (or right after it, when window memory dropped it). With window memory the
     lost round's user message cannot be recovered and is missing from the session.
+  - Reasoning: an assistant message from a response with `provider_content` (Anthropic
+    thinking) has its blocks in the provider's order, `thinking` as pi `{"type": "thinking",
+    "thinking", "thinkingSignature"}` (text `""` when the display was omitted) and
+    `redacted_thinking` as `{"type": "thinking", "thinking": "", "thinkingSignature": <data>,
+    "redacted": true}`; a response with only `reasoning` text (OpenAI-compatible) gets one
+    `thinking` block before its text.
   - An image part of a message becomes a text block `[image: PNG <w>×<h>]` (M5 §4,
     `render.image_label`); the pixels stay in the request blobs.
   - pi `usage.cost` holds the logged `cost_usd` in `total` only (the run does not split cost
@@ -91,6 +97,17 @@ Decisions where the contract is silent:
   `run.json["spend_discarded_usd"]` is their sum. The ledger (`spend`) includes what hard-ceiling
   aborts charged, so `spend` minus the logged `inference.cost_usd` is about
   `spend_discarded_usd`, not 0. `EXPORT_SCHEMA` 2 added this table.
+- **Refusals.** `inference.refusal_category` is the `inference_response` event's
+  `refusal_category` (null unless the response was a refusal that named a category; a refusal
+  is `finish_reason == "refusal"`). `EXPORT_SCHEMA` 3 added the column (appended last, so the
+  earlier columns keep their positions).
+- **Reasoning.** `inference.reasoning` is the response's `reasoning` text (null when the
+  response carried none, `""` when the provider hid it: `reasoning_kind` `"omitted"`), inlined
+  like blob text up to `INLINE_LIMIT` bytes, else `"sha256:<response_hash>"` (the response blob
+  holding it, then kept in `raw/blobs/`); `reasoning_kind` (`summary`, `omitted`, `text`) and
+  `reasoning_redacted` (Anthropic `redacted_thinking` blocks; 0 without thinking, null when the
+  response blob is missing) come with it. Sessions carry it as pi `thinking` blocks (below).
+  `EXPORT_SCHEMA` 3 added these columns too.
 - `EXPORT_SCHEMA` is recorded in `run.json["export_schema"]`; outputs are deterministic for a
   given run directory and code version (no export timestamp), so re-publishing an unchanged run
   uploads nothing.
@@ -114,7 +131,7 @@ import pyarrow.parquet as pq
 
 from .world.render import image_label
 
-EXPORT_SCHEMA = "swarmlab-export/2"
+EXPORT_SCHEMA = "swarmlab-export/3"
 INLINE_LIMIT = 64 * 1024
 IMAGE_MARK = b'"type":"image"'  # an image Part in a canonical-JSON request blob
 FULL_BLOBS_LIMIT = 500 * 1024 * 1024
@@ -148,7 +165,9 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
                          ("served_by", _S), ("request_hash", _S), ("response_hash", _S),
                          *_USAGE, ("cost_usd", _F), ("reserved_usd", _F), ("latency_s", _F),
                          ("finish_reason", _S), ("cached", _B), ("attempts", _I),
-                         ("request", _S), ("response", _S), ("response_seq", _I)),
+                         ("request", _S), ("response", _S), ("response_seq", _I),
+                         ("refusal_category", _S), ("reasoning", _S), ("reasoning_kind", _S),
+                         ("reasoning_redacted", _I)),
     "probes": _schema(("probe", _S), ("ok", _B), ("candidate", _S), ("parsed", _S),
                       ("cost_usd", _F), ("question_hash", _S), ("question", _S),
                       ("raw_hash", _S), ("raw", _S)),
@@ -259,6 +278,23 @@ class _Blobs:
                 pass
         self.oversize.add(str(sha))
         return f"sha256:{sha}"
+
+
+def _reasoning_cells(blobs: _Blobs, sha: str | None) -> dict:
+    """`inference.reasoning` / `reasoning_kind` / `reasoning_redacted` from the response blob:
+    the text inlined up to INLINE_LIMIT bytes, else `"sha256:<response blob>"` (module doc)."""
+    resp = blobs.json(sha)
+    if not isinstance(resp, dict):
+        return {"reasoning": None, "reasoning_kind": None, "reasoning_redacted": None}
+    redacted = int(resp.get("reasoning_redacted") or 0)
+    if resp.get("reasoning") is None:
+        return {"reasoning": None, "reasoning_kind": None, "reasoning_redacted": redacted}
+    text = str(resp["reasoning"])
+    if len(text.encode("utf-8")) > INLINE_LIMIT:
+        blobs.oversize.add(str(sha))
+        text = f"sha256:{sha}"
+    return {"reasoning": text, "reasoning_kind": resp.get("reasoning_kind"),
+            "reasoning_redacted": redacted}
 
 
 class _SafeUnpickler(pickle.Unpickler):
@@ -374,6 +410,8 @@ def build_tables(events: list[dict], meta: dict, blobs: _Blobs) -> dict[str, lis
                        cost_usd=ev.get("cost_usd"), latency_s=ev.get("latency_s"),
                        served_by=ev.get("served_by"), finish_reason=ev.get("finish_reason"),
                        cached=ev.get("cached"), attempts=ev.get("attempts", 1),
+                       refusal_category=ev.get("refusal_category"),
+                       **_reasoning_cells(blobs, ev.get("response_hash")),
                        response=blobs.inline(ev.get("response_hash")),
                        response_seq=ev.get("seq"), **{k: usage.get(k) for k, _ in _USAGE})
         elif t == "probe":
@@ -518,6 +556,28 @@ def _usage(usage: dict | None, cost: float | None) -> dict:
     return d
 
 
+def _pi_blocks(content: list, calls: list[dict]) -> list[dict]:
+    """Anthropic content blocks (`provider_content`) as pi assistant content, in order; tool
+    calls take their parsed arguments from `calls` (matched by id)."""
+    args = {str(c.get("call_id")): c.get("args") or {} for c in calls}
+    out: list[dict] = []
+    for b in content:
+        t = b.get("type") if isinstance(b, dict) else None
+        if t == "thinking":
+            out.append({"type": "thinking", "thinking": b.get("thinking") or "",
+                        "thinkingSignature": b.get("signature") or ""})
+        elif t == "redacted_thinking":
+            out.append({"type": "thinking", "thinking": "", "thinkingSignature": b.get("data") or "",
+                        "redacted": True})
+        elif t == "text" and b.get("text"):
+            out.append({"type": "text", "text": b["text"]})
+        elif t == "tool_use":
+            cid = str(b.get("id"))
+            out.append({"type": "toolCall", "id": cid, "name": b.get("name"),
+                        "arguments": args.get(cid, b.get("input") or {})})
+    return out
+
+
 class _Session:
     def __init__(self, run_id: str, agent: str) -> None:
         self.run_id = run_id
@@ -552,13 +612,18 @@ class _Session:
         self.add({"role": "user", "content": _content_blocks(content)}, ts)
 
     def assistant(self, text: str, calls: list[dict], *, provider: str, model: str, api: str,
-                  usage: dict, finish: str | None, ts: float | None) -> None:
-        blocks: list[dict] = [{"type": "text", "text": text}] if text else []
+                  usage: dict, finish: str | None, ts: float | None,
+                  reasoning: str | None = None, provider_content: list | None = None) -> None:
         for c in calls:
-            cid = str(c.get("call_id"))
-            self.tool_names[cid] = str(c.get("name"))
-            blocks.append({"type": "toolCall", "id": cid, "name": c.get("name"),
-                           "arguments": c.get("args") or {}})
+            self.tool_names[str(c.get("call_id"))] = str(c.get("name"))
+        if provider_content:
+            blocks = _pi_blocks(provider_content, calls)
+        else:
+            blocks = [{"type": "thinking", "thinking": reasoning}] if reasoning else []
+            if text:
+                blocks.append({"type": "text", "text": text})
+            blocks += [{"type": "toolCall", "id": str(c.get("call_id")), "name": c.get("name"),
+                        "arguments": c.get("args") or {}} for c in calls]
         msg = {"role": "assistant", "content": blocks, "api": api, "provider": provider,
                "model": model, "usage": usage, "stopReason": _stop_reason(finish, bool(calls))}
         if finish:
@@ -665,7 +730,8 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
                        api="anthropic-messages" if provider == "anthropic" else "openai-completions",
                        usage=_usage(resp_ev.get("usage") or resp.get("usage"),
                                     resp_ev.get("cost_usd")),
-                       finish=resp.get("finish_reason"), ts=resp_ev.get("ts"))
+                       finish=resp.get("finish_reason"), ts=resp_ev.get("ts"),
+                       reasoning=resp.get("reasoning"), provider_content=resp.get("provider_content"))
         unseen += 1
         rnd = int(att.get("round") or 0)
         evs = tool_events.get(rnd, [])

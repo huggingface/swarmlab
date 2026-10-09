@@ -117,6 +117,11 @@ when the experiment came from a YAML: its directory, put on `sys.path` by `Run.e
 errored turn's exception line, when there is one) and `health: "degraded"` when more than half
 of the turns ended `error` (the end reason is left as it is: a run whose every turn failed still
 ends `max_rounds`, but `swarmlab run` reports it `errored` and exits 1).
+`turns_refused` (turns whose final model response was a refusal: the last entry of
+`turn_ended.usage.finish_reasons` is `"refusal"`) and, when non-zero, `refusal_categories`
+(`{category: turns}`, the category from the turn's last `refusal:<category>` note, `none` for a
+refusal without one, `unknown` for a log written before the notes existed). Refusals do not
+change `health`: a refused turn ended normally, and the CLI warns about it separately.
 
 Recovery (`resume(budget=None)`): if the log has `run_ended` with a reason other than
 `soft_budget`/`hard_ceiling`/`hard_ceiling_probes`, nothing to do (budget-ended runs are resumed like crashed ones). Else find the last
@@ -355,13 +360,27 @@ def error_headline(text: str | None) -> str:
     return f"{name}{sep}{rest}"
 
 
+def refusal_of_turn(usage: Any) -> str | None:
+    """The refusal category of a turn whose final model response was a refusal (`none` when the
+    refusal named none, `unknown` without a `refusal:` note), else None."""
+    if not isinstance(usage, dict):
+        return None
+    finish = usage.get("finish_reasons") or []
+    if not finish or finish[-1] != "refusal":
+        return None
+    notes = [n for n in usage.get("notes") or [] if isinstance(n, str) and n.startswith("refusal:")]
+    return (notes[-1].split(":", 1)[1] or "none") if notes else "unknown"
+
+
 class TurnTally:
-    """Turns ended and turns ended `error` in the log, plus the first error's headline."""
+    """Turns ended, turns ended `error` (plus the first error's headline) and turns refused (by
+    category) in the log."""
 
     def __init__(self) -> None:
         self.total = 0
         self.errored = 0
         self.first_error: str | None = None
+        self.refused: dict[str, int] = {}
 
     @classmethod
     def of(cls, events: list[Event]) -> TurnTally:
@@ -377,15 +396,21 @@ class TurnTally:
             self.errored += 1
             if self.first_error is None:
                 self.first_error = error_headline(ev.error) or "(no error text)"
+        category = refusal_of_turn(ev.usage)
+        if category is not None:
+            self.refused[category] = self.refused.get(category, 0) + 1
 
     @property
     def degraded(self) -> bool:
         return self.errored * 2 > self.total
 
     def meta(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"turns_total": self.total, "turns_errored": self.errored}
+        out: dict[str, Any] = {"turns_total": self.total, "turns_errored": self.errored,
+                               "turns_refused": sum(self.refused.values())}
         if self.first_error is not None:
             out["first_error"] = self.first_error
+        if self.refused:
+            out["refusal_categories"] = dict(sorted(self.refused.items()))
         if self.degraded:
             out["health"] = "degraded"
         return out

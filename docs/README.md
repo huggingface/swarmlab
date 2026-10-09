@@ -9,7 +9,7 @@ The [project README](../README.md) is the overview. These pages are the referenc
 | [Getting started](guide/getting-started.md) | install, run the free starter, understand skipped and repeated run dirs, install the experimenter skill |
 | [Building experiments](guide/building-experiments.md) | see every built-in world, topology, participant, provider, probe, intervention, metric and role; use the Python API; write a new world; change agents' prompts |
 | [The Flag Game](guide/flag-game.md) | run image or text crops, the broadcast / gossip / manager protocols, or the paper replication |
-| [Real models and budgets](guide/real-models.md) | pick a model id, set keys, read prices, tune timeouts, preflight, set reasoning controls, size `soft_usd` / `hard_usd` / `total_usd` |
+| [Real models and budgets](guide/real-models.md) | pick a model id, set keys, read prices, tune timeouts, preflight, set reasoning controls, size `soft_usd` / `hard_usd` / `total_usd`, handle refusals, capture reasoning traces |
 | [Spec reference](guide/spec-reference.md) | look up any YAML key, its shape and default (generated from the pydantic models) |
 | [CLI and run directory](guide/cli.md) | look up a command's flags, exit codes, or a file in `runs/<run_id>/` |
 | [Analysing and publishing](guide/analysis.md) | write a report, read the Parquet exports and sessions, write a truth-aware metric, publish to the Hub |

@@ -42,6 +42,14 @@ Mapping:
   JSON; a non-JSON string becomes `{"_raw": <string>}` and `finish_reason = "bad_tool_args"`.
   Usage from `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`,
   `completion_tokens_details.reasoning_tokens`. `served_by` = the `x-inference-provider` header.
+  `finish_reason == "content_filter"` (the server's safety filter declined) becomes
+  `"refusal"` with `ChatResponse.refusal = Refusal()` (no category: the API gives none), so
+  refusals read the same across providers. `ChatRequest.attempt` is never sent.
+- Reasoning: `message.reasoning_content` (vLLM, SGLang, DeepInfra, DeepSeek), else
+  `message.reasoning` (OpenRouter, some routers), when a non-empty string, becomes
+  `ChatResponse.reasoning` with `reasoning_kind = "text"` (what the server returned; for open
+  models usually the full chain of thought). It is recorded only: it is never sent back
+  (chat templates drop earlier turns' reasoning, and some servers reject it in a request).
 - Timeouts and retries (see `base.py`): each attempt is bounded by `timeout_s` (httpx timeout and
   an `asyncio.timeout` around the attempt). `httpx.TimeoutException`, the attempt deadline,
   other `httpx.TransportError`s, HTTP 429 and 5xx are retried up to `max_retries` times with
@@ -69,6 +77,7 @@ from .base import (
     ChatResponse,
     Provider,
     ProviderError,
+    Refusal,
     Usage,
     model_id,
     parse_json_args,
@@ -147,8 +156,21 @@ def parse_completion(data: dict) -> tuple[str, list[ToolCall], Usage, str]:
         cached_prompt_tokens=int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
         reasoning_tokens=int((u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0),
     )
-    finish = "bad_tool_args" if bad else str(choice.get("finish_reason") or "")
+    stop = str(choice.get("finish_reason") or "")
+    if stop == "content_filter":
+        stop = "refusal"
+    finish = stop if stop == "refusal" else "bad_tool_args" if bad else stop
     return msg.get("content") or "", calls, usage, finish
+
+
+def parse_reasoning(data: dict) -> dict:
+    """`ChatResponse` reasoning fields from a chat-completions body (module doc); {} without."""
+    msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+    for key in ("reasoning_content", "reasoning"):
+        value = msg.get(key)
+        if isinstance(value, str) and value:
+            return {"reasoning": value, "reasoning_kind": "text"}
+    return {}
 
 
 class OpenAICompatProvider(Provider):
@@ -215,7 +237,8 @@ class OpenAICompatProvider(Provider):
                                         f"attempt(s))", status=status, attempts=attempt + 1) from err
                 await asyncio.sleep(self._delay(attempt, retry_after))
                 attempt += 1
-        text, calls, usage, finish = parse_completion(resp.json())
+        data = resp.json()
+        text, calls, usage, finish = parse_completion(data)
         return ChatResponse(
             text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage),
             provider=self.name, model=model_id(request),
@@ -223,6 +246,7 @@ class OpenAICompatProvider(Provider):
             or (self.name if self.self_hosted else None),
             latency_s=time.monotonic() - start, finish_reason=finish,
             attempts=attempt + 1, retried_after_timeout=timed_out,
+            refusal=Refusal() if finish == "refusal" else None, **parse_reasoning(data),
         )
 
 

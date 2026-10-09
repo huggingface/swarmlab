@@ -27,9 +27,32 @@ Mapping (ChatRequest -> `messages.create` kwargs):
 - Response: `text` = the text blocks joined; `tool_calls` from `tool_use` blocks (an input that
   arrives as a string is parsed with `json.loads`; non-JSON -> `{"_raw": ...}` and
   `finish_reason = "bad_tool_args"`); otherwise `finish_reason` = `stop_reason`.
+- Refusals (`parse_refusal`): `stop_reason == "refusal"` (a safety classifier declined; HTTP 200)
+  gives `finish_reason = "refusal"` (it wins over `bad_tool_args`: the content may be a partial
+  reply cut off mid-stream) and `ChatResponse.refusal = Refusal(category, explanation)` from
+  `stop_details`. The API fills `stop_details` only on refusals and may leave it null even then,
+  so it is read only when `stop_reason == "refusal"`, and a null one gives `Refusal()` (both
+  fields None). `ChatRequest.attempt` is never sent. The server-side `fallbacks` option is not
+  used (passed through `extra` it would silently serve the request from another model).
   `usage.prompt_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`,
-  `cached_prompt_tokens = cache_read_input_tokens`, `completion_tokens = output_tokens`.
+  `cached_prompt_tokens = cache_read_input_tokens`, `completion_tokens = output_tokens`
+  (thinking included), `reasoning_tokens = output_tokens_details.thinking_tokens` when the API
+  reports it (the tokens of the raw reasoning, not of the possibly shorter summary returned).
   `served_by` is None.
+- Reasoning (`parse_reasoning`): `thinking` blocks' text joined by blank lines is
+  `ChatResponse.reasoning`, with `reasoning_kind` `"summary"` when any has text (`thinking:
+  {type: adaptive, display: summarized}` in `extra`) and `"omitted"` when all are empty (the
+  default display on Claude Opus 5.5 / Sonnet 5.5 / Haiku 5.5 / Fable; reasoning `""`);
+  `redacted_thinking` blocks are counted in `reasoning_redacted`. The raw chain of thought is
+  never returned. When the response has any thinking block, `provider_content` holds every
+  content block in order as a request block (`text`: type, text; `thinking`: type, thinking,
+  signature; `redacted_thinking`: type, data; `tool_use`: type, id, name, input; other types:
+  their fields minus None), and an assistant message carrying `provider_content` is sent as
+  exactly those blocks instead of text + tool calls. Passing thinking blocks back unchanged is
+  what the API asks for in tool loops (preserved thinking on Opus 5.5, Sonnet 5.5 and Fable 5.1:
+  the model reads its earlier reasoning; leaving the blocks out is accepted but loses it). The
+  blocks are bound to the history before them, so a caller that trims history must drop them
+  (`LLMAgent` does, see its module doc).
 - Timeouts and retries (see `base.py`): the SDK client gets `timeout=timeout_s` and
   `max_retries=0`, and each attempt also runs under `asyncio.timeout(timeout_s)`. Our own loop
   retries `APITimeoutError` (and the attempt deadline), `APIConnectionError`, `RateLimitError`
@@ -58,6 +81,7 @@ from .base import (
     PricingRow,
     Provider,
     ProviderError,
+    Refusal,
     Usage,
     model_id,
     parse_json_args,
@@ -77,6 +101,8 @@ def tool_definition(schema: ToolSchema) -> dict:
 
 
 def _blocks(m: ChatMessage) -> list[dict]:
+    if m.role == "assistant" and m.provider_content is not None:
+        return [dict(b) for b in m.provider_content]  # verbatim: thinking signatures bind order
     if m.role == "tool":
         return [{"type": "tool_result", "tool_use_id": m.tool_call_id or "",
                  "content": text_of(m.content)}]
@@ -155,9 +181,53 @@ def parse_message(message: Any) -> tuple[str, list[ToolCall], Usage, str]:
         prompt_tokens=int(_get(u, "input_tokens", 0) or 0) + cache_read + cache_write,
         completion_tokens=int(_get(u, "output_tokens", 0) or 0),
         cached_prompt_tokens=cache_read,
+        reasoning_tokens=int(_get(_get(u, "output_tokens_details"), "thinking_tokens", 0) or 0),
     )
-    finish = "bad_tool_args" if bad else str(_get(message, "stop_reason", "") or "")
+    stop = str(_get(message, "stop_reason", "") or "")
+    finish = stop if stop == "refusal" else "bad_tool_args" if bad else stop
     return "".join(texts), calls, usage, finish
+
+
+def _request_block(block: Any) -> dict:
+    """One response content block as the request block that sends it back unchanged."""
+    btype = _get(block, "type")
+    if btype == "text":
+        return {"type": "text", "text": _get(block, "text", "")}
+    if btype == "thinking":
+        return {"type": "thinking", "thinking": _get(block, "thinking", "") or "",
+                "signature": _get(block, "signature", "") or ""}
+    if btype == "redacted_thinking":
+        return {"type": "redacted_thinking", "data": _get(block, "data", "") or ""}
+    if btype == "tool_use":
+        return {"type": "tool_use", "id": _get(block, "id"), "name": _get(block, "name"),
+                "input": _get(block, "input")}
+    raw = block if isinstance(block, dict) else block.model_dump(mode="json")
+    return {k: v for k, v in raw.items() if v is not None}
+
+
+def parse_reasoning(message: Any) -> dict:
+    """`ChatResponse` reasoning fields from an SDK `Message` (module doc); {} without thinking."""
+    blocks = list(_get(message, "content", []) or [])
+    thoughts = [_get(b, "thinking", "") or "" for b in blocks if _get(b, "type") == "thinking"]
+    redacted = sum(1 for b in blocks if _get(b, "type") == "redacted_thinking")
+    if not thoughts and not redacted:
+        return {}
+    text = "\n\n".join(t for t in thoughts if t)
+    return {"reasoning": text, "reasoning_kind": "summary" if text else "omitted",
+            "reasoning_redacted": redacted,
+            "provider_content": [_request_block(b) for b in blocks]}
+
+
+def parse_refusal(message: Any) -> Refusal | None:
+    """`Refusal` from `stop_details` when `stop_reason == "refusal"`, else None (module doc)."""
+    if _get(message, "stop_reason") != "refusal":
+        return None
+    details = _get(message, "stop_details")
+    if details is None:
+        return Refusal()
+    category, explanation = _get(details, "category"), _get(details, "explanation")
+    return Refusal(category=None if category is None else str(category),
+                   explanation=None if explanation is None else str(explanation))
 
 
 class AnthropicProvider(Provider):
@@ -221,5 +291,6 @@ class AnthropicProvider(Provider):
             text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage),
             provider=self.name, model=model_id(request), served_by=None,
             latency_s=time.monotonic() - start, finish_reason=finish,
-            attempts=attempt + 1, retried_after_timeout=timed_out,
+            attempts=attempt + 1, retried_after_timeout=timed_out, refusal=parse_refusal(message),
+            **parse_reasoning(message),
         )
