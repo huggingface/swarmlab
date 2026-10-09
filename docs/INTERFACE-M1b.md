@@ -51,6 +51,15 @@ class Provider(Plugin):
 ```
 `request_hash(request) -> sha256` over canonical JSON of the request with `extra` included. Unknown model pricing is an error at `Experiment` construction, not at call time.
 
+(Refusals, additive) Models with safety classifiers (Claude Opus 5.5, Sonnet 5.5, Fable) can decline with HTTP 200 and `stop_reason: "refusal"`. Two optional fields record and route around that:
+
+```python
+class Refusal(BaseModel): category: str | None = None; explanation: str | None = None
+class ChatRequest:  ... attempt: int = 0     # re-send number after refusals; part of request_hash/request_bytes when > 0, never sent to a provider
+class ChatResponse: ... refusal: Refusal | None = None   # set iff finish_reason == "refusal"
+```
+`attempt` is left out of the hashed JSON when it is 0, so every request hash from before the field existed is unchanged. Adapters: Anthropic maps `stop_reason == "refusal"` to `finish_reason = "refusal"` and `refusal` from `stop_details` (`category`, `explanation`; `stop_details` is read only on refusals, and a null one gives `Refusal()`); the OpenAI-compatible adapter maps `finish_reason == "content_filter"` to `"refusal"` with `Refusal()` (no category). Neither sends `attempt`.
+
 - **AnthropicProvider**: official `anthropic` SDK, `AsyncAnthropic`; API key from `ANTHROPIC_API_KEY`, falling back to `ANTHROPIC_KEY` (this environment's variable). Tools map to Anthropic tool definitions with `strict: true` where the schema allows; `tool_choice` is always `auto` (forced tool choice is rejected on current models). Images as base64 image blocks. `thinking_budget` maps to `thinking={"type":"enabled","budget_tokens":N}` only for models that take it (Haiku 4.5); omitted otherwise. Pricing table seeded with `claude-haiku-4-5: (1.00, 5.00, 0.10)`; other Claude models may be added from the API reference, never guessed. Error handling: a typed chain (rate limit -> retry with backoff up to 3 times; other API status errors -> raise). Streaming is not required in M1b (short outputs).
 - **OpenAICompatProvider(name, base_url, api_key_env, pricing, concurrency)** over `httpx.AsyncClient`: chat-completions with `tools` and `tool_choice="auto"` when `tool_protocol == "native"`, images as `image_url` data URLs, `seed` passed when given, records `x-inference-provider` (HF router) as `served_by`. Presets: `hf` (`https://router.huggingface.co/v1`, `HF_TOKEN`), `openai` (`https://api.openai.com/v1`, `OPENAI_API_KEY`), `vllm` (`base_url` required, no key). Retries 429/5xx with backoff up to 3 times.
 - **FakeProvider(script)**: deterministic. `script` is an entry-point name or `module:function` of `(request: ChatRequest, rng: random.Random) -> ChatResponse`; the rng is derived per call from the request hash so the fake is a pure function of the request. Pricing `(1.0, 5.0, 0.1)` so budget tests have real numbers. Ships with `scripts.flaggame_reader`: reads the board, guesses the candidate consistent with the most crops it can parse from the conversation, calls `end_turn`.
@@ -84,6 +93,8 @@ Runner rules: before starting a round, if `ledger.spent["swarm"] >= budget.soft_
 
 Events added: `inference_attempt{call_id, provider, model, request_hash, reserved_usd, category}`, `inference_response{call_id, response_hash, usage, cost_usd, latency_s, served_by, finish_reason, cached}` (both operational); `budget{spent_swarm, spent_measurement, reserved, calls}` and `budget_changed{old, new}` (logical); `probe{probe, question_hash, raw_hash, parsed, ok, cost_usd}` (logical).
 
+(Refusals, additive) A refusal is cached like any response, so re-sending the identical request inside a run returns the stored refusal. A participant that wants a fresh answer re-sends with `ChatRequest.attempt` raised: a different hash, so a different cache entry. The cache stays keyed on the request hash alone and step 2 above is unchanged: `replay()` still never calls a provider, and `resume()` re-creates the same attempts (they are a function of the logged responses) and hits the cache. `inference_response` gains `refusal_category: str | None` (the response's `Refusal.category`; omitted from the JSON when None). Run health: `run.json` and `Run.summary()` gain `turns_refused` (turns whose final model response was a refusal, i.e. `turn_ended.usage.finish_reasons[-1] == "refusal"`) next to `turns_errored`, and `refusal_categories: {category: turns}` when it is non-zero; refusals do not change `health`.
+
 ## 4. LLMAgent
 
 ```python
@@ -94,6 +105,7 @@ class LLMAgent(Participant):   entry_point = "llm"
                  max_calls: int | None = None, role: str = "worker", extra: dict | None = None,
                  text_tool_fallback: bool = False)
 ```
+- (Refusals, additive) `refusal_retries: int = 0` (in `params` only when non-zero). Every refused response is noted in the turn (`LLMTurnUsage.notes` gets `"refusal:<category>"`, `none` without one). With N > 0 a refused response is not appended or executed and the same messages are re-sent with `attempt` 1, 2, ..., at most N re-sends per turn, in the native/json loop and under `report_json`; re-sends do not count toward `max_calls`. With 0, or once the N are used, a refusal is handled as before.
 - **Provider passthrough and diagnostics** (added after the 2026-10-06 smoke): `extra` goes to `ChatRequest.extra` on every request including probes; `text_tool_fallback` (opt-in, native protocol) executes tool calls the model wrote as text; `turn()` returns `LLMTurnUsage` with `finish_reasons` and `notes` (`"length"`, `"text_tool_fallback:<n>"`). Details in `swarmlab/participants/llm.py`.
 - **System prompt**: Jinja2 template; the default template (`participants/prompts/default_system.j2`) states the agent's id and role, that it acts in rounds, that actions are tool calls, that `end_turn` ends its turn, and lists the tools from `view.tools` with descriptions. It must not instruct the agent to read the board or to collaborate; that is the experiment's business. `system_prompt` overrides the template text (a string, or `file:<path>`). The rendered prompt is a spec parameter by construction (it is in `params`).
 - **Round message**: one user message per round with: `Round {r}.`, the observation parts (text and image parts passed through), the previous round's outcomes rendered as short lines, pushed inbox items if any. Nothing else.

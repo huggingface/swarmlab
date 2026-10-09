@@ -376,3 +376,38 @@ def site_experiment(name: str = "sites", n_llm: int = 3, crash: bool = True) -> 
     return Experiment(name=name, world=SiteWorld(), participants=parts,
                       medium=Board(topology="broadcast"), metrics=[CrowdMetric()],
                       providers={"fake": FakeProvider(pricing=TEST_PRICING)})
+
+
+# ---- refusals: fake scripts that decline like an Anthropic safety classifier ------------------------
+def _refusal(request, category: str | None = "cyber", text: str = "", calls=()):
+    from swarmlab.providers.base import Refusal
+
+    return _resp(request, text, calls, finish="refusal").model_copy(
+        update={"refusal": Refusal(category=category, explanation="declined by a test classifier")})
+
+
+def script_refuse_first(request, rng):
+    """Refuse every request at attempt 0 (with a partial tool call, as a mid-stream decline
+    can leave), answer like `fake:reader` on a re-send."""
+    from swarmlab.providers.fake import flaggame_reader
+
+    if request.attempt == 0:
+        return _refusal(request, "cyber", "I can't", calls=[("guess", {"candidate": "A"})])
+    return flaggame_reader(request, rng)
+
+
+def script_always_refuse(request, rng):
+    return _refusal(request, "cyber", "I can't help with that.")
+
+
+def script_refuse_uncategorised(request, rng):
+    return _refusal(request, None)
+
+
+def script_report_refuse_first(request, rng):
+    """`report_json`: refuse at attempt 0, then answer like `fake:country_reporter`."""
+    from swarmlab.providers.fake import country_reporter
+
+    if request.attempt == 0:
+        return _refusal(request, "bio", '{"country": "nowhere"}')
+    return country_reporter(request, rng)
