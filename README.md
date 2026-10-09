@@ -25,7 +25,7 @@ The framework handles everything else: tool dispatch, turn order, logging, budge
 
 ## Highlights
 
-- **Tasks with a ground truth.** The [Flag Game](https://arxiv.org/abs/2609.19124) tests belief dynamics and Coloring tests allocation. You can add your own `World` in about 15 lines.
+- **Tasks with a ground truth.** The [Flag Game](https://arxiv.org/abs/2609.19124) tests belief dynamics, Coloring tests allocation, and [Hidden Sites](docs/guide/hidden-sites.md) tests allocation when site qualities are hidden and evidence must be pooled through the board. You can add your own `World` in about 15 lines.
 - **Communication is the variable you change.** Pick a topology (`broadcast`, `gossip`, `groups`, `star`, `tree`), add delay or custom visibility policies, use a claim registry, and assign roles such as manager, skeptic or reviewer.
 - **Mixed swarms.** Use Anthropic, Hugging Face Inference Providers, OpenAI, self-hosted vLLM or deterministic fake models, and mix them within one arm.
 - **Built-in measurement.** Belief consensus, accuracy, polarization and entropy; out-of-band belief probes; communication metrics; interventions in the middle of a run; paired runs.
@@ -155,7 +155,7 @@ Every command takes `--json`. The full flag list is in [CLI and run directory](d
 
 ## Documentation
 
-The [documentation index](docs/README.md) links every page: [getting started](docs/guide/getting-started.md), [building experiments](docs/guide/building-experiments.md), [the Flag Game](docs/guide/flag-game.md), [real models and budgets](docs/guide/real-models.md), [spec reference](docs/guide/spec-reference.md), [CLI](docs/guide/cli.md) and [analysing and publishing](docs/guide/analysis.md). The design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md), and open problems are in [`docs/notes/known-issues.md`](docs/notes/known-issues.md).
+The [documentation index](docs/README.md) links every page: [getting started](docs/guide/getting-started.md), [building experiments](docs/guide/building-experiments.md), [the Flag Game](docs/guide/flag-game.md), [Hidden Sites](docs/guide/hidden-sites.md), [real models and budgets](docs/guide/real-models.md), [spec reference](docs/guide/spec-reference.md), [CLI](docs/guide/cli.md) and [analysing and publishing](docs/guide/analysis.md). The design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md), and open problems are in [`docs/notes/known-issues.md`](docs/notes/known-issues.md).
 
 **Coding agents:** read [`AGENTS.md`](AGENTS.md) first. To run experiments, follow [`skill/SKILL.md`](skill/SKILL.md).
 
