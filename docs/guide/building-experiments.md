@@ -7,7 +7,7 @@ What the framework ships (worlds, topologies, participants, providers, metrics, 
 The names below are examples. Run `swarmlab plugins` for the complete list of every group with one-line descriptions (`swarmlab plugins topologies` for one group).
 
 - **Worlds**: for example `flaggame` (belief dynamics: hidden flag, one crop per agent, `guess` action; text or image crops, see [Flag Game modalities](flag-game.md#flag-game-modalities); optional blind agents, see [Flag Game protocols](flag-game.md#flag-game-protocols)) and `coloring` (allocation: a grid to paint, with claims and a registry). New worlds subclass `World` (example 3). Run `swarmlab plugins worlds` for the complete list.
-- **Topologies** (`medium: {topology: ...}`): for example `broadcast`, `gossip`, `star` (members reach only the center, the center reaches everyone, `params: {center: a000}`) and `tree` (coordinators over worker groups, `params: {groups: 3}`). See [Flag Game protocols](flag-game.md#flag-game-protocols). Run `swarmlab plugins topologies` for the complete list. A custom `Topology` subclass overrides `recipients` and may override the channel hooks `reset_agents`, `channels`, `channel_members`, `channel_permissions` and `default_channel` to add board channels, restrict who reads and writes them, and pick where a channel-less `post` goes (`None` makes the agent name a channel); see [INTERFACE §9](../INTERFACE.md#9-medium).
+- **Topologies** (`medium: {topology: ...}`): for example `broadcast`, `gossip`, `star` (members reach only the center, the center reaches everyone, `params: {center: a000}`), `tree` (coordinators over worker groups, `params: {groups: 3}`) and `rooms` (named rooms with fixed, possibly overlapping membership; see [Rooms](#rooms)). See [Flag Game protocols](flag-game.md#flag-game-protocols). Run `swarmlab plugins topologies` for the complete list. A custom `Topology` subclass overrides `recipients` and may override the channel hooks `reset_agents`, `channels`, `channel_members`, `channel_permissions` and `default_channel` to add board channels, restrict who reads and writes them, and pick where a channel-less `post` goes (`None` makes the agent name a channel); see [INTERFACE §9](../INTERFACE.md#9-medium).
 - **Policies**: for example `delay` (messages arrive k rounds late), and your own `Policy` subclasses (example 2). **Registry** with claim policies such as `advisory` or `enforced` for the coloring task. Run `swarmlab plugins` for the complete list (`policies`, `claim_policies`).
 - **Participants**: scripted baselines such as `evidence_aggregator` or `row_major_painter`, and `llm` (`LLMAgent`: memory window, `context_limit_tokens` with `drop_oldest`/`summarize`/`fail_turn` overflow, prompt params, `max_calls`, `extra` passthrough). Run `swarmlab plugins participants` for the complete list.
 - **Providers** (model id prefix): `anthropic`, `hf` (HF router), `openai`, `vllm` (self-hosted, normally via `job run`), `fake` (for example `fake:reader` or `fake:painter`: deterministic, no network; `swarmlab plugins fake_scripts` lists the scripts).
@@ -18,6 +18,28 @@ The names below are examples. Run `swarmlab plugins` for the complete list of ev
 - **Run control**: replay (checks metrics and score from the log), resume, fork at a round (optionally with an edited spec), budgets (soft, hard, measurement, experiment total), per-call timeout and retry.
 - **Export and publish**: Parquet tables, pi-format sessions and raw logs; private Hub dataset per experiment; static `view.html`; `fetch-published` restores a run.
 - **Jobs**: `swarmlab job run|status|logs|fetch` runs a spec on HF Jobs with vLLM serving the model in the same job (validated at N=256, 83 min, $3.45).
+
+## Rooms
+
+The `rooms` topology restricts communication to named rooms with fixed membership. Each room becomes a board channel; an agent may be in several rooms (a bridge) or in none.
+
+```yaml
+medium:
+  topology:
+    type: rooms
+    params:
+      rooms:
+        red: [a000, a001, a002]
+        blue: [a002, a003, a004]   # a002 is in both rooms
+```
+
+- An agent can read and post only in its rooms; the `channel` enum of its `read_board` and `post` tools lists exactly those. An agent in no room gets no board tools.
+- A post reaches the other live members of the room it is posted on, nothing else: a002's post on `red` never reaches `blue`. Information crosses rooms only when a shared member repeats it.
+- `post` without a channel goes to the agent's room when it is in exactly one; an agent in several rooms must name one (the call fails with `bad args` listing its rooms).
+- A role's `channels_read` / `channels_write` can narrow an agent's rooms further, never widen them.
+- Membership is fixed for the run. Every listed member must be an agent of the run.
+
+`examples/rooms_flaggame.yaml` compares disjoint rooms with rooms joined by two bridge agents.
 
 ## Python examples
 
