@@ -390,12 +390,3 @@ def test_cap_note_marks_spinning_turns_and_report_counts_rejected_calls(tmp_path
     text = build_report(out, "cap")
     assert "| rejected tool calls |" in text
     assert "| 8/20 |" in text  # per round: spinner 4 of 5 answered calls refused, busy 0 of 5
-
-
-def test_m3_vllm_spec_caps_model_calls_per_turn():
-    import yaml  # the spec needs a vLLM base_url to build, so read it as data
-
-    doc = yaml.safe_load((REPO / "experiments" / "m3_coloring_vllm.yaml").read_text())
-    assert set(doc["arms"]) == {"s0", "claims-advisory", "claims-enforced"}
-    for arm in doc["arms"].values():
-        assert [g["params"]["max_calls"] for g in arm["participants"]] == [4]

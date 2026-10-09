@@ -32,4 +32,3 @@ The [project README](../README.md) is the overview. These pages are the referenc
 - [`notes/known-issues.md`](notes/known-issues.md): open problems: JSON tool protocol on Haiku, DeepInfra tool-call stalls, estimates overstating spend, `validate` rejecting `vllm:` specs, and role and paired-run gaps.
 - [`notes/m6-results-2026-10-08.md`](notes/m6-results-2026-10-08.md): latest results (Flag Game paper replication on Gemma 4).
 - [`notes/`](notes/): every run report and smoke note, dated.
-- [`../experiments/README.md`](../experiments/README.md): the experiment specs in the repo, with cost notes.
