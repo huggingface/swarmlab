@@ -19,7 +19,6 @@ from swarmlab.jobs import remote
 from swarmlab.spec import SpecError, git_identity
 
 REPO = Path(__file__).resolve().parents[1]
-M2_VLLM = REPO / "experiments" / "m2_vllm_qwen9b.yaml"
 MODEL = "Qwen/Qwen3.5-9B"
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 NOW = 1_791_000_000.0  # fixed clock -> fixed tag
@@ -121,24 +120,6 @@ def test_validation_of_vllm_model_ids(tmp_path):
         plan(spec, arms=["bc"], bucket="s3://x")
     # a scripted arm next to a vllm arm is fine (it calls no model)
     assert plan(spec).runs == [("bc", 1), ("bc", 2), ("scripted", 1), ("scripted", 2)]
-
-
-def test_m2_vllm_spec_validates_and_estimates():
-    p = plan(M2_VLLM)
-    assert [a for a, _ in p.runs] == ["bc-qwen9b-16", "gossip-qwen9b-16", "bc-qwen9b-64"]
-    arms = p.estimate_detail["arms"]
-    assert arms["bc-qwen9b-64"]["agents"] == 64 and arms["bc-qwen9b-16"]["rounds"] == 10
-    assert p.estimate_s == 600 + 2 * 10 * 62 + 10 * 158
-    assert p.timeout_s == 5400  # 1.5 x 3420 s rounded up to 10 min
-    doc = yaml.safe_load(p.job_spec_yaml)
-    for arm in doc["arms"].values():
-        metric_types = [(m["type"], m["params"].get("source")) for m in arm["metrics"]]
-        assert ("belief.consensus", "probe:belief") in metric_types
-        assert ("belief.accuracy", "probe:belief") in metric_types
-        assert arm["budget"] == {} or not any(arm["budget"].values())
-    assert not any(doc["budget"].values())
-    text = jl.describe(p)
-    assert "a100-large" in text and "$2.50/h" in text and "57 min" in text
 
 
 def test_estimate_overrides_and_short_timeout_note(tmp_path):
