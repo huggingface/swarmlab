@@ -14,6 +14,7 @@ from swarmlab import (
 )
 from swarmlab.base import _plain
 from swarmlab.ids import ActionId, AgentId
+from swarmlab.registry import build
 
 
 class Counter(World):
@@ -47,6 +48,14 @@ class Branch(Plugin):
 class Sub(Leaf):
     def __init__(self, z=9):
         super().__init__(a=1)
+
+
+class Forwarder(Leaf):
+    """Takes its own option and forwards the rest to its parent through `**extra`."""
+
+    def __init__(self, d=0, **extra):
+        super().__init__(**extra)
+        self.d = d
 
 
 class Bag(Persistable):
@@ -117,6 +126,27 @@ def test_spec_nested_plugins_serialise():
 
 def test_spec_most_derived_constructor_wins():
     assert Sub(z=4).params == {"z": 4}
+
+
+def test_spec_var_keyword_params_are_flat():
+    f = Forwarder(d=1, a=5, c="y")
+    assert f.params == {"d": 1, "a": 5, "c": "y"}
+    assert Forwarder(a=2).params == {"d": 0, "a": 2}
+
+
+def test_spec_var_keyword_round_trips_through_build():
+    f = Forwarder(d=1, a=5, c="y")
+    g = build(f.spec(), "swarmlab.participants")
+    assert type(g) is Forwarder and (g.a, g.d) == (5, 1)
+    assert g.spec() == f.spec()
+
+
+def test_build_accepts_nested_var_keyword_form():
+    # run.json files written before the flattening nest the `**extra` arguments under its name
+    old = {"type": "tests.test_base:Forwarder", "params": {"d": 1, "extra": {"a": 5, "c": "y"}}}
+    g = build(old, "swarmlab.participants")
+    assert (g.a, g.d) == (5, 1)
+    assert g.spec() == Forwarder(d=1, a=5, c="y").spec()
 
 
 def test_spec_without_init_is_empty_params():

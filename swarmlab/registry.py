@@ -2,6 +2,9 @@
 
 `resolve(type_name, group)` finds the class: first an entry point named `type_name` in `group`,
 then `module:Qual.Name` import. `build(spec, group)` instantiates it with `params`.
+`flat_params(cls, params)` accepts the form `Plugin.spec()` wrote before it flattened `**name`
+arguments (`{"kwargs": {...}}`, nested under the parameter's name), so older run.json files
+still rebuild; `build` applies it.
 Groups used by `Experiment.from_spec`: `swarmlab.worlds`, `swarmlab.participants`,
 `swarmlab.metrics`; the board resolves `swarmlab.topologies` and `swarmlab.policies` itself.
 
@@ -14,6 +17,7 @@ run dir) can do the same from any working directory.
 from __future__ import annotations
 
 import importlib
+import inspect
 import sys
 from collections.abc import Mapping
 from importlib.metadata import entry_points
@@ -60,4 +64,17 @@ def build(spec: Mapping[str, Any] | Any, group: str) -> Any:
     if not isinstance(spec, Mapping):
         spec = {"type": spec.type, "params": dict(spec.params)}
     cls = resolve(spec["type"], group)
-    return cls(**dict(spec.get("params") or {}))
+    return cls(**flat_params(cls, spec.get("params") or {}))
+
+
+def flat_params(cls: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+    """`params` with a dict under `cls`'s `**name` parameter merged into the top level."""
+    out = dict(params)
+    try:
+        sig = inspect.signature(cls)
+    except (TypeError, ValueError):
+        return out
+    var_kw = next((p.name for p in sig.parameters.values() if p.kind is p.VAR_KEYWORD), None)
+    if var_kw is not None and isinstance(out.get(var_kw), dict):
+        out.update(out.pop(var_kw))
+    return out
