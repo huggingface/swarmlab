@@ -33,7 +33,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -42,6 +42,9 @@ from ..ids import ActionId, AgentId
 from ..interventions import NotSupported
 from ..tools import ToolSchema
 from ..view import Observation
+
+if TYPE_CHECKING:  # swarmlab.experiment imports this module
+    from ..experiment import Run
 
 
 class Action(BaseModel):
@@ -260,6 +263,17 @@ class World(Persistable, Plugin):
         - a scalar: a key/value row; anything else: JSON text.
         """
         return None
+
+    def report_sections(self, arms: dict[str, list[Run]]) -> list[str]:
+        """Evaluator-side Markdown lines appended to `swarmlab report` after its generic
+        "Final score" table (which already lists every scalar key of the recorded `score()`).
+
+        `arms` maps arm name to that arm's finished runs (`Run`: `score`, `metrics`, `events`,
+        `spec`, ...). Called once per report on a world built from the first run's spec, not
+        reset, so it may use constructor config only; read per-run state from the runs.
+        Default: no lines.
+        """
+        return []
 
     # ---- per-agent hooks (WP16: Flag Game blind agents) ----------------------------------------
     def allows_tool(self, agent: AgentId, name: str) -> bool:

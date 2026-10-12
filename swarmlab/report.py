@@ -16,9 +16,16 @@ Decisions:
   `post_rate`, the share of the round's turns that posted, computed from the events so it is
   there whether or not `comm.post_rate` was logged), reading behaviour, tool-protocol health and
   protocol health for every world; "where the swarm went" and "probe vs world belief" only when
-  a run's world is a FlagGame (or subclass) or some run has committed `guess` actions (truth and
-  rival come from rebuilding the world, since `verify()` is not persisted); "Coloring (final
-  grid)" (the recorded `score()` per run) only when a run's world is a ColoringGrid.
+  some run has committed `guess` actions or, failing that, some run's rebuilt world names a
+  `truth` and a `rival` in `verify()` (truth and rival come from rebuilding the world, since
+  `verify()` is not persisted; no world class is checked, so FlagGame-style worlds that do not
+  subclass FlagGame get them too); last, "Final score" for every world: per run, every scalar
+  key of the recorded `score()` (int, float, str, bool, None; nested values skipped) in
+  first-seen order across runs.
+- World hook: after "Final score", the lines of `World.report_sections({arm: [Run, ...]})` on a
+  world built from the first run's spec (`runs[0].experiment.world`, not reset), so a world adds
+  its own sections without editing this module; a world that cannot be built here (a custom
+  world that does not import) leaves the line `(world report sections unavailable: <error>)`.
 - M6 "Terminal states (Flag Game paper)" (FlagGame-style runs, after "where the swarm went"):
   per arm, the share of runs whose endpoint is correct consensus / wrong consensus / polarized /
   fragmented (`metrics.belief.classify_state`, thresholds 0.85 / 0.25) and the mean terminal
@@ -263,39 +270,40 @@ def health_rows(rs) -> list[list]:
 
 TRAJECTORY_ROWS = [("accuracy", "belief.accuracy"), ("consensus", "belief.consensus"),
                    ("entropy", "belief.entropy"), ("read_rate", "comm.read_rate")]
-COLORING_KEYS = ("coverage", "correct", "wrong", "unpainted", "paints", "useful_paints",
-                 "duplicate_paints", "wrong_paints", "overwritten_paints", "wasted_paints")
+SCALARS = (int, float, str, bool, type(None))
 
 
-def world_kind(run) -> str:
-    """`flaggame`, `coloring` (built-ins and their subclasses) or `other`."""
-    from .registry import resolve
-    from .world.coloring import ColoringGrid
-    from .world.flaggame import FlagGame
+def score_section(arms) -> list[str]:
+    """Final score per run (any world): every scalar key of the `score()` recorded in run.json
+    (int, float, str, bool, None; nested dicts and lists are skipped), in first-seen order across
+    the runs. A run without a key shows `n/a`."""
+    runs = [(run, d) for _, rs in sorted(arms.items()) for run, d in rs]
+    scores = [(run, d, run.score if isinstance(run.score, dict) else {}) for run, d in runs]
+    keys: dict[str, None] = {}
+    for _, _, sc in scores:
+        keys.update((k, None) for k, v in sc.items() if isinstance(v, SCALARS))
 
+    def cell(v):
+        if isinstance(v, float):
+            return f(v)
+        return NA if v is None or not isinstance(v, SCALARS) else v
+
+    rows = [[run.id, d["last_round"]] + [cell(sc.get(k)) for k in keys] for run, d, sc in scores]
+    return ["## Final score", ""] + table(["run", "rounds", *keys], rows) + [""]
+
+
+def world_sections(arms) -> list[str]:
+    """The world's own `report_sections` (World hook), on a world built from the first run's
+    spec; a world that cannot be built here (a custom world that does not import) leaves a
+    one-line note instead."""
+    by_arm = {arm: [run for run, _ in rs] for arm, rs in sorted(arms.items())}
+    first = next((rs[0] for rs in by_arm.values() if rs), None)
+    if first is None:
+        return []
     try:
-        cls = resolve(run.spec.world.type, "swarmlab.worlds")
-    except Exception:  # noqa: BLE001 - a custom world that does not import here
-        return "other"
-    if isinstance(cls, type) and issubclass(cls, FlagGame):
-        return "flaggame"
-    if isinstance(cls, type) and issubclass(cls, ColoringGrid):
-        return "coloring"
-    return "other"
-
-
-def coloring_section(arms) -> list[str]:
-    """Final grid score per run (ColoringGrid `score()` as recorded in run.json)."""
-    rows = []
-    for arm, rs in sorted(arms.items()):
-        for run, d in rs:
-            if world_kind(run) != "coloring":
-                continue
-            sc = run.score or {}
-            rows.append([run.id, d["last_round"]] +
-                        [f(sc.get(k)) if isinstance(sc.get(k), float) else sc.get(k, NA)
-                         for k in COLORING_KEYS])
-    return ["## Coloring (final grid)", ""] + table(["run", "rounds", *COLORING_KEYS], rows) + [""]
+        return list(first.experiment.world.report_sections(by_arm))
+    except Exception as e:  # noqa: BLE001 - a custom world must not break the whole report
+        return [f"(world report sections unavailable: {type(e).__name__}: {e})", ""]
 
 
 def world_verify(run, agents):
@@ -305,6 +313,15 @@ def world_verify(run, agents):
     ag = [p.agent for p in exp.participants if getattr(p, "agent", None)] or sorted(agents)
     exp.world.reset(derive(seed, "world"), ag)
     return exp.world.verify()
+
+
+def has_truth(run, agents) -> bool:
+    """True when the rebuilt world's `verify()` names a truth and a rival (Flag Game style)."""
+    try:
+        v = world_verify(run, agents)
+    except Exception:  # noqa: BLE001 - a world that does not rebuild here has no usable truth
+        return False
+    return isinstance(v, dict) and "truth" in v and "rival" in v
 
 
 def truth_info(run, agents):
@@ -427,9 +444,11 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
         arms[f"{arm} (simulated)" if fake else arm].append((run, scan(run)))
     last = [d["last_round"] for rs in arms.values() for _, d in rs]
     R = range(1, max([*last, 1]) + 1)
-    kinds = {world_kind(run) for rs in arms.values() for run, _ in rs}
-    flag = "flaggame" in kinds or any(d["guess_by_round"].get(d["last_round"])
-                                      for rs in arms.values() for _, d in rs)
+    every = [(run, d) for rs in arms.values() for run, d in rs]
+    # Flag Game style: some run has committed `guess` actions, else (rebuilt only then) some
+    # run's world verifies a truth and a rival
+    flag = (any(d["guess_by_round"].get(d["last_round"]) for _, d in every)
+            or any(has_truth(run, d["agents"]) for run, d in every))
     L = [f"# {title}", "", f"Runs dir: `{runs_dir}`; skipped (not ended / unreadable): {', '.join(skipped) or 'none'}", ""]
     if simulated:
         how = ("included below as `<arm> (simulated)`" if include_fake else
@@ -576,8 +595,9 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
     for arm, rs in sorted(arms.items()):
         L += [f"**{arm}**", ""] + table(["measure", "value"], health_rows(rs)) + [""]
 
-    if "coloring" in kinds:
-        L += coloring_section(arms)
+    if arms:
+        L += score_section(arms)
+        L += world_sections(arms)
     return "\n".join(L)
 
 
