@@ -166,3 +166,81 @@ def test_validate_cli_runs_the_requirement_check(tmp_path):
     good.write_text(SPEC.format(extra=", commit: immediate", limit=4))
     res = CliRunner().invoke(app, ["validate", str(good), "--json"])
     assert res.exit_code == 0, res.output
+
+
+# ---- role overrides are checked as the run applies them -----------------------------------------
+VISION = "fake:tests.helpers:script_end_turn_first"  # a fake script that does not read text grids
+
+
+def role_exp(proto_model: str, role_model: str) -> Experiment:
+    from swarmlab.participants import LLMAgent
+    from swarmlab.providers.fake import FakeProvider
+    from swarmlab.roles import Role, assign
+
+    from .helpers import TEST_PRICING
+
+    return Experiment(name="img", world=FlagGame(modality="image"),
+                      participants=[assign(LLMAgent(model=proto_model), "seer") for _ in range(2)],
+                      medium=Board(topology="broadcast"), roles={"seer": Role(name="seer", model=role_model)},
+                      providers={"fake": FakeProvider(pricing=TEST_PRICING)})
+
+
+def test_a_role_model_that_fixes_a_rejected_prototype_is_accepted(tmp_path):
+    good = role_exp("fake:reader", VISION)
+    assert [p.model for p in good.participants] == ["fake:reader"] * 2  # prototypes untouched
+    assert [p.model for p in good.effective_participants()] == [VISION] * 2
+    assert good.run(seed=1, max_rounds=1, out=tmp_path).status == "ended"
+
+
+def test_a_role_model_that_breaks_an_accepted_prototype_fails_like_run_start(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match=r"participants \['a000', 'a001'\]") as built:
+        role_exp(VISION, "fake:reader")
+    # the same experiment past construction: run start (bound participants) gives the same error
+    sneaked = role_exp(VISION, VISION)
+    from swarmlab.roles import Role
+    sneaked = sneaked.model_copy(update={"roles": {"seer": Role(name="seer", model="fake:reader")}})
+    monkeypatch.setattr(Experiment, "check_run", lambda self, *a, **k: None)
+    with pytest.raises(ValueError) as at_start:
+        sneaked.run(seed=1, max_rounds=1, out=tmp_path)
+    assert str(at_start.value) == str(built.value)
+
+
+# ---- estimate and run check the effective settings, overrides included ---------------------------
+ROUNDS_SPEC = """\
+name: req
+seeds: [1, 2]
+options: {max_rounds: 3}
+arms:
+  A:
+    world: {type: "tests.test_requirements:RoundsWorld", params: {rounds: 3}}
+    participants: [{type: evidence_aggregator, count: 2}]
+"""
+
+
+def test_estimate_checks_its_max_rounds():
+    good = exp(RoundsWorld(rounds=3), options={"max_rounds": 3})
+    assert good.estimate(seed=1, max_rounds=3)["rounds"] == 3
+    with pytest.raises(ValueError, match=r"requires max_rounds=3 \(world.rounds\), got 5"):
+        good.estimate(seed=1, max_rounds=5)
+    with pytest.raises(ValueError, match="requires commit=immediate"):
+        push_ok().check_run(commit="round_end")
+    push_ok().check_run(max_rounds=7)
+
+
+def test_cli_estimate_and_run_refuse_a_bad_max_rounds_override_up_front(tmp_path):
+    spec = tmp_path / "rounds.yaml"
+    spec.write_text(ROUNDS_SPEC)
+    res = CliRunner().invoke(app, ["estimate", str(spec), "--max-rounds", "5", "--json"])
+    assert res.exit_code == 2, res.output
+    out = json.loads(res.stdout)
+    assert "requires max_rounds=3 (world.rounds), got 5" in out["error"] and "arms" not in out
+    res = CliRunner().invoke(app, ["estimate", str(spec), "--max-rounds", "3", "--json"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["arms"]["A"]["rounds"] == 3
+    res = CliRunner().invoke(app, ["run", str(spec), "--max-rounds", "5", "--out", str(tmp_path / "runs")])
+    assert res.exit_code == 2, res.output
+    assert "requires max_rounds=3 (world.rounds), got 5" in res.output
+    assert "running" not in res.output and not (tmp_path / "runs").exists()
+    res = CliRunner().invoke(app, ["run", str(spec), "--max-rounds", "3", "--out", str(tmp_path / "runs")])
+    assert res.exit_code == 0, res.output
+    assert "running" in res.output

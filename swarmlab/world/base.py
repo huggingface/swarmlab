@@ -34,7 +34,9 @@ is called at two points, with the same method:
 
 - at `Experiment` construction (a model validator, so the Python constructor, `from_spec`,
   `from_yaml` and every CLI command that builds the experiment: `validate`, `run`, `prompts`,
-  `estimate`). It sees `experiment.options` as declared: an unset `commit` or `scheduler` counts as
+  `estimate`), and again by `Experiment.estimate`/`run` and the CLI `estimate`/`run` with their
+  overrides (`Experiment.check_run`, swarmlab/experiment.py). Its participants are the effective
+  ones (role overrides applied to copies). It sees `experiment.options` as declared: an unset `commit` or `scheduler` counts as
   its default (`round_end`, `SeededShuffle`); `max_rounds` (no default) is checked only when the
   options carry it (or `rounds_per_agent`), since `run(max_rounds=...)` may give it later.
   `delivery` and `push_limit` come from `experiment.medium`, `n_agents` from the participants.

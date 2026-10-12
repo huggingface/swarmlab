@@ -104,6 +104,7 @@ present: more than half of the turns ended `error`, see swarmlab/runner.py; + `s
 """
 from __future__ import annotations
 
+import copy
 import json
 import time
 import warnings
@@ -127,7 +128,7 @@ from .providers import catalog_priced, ensure_pricing
 from .providers import resolve as resolve_provider
 from .providers.base import Provider, split_model
 from .registry import add_import_dir, build
-from .roles import Role, assign, role_name, roles_from_spec, spec_roles
+from .roles import Role, agent_roles, assign, role_name, roles_from_spec, spec_roles
 from .runner import Runner
 from .scheduler import build_scheduler
 from .spec import (
@@ -196,9 +197,55 @@ class Experiment(BaseModel):
     @model_validator(mode="after")
     def _check_world(self) -> Experiment:
         """The world's requirements (`World.check_experiment`, swarmlab/world/base.py), once per
-        construction; the runner checks again at run start with the resolved run options."""
-        self.world.check_experiment(self)
+        construction (`check_run` with no overrides); the runner checks again at run start."""
+        self.check_run()
         return self
+
+    def effective_participants(self) -> list[Participant]:
+        """The participants as a run sees them after roles apply (M3c), prototypes untouched.
+
+        For each agent with a role, a deep copy of its prototype with `apply_role(role)` called,
+        as the runner does on its own copies (`bind_roles`); other prototypes as they are. When the
+        roles do not resolve (an unknown role name, reported by `to_spec`), the prototypes.
+        """
+        names = [role_name(p) for p in self.participants]
+        try:
+            roles, names = spec_roles(self.roles, names)
+        except ValueError:
+            return list(self.participants)
+        out: list[Participant] = []
+        for p, role in zip(self.participants, agent_roles(roles, names, len(self.participants)),
+                           strict=True):
+            apply = getattr(p, "apply_role", None)
+            if role is not None and callable(apply):
+                p = copy.deepcopy(p)
+                p.apply_role(role)
+            out.append(p)
+        return out
+
+    def _merged_options(self, max_rounds: int | None = None, **overrides: Any) -> dict:
+        """The run options a run with these overrides resolves (explicit argument, else
+        `options`; None = not given), `rounds_per_agent` resolved; no `RunOptions` defaults."""
+        merged = {k: v for k, v in self.options.items() if k != "seed"}
+        merged.update({k: v for k, v in overrides.items() if v is not None})
+        merged = resolve_rounds(merged, len(self.participants))  # M6: rounds_per_agent
+        if max_rounds is not None:
+            merged["max_rounds"] = max_rounds
+        return merged
+
+    def check_run(self, max_rounds: int | None = None, **overrides: Any) -> None:
+        """`world.check_experiment` on the settings a run with these overrides would have.
+
+        Raises the world's `ValueError`. The view is a copy of this experiment whose `options`
+        are the merged options (`run` resolution, no defaults filled in) and whose participants
+        are `effective_participants()`. Called at construction (no overrides), by `estimate`,
+        `run` and the CLI `estimate`/`run` commands before anything starts; the runner's check at
+        run start (resolved `RunOptions`, bound participants) stays the authoritative one.
+        """
+        options = self._merged_options(max_rounds, **overrides)
+        options.pop("rounds_per_agent", None)  # already resolved into max_rounds
+        self.world.check_experiment(self.model_copy(update={
+            "options": options, "participants": self.effective_participants()}))
 
     def _pin_price(self, prefix: str, provider: Provider, mid: str, row: tuple) -> None:
         """Record a catalog price in the provider's params so `to_spec` carries it."""
@@ -224,6 +271,7 @@ class Experiment(BaseModel):
                  prompt_tokens: float = 3000, completion_tokens: float = 300,
                  seeds: list[int] | None = None, prompt_growth: float = 0,
                  probe_call_usd: float | None = None) -> dict:
+        self.check_run(max_rounds)  # the world's requirements, as `run` would see them
         rounds = range(1, max_rounds + 1)
         # sum over rounds of the prompt tokens of one call per round (flat and growth-adjusted)
         flat_tokens = prompt_tokens * max_rounds
@@ -292,11 +340,7 @@ class Experiment(BaseModel):
 
     # ---- running -----------------------------------------------------------------------------
     def _options(self, seed: int, max_rounds: int | None, **kw: Any) -> RunOptions:
-        merged = {k: v for k, v in self.options.items() if k != "seed"}
-        merged.update({k: v for k, v in kw.items() if v is not None})
-        merged = resolve_rounds(merged, len(self.participants))  # M6: rounds_per_agent
-        if max_rounds is not None:
-            merged["max_rounds"] = max_rounds
+        merged = self._merged_options(max_rounds, **kw)
         if "max_rounds" not in merged:
             raise ValueError("max_rounds is required (argument or experiment options)")
         return RunOptions(seed=seed, **merged)
@@ -318,6 +362,8 @@ class Experiment(BaseModel):
         """Run one seed into `out/<run_id>` (or exactly `run_dir` when given)."""
         options = self._options(seed, max_rounds, commit=commit, max_calls_per_turn=max_calls_per_turn,
                                 snapshot_every=snapshot_every, concurrency=concurrency, repeat=repeat)
+        self.check_run(max_rounds, commit=commit, max_calls_per_turn=max_calls_per_turn,
+                       snapshot_every=snapshot_every, concurrency=concurrency, repeat=repeat)
         rid = run_id or self.run_id(seed)
         target = Path(run_dir) if run_dir is not None else Path(out) / rid
         Runner(target, self, options, run_id=run_id).live()

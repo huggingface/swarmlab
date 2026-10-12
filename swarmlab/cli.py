@@ -260,6 +260,15 @@ def _fail(e: BaseException, code: int, as_json: bool) -> None:
     raise typer.Exit(code)
 
 
+def _check_run(exp: Experiment, spec: Path, max_rounds: int | None) -> None:
+    """`Experiment.check_run` with the CLI's `--max-rounds`, its `ValueError` as a `SpecError`
+    (exit 2, like `validate`), so `estimate` and `run` refuse before estimating or starting."""
+    try:
+        exp.check_run(max_rounds)
+    except ValueError as e:
+        raise SpecError(f"{spec}: arm {exp.arm!r}: {type(e).__name__}: {e}") from e
+
+
 def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
               calls_per_turn: int | None = None, prompt_growth: int = 0,
               measured: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -566,6 +575,7 @@ def run(
         for a, exp in exps.items():
             if max_rounds is None and "max_rounds" not in exp.options:
                 raise SpecError(f"{spec}: arm {a!r}: no max_rounds in options; pass --max-rounds")
+            _check_run(exp, spec, max_rounds)  # the world's requirements, with --max-rounds
         ests = {a: _estimate(exp, seeds[0], max_rounds) for a, exp in exps.items()}
         total_cap = float(doc["budget"].get("total_usd") or 0)
         if total_cap > 0:
@@ -828,8 +838,11 @@ def estimate(
             raise SpecError(f"{spec}: unknown arm {arm!r}; available: {sorted(doc['arms'])}")
         arms = [arm] if arm is not None else list(doc["arms"])
         seeds = [seed] if seed is not None else experiment_seeds(doc)
-        ests = {a: _estimate(_build(spec, a), seeds[0], max_rounds, calls_per_turn, prompt_growth,
-                             measured) for a in arms}
+        exps = {a: _build(spec, a) for a in arms}
+        for exp in exps.values():
+            _check_run(exp, spec, max_rounds)  # the world's requirements, with --max-rounds
+        ests = {a: _estimate(exp, seeds[0], max_rounds, calls_per_turn, prompt_growth, measured)
+                for a, exp in exps.items()}
         note = _measured_text(measured) if measured else None
         if seed is not None and len(arms) == 1:  # the single-run form: one estimate dict
             est = ests[arms[0]]

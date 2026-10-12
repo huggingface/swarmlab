@@ -26,6 +26,8 @@ swarmlab job status JOB_ID    swarmlab job logs JOB_ID [--follow]    swarmlab jo
 `swarmlab plugins` lists every plugin group (worlds, topologies, policies, participants, metrics, claim_policies, schedulers, probes, interventions, fake_scripts) with each entry point's name and one-line description; `swarmlab plugins GROUP` lists one group, and `--json` prints `{"ok": true, "plugins": {group: [{"name", "description", "target"}]}}` (`target` is `module:Class`). It is the complete list the guides defer to. `swarmlab metrics` is the `metrics` group with a note on probe-sourced belief metrics.
 
 `validate` builds every arm, which runs each world's requirement check (`World.requires` / `check_experiment`, e.g. a world that needs `commit: immediate` or `delivery: push`); a violation exits 2 naming every unmet setting. `run`, `prompts` and `estimate` build the experiment the same way, so they fail the same way.
+
+`validate` builds every arm, which runs each world's requirement check (`World.requires` / `check_experiment`, e.g. a world that needs `commit: immediate` or `delivery: push`); a violation exits 2 naming every unmet setting. `run`, `prompts` and `estimate` build the experiment the same way, so they fail the same way; `run` and `estimate` check again with `--max-rounds` (and role model overrides) before estimating or starting anything, so an override the world refuses exits 2 once rather than failing every run.
 Every command takes `--json` and then prints one JSON object. Exit codes: 0 success, 2 invalid spec, 1 any other error (including a declined confirmation or a failed run).
 
 ## Run directory
