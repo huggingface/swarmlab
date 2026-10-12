@@ -4,7 +4,8 @@
 temperature=None, tool_protocol="native", thinking_budget=None, max_calls=None, role="worker",
 extra=None, text_tool_fallback=False, context_limit_tokens=None, overflow="drop_oldest",
 summary_model=None, system_prompt_append=None, memory_messages=8, report_json=False,
-report_fields=None, answers_kept=None, refusal_retries=0)`, entry point `llm`.
+report_fields=None, answers_kept=None, refusal_retries=0, carry_thinking=False)`, entry point
+`llm`.
 
 **max_tokens** defaults to 2048 (was 1024). In the 2026-10-06 smoke, Qwen3.5-9B with thinking on
 spent the whole 1024-token budget reasoning (`finish_reason="length"`, empty text, no tool call)
@@ -145,26 +146,36 @@ protocol a reply with native tool calls is executed as such instead and ends the
 protocol no tools go through the API and the JSON answer is the only path. `report_json` and
 `report_fields` are in `params` only when set.
 
-**Reasoning** (thinking blocks). An assistant message keeps the response's `provider_content`
-(Anthropic content blocks with thinking and signatures, set only when the response carried
-thinking), so the adapter sends the thinking back unchanged in later requests, as the API asks
-for tool loops with thinking on (the model reads its earlier reasoning; without the blocks the
-request is accepted but that reasoning is lost). The blocks are bound to the exact history
-before them, and a request that replays one after that history changed is rejected (preserved
-thinking, enforced for accounts created on or after 2026-08-31). So whenever memory is trimmed
-from the front (`window` dropping a round, a context-limit `drop_oldest`/`summarize` overflow)
-every kept `provider_content` is removed first; removing all thinking is always accepted, and
-the turns after the trim produce new blocks on the new history. The same holds for the request's
-other inputs: `reasoning_binding` (snapshot state) is the sha256 of the system prompt and the
-tool list (`ToolSchema` JSON) of the request whose response produced the kept blocks, and before
-every request whose system prompt or tool list differs (a `reconfigure(system_prompt=...)`
-intervention re-renders the prompt; a role or a world that changes its tool schemas) every kept
-block is removed. A model change alone does not remove them: the API drops what the new model
-cannot read, unbilled, and asks callers to keep passing blocks across a switch. `full` memory is append-only
-and keeps all of them; `received` memory starts each turn afresh, so blocks live within a
-turn. The stripping is a pure function of the memory, so replay and resume rebuild the same
-requests. A message without reasoning has no `provider_content` key, so requests and memory
-are unchanged for models that do not think.
+**Reasoning** (thinking blocks). Every response's reasoning (text, kind, redacted count, the
+signed `provider_content`) is recorded as the provider returned it, in the response blob and the
+cache; nothing here deletes or changes that record. What follows only decides which thinking is
+*sent back* in later requests.
+
+- Within a swarm turn, an assistant message keeps the response's `provider_content` (Anthropic
+  content blocks with thinking and signatures, set only when the response carried thinking), so
+  the adapter returns the thinking unchanged through the tool-call loop, as the API asks for
+  tool loops with thinking on.
+- Between swarm turns (default): at the start of each turn every kept `provider_content` is
+  removed from memory, so later requests carry only text and tool calls of earlier turns.
+  Removing all thinking is always accepted. Ordinary messages and tool results follow the memory
+  policy as before.
+- `carry_thinking=True` (opt-in; in `params` only when set) keeps earlier turns' thinking too.
+  The blocks are bound to the exact history before them, and a request that replays one after
+  that history changed is rejected (preserved thinking, enforced for accounts created on or after
+  2026-08-31), so kept blocks are still removed whenever memory is trimmed from the front
+  (`window` dropping a round, a context-limit `drop_oldest`/`summarize` overflow) and whenever
+  the system prompt or tool list changes: `reasoning_binding` (snapshot state) is the sha256 of
+  the system prompt and tool list (`ToolSchema` JSON) of the request whose response produced the
+  kept blocks, and before every request whose prompt or tools differ (a
+  `reconfigure(system_prompt=...)` intervention; a world or role that changes tool schemas)
+  every kept block is removed. A model change alone does not remove them: the API drops what the
+  new model cannot read, unbilled, and asks callers to keep passing blocks across a switch.
+
+These removals run before the context-limit estimate of a request, so thinking that will not be
+sent never triggers trimming or `fail_turn`. They are pure functions of the memory, so replay and
+resume rebuild the same requests. A message without reasoning has no `provider_content` key, so
+requests and memory are unchanged for models that do not think. Probe requests
+(`probes.probe_messages`) never carry thinking.
 
 **Probing.** `probe_context()` returns `[system] + memory` as fresh `ChatMessage` objects (callers
 cannot mutate the agent's memory through them); `model_request_defaults()` returns `model,
@@ -487,6 +498,7 @@ class LLMAgent(Participant):
         report_fields: list[str] | None = None,
         answers_kept: int | None = None,
         refusal_retries: int = 0,
+        carry_thinking: bool = False,
     ) -> None:
         if memory not in MEMORY_MODES:
             raise ValueError(f"memory must be one of {MEMORY_MODES}, got {memory!r}")
@@ -550,6 +562,11 @@ class LLMAgent(Participant):
         if not refusal_retries:  # in params (and the spec hash) only when set
             params.pop("refusal_retries", None)
         self.refusal_retries = refusal_retries
+        if type(carry_thinking) is not bool:  # ValueError like the other params (spec errors)
+            raise ValueError("carry_thinking must be true or false")
+        if not carry_thinking:  # in params (and the spec hash) only when set
+            params.pop("carry_thinking", None)
+        self.carry_thinking = carry_thinking
         self.memory_messages = memory_messages
         self.report_json = bool(report_json)
         self.report_fields = fields
@@ -857,6 +874,8 @@ class LLMAgent(Participant):
             if len(kept) < len(self.rounds):
                 self._drop_reasoning()
             self.rounds = kept
+        if not getattr(self, "carry_thinking", False):  # thinking lives within one swarm turn
+            self._drop_reasoning()
         if self.memory == "received":  # M6 §3: no history across turns, one constructed message
             self.ingest(list(view.pushed))
             self.last_observation = [p.model_dump(mode="json") for p in view.observation.parts]
@@ -874,8 +893,8 @@ class LLMAgent(Participant):
         retried = False
         resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
         while self.max_calls is None or model_calls < self.max_calls:
+            self._check_reasoning_binding(view.tools)  # before estimating: only what is sent
             await self._enforce_context_limit(view.tools, tools)  # M3a §3 context limit
-            self._check_reasoning_binding(view.tools)
             resp = await tools.infer(self._request(view.tools, resend))
             usage.finish_reasons.append(resp.finish_reason)
             if resp.finish_reason == "length" and "length" not in usage.notes:
@@ -975,8 +994,8 @@ class LLMAgent(Participant):
         call = 0
         resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
         while call < attempts:
+            self._check_reasoning_binding(view.tools)  # before estimating: only what is sent
             await self._enforce_context_limit(view.tools, tools)
-            self._check_reasoning_binding(view.tools)
             resp = await tools.infer(self._request(view.tools, resend))
             usage.finish_reasons.append(resp.finish_reason)
             if resp.finish_reason == "length" and "length" not in usage.notes:

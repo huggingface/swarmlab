@@ -297,3 +297,45 @@ def test_session_exhausted_retries_keep_normal_matching(tmp_path):
     first, last = results
     assert first["isError"] and "not executed" in first["content"][0]["text"]  # re-sent
     assert not last["isError"] and last["toolName"] == "end_turn"  # handled as default: it ran
+
+
+def test_session_discard_does_not_depend_on_request_blobs(tmp_path):
+    run = refusing("script_refuse_first", 1, refusal_retries=1, max_calls=1).run(
+        seed=1, max_rounds=1, out=tmp_path / "runs")
+    attempts = [e for e in run.events_all if e.type == "inference_attempt"]
+    assert [a.attempt for a in attempts] == [0, 1]  # the log itself marks the re-send
+    raw = [json.loads(x) for x in (run.dir / "events.jsonl").read_text().splitlines()]
+    assert [e.get("attempt") for e in raw if e["type"] == "inference_attempt"] == [None, 1]
+    h = attempts[1].request_hash  # remove only the re-sent request's blob
+    (run.dir / "blobs" / h[:2] / h).unlink()
+    msgs = session_messages(run.export(tmp_path / "export"))
+    calls = {b["id"]: b["name"] for m in msgs if m["role"] == "assistant"
+             for b in m["content"] if b["type"] == "toolCall"}
+    results = {m["toolCallId"]: m for m in msgs if m["role"] == "toolResult"}
+    guess = next(cid for cid, name in calls.items() if name == "guess")
+    assert results[guess]["isError"] and "not executed" in results[guess]["content"][0]["text"]
+    for cid, name in calls.items():  # every executed result sits under the call that made it
+        if name == "post":
+            assert json.loads(results[cid]["content"][0]["text"])["result"] == {"id": "tmp-a000-0"}
+        elif name == "read_board":
+            assert "items" in json.loads(results[cid]["content"][0]["text"])["result"]
+
+
+def test_session_never_attributes_a_result_to_a_call_of_another_tool():
+    from swarmlab.export import UNMATCHED_RESULT, _llm_session, _Session
+
+    class NoBlobs:
+        def json(self, sha):
+            return {"messages": [{"role": "user", "content": "Round 1."}]} if sha == "req" else (
+                {"text": "", "finish_reason": "tool_use", "provider": "fake", "model": "m",
+                 "tool_calls": [{"call_id": "c1", "name": "guess", "args": {"candidate": "A"}}]})
+
+    att = {"round": 1, "request_hash": "req", "ts": 1.0}
+    called = {"type": "tool_called", "tool": "post", "ts": 2.0}
+    returned = {"type": "tool_returned", "result": {"ok": True, "result": {"id": "p1"}}, "ts": 2.0}
+    sess = _Session("run", "a000")
+    _llm_session(sess, [(att, {"response_hash": "resp", "ts": 1.5})], NoBlobs(), None,
+                 {1: [(called, returned)]}, 3.0)
+    (result,) = [e["message"] for e in sess.entries if e["message"]["role"] == "toolResult"]
+    assert result["toolCallId"] == "c1" and result["isError"]
+    assert result["content"][0]["text"] == UNMATCHED_RESULT  # the post's result is not borrowed

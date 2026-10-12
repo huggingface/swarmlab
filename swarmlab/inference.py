@@ -31,7 +31,8 @@ Decisions where the contract is silent:
   returns the same refusal. `inference_response.refusal_category` carries the response's
   `Refusal.category` (hit or miss). A caller that wants a fresh answer re-sends with
   `ChatRequest.attempt` raised (`LLMAgent(refusal_retries=N)`), which is a different hash and so
-  a different cache entry; replay and resume reproduce the same attempts from the log's
+  a different cache entry; `inference_attempt.attempt` records it (omitted when 0), so the log
+  itself says which requests were re-sends; replay and resume reproduce the same attempts from the log's
   requests, so they hit the cache and never call a provider.
 - **Reasoning** (`ChatResponse.reasoning`, `provider_content`, ...) is part of the stored
   response JSON, so cache hits, replay and resume return it unchanged.
@@ -123,7 +124,8 @@ class Inference:
         if hit is not None:
             self.log(InferenceAttemptEvent(run=self.run_id, round=round, agent=agent, call_id=call_id,
                                            provider=provider.name, model=request.model,
-                                           request_hash=h, reserved_usd=0.0, category=category))
+                                           request_hash=h, reserved_usd=0.0, category=category,
+                                           attempt=request.attempt))
             self.log(InferenceResponseEvent(
                 run=self.run_id, round=round, agent=agent, call_id=call_id,
                 response_hash=self.blobs.put(hit.model_dump_json().encode()),
@@ -134,7 +136,8 @@ class Inference:
         async with self.gate.admit(request, category) as res:
             self.log(InferenceAttemptEvent(run=self.run_id, round=round, agent=agent, call_id=call_id,
                                            provider=provider.name, model=request.model,
-                                           request_hash=h, reserved_usd=res.amount, category=category))
+                                           request_hash=h, reserved_usd=res.amount, category=category,
+                                           attempt=request.attempt))
             self.gate.dispatch(res)
             start = time.monotonic()
             try:

@@ -70,11 +70,15 @@ Decisions where the contract is silent:
     holds (window memory drops it; no snapshot) is rebuilt from its `tool_returned` event, so
     every `toolCall` has a `toolResult`. A response that `LLMAgent(refusal_retries=N)` dropped
     and re-sent (the agent's next request in the same round has `attempt > 0`, which the retry
-    loop sets only then) is kept as an audit record: its assistant message (`rawStopReason:
+    loop sets only then; the attempt number is read from the `inference_attempt` event, never
+    from a request blob, which may be missing) is kept as an audit record: its assistant message (`rawStopReason:
     "refusal"`) is followed by one `toolResult` per tool call with `isError: true` and "not
     executed: ... discarded and re-sent", and its calls are not matched to the round's
     `tool_called` events. A refusal handled normally (retries 0 or used up) is matched as before,
-    since its calls did run. Probe (`measurement`) calls are not part of the
+    since its calls did run. Matching is conservative: a call takes the round's next executed
+    event only when that event is a call of the same tool; otherwise (and when the round has no
+    events left) it gets an `isError` "not found in the log" result unless a later request holds
+    its real result, and the cursor does not move, so a result is never shifted onto another call. Probe (`measurement`) calls are not part of the
     agent's conversation and are left out (they are in `tables/probes` and `inference`).
     A request blob that cannot be read (deleted, or an I/O error on a bucket mount) adds
     nothing and leaves the overlap reference at the last readable request, so the next request
@@ -696,6 +700,8 @@ def _payload_text(ret: dict | None) -> str:
                        "error": res.get("error")}, sort_keys=True)
 
 
+UNMATCHED_RESULT = json.dumps({"ok": False, "result": {}, "error": (
+    "not found in the log: no executed call of this tool matches it")}, sort_keys=True)
 DISCARDED_RESULT = json.dumps({"ok": False, "result": {}, "error": (
     "not executed: the response was a refusal, discarded and re-sent (refusal_retries)")},
     sort_keys=True)
@@ -713,7 +719,7 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
     """
     prev: list[dict] = []
     first = True
-    pending: dict[str, tuple[dict, dict | None] | None] = {}
+    pending: dict[str, tuple[dict, dict | None] | str | None] = {}
     cursor: dict[int, int] = defaultdict(int)
     # responses whose request blob could not be read: their assistant message is emitted where
     # the next readable request places it (after the user message of its round), not before
@@ -723,7 +729,9 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
 
     def flush(ts: float | None) -> None:
         for cid, pair in list(pending.items()):
-            if pair is not None:
+            if isinstance(pair, str):
+                sess.tool_result(cid, pair, ts)
+            elif pair is not None:
                 sess.tool_result(cid, _payload_text(pair[1]), (pair[1] or pair[0]).get("ts") or ts)
             else:
                 sess.tool_result(cid, json.dumps({"ok": False, "result": {}, "error":
@@ -753,9 +761,11 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
         for c in rcalls:
             if set(c.get("args") or {}) == {"_raw"}:
                 pending[str(c.get("call_id"))] = None
-            elif cursor[rnd] < len(evs):
+            elif cursor[rnd] < len(evs) and evs[cursor[rnd]][0].get("tool") == c.get("name"):
                 pending[str(c.get("call_id"))] = evs[cursor[rnd]]
                 cursor[rnd] += 1
+            else:  # no executed call of that tool next in the log: never borrow another's result
+                pending[str(c.get("call_id"))] = UNMATCHED_RESULT
 
     def emit(msgs: list[dict], ts: float | None) -> None:
         nonlocal unseen
@@ -777,21 +787,12 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
                 flush(ts)
                 sess.user(m["content"], ts)
 
-    loaded: dict[int, Any] = {}
-
-    def request(i: int) -> Any:  # each request blob is read once; only i and i + 1 are kept
-        if i not in loaded:
-            for k in [k for k in loaded if k < i - 1]:
-                del loaded[k]
-            loaded[i] = blobs.json(calls[i][0].get("request_hash"))
-        return loaded[i]
-
     for i, (att, resp_ev) in enumerate(calls):
-        req = request(i)
-        nxt = request(i + 1) if i + 1 < len(calls) else None
-        # the retry loop raises `attempt` only when it drops a refused response and re-sends
-        discarded = (isinstance(nxt, dict) and int(nxt.get("attempt") or 0) > 0
-                     and calls[i + 1][0].get("round") == att.get("round"))
+        req = blobs.json(att.get("request_hash"))
+        # explicit evidence from the log, never from a blob: the retry loop sends `attempt > 0`
+        # (recorded on `inference_attempt`) only after it dropped the previous refused response
+        nxt = calls[i + 1][0] if i + 1 < len(calls) else {}
+        discarded = int(nxt.get("attempt") or 0) > 0 and nxt.get("round") == att.get("round")
         resp = blobs.json((resp_ev or {}).get("response_hash"))
         if req is None:  # unreadable request blob: keep `prev`, so nothing is emitted twice
             if resp_ev is not None and resp is not None:

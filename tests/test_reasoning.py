@@ -120,8 +120,12 @@ class ThinkingClaude:
     """`messages.create` stub: a round's first call thinks and reads the board, the call after
     the tool results thinks again and ends the turn. Records every request's kwargs."""
 
-    def __init__(self):
+    def __init__(self, pad: int = 0, pad_on: tuple[int, ...] = ()):
         self.kwargs: list[dict] = []
+        self.pad, self.pad_on = pad, pad_on  # a `pad`-char signature on the calls in `pad_on`
+
+    def sig(self, n):
+        return f"sig-{n}" + ("s" * self.pad if n in self.pad_on else "")
 
     async def create(self, **kw):
         self.kwargs.append(kw)
@@ -129,10 +133,10 @@ class ThinkingClaude:
         # a new round's text joins the previous tool results in one user message: look at the end
         after_tools = kw["messages"][-1]["content"][-1].get("type") == "tool_result"
         if after_tools:
-            content = [thinking(f"Board read; done (call {n}).", f"sig-{n}"),
+            content = [thinking(f"Board read; done (call {n}).", self.sig(n)),
                        SimpleNamespace(type="tool_use", id=f"toolu_{n}", name="end_turn", input={})]
         else:
-            content = [thinking(f"I should read the board first (call {n}).", f"sig-{n}"),
+            content = [thinking(f"I should read the board first (call {n}).", self.sig(n)),
                        SimpleNamespace(type="text", text="Let me look.", citations=None),
                        SimpleNamespace(type="tool_use", id=f"toolu_{n}", name="read_board",
                                        input={"limit": 10})]
@@ -141,12 +145,12 @@ class ThinkingClaude:
         return msg
 
 
-def claude_experiment(stub, **agent_kw):
+def claude_experiment(stub, prefix="anthropic", **agent_kw):
     p = AnthropicProvider()
     p._client = SimpleNamespace(messages=stub)
     return Experiment(name="think", world=FlagGame(),
-                      participants=[LLMAgent(model="anthropic:claude-haiku-4-5", **agent_kw)],
-                      medium=Board(topology="broadcast"), providers={"anthropic": p})
+                      participants=[LLMAgent(model=f"{prefix}:claude-haiku-4-5", **agent_kw)],
+                      medium=Board(topology="broadcast"), providers={prefix: p})
 
 
 def assistant_turns(kw):
@@ -166,17 +170,31 @@ def test_thinking_goes_back_unchanged_in_the_tool_loop(tmp_path):
          "signature": "sig-1"},
         {"type": "text", "text": "Let me look."},
         {"type": "tool_use", "id": "toolu_1", "name": "read_board", "input": {"limit": 10}}]
-    # full memory is append-only: round 2 still carries round 1's thinking, in order
-    sigs = [b.get("signature") for m in assistant_turns(third) for b in m["content"]
-            if b["type"] == "thinking"]
-    assert sigs == ["sig-1", "sig-2"]
+    # default: thinking lives within one swarm turn; round 2 starts without round 1's blocks
+    assert thinking_sigs(third) == [] and assistant_turns(third)  # text and tool calls stay
+    assert thinking_sigs(stub.kwargs[3]) == ["sig-3"]  # round 2's own loop still returns them
     t = next(e for e in run.events if e["type"] == "turn_ended")
     assert t["usage"]["reasoning_tokens"] == 50  # 2 calls x 25 thinking tokens
 
 
+def test_carry_thinking_keeps_earlier_turns_blocks(tmp_path):
+    stub = ThinkingClaude()
+    claude_experiment(stub, carry_thinking=True).run(seed=1, max_rounds=2, out=tmp_path)
+    assert thinking_sigs(stub.kwargs[2]) == ["sig-1", "sig-2"]  # full memory: append-only
+    assert thinking_sigs(stub.kwargs[3]) == ["sig-1", "sig-2", "sig-3"]
+
+
+def test_carry_thinking_param_is_opt_in():
+    assert "carry_thinking" not in LLMAgent(model="fake:reader").params
+    assert LLMAgent(model="fake:reader", carry_thinking=True).params["carry_thinking"] is True
+    with pytest.raises(ValueError, match="carry_thinking"):
+        LLMAgent(model="fake:reader", carry_thinking="no")
+
+
 def test_window_trim_drops_all_kept_thinking(tmp_path):
     stub = ThinkingClaude()
-    claude_experiment(stub, memory="window", window_rounds=2).run(seed=1, max_rounds=3, out=tmp_path)
+    claude_experiment(stub, memory="window", window_rounds=2, carry_thinking=True).run(
+        seed=1, max_rounds=3, out=tmp_path)
     # round 2 starts with round 1 intact (nothing trimmed yet): its thinking is replayed
     r2 = stub.kwargs[2]
     assert any(b["type"] == "thinking" for m in assistant_turns(r2) for b in m["content"])
@@ -276,7 +294,7 @@ def test_system_prompt_reconfigure_drops_kept_thinking(tmp_path):
     from swarmlab.interventions import Reconfigure
 
     stub = ThinkingClaude()
-    exp = claude_experiment(stub)
+    exp = claude_experiment(stub, carry_thinking=True)
     exp.interventions = [Reconfigure(agents=["a000"], settings={"system_prompt": "A new system prompt."},
                                      at_round=1)]
     run = exp.run(seed=1, max_rounds=2, out=tmp_path)
@@ -291,7 +309,7 @@ def test_system_prompt_reconfigure_drops_kept_thinking(tmp_path):
 
 
 def kept_agent(binding_tools):
-    agent = LLMAgent(model="anthropic:claude-opus-5-5")
+    agent = LLMAgent(model="anthropic:claude-opus-5-5", carry_thinking=True)
     agent.system = "sys"
     block = [{"type": "thinking", "thinking": "", "signature": "s"}, {"type": "text", "text": "a"}]
     agent.rounds = [{"round": 1, "messages": [
@@ -333,3 +351,55 @@ def test_old_snapshots_without_a_binding_keep_working():
     del agent.__dict__["reasoning_binding"]  # restored from a snapshot written before the field
     agent._check_reasoning_binding([])
     assert kept(agent)
+
+
+# ---- cleanup runs before the context-limit estimate; disk traces are never touched -----------------------
+# `research:` has no preset, so the agent estimates with ceil(chars / 4) of the request JSON, which
+# counts thinking signatures. Round 1's last response (call 2, never re-sent within round 1)
+# carries a 60k-char signature: ~15k tokens if round 2 sends it, against a 10k limit.
+PAD = 60_000
+LIMIT = 10_000
+
+
+def assert_round1_traces_on_disk(run):
+    attempts = [e for e in run.events_all if e.type == "inference_attempt" and e.round == 1]
+    cached = [json.loads((run.dir / "blobs" / "cache" / a.request_hash).read_text()) for a in attempts]
+    assert [len(c["provider_content"][0]["signature"]) for c in cached] == [5, PAD + 5]
+    assert all(c["reasoning_kind"] == "summary" for c in cached)  # recorded as returned
+
+
+def test_default_strips_earlier_turns_thinking_before_the_estimate(tmp_path):
+    stub = ThinkingClaude(pad=PAD, pad_on=(2,))
+    run = claude_experiment(stub, prefix="research", context_limit_tokens=LIMIT,
+                            overflow="fail_turn").run(seed=1, max_rounds=2, out=tmp_path)
+    turns = [e for e in run.events if e["type"] == "turn_ended"]
+    assert [t["yield_kind"] for t in turns] == ["end_turn", "end_turn"]  # no context_limit error
+    assert not [e for e in run.events if e["type"] == "overflow"]
+    assert thinking_sigs(stub.kwargs[2]) == []
+    assert_round1_traces_on_disk(run)
+
+
+def test_opt_in_prompt_change_strips_before_the_estimate(tmp_path):
+    from swarmlab.interventions import Reconfigure
+
+    stub = ThinkingClaude(pad=PAD, pad_on=(2,))
+    exp = claude_experiment(stub, prefix="research", carry_thinking=True,
+                            context_limit_tokens=LIMIT, overflow="fail_turn")
+    exp.interventions = [Reconfigure(agents=["a000"], settings={"system_prompt": "A new system prompt."},
+                                     at_round=1)]
+    run = exp.run(seed=1, max_rounds=2, out=tmp_path)
+    turns = [e for e in run.events if e["type"] == "turn_ended"]
+    assert [t["yield_kind"] for t in turns] == ["end_turn", "end_turn"]
+    assert stub.kwargs[2]["system"] == "A new system prompt." and thinking_sigs(stub.kwargs[2]) == []
+    assert_round1_traces_on_disk(run)
+
+
+def test_opt_in_kept_thinking_still_counts_when_it_is_sent(tmp_path):
+    # control: with carry_thinking and nothing invalidating, the 15k tokens are really sent, so
+    # the same limit fails the turn: the cleanup above is what made those runs fit
+    stub = ThinkingClaude(pad=PAD, pad_on=(2,))
+    run = claude_experiment(stub, prefix="research", carry_thinking=True, context_limit_tokens=LIMIT,
+                            overflow="fail_turn").run(seed=1, max_rounds=2, out=tmp_path)
+    turns = [e for e in run.events if e["type"] == "turn_ended"]
+    assert [t["yield_kind"] for t in turns] == ["end_turn", "error"]
+    assert "context_limit" in turns[1]["error"]

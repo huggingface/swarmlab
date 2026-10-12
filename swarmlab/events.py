@@ -34,7 +34,9 @@ Decisions where the contract is silent:
 - M6: `metric` gained `label` (a string, e.g. `belief.state`'s class), omitted when None.
 - M6: `round_started` gained `live` (the live agents), written only when the scheduler's `order`
   is not a permutation of them (OneSpeaker); absent, `order` is the live list as before.
-- Refusals: `inference_response` gained `refusal_category` (the response's
+- Refusals: `inference_attempt` gained `attempt` (`ChatRequest.attempt`, the re-send number
+  of a refused request; omitted when 0, so it marks exactly the re-sends), and
+  `inference_response` gained `refusal_category` (the response's
   `Refusal.category` when `finish_reason == "refusal"`), omitted when None.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
@@ -121,6 +123,14 @@ class InferenceAttemptEvent(Event):
     request_hash: str
     reserved_usd: float = 0.0
     category: Literal["swarm", "measurement"] = "swarm"
+    attempt: int = 0  # the request's re-send number after a refusal; omitted when 0
+
+    @model_serializer(mode="wrap")
+    def _drop_zero_attempt(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("attempt", 1) == 0:
+            data.pop("attempt")
+        return data
 
 
 class InferenceResponseEvent(Event):
