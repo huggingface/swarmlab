@@ -1,4 +1,4 @@
-from importlib.metadata import entry_points
+from importlib.metadata import distribution, entry_points
 
 from swarmlab.ids import agent_id
 from swarmlab.medium import topology as topology_module
@@ -96,6 +96,13 @@ def test_specs_and_registry():
     defined = {c for c in vars(topology_module).values()
                if isinstance(c, type) and issubclass(c, Topology) and c is not Topology
                and c.__module__ == topology_module.__name__}
-    loaded = {ep.name: ep.load() for ep in entry_points(group="swarmlab.topologies")}
+    loaded = {ep.name: ep.load() for ep in distribution("swarmlab").entry_points
+              if ep.group == "swarmlab.topologies"}
     assert set(loaded.values()) == defined
     assert all(loaded[c.entry_point] is c for c in defined)
+
+
+def test_specs_and_registry_with_an_external_topology_installed(research_plugin):
+    # an external `swarmlab.topologies` entry point is discovered but not counted as built-in
+    assert "research_custom" in {ep.name for ep in entry_points(group="swarmlab.topologies")}
+    test_specs_and_registry()

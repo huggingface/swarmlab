@@ -25,9 +25,11 @@ no hand-kept name-to-class dict).
 `catalog(group)` lists a group for `swarmlab plugins` (and `swarmlab metrics`): every entry point
 as `(name, description, target)`, sorted by name, where `target` is the entry point's
 `module:Class` and `description` comes from `describe`: the plugin's `description` class
-attribute when it is a string (every plugin base class defines it as `""`), else the first line
-of its docstring (worlds, whose `description()` is the agent-facing task text, and fake scripts,
-which are functions). A plugin that fails to load is listed with `(cannot load: ...)`. `group`
+attribute when it is a non-empty string, else the first line of the object's own docstring
+(trailing period stripped), else `""`. Every plugin base class defines `description` as `""`, so a
+subclass that sets neither is listed without a description; the docstring is also what describes
+worlds (whose `description()` is the agent-facing task text, a method, not a string) and fake
+scripts (functions). A plugin that fails to load is listed with `(cannot load: ...)`. `group`
 is the full name (`swarmlab.worlds`) or the short one (`worlds`); `GROUPS` are the groups
 `swarmlab plugins` lists.
 
@@ -139,9 +141,9 @@ def full_group(group: str) -> str:
 def describe(obj: Any) -> str:
     """One-line description of a plugin class or function (see the module docstring)."""
     desc = getattr(obj, "description", None)
-    if isinstance(desc, str):
+    if isinstance(desc, str) and desc.strip():
         return desc.strip()
-    doc = (obj.__doc__ or "").strip()
+    doc = (getattr(obj, "__doc__", None) or "").strip()
     return doc.splitlines()[0].strip().removesuffix(".") if doc else ""
 
 

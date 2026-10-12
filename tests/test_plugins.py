@@ -2,14 +2,16 @@
 one-line description (the guard that keeps the listing, and docs that defer to it, complete)."""
 import json
 import tomllib
-from importlib.metadata import EntryPoint
+from importlib.metadata import EntryPoint, distribution
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from swarmlab import registry
 from swarmlab.cli import app
+from swarmlab.medium.base import Topology
 from swarmlab.metrics.base import catalog as metrics_catalog
+from swarmlab.scheduler import Scheduler
 
 PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 UNLISTED = {"swarmlab.providers"}  # configured under `providers:`, not listed by `plugins`
@@ -25,19 +27,64 @@ def test_every_pyproject_group_is_listed():
     assert set(_pyproject_groups()) - UNLISTED == set(registry.GROUPS)
 
 
+def _own_entry_points() -> dict[str, dict[str, str]]:
+    """This distribution's installed entry points (other installed plugins are left out)."""
+    out: dict[str, dict[str, str]] = {}
+    for ep in distribution("swarmlab").entry_points:
+        if ep.group.startswith("swarmlab."):
+            out.setdefault(ep.group, {})[ep.name] = ep.value
+    return out
+
+
 def test_every_builtin_entry_point_has_a_description():
+    # the installed metadata matches pyproject (else re-run `uv sync`)
+    assert _own_entry_points() == _pyproject_groups()
     missing = []
     for group, declared in _pyproject_groups().items():
         if group in UNLISTED:
             continue
         rows = {name: (desc, target) for name, desc, target in registry.catalog(group)}
-        # the installed metadata matches pyproject (else re-run `uv sync`)
-        assert {n: t for n, (_, t) in rows.items()} == declared, group
-        missing += [f"{group}:{n}" for n, (d, _) in rows.items() if not d or "cannot load" in d]
+        # catalog lists every built-in (and any external plugin installed alongside)
+        assert {n: rows[n][1] for n in declared if n in rows} == declared, group
+        missing += [f"{group}:{n}" for n in declared
+                    if not rows[n][0] or "cannot load" in rows[n][0]]
+        for name in declared:
+            assert "\n" not in rows[name][0] and len(rows[name][0]) <= 160, (group, name)
     assert not missing, f"entry points without a one-line description: {missing}"
-    for group in registry.GROUPS:
-        for name, desc, _ in registry.catalog(group):
-            assert "\n" not in desc and len(desc) <= 160, (group, name, desc)
+
+
+def test_external_plugin_is_listed_and_built(research_plugin):
+    rows = {name: (desc, target) for name, desc, target in registry.catalog("topologies")}
+    assert rows["research_custom"] == ("A researcher-provided topology",
+                                       "research_topology:ResearchTopology")
+    topo = registry.build({"type": "research_custom"}, "swarmlab.topologies")
+    assert type(topo).__name__ == "ResearchTopology"
+    # the built-in guard still holds with an external plugin installed
+    test_every_pyproject_group_is_listed()
+    test_every_builtin_entry_point_has_a_description()
+
+
+def test_describe_falls_back_to_the_docstring():
+    class Documented(Topology):
+        """Sends to nobody, documented.
+
+        More detail."""
+
+    class Explicit(Topology):
+        """Docstring loses."""
+
+        description = "The attribute wins"
+
+    class Bare(Topology):
+        pass
+
+    assert registry.describe(Documented) == "Sends to nobody, documented"
+    assert registry.describe(Explicit) == "The attribute wins"
+    assert registry.describe(Bare) == ""
+
+
+def test_base_scheduler_is_described():
+    assert registry.describe(Scheduler)
 
 
 def test_catalog_short_group_name_and_metrics_alias():
