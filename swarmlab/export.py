@@ -79,7 +79,14 @@ Decisions where the contract is silent:
     since its calls did run. Matching is conservative: a call takes the round's next executed
     event only when that event is a call of the same tool; otherwise (and when the round has no
     events left) it gets an `isError` "not found in the log" result unless a later request holds
-    its real result, and the cursor does not move, so a result is never shifted onto another call. Probe (`measurement`) calls are not part of the
+    its real result, and the cursor does not move, so a result is never shifted onto another call.
+    A participant that handles a call itself (cascade_worker carries out `submit` with `guess` and
+    `post`) writes its own `tool` message for it, and that result is exported as written (its
+    `isError` from the payload's `ok`, like every result). An assistant message with tool calls
+    that no response produced (the participant wrote it into its memory, e.g. cascade_worker's
+    `read_board` prefill) is exported in its place as an assistant message with provider
+    `swarmlab`, api `swarmlab-participant`, model the participant type and zero usage; an
+    assistant message without tool calls that no response produced is still left out. Probe (`measurement`) calls are not part of the
     agent's conversation and are left out (they are in `tables/probes` and `inference`).
     A request blob that cannot be read (deleted, or an I/O error on a bucket mount) adds
     nothing and leaves the overlap reference at the last readable request, so the next request
@@ -701,6 +708,7 @@ def _payload_text(ret: dict | None) -> str:
                        "error": res.get("error")}, sort_keys=True)
 
 
+PARTICIPANT_PROVIDER, PARTICIPANT_API = "swarmlab", "swarmlab-participant"
 UNMATCHED_RESULT = json.dumps({"ok": False, "result": {}, "error": (
     "not found in the log: no executed call of this tool matches it")}, sort_keys=True)
 DISCARDED_RESULT = json.dumps({"ok": False, "result": {}, "error": (
@@ -710,13 +718,16 @@ DISCARDED_RESULT = json.dumps({"ok": False, "result": {}, "error": (
 
 def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _Blobs,
                  tail: list[dict] | None, tool_events: dict[int, list[tuple[dict, dict | None]]],
-                 end_ts: float | None) -> None:
+                 end_ts: float | None, author: str = "participant") -> None:
     """Rebuild an LLM agent's conversation (see the module doc).
 
     Native tool calls of each response are matched, in order, to the executor's `tool_called`
     events of that round; when a call's result never shows up in a later request or in the
     final memory (window memory drops it at the next round), the result is taken from the
-    matching `tool_returned` event.
+    matching `tool_returned` event. An assistant message with tool calls that no response
+    produced (the participant wrote it, e.g. cascade_worker's `read_board` prefill) is emitted
+    with provider `swarmlab`, api `swarmlab-participant` and model `author` (the participant
+    type); its results are the participant's own `tool` messages.
     """
     prev: list[dict] = []
     first = True
@@ -779,6 +790,11 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
                 elif deferred:
                     answer(*deferred.pop(0))
                     unseen = 0  # it is in this segment, not in the next request's
+                elif m.get("tool_calls"):  # written by the participant itself, no response
+                    flush(ts)
+                    sess.assistant(_text_of(m["content"]), list(m["tool_calls"]),
+                                   provider=PARTICIPANT_PROVIDER, model=author,
+                                   api=PARTICIPANT_API, usage=_usage(None, 0.0), finish=None, ts=ts)
                 continue
             if role == "tool":
                 cid = str(m.get("tool_call_id"))
@@ -882,7 +898,7 @@ def build_sessions(run_dir: Path, events: list[dict], meta: dict,
             tool_events = _tool_events_by_round(evs)
             tail = _final_memory(run_dir, blobs, agent)
             last_ts = max((e.get("ts") or 0.0) for e in evs) if evs else None
-            _llm_session(sess, calls, blobs, tail, tool_events, last_ts)
+            _llm_session(sess, calls, blobs, tail, tool_events, last_ts, author=ptype)
             label = model or ptype
         else:
             _scripted_session(sess, evs, ptype)

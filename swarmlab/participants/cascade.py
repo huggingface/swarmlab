@@ -1,8 +1,13 @@
 """CascadeWorker: the one-shot worker of the `cascade` world (swarmlab/world/cascade.py).
 
 An `LLMAgent` subclass (entry point `cascade_worker`) that sends the source's prompt instead of
-the default framing: the system message is `SYSTEM` with the worker's name (`a003` -> `W03`), and
-the turn's single user message (`turn_message`) is, separated by blank lines,
+the default framing: the system message is `SYSTEM` with the worker's name (`a003` -> `W03`).
+A set `system_prompt` (param, or a role's `system_prompt`) replaces it and is rendered as
+`LLMAgent` renders it (Jinja: `agent`, `role`, `description`, `tools` = the tools the worker
+offers, `system_prompt_append`, plus `wid`); `system_prompt_append` follows the default prompt
+after a blank line (a custom template places it itself or gets it at the end), and a role's
+`prompt_append` comes last. The turn's single user message (`turn_message`) is, separated by
+blank lines,
 
     <world observation: documentation + private probe result>
     <board>                      EMPTY_BOARD, or the board header and one paragraph per post
@@ -23,7 +28,14 @@ a usable one runs `guess(candidate=<interpretation>)`, `post(text="W03: <board_p
 `disclose_belief`: `"W03 [committed: <interpretation>]: <board_post>"`) and `end_turn`; an unusable
 one gets a correction (a `tool` result per tool call, else a user message) and the note
 `cascade:retry:<reason>`, or `cascade:failed:<reason>` on the last call, which leaves the worker
-with no commitment and no post. `max_calls` defaults to 2 and is capped at 2. Requests are the
+with no commitment and no post. A guess the world does not accept (`accepted: false` or an
+`error` in its feedback; the world refuses a second commitment) ends the turn at once with
+`cascade:failed:commit rejected: <error>` and no post. Every tool call of the answer gets a
+`tool` result in memory: the submit call that was carried out gets
+`{"ok": true, "result": {"interpretation", "committed": true, "posted": <post text>}}` (or
+`{"ok": false, "error": "commit rejected: ..."}`), any other call a "not executed" error, so the
+exported session (swarmlab/export.py) pairs every call with its result. `max_calls` defaults to 2
+and is capped at 2. Requests are the
 same as the earlier hand-written loop's; from the base class come a `refusal:<category>` note per
 refused response and `memory`, kept-thinking and `context_limit_tokens` handling.
 `memory="received"` and `report_json` are refused (they replace the prompt or the reply handling).
@@ -39,7 +51,8 @@ Board channel `tool`
 The user message says the board is "available through the read_board tool". Before the turn's
 first call the transcript gets the worker's `read_board` call (an assistant message with one tool
 call, id `read_board_0`) and its result: a `tool` message whose text is exactly the board the
-`user` channel would show. The model is offered `read_board` and `submit(board_post,
+`user` channel would show. The worker writes both itself (no executed `read_board` call, so the
+log's `reads` are unchanged); the export shows the call as a `swarmlab-participant` message. The model is offered `read_board` and `submit(board_post,
 interpretation)`, and the request forces `submit` (`tool_choice` naming it, through the request's
 `extra`; a text reply is still parsed as JSON). Plain JSON answers after a tool result were
 unreliable on Qwen3.8-27B (it re-called `read_board`, or replied empty or in prose).

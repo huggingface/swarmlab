@@ -452,3 +452,77 @@ def test_a_refused_guess_fails_the_turn_without_a_post(channel):
     if channel == "tool":
         result = p.rounds[0]["messages"][-1]
         assert result["tool_call_id"] == "s1" and json.loads(result["content"])["ok"] is False
+
+
+# ---- exported sessions (swarmlab export) ---------------------------------------------------------
+
+def script_submit_ok(request, rng):
+    """A valid submit on the first call."""
+    from .helpers import _resp
+
+    return _resp(request, calls=[("submit", {"board_post": "my probe said so",
+                                             "interpretation": "reads_transcript"})])
+
+
+def exported_session(tmp_path, arm: str, agent: str = "a005", **params) -> list[dict]:
+    from typer.testing import CliRunner
+
+    from swarmlab.cli import app
+
+    from .pi_session import validate_file
+
+    run = Experiment.from_yaml(dry_spec(tmp_path, arm, **params), arm).run(seed=3, out=tmp_path / "runs")
+    out = tmp_path / f"export-{arm}"
+    res = CliRunner().invoke(app, ["export", str(run.dir), "--out", str(out)])
+    assert res.exit_code == 0, res.output
+    for f in sorted((out / "sessions").glob("*.jsonl")):
+        assert validate_file(f) == [], f
+    lines = (out / "sessions" / f"{agent}.jsonl").read_text().splitlines()[1:]
+    return [json.loads(x)["message"] for x in lines]
+
+
+def pairs(msgs: list[dict]) -> list[tuple[str, str, bool, str]]:
+    """(tool name, author provider, isError, result text) per tool call, in order."""
+    calls = {b["id"]: (b["name"], m["provider"]) for m in msgs if m["role"] == "assistant"
+             for b in m["content"] if b["type"] == "toolCall"}
+    out = []
+    for m in msgs:
+        if m["role"] == "toolResult":
+            name, provider = calls[m["toolCallId"]]
+            assert m["toolName"] == name
+            out.append((name, provider, m["isError"], m["content"][0]["text"]))
+    return out
+
+
+def assert_prefill(got: tuple, board_fragment: str) -> None:
+    name, provider, is_error, text = got
+    assert (name, provider, is_error) == ("read_board", "swarmlab", False)
+    assert text.startswith("SHARED WORKER BOARD (posts by earlier workers") and board_fragment in text
+
+
+def test_export_pairs_the_prefill_and_a_successful_submit(tmp_path):
+    msgs = exported_session(tmp_path, "ok", model="fake:tests.test_cascade:script_submit_ok",
+                            board_channel="tool")
+    prefill, submit = pairs(msgs)
+    assert_prefill(prefill, "W04: my probe said so")
+    assert submit[:3] == ("submit", "fake", False)
+    assert json.loads(submit[3]) == {"ok": True, "error": None, "result": {
+        "interpretation": READS, "committed": True, "posted": "W05: my probe said so"}}
+    prefill_call = next(m for m in msgs if m["role"] == "assistant")
+    assert prefill_call["model"] == "cascade_worker" and prefill_call["api"] == "swarmlab-participant"
+
+
+def test_export_pairs_a_correction_then_the_successful_submit(tmp_path):
+    msgs = exported_session(tmp_path, "fix", model="fake:tests.test_cascade:script_submit",
+                            board_channel="tool")
+    prefill, bad, good = pairs(msgs)
+    assert_prefill(prefill, "W04: my probe said so")
+    assert bad[:3] == ("submit", "fake", False) and bad[3].startswith("Your submit call could not be used")
+    assert good[:3] == ("submit", "fake", False) and json.loads(good[3])["result"]["committed"] is True
+    assert "not found in the log" not in json.dumps(msgs)
+
+
+def test_export_of_the_user_channel_is_clean(tmp_path):
+    msgs = exported_session(tmp_path, "user")
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant"]
+    assert pairs(msgs) == [] and "not found in the log" not in json.dumps(msgs)

@@ -10,8 +10,9 @@ whether early wrong signals spread through the board.
 Use it with the `cascade_worker` participant (swarmlab/participants/cascade.py), which renders the
 source's prompt verbatim, under one round with `commit: immediate` and the `fixed` scheduler
 (order a000, a001, ...), so worker k sees the posts of workers 0..k-1, delivered by push with
-`push_limit` at least the worker count. `requires` declares those settings, so an arm without
-them is refused when the experiment is built. docs/guide/cascade.md shows the spec.
+`push_limit` at least the worker count. `requires` declares those settings (and
+`max_rounds: 1`: each worker commits once), so an arm without them is refused when the
+experiment is built. docs/guide/cascade.md shows the spec.
 
 Signals
 -------
@@ -31,7 +32,8 @@ One text part: the source's documentation paragraph, a blank line, then
     Caveat: infrastructure here is flaky. ...
 
 (`Result: ACCEPTED.` for the other signal; the source shows only the REJECTED line, so the
-ACCEPTED line is a reconstruction). The board, question and instruction are added by the worker.
+ACCEPTED line is a reconstruction). The caveat states the configured `accuracy`, rounded to a
+whole percent ("about 70% of the time" at the default 0.7, the source's text). The board, question and instruction are added by the worker.
 
 Actions and scoring
 -------------------
