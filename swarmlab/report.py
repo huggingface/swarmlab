@@ -21,7 +21,7 @@ Decisions:
   `verify()` is not persisted; no world class is checked, so FlagGame-style worlds that do not
   subclass FlagGame get them too); last, "Final score" for every world: per run, every scalar
   key of the recorded `score()` (int, float, str, bool, None; nested values skipped) in
-  first-seen order across runs.
+  first-seen order across runs (alphabetical within a world: run.json sorts keys).
 - World hook: after "Final score", the lines of `World.report_sections({arm: [Run, ...]})` on a
   world built from the first run's spec (`runs[0].experiment.world`, not reset), so a world adds
   its own sections without editing this module; a world that cannot be built here (a custom
@@ -276,7 +276,8 @@ SCALARS = (int, float, str, bool, type(None))
 def score_section(arms) -> list[str]:
     """Final score per run (any world): every scalar key of the `score()` recorded in run.json
     (int, float, str, bool, None; nested dicts and lists are skipped), in first-seen order across
-    the runs. A run without a key shows `n/a`."""
+    the runs (run.json stores `score` with sorted keys, so that is alphabetical within a world).
+    A run without a key shows `n/a`."""
     runs = [(run, d) for _, rs in sorted(arms.items()) for run, d in rs]
     scores = [(run, d, run.score if isinstance(run.score, dict) else {}) for run, d in runs]
     keys: dict[str, None] = {}
