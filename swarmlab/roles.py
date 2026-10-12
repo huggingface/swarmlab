@@ -36,7 +36,7 @@ Decisions where the contract is silent:
 - `tools` filters every tool but `end_turn`, which is always allowed. `may_act=False` removes the
   world's action tools (status tools are not actions). `registry`: "none" removes every registry
   tool, "read" keeps `registry_get` only.
-- Topology permissions (`Tree.channel_permissions`) are intersected with the role's channel
+- Topology permissions (`Topology.channel_permissions`; only `Tree` restricts) are intersected with the role's channel
   lists (None means all) by `bind_roles`; an agent with no role under such a topology gets an
   anonymous effective role (name "") that carries only the channel limits, and its
   `turn_started.role` stays None.
@@ -253,28 +253,25 @@ def bind_roles(board: Board, participants: Mapping[AgentId, Any],
                roles: Sequence[Role | None]) -> dict[AgentId, Role]:
     """Prepare roles for a run (called by the runner right after `bind`).
 
-    Resets a topology that lays out channels (`Tree`) with the full agent list and adds its
-    channels to the board; calls `apply_role(role)` on each participant that has a role and the
-    hook; returns the effective role per agent (role lists intersected with the topology's
+    Calls `topology.reset_agents` with the full agent list and adds `topology.channels()` to the
+    board (the `Topology` base-class protocol, docs/INTERFACE.md §9); calls `apply_role(role)` on
+    each participant that has a role and the hook; returns the effective role per agent (role lists intersected with the topology's
     channel permissions) for the executor. Agents with neither a role nor topology permissions
     are left out.
     """
     agents = list(participants)
     topology = board.topology
-    reset = getattr(topology, "reset_agents", None)
-    if callable(reset):
-        reset(agents)
-        for ch in topology.channels():
-            if ch not in board.channels:
-                board.channels.append(ch)
-    perms = getattr(topology, "channel_permissions", None)
+    topology.reset_agents(agents)
+    for ch in topology.channels():
+        if ch not in board.channels:
+            board.channels.append(ch)
     out: dict[AgentId, Role] = {}
     for a, role in zip(agents, list(roles) + [None] * (len(agents) - len(roles)), strict=False):
         if role is not None:
             apply = getattr(participants[a], "apply_role", None)
             if callable(apply):
                 apply(role)
-        limits = perms(a) if callable(perms) else None
+        limits = topology.channel_permissions(a)
         if role is None and limits is None:
             continue
         eff = role or Role(name="")
