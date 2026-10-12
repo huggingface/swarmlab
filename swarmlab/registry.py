@@ -2,13 +2,21 @@
 
 `resolve(type_name, group)` finds the class: first an entry point named `type_name` in `group`,
 then `module:Qual.Name` import. `normalize(spec, group)` returns the spec as a plain
-`{"type", "params"}` dict in the form `Plugin.spec()` writes now; `build(spec, group)` instantiates
-the class with the normalised `params`. Both take a mapping or a `PluginSpec`-like object.
+`{"type", "params"}` dict with legacy nested `**name` params flattened; `build(spec, group)`
+instantiates the class with those `params`. Both take a mapping or a `PluginSpec`-like object.
 `flat_params(cls, params)` is the lower-level step `normalize` applies: it accepts the form
 `Plugin.spec()` wrote before it flattened `**name` arguments (`{"kwargs": {...}}`, nested under
-the parameter's name), so older run.json files still rebuild and compare equal (the runner's fork
-normalises the parent's participant specs this way). `normalize` leaves `params` as given when
-the type does not resolve; `build` raises then.
+the parameter's name), so older run.json files still rebuild, and a spec stored in that form
+compares equal to the same spec written in the flat form (the runner's fork normalises the
+parent's participant specs this way). `normalize` leaves `params` as given when the type does not
+resolve; `build` raises then.
+
+`normalize` only flattens. It keeps the input's `type` spelling (an entry-point name stays a name,
+`module:Class` stays `module:Class`, an alias stays the alias) and adds no omitted defaults, so it
+is NOT a canonical form: two specs that build equivalent plugins can still normalise differently,
+and `normalize(spec)` is not in general equal to the built plugin's `Plugin.spec()`. Do not use it
+for equality or hashing beyond the fork's comparison of a stored spec with the same spec
+re-stated.
 Groups used by `Experiment.from_spec`: `swarmlab.worlds`, `swarmlab.participants`,
 `swarmlab.metrics`; the board resolves `swarmlab.topologies` and `swarmlab.policies` itself.
 
@@ -71,7 +79,12 @@ def build(spec: Mapping[str, Any] | Any, group: str) -> Any:
 
 def normalize(spec: Mapping[str, Any] | Any, group: str) -> dict[str, Any]:
     """`spec` (a dict or `PluginSpec`-like) as `{"type", "params"}` with `flat_params` applied;
-    `params` unchanged when the type does not resolve."""
+    `params` unchanged when the type does not resolve.
+
+    Not a canonical form: the `type` spelling (entry-point name vs `module:Class`) and any
+    omitted defaults are kept as given, so equivalent configurations may normalise differently
+    and the result need not equal `Plugin.spec()`. Written for the fork's participant comparison;
+    do not use it for general equality or hashing."""
     try:
         return _resolved(spec, group)[1]
     except (ImportError, AttributeError, ValueError):

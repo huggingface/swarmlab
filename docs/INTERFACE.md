@@ -42,7 +42,7 @@ class Run:
     def load(cls, dir) -> "Run": ...            # replays the log; never calls plugins' mutating paths
 ```
 
-`participants=[EvidenceAggregator()] * 16` is valid: the runner deep-copies each prototype per agent and calls `bind`. Every plugin instance exposes `spec() -> dict` as `{"type": <entry-point name>, "params": {...}}` built from its constructor kwargs; `to_spec` serialises the experiment from those, and `from_spec` rebuilds it through entry points. A plugin defined inline in a script (no entry point) is allowed for Python use; `to_spec` records `type` as `module:Class` and `from_spec` imports it, so identity and replay still work on the same code tree.
+`participants=[EvidenceAggregator()] * 16` is valid: the runner deep-copies each prototype per agent and calls `bind`. Every plugin instance exposes `spec() -> dict` as `{"type": <entry-point name>, "params": {...}}` built from its constructor kwargs; `to_spec` serialises the experiment from those, and `from_spec` rebuilds it through entry points. A plugin defined inline in a script (no entry point) is allowed for Python use; `to_spec` records `type` as `module:Class` and `from_spec` imports it, so identity and replay still work on the same code tree. `swarmlab.registry.normalize(spec, group)` only flattens legacy nested `**kwargs` params; it keeps the given `type` spelling (entry-point name or `module:Class`) and omitted defaults, so it is not a canonical form, need not equal `Plugin.spec()`, and is used only for the fork's comparison of a stored participant spec with the same spec re-stated, not for general equality or hashing.
 
 YAML is the serialised `Experiment` plus arms: `Experiment.from_yaml(path, arm)` and the CLI build the same object and call `run`.
 
@@ -240,6 +240,8 @@ class Scheduler(Persistable, Plugin):
 class SeededShuffle(Scheduler)   # shuffles live with ("schedule", round)
 ```
 The commit policy is a run option read by the runner. In M1a the scheduler is always `SeededShuffle` and is not part of the run spec.
+
+The base `Scheduler` (every live agent acts every round, in agent order) is registered as `fixed` in the `swarmlab.schedulers` entry-point group, so `Scheduler().spec()` is `{"type": "fixed", "params": {}}`; schedulers named in a spec (M6 `options.scheduler`) resolve through that group, then `module:Class`, like every other plugin.
 
 ## 12. Runner
 
