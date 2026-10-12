@@ -17,7 +17,6 @@ from swarmlab.registry import resolve
 from swarmlab.report import build_report
 from swarmlab.rng import derive
 from swarmlab.tools import ToolSchema
-from swarmlab.world import hidden_sites as hs
 from swarmlab.world.base import Action
 from swarmlab.world.hidden_sites import (
     ALREADY_CHOSE,
@@ -92,7 +91,8 @@ def test_references_for_default_multiset():
     assert ref["optimum"]["W"] == pytest.approx(2.63484375, abs=1e-12)
     assert tuple(ref["optimum"]["allocation"].values()) == (2, 3, 4, 3, 0, 0, 0, 0)
     counts, w = optimum_counts(12, tuple(DEFAULT_PROBABILITIES))
-    assert sum(1 for _ in hs._compositions(12, 8)) == 50388
+    assert sum(1 for _ in _compositions(12, 8)) == 50388
+    assert (counts, w) == _exhaustive_optimum(12, tuple(DEFAULT_PROBABILITIES))
     assert counts == (2, 3, 4, 3, 0, 0, 0, 0) and w == pytest.approx(2.63484375, abs=1e-12)
     # under a permutation the references follow the labels and keep their values
     w0 = make(seed=5)
@@ -103,6 +103,59 @@ def test_references_for_default_multiset():
     assert sc["random"]["W"] == pytest.approx(1.8284913265790605, abs=1e-15)
     assert {w0.assignment[k]: n for k, n in sc["optimum"]["allocation"].items() if n} == \
         {0.60: 2, 0.35: 3, 0.25: 4, 0.15: 3}
+
+
+def _compositions(n, parts):
+    if parts == 1:
+        yield (n,)
+        return
+    for head in range(n + 1):
+        for tail in _compositions(n - head, parts - 1):
+            yield (head, *tail)
+
+
+def _exhaustive_optimum(n_agents, probs):
+    """The former `optimum_counts`: every allocation, first maximum wins (reference only)."""
+    best = ((), -1.0)
+    for comp in _compositions(n_agents, len(probs)):
+        w = sum(1.0 - (1.0 - p) ** c for p, c in zip(probs, comp))
+        if w > best[1] + 1e-15:
+            best = (comp, w)
+    return best
+
+
+def test_greedy_optimum_matches_exhaustive_search():
+    rng = random.Random(20261012)
+    for n_sites in range(1, 5):
+        for n_agents in range(9):
+            for _ in range(15):
+                probs = tuple(rng.uniform(0.005, 0.995) for _ in range(n_sites))
+                counts, w = optimum_counts(n_agents, probs)
+                ref_counts, ref_w = _exhaustive_optimum(n_agents, probs)
+                assert sum(counts) == n_agents and len(counts) == n_sites
+                assert w == pytest.approx(ref_w, abs=1e-12), (n_agents, probs)
+                assert counts == ref_counts, (n_agents, probs)
+
+
+def test_greedy_optimum_large_cases_and_ties():
+    counts, w = optimum_counts(64, tuple(DEFAULT_PROBABILITIES))      # ~42 min exhaustively
+    assert sum(counts) == 64 and w == pytest.approx(
+        sum(1.0 - (1.0 - p) ** c for p, c in zip(DEFAULT_PROBABILITIES, counts)))
+    def w_of(cs):
+        return sum(1.0 - (1.0 - p) ** c for p, c in zip(DEFAULT_PROBABILITIES, cs))
+    for i in range(8):                                                # no single move improves W
+        for j in range(8):
+            if i != j and counts[i]:
+                moved = list(counts)
+                moved[i] -= 1
+                moved[j] += 1
+                assert w_of(moved) <= w + 1e-12
+    probs26 = tuple(0.9 * (i + 1) / 27 for i in range(26))[::-1]
+    counts, w = optimum_counts(12, probs26)                           # hours exhaustively
+    assert sum(counts) == 12 and len(counts) == 26 and 0 < w < 12
+    assert optimum_counts(3, (0.5, 0.5, 0.5))[0] == (1, 1, 1)
+    assert optimum_counts(1, (0.5, 0.5))[0] == (1, 0)                  # tie: the earlier site
+    assert optimum_counts(0, (0.5, 0.2)) == ((0, 0), 0.0)
 
 
 def test_matched_permutation_and_trial_key_for_the_same_rng():

@@ -87,7 +87,10 @@ Score, verify, metrics
 `score()` -> `expected_cum` (sum of W), `actual_cum` (sum of R), `W_last`, `W_by_round`,
 `R_by_round`, `allocation` (site -> current count), `unassigned`, `assignment` (site -> p) and
 `references` (`all_at_best`: everyone at the best site; `random`: E[W] with uniform independent
-picks; `optimum`: the best allocation of all agents by exhaustive search, with its W).
+picks; `optimum`: the best allocation of all agents, with its W, found by the exact marginal-gain
+greedy in `optimum_counts`: each next agent goes to the site with the largest gain
+p_k * (1 - p_k) ** n_k, ties to the earlier site; exact because each site's gains decrease, and
+O(K + N log K), so it stays instant for any agent and site count).
 `verify()` -> `{"probabilities": assignment, "trial_key", "rounds"}`.
 
 Metrics (entry points; all fold the `round_resolved` events, so `swarmlab replay` reproduces them;
@@ -120,6 +123,7 @@ Decisions the contract leaves open
 """
 from __future__ import annotations
 
+import heapq
 import random
 import re
 from functools import lru_cache
@@ -203,25 +207,26 @@ def random_reference(n_agents: int, probs: list[float] | tuple[float, ...]) -> f
     return sum(1.0 - (1.0 - p / m) ** n_agents for p in probs)
 
 
-def _compositions(n: int, parts: int):
-    if parts == 1:
-        yield (n,)
-        return
-    for head in range(n + 1):
-        for tail in _compositions(n - head, parts - 1):
-            yield (head, *tail)
-
-
 @lru_cache(maxsize=32)
 def optimum_counts(n_agents: int, probs: tuple[float, ...]) -> tuple[tuple[int, ...], float]:
-    """Exhaustive search over every allocation of all n_agents to the sites (counts in the order
-    of `probs`); the first maximum wins. 12 agents over 8 sites: 50388 allocations."""
-    best: tuple[tuple[int, ...], float] = ((), -1.0)
-    for comp in _compositions(n_agents, len(probs)):
-        w = sum(1.0 - (1.0 - p) ** c for p, c in zip(probs, comp))
-        if w > best[1] + 1e-15:
-            best = (comp, w)
-    return best
+    """The allocation of all n_agents to the sites (counts in the order of `probs`) that maximises
+    W = sum_k 1 - (1 - p_k) ** n_k, and that W.
+
+    Exact marginal-gain greedy: adding an agent to site k (holding n_k) gains p_k * (1 - p_k) ** n_k,
+    a decreasing sequence in n_k, and W is a sum of per-site concave terms, so assigning each next
+    agent to the site with the largest gain is optimal. A heap keeps it O(K + N log K). Equal gains
+    go to the lower site index (the earlier position in `probs`)."""
+    k = len(probs)
+    counts = [0] * k
+    heap = [(-p, i) for i, p in enumerate(probs)]
+    heapq.heapify(heap)
+    for _ in range(n_agents if k else 0):
+        _, i = heapq.heappop(heap)
+        counts[i] += 1
+        p = probs[i]
+        heapq.heappush(heap, (-(p * (1.0 - p) ** counts[i]), i))
+    w = sum(1.0 - (1.0 - p) ** c for p, c in zip(probs, counts))
+    return tuple(counts), w
 
 
 def references(n_agents: int, assignment: dict[str, float]) -> dict[str, Any]:
