@@ -268,10 +268,14 @@ class World(Persistable, Plugin):
         """Evaluator-side Markdown lines appended to `swarmlab report` after its generic
         "Final score" table (which already lists every scalar key of the recorded `score()`).
 
-        `arms` maps arm name to that arm's finished runs (`Run`: `score`, `metrics`, `events`,
-        `spec`, ...). Called once per report on a world built from the first run's spec, not
-        reset, so it may use constructor config only; read per-run state from the runs.
-        Default: no lines.
+        Called once per world type in the report: runs are grouped by `run.spec.world.type`,
+        and this world is built (not reset, so use constructor config only) from the first
+        reconstructed run of its group. `arms` maps arm name to that arm's finished runs of this
+        world type only (`Run`: `score`, `metrics`, `events`, `spec`, ...; an arm without such a
+        run is absent); read per-run state from the runs. A run whose plugins did not import
+        when the report was built is a plain `Run` read from run.json (no replay; its
+        `experiment` cannot be built). With several world types in one report, the lines are
+        placed under a `### World <type>` heading. Default: no lines.
         """
         return []
 

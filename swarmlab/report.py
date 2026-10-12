@@ -6,6 +6,13 @@ Decisions:
 
 - Every run directory directly under RUNS_DIR whose `run.json` says `status: ended` is loaded with
   `Run.load` (a full replay: a run that does not replay is listed as skipped with the error).
+  A run whose plugins cannot be imported here (`registry.PLUGIN_IMPORT_ERRORS`: a custom world,
+  participant or metric whose module is gone) is not skipped: it is read as a plain `Run` from
+  its recorded run.json and events (no replay, no rebuilt world), so its score, metrics and
+  per-round sections still appear, and a header line under "skipped" reads
+  `reconstruction unavailable for <run_id>: <ErrorType>: <msg>`. Such a run has no truth for
+  the Flag Game sections (`world_verify` raises for it) and never hosts a world hook. Runs with
+  no run.json, not ended, or whose run.json/events cannot be read stay skipped.
   Runs are grouped by arm (the middle part of `<experiment>__<arm>__s<seed>`, else `run.json`'s
   arm, else `?`).
 - Per-round columns span rounds 1..max(last committed round) over the runs (10 for M2), and the
@@ -22,10 +29,17 @@ Decisions:
   subclass FlagGame get them too); last, "Final score" for every world: per run, every scalar
   key of the recorded `score()` (int, float, str, bool, None; nested values skipped) in
   first-seen order across runs (alphabetical within a world: run.json sorts keys).
-- World hook: after "Final score", the lines of `World.report_sections({arm: [Run, ...]})` on a
-  world built from the first run's spec (`runs[0].experiment.world`, not reset), so a world adds
-  its own sections without editing this module; a world that cannot be built here (a custom
-  world that does not import) leaves the line `(world report sections unavailable: <error>)`.
+- World hook: after "Final score", runs are grouped by world type (`run.spec.world.type`, the
+  spec's type string); for each group, in sorted order of that string, a world is built from the
+  group's first reconstructed run (`run.experiment.world`, not reset) and its
+  `World.report_sections({arm: [Run, ...]})` gets only that group's runs (an arm with no run of
+  that type is absent). With more than one world type, each group's lines (when it has any) are
+  preceded by `### World <type>`; with one type, no heading. A group whose world cannot be built
+  here, or whose hook raises, leaves the line `(world report sections unavailable: <error>)`.
+- Table cells (every table, header and body) are escaped after `str()`: `|` becomes a
+  backslash-escaped pipe and a line break (CR, LF or CRLF) becomes one space (not `<br>`, which
+  only some renderers honour), so a score key or value with those characters keeps the row and
+  column count.
 - M6 "Terminal states (Flag Game paper)" (FlagGame-style runs, after "where the swarm went"):
   per arm, the share of runs whose endpoint is correct consensus / wrong consensus / polarized /
   fragmented (`metrics.belief.classify_state`, thresholds 0.85 / 0.25) and the mean terminal
@@ -71,6 +85,7 @@ from pathlib import Path
 from .budget import ledger_total
 from .experiment import Experiment, Run
 from .export import discarded_spend
+from .registry import PLUGIN_IMPORT_ERRORS
 from .rng import derive
 
 DEFAULT_TITLE = "swarmlab report"
@@ -92,9 +107,14 @@ def sd(xs):
     return st.stdev(xs) if len(xs) > 1 else (0.0 if xs else None)
 
 
+def cell_text(c) -> str:
+    """A Markdown table cell: `str(c)` with `|` escaped and line breaks as one space."""
+    return str(c).replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+
+
 def table(head, rows):
-    out = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
-    out += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
+    out = ["| " + " | ".join(cell_text(h) for h in head) + " |", "|" + "---|" * len(head)]
+    out += ["| " + " | ".join(cell_text(c) for c in r) + " |" for r in rows]
     return out
 
 
@@ -293,22 +313,42 @@ def score_section(arms) -> list[str]:
     return ["## Final score", ""] + table(["run", "rounds", *keys], rows) + [""]
 
 
+def unrebuilt(run) -> str | None:
+    """Why `run` was read without replay (its plugins do not import here), else None."""
+    return getattr(run, "report_unrebuilt", None)
+
+
 def world_sections(arms) -> list[str]:
-    """The world's own `report_sections` (World hook), on a world built from the first run's
-    spec; a world that cannot be built here (a custom world that does not import) leaves a
-    one-line note instead."""
-    by_arm = {arm: [run for run, _ in rs] for arm, rs in sorted(arms.items())}
-    first = next((rs[0] for rs in by_arm.values() if rs), None)
-    if first is None:
-        return []
-    try:
-        return list(first.experiment.world.report_sections(by_arm))
-    except Exception as e:  # noqa: BLE001 - a custom world must not break the whole report
-        return [f"(world report sections unavailable: {type(e).__name__}: {e})", ""]
+    """The worlds' own `report_sections` (World hook), one call per world type: runs grouped by
+    `run.spec.world.type`, in sorted order of that string; each group's world is built from its
+    first reconstructed run and sees only that group's runs. With several types, each group's
+    lines are headed `### World <type>`. A group whose world cannot be built here (a custom world
+    that does not import) or whose hook raises leaves a one-line note instead."""
+    groups: dict[str, dict[str, list]] = {}
+    for arm, rs in sorted(arms.items()):
+        for run, _ in rs:
+            groups.setdefault(run.spec.world.type, {}).setdefault(arm, []).append(run)
+    out = []
+    for wtype, by_arm in sorted(groups.items()):
+        runs = [run for rs in by_arm.values() for run in rs]
+        first = next((run for run in runs if unrebuilt(run) is None), None)
+        try:
+            if first is None:
+                raise RuntimeError(unrebuilt(runs[0]))
+            lines = list(first.experiment.world.report_sections(by_arm))
+        except Exception as e:  # noqa: BLE001 - a custom world must not break the whole report
+            lines = [f"(world report sections unavailable: {type(e).__name__}: {e})", ""]
+        if lines and len(groups) > 1:
+            lines = [f"### World {wtype}", "", *lines]
+        out += lines
+    return out
 
 
 def world_verify(run, agents):
-    """verify() is not persisted: rebuild the world exactly as the runner does."""
+    """verify() is not persisted: rebuild the world exactly as the runner does. A run read
+    without replay (its plugins do not import here) has no truth: this raises for it."""
+    if unrebuilt(run) is not None:
+        raise RuntimeError(f"reconstruction unavailable: {unrebuilt(run)}")
     seed = run.spec.options.seed
     exp = Experiment.from_spec(run.spec)
     ag = [p.agent for p in exp.participants if getattr(p, "agent", None)] or sorted(agents)
@@ -421,6 +461,7 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
     never count towards the spend total."""
     arms = defaultdict(list)
     skipped = []
+    unavailable = []
     simulated = []
     for d in sorted(Path(runs_dir).iterdir()):
         rj = d / "run.json"
@@ -436,13 +477,23 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
                 simulated.append(d.name)
                 if not include_fake:
                     continue
-            run = Run.load(d)
+            run = Run(d)
+            try:  # build the plugins first: one that does not import here is not a replay error
+                run.experiment  # noqa: B018 - builds and caches the experiment
+            except PLUGIN_IMPORT_ERRORS as e:  # read the recorded results without replay
+                run.report_unrebuilt = f"{type(e).__name__}: {e}"
+                note = f"reconstruction unavailable for {run.id}: {run.report_unrebuilt}"
+            else:
+                run, note = Run.load(d), None
+            data = scan(run)
         except Exception as e:  # noqa: BLE001
             skipped.append(f"{d.name} ({type(e).__name__})")
             continue
+        if note:
+            unavailable.append(note)
         parts = run.id.split("__")
         arm = parts[1] if len(parts) >= 3 else (run.meta.get("arm") or "?")
-        arms[f"{arm} (simulated)" if fake else arm].append((run, scan(run)))
+        arms[f"{arm} (simulated)" if fake else arm].append((run, data))
     last = [d["last_round"] for rs in arms.values() for _, d in rs]
     R = range(1, max([*last, 1]) + 1)
     every = [(run, d) for rs in arms.values() for run, d in rs]
@@ -451,6 +502,8 @@ def build_report(runs_dir: Path | str, title: str = DEFAULT_TITLE, include_fake:
     flag = (any(d["guess_by_round"].get(d["last_round"]) for _, d in every)
             or any(has_truth(run, d["agents"]) for run, d in every))
     L = [f"# {title}", "", f"Runs dir: `{runs_dir}`; skipped (not ended / unreadable): {', '.join(skipped) or 'none'}", ""]
+    if unavailable:  # read from run.json without replay: no rebuilt world (truth, world hook)
+        L += [*unavailable, ""]
     if simulated:
         how = ("included below as `<arm> (simulated)`" if include_fake else
                "left out of every table below (`--include-fake` adds them)")

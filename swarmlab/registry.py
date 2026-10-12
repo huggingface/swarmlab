@@ -39,6 +39,11 @@ already on it), so `module:Class` plugins in files next to an experiment YAML im
 `PYTHONPATH`. `Experiment.from_yaml` calls it with the YAML's directory, and the runner records
 that directory in `run.json["import_dir"]` so `Run.experiment` (replay, resume, fork, view of a
 run dir) can do the same from any working directory.
+
+`UnknownPlugin` (a `ValueError`) is what `resolve` raises for a type name that is neither an
+entry point nor `module:Class`; with `ImportError` and `AttributeError` (a missing module or
+class) it is how a caller tells "this plugin cannot be imported here" from other failures
+(`swarmlab report` falls back to the recorded run.json on those).
 """
 from __future__ import annotations
 
@@ -64,6 +69,13 @@ GROUPS = (
 )
 
 
+class UnknownPlugin(ValueError):
+    """A plugin type name with no entry point that is not `module:Class` either."""
+
+
+PLUGIN_IMPORT_ERRORS = (ImportError, AttributeError, UnknownPlugin)
+
+
 def add_import_dir(path: Path | str) -> str:
     """Put `path` (a directory) at the front of `sys.path`; returns it as a resolved string."""
     d = str(Path(path).resolve())
@@ -85,7 +97,7 @@ def resolve(type_name: str, group: str) -> type:
         for part in qualname.split("."):
             obj = getattr(obj, part)
         return obj
-    raise ValueError(f"unknown {group} plugin {type_name!r} (no entry point, not module:Class)")
+    raise UnknownPlugin(f"unknown {group} plugin {type_name!r} (no entry point, not module:Class)")
 
 
 def build(spec: Mapping[str, Any] | Any, group: str) -> Any:
