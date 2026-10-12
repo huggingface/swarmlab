@@ -411,3 +411,8 @@ def script_report_refuse_first(request, rng):
     if request.attempt == 0:
         return _refusal(request, "bio", '{"country": "nowhere"}')
     return country_reporter(request, rng)
+
+
+def script_always_refuse_ending(request, rng):
+    """Always refuse, leaving a partial `end_turn` call (it runs once the re-sends are used up)."""
+    return _refusal(request, "cyber", "I can't", calls=[("end_turn", {})])

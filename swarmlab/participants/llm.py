@@ -154,12 +154,17 @@ before them, and a request that replays one after that history changed is reject
 thinking, enforced for accounts created on or after 2026-08-31). So whenever memory is trimmed
 from the front (`window` dropping a round, a context-limit `drop_oldest`/`summarize` overflow)
 every kept `provider_content` is removed first; removing all thinking is always accepted, and
-the turns after the trim produce new blocks on the new history. `full` memory is append-only
+the turns after the trim produce new blocks on the new history. The same holds for the request's
+other inputs: `reasoning_binding` (snapshot state) is the sha256 of the system prompt and the
+tool list (`ToolSchema` JSON) of the request whose response produced the kept blocks, and before
+every request whose system prompt or tool list differs (a `reconfigure(system_prompt=...)`
+intervention re-renders the prompt; a role or a world that changes its tool schemas) every kept
+block is removed. A model change alone does not remove them: the API drops what the new model
+cannot read, unbilled, and asks callers to keep passing blocks across a switch. `full` memory is append-only
 and keeps all of them; `received` memory starts each turn afresh, so blocks live within a
 turn. The stripping is a pure function of the memory, so replay and resume rebuild the same
 requests. A message without reasoning has no `provider_content` key, so requests and memory
-are unchanged for models that do not think. The system prompt and the tool list must not change
-within a run for the blocks to stay valid (both are fixed in the built-in worlds).
+are unchanged for models that do not think.
 
 **Probing.** `probe_context()` returns `[system] + memory` as fresh `ChatMessage` objects (callers
 cannot mutate the agent's memory through them); `model_request_defaults()` returns `model,
@@ -210,6 +215,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -556,6 +562,8 @@ class LLMAgent(Participant):
         self.received_upto: list | None = None
         self.own_answers: list[str] = []
         self.last_observation: list[dict] | None = None
+        # sha256 of the system prompt + tool list the kept thinking blocks were produced under
+        self.reasoning_binding: str | None = None
 
     # ---- probing support ---------------------------------------------------------------------
     def probe_context(self) -> list[ChatMessage]:
@@ -802,9 +810,11 @@ class LLMAgent(Participant):
     def _append(self, msg: ChatMessage) -> None:
         self.rounds[-1]["messages"].append(msg.model_dump(mode="json"))
 
-    @staticmethod
-    def _assistant(resp: Any, tool_calls: list[ToolCall] | None = None) -> ChatMessage:
-        """The assistant message for `resp`, with its `provider_content` (thinking blocks) kept."""
+    def _assistant(self, resp: Any, tool_calls: list[ToolCall] | None = None) -> ChatMessage:
+        """The assistant message for `resp`, with its `provider_content` (thinking blocks) kept;
+        kept blocks are bound to the prefix of the request that produced them."""
+        if resp.provider_content is not None:
+            self.reasoning_binding = getattr(self, "_request_prefix", None)
         return ChatMessage(role="assistant", content=resp.text or "", tool_calls=tool_calls,
                            provider_content=resp.provider_content)
 
@@ -814,6 +824,17 @@ class LLMAgent(Participant):
         for entry in self.rounds:
             for m in entry["messages"]:
                 m.pop("provider_content", None)
+        self.reasoning_binding = None
+
+    def _check_reasoning_binding(self, tools_offered: list[ToolSchema]) -> None:
+        """Before a request: drop kept thinking blocks when the system prompt or the tool list
+        differs from the one they were produced under (module doc, Reasoning)."""
+        prefix = hashlib.sha256(canonical_json({
+            "system": self.system,
+            "tools": [t.model_dump(mode="json") for t in tools_offered]}).encode()).hexdigest()
+        self._request_prefix = prefix
+        if getattr(self, "reasoning_binding", None) not in (None, prefix):
+            self._drop_reasoning()
 
     def _request(self, tools: list[ToolSchema], attempt: int = 0) -> ChatRequest:
         return ChatRequest(messages=self.probe_context(), tools=tools, attempt=attempt,
@@ -854,6 +875,7 @@ class LLMAgent(Participant):
         resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
         while self.max_calls is None or model_calls < self.max_calls:
             await self._enforce_context_limit(view.tools, tools)  # M3a §3 context limit
+            self._check_reasoning_binding(view.tools)
             resp = await tools.infer(self._request(view.tools, resend))
             usage.finish_reasons.append(resp.finish_reason)
             if resp.finish_reason == "length" and "length" not in usage.notes:
@@ -954,6 +976,7 @@ class LLMAgent(Participant):
         resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
         while call < attempts:
             await self._enforce_context_limit(view.tools, tools)
+            self._check_reasoning_binding(view.tools)
             resp = await tools.infer(self._request(view.tools, resend))
             usage.finish_reasons.append(resp.finish_reason)
             if resp.finish_reason == "length" and "length" not in usage.notes:

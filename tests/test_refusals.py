@@ -259,3 +259,41 @@ def test_refusal_retries_param_and_validation():
     for bad in (-1, True, 1.5):
         with pytest.raises(ValueError, match="refusal_retries"):
             LLMAgent(model="fake:reader", refusal_retries=bad)
+
+
+# ---- exported sessions: discarded refusals never look executed -----------------------------------------
+def session_messages(out, agent="a000"):
+    lines = (out / "sessions" / f"{agent}.jsonl").read_text().splitlines()[1:]
+    return [json.loads(x)["message"] for x in lines]
+
+
+def test_session_marks_discarded_refusal_calls_not_executed(tmp_path):
+    run = refusing("script_refuse_first", 1, refusal_retries=1, max_calls=1).run(
+        seed=1, max_rounds=1, out=tmp_path / "runs")
+    assert [e["tool"] for e in run.events if e["type"] == "tool_called"] == ["post", "read_board"]
+    msgs = session_messages(run.export(tmp_path / "export"))
+    results = {m["toolCallId"]: m for m in msgs if m["role"] == "toolResult"}
+    refused = next(m for m in msgs if m["role"] == "assistant" and m.get("rawStopReason") == "refusal")
+    (guess,) = [b for b in refused["content"] if b["type"] == "toolCall"]
+    assert guess["name"] == "guess"  # kept as an audit record ...
+    r = results[guess["id"]]
+    assert r["isError"] and "not executed" in r["content"][0]["text"]  # ... that ran nothing
+    answered = next(m for m in msgs if m["role"] == "assistant" and m.get("rawStopReason") == "tool_use")
+    post, read = [b for b in answered["content"] if b["type"] == "toolCall"]
+    assert json.loads(results[post["id"]]["content"][0]["text"])["result"] == {"id": "tmp-a000-0"}
+    assert not results[post["id"]]["isError"] and not results[read["id"]]["isError"]
+    # every tool result belongs to exactly one call, and no executed result appears twice
+    texts = [m["content"][0]["text"] for m in msgs if m["role"] == "toolResult"]
+    assert sum('"tmp-a000-0"' in t for t in texts) == 1
+
+
+def test_session_exhausted_retries_keep_normal_matching(tmp_path):
+    run = refusing("script_always_refuse_ending", 1, refusal_retries=1).run(
+        seed=1, max_rounds=1, out=tmp_path / "runs")
+    assert [e["tool"] for e in run.events if e["type"] == "tool_called"] == ["end_turn"]
+    msgs = session_messages(run.export(tmp_path / "export"))
+    results = [m for m in msgs if m["role"] == "toolResult"]
+    assert len(results) == 2
+    first, last = results
+    assert first["isError"] and "not executed" in first["content"][0]["text"]  # re-sent
+    assert not last["isError"] and last["toolName"] == "end_turn"  # handled as default: it ran

@@ -264,3 +264,72 @@ async def test_context_limit_trim_drops_all_kept_thinking():
     agent.rounds[0]["messages"][1]["provider_content"] = block
     await agent._enforce_context_limit([], tools=None)
     assert agent.rounds[0]["messages"][1]["provider_content"] == block
+
+
+# ---- kept thinking is dropped when the request's prefix changes ----------------------------------------
+def thinking_sigs(kw):
+    return [b.get("signature") for m in assistant_turns(kw) for b in m["content"]
+            if b["type"] == "thinking"]
+
+
+def test_system_prompt_reconfigure_drops_kept_thinking(tmp_path):
+    from swarmlab.interventions import Reconfigure
+
+    stub = ThinkingClaude()
+    exp = claude_experiment(stub)
+    exp.interventions = [Reconfigure(agents=["a000"], settings={"system_prompt": "A new system prompt."},
+                                     at_round=1)]
+    run = exp.run(seed=1, max_rounds=2, out=tmp_path)
+    r2_first, r2_second = stub.kwargs[2], stub.kwargs[3]
+    assert r2_first["system"] == "A new system prompt."
+    assert thinking_sigs(r2_first) == []  # sig-1 / sig-2 were bound to the old prompt
+    assert thinking_sigs(r2_second) == ["sig-3"]  # new blocks go back as usual
+    # what the responses recorded is untouched (analysis keeps it)
+    out = run.export(tmp_path / "export")
+    rows = pq.read_table(out / "tables" / "inference.parquet").to_pylist()
+    assert [r["reasoning_kind"] for r in rows] == ["summary"] * 4
+
+
+def kept_agent(binding_tools):
+    agent = LLMAgent(model="anthropic:claude-opus-5-5")
+    agent.system = "sys"
+    block = [{"type": "thinking", "thinking": "", "signature": "s"}, {"type": "text", "text": "a"}]
+    agent.rounds = [{"round": 1, "messages": [
+        ChatMessage(role="user", content="Round 1.").model_dump(mode="json"),
+        ChatMessage(role="assistant", content="a", provider_content=block).model_dump(mode="json")]}]
+    agent._check_reasoning_binding(binding_tools)
+    agent.reasoning_binding = agent._request_prefix  # as if the response came from that request
+    return agent
+
+
+def kept(agent):
+    return [m for e in agent.rounds for m in e["messages"] if "provider_content" in m]
+
+
+def test_tool_schema_change_drops_kept_thinking():
+    from swarmlab.tools import ToolSchema
+
+    a = ToolSchema(name="guess", description="Guess.", parameters={"type": "object", "properties": {}})
+    b = ToolSchema(name="guess", description="Guess the flag.", parameters={"type": "object", "properties": {}})
+    agent = kept_agent([a])
+    agent._check_reasoning_binding([a])  # same prefix: kept
+    assert kept(agent)
+    agent._check_reasoning_binding([a, b.model_copy(update={"name": "post"})])  # a tool added
+    assert not kept(agent) and agent.reasoning_binding is None
+    agent = kept_agent([a])
+    agent._check_reasoning_binding([b])  # same name, changed schema
+    assert not kept(agent)
+
+
+def test_model_change_alone_keeps_thinking():
+    agent = kept_agent([])
+    agent.reconfigure(model="anthropic:claude-fable-5-1")
+    agent._check_reasoning_binding([])
+    assert kept(agent)  # the API drops what the new model cannot read; we do not strip
+
+
+def test_old_snapshots_without_a_binding_keep_working():
+    agent = kept_agent([])
+    del agent.__dict__["reasoning_binding"]  # restored from a snapshot written before the field
+    agent._check_reasoning_binding([])
+    assert kept(agent)
