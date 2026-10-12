@@ -5,6 +5,7 @@
 - Python 3.12, pydantic v2, asyncio. No global `random`; use `swarmlab.rng.derive`.
 - `docs/README.md` indexes the user guide (`docs/guide/`: spec reference, CLI, budgets, Flag Game, analysis); the top-level README is the human overview and holds no reference material.
 - `docs/handoff/INDEX.md` says what each work package built; `docs/known-issues.md` lists open problems.
+- Docs may name components as examples but never as a complete list; the complete list is `swarmlab plugins`, and every built-in entry point must have a one-line `description` (tested).
 - Tests live in `tests/`; run them with `UV_PROJECT_ENVIRONMENT="$AM_LOCAL/envs/swarmlab" uv run pytest`.
 - Commits: plain messages, no `Co-Authored-By` or attribution trailers, do not change git user config.
 - Do not edit files owned by another work package; stub what you need and note the stub in your handoff.

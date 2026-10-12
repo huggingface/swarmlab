@@ -6,7 +6,8 @@ Every `swarmlab` command and what a run directory holds. `swarmlab COMMAND --hel
 
 ```
 swarmlab doctor [SPEC...] [--offline]    swarmlab models [--provider P] [--tools] [--search S] [--refresh]
-swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC    swarmlab spec-reference    swarmlab metrics
+swarmlab init [NAME] [--dir D] [--force]  swarmlab validate SPEC    swarmlab spec-reference
+swarmlab plugins [GROUP]                  swarmlab metrics
 swarmlab run SPEC [--arm A] [--seed N] [--max-rounds R] [--out runs/] [--yes] [--rerun] [--parallel N]
 swarmlab estimate SPEC [--arm A] [--seed N] [--max-rounds R] [--prompt-growth G] [--calls-per-turn C] [--from RUN_DIR]
 swarmlab preflight SPEC [--arm A] [--seed N] [--max-usd 0.05]
@@ -22,6 +23,7 @@ swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 
 swarmlab job status JOB_ID    swarmlab job logs JOB_ID [--follow]    swarmlab job fetch RUN_ID [--out runs/]
 ```
 `swarmlab job ...` runs a spec whose models are `vllm:<model>` in an HF Job with vLLM serving the model in the same job, and brings run dirs back from the bucket; `job run` only prints the `hf jobs run` command and the estimate unless `--launch` (docs/handoff/WP8.md).
+`swarmlab plugins` lists every plugin group (worlds, topologies, policies, participants, metrics, claim_policies, schedulers, probes, interventions, fake_scripts) with each entry point's name and one-line description; `swarmlab plugins GROUP` lists one group, and `--json` prints `{"ok": true, "plugins": {group: [{"name", "description", "target"}]}}` (`target` is `module:Class`). It is the complete list the guides defer to. `swarmlab metrics` is the `metrics` group with a note on probe-sourced belief metrics.
 Every command takes `--json` and then prints one JSON object. Exit codes: 0 success, 2 invalid spec, 1 any other error (including a declined confirmation or a failed run).
 
 ## Run directory
