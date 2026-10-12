@@ -1,10 +1,14 @@
 """Build plugins from `{"type", "params"}` specs (docs/INTERFACE.md §0).
 
 `resolve(type_name, group)` finds the class: first an entry point named `type_name` in `group`,
-then `module:Qual.Name` import. `build(spec, group)` instantiates it with `params`.
-`flat_params(cls, params)` accepts the form `Plugin.spec()` wrote before it flattened `**name`
-arguments (`{"kwargs": {...}}`, nested under the parameter's name), so older run.json files
-still rebuild; `build` applies it.
+then `module:Qual.Name` import. `normalize(spec, group)` returns the spec as a plain
+`{"type", "params"}` dict in the form `Plugin.spec()` writes now; `build(spec, group)` instantiates
+the class with the normalised `params`. Both take a mapping or a `PluginSpec`-like object.
+`flat_params(cls, params)` is the lower-level step `normalize` applies: it accepts the form
+`Plugin.spec()` wrote before it flattened `**name` arguments (`{"kwargs": {...}}`, nested under
+the parameter's name), so older run.json files still rebuild and compare equal (the runner's fork
+normalises the parent's participant specs this way). `normalize` leaves `params` as given when
+the type does not resolve; `build` raises then.
 Groups used by `Experiment.from_spec`: `swarmlab.worlds`, `swarmlab.participants`,
 `swarmlab.metrics`; the board resolves `swarmlab.topologies` and `swarmlab.policies` itself.
 
@@ -61,10 +65,30 @@ def resolve(type_name: str, group: str) -> type:
 
 def build(spec: Mapping[str, Any] | Any, group: str) -> Any:
     """Instantiate a plugin from a dict or a `PluginSpec`-like object with `type`/`params`."""
-    if not isinstance(spec, Mapping):
-        spec = {"type": spec.type, "params": dict(spec.params)}
-    cls = resolve(spec["type"], group)
-    return cls(**flat_params(cls, spec.get("params") or {}))
+    cls, norm = _resolved(spec, group)
+    return cls(**norm["params"])
+
+
+def normalize(spec: Mapping[str, Any] | Any, group: str) -> dict[str, Any]:
+    """`spec` (a dict or `PluginSpec`-like) as `{"type", "params"}` with `flat_params` applied;
+    `params` unchanged when the type does not resolve."""
+    try:
+        return _resolved(spec, group)[1]
+    except (ImportError, AttributeError, ValueError):
+        t, params = _parts(spec)
+        return {"type": t, "params": params}
+
+
+def _parts(spec: Mapping[str, Any] | Any) -> tuple[str, dict[str, Any]]:
+    if isinstance(spec, Mapping):
+        return spec["type"], dict(spec.get("params") or {})
+    return spec.type, dict(spec.params or {})
+
+
+def _resolved(spec: Mapping[str, Any] | Any, group: str) -> tuple[type, dict[str, Any]]:
+    t, params = _parts(spec)
+    cls = resolve(t, group)
+    return cls, {"type": t, "params": flat_params(cls, params)}
 
 
 def flat_params(cls: Any, params: Mapping[str, Any]) -> dict[str, Any]:
