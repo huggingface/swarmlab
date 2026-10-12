@@ -126,6 +126,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 | `post` | `post_id, provisional_id, channel, text, fields` | at commit, per accepted post |
 | `delivery` | `post_id, recipient, delivery_id, eligible_round, content_hash` | at commit, per fan-out |
 | `action_committed` | `action_id, action, accepted, feedback` | at commit, per buffered action |
+| `round_resolved` | `data: dict` (what `World.end_round(r)` returned; evaluator-only) | at commit, after the last `action_committed`; only when the hook returns a dict |
 | `world_changed` | `payload` (opaque) | at commit, optional |
 | `metric` | `name, value, denominator` | after fold, per metric |
 | `round_committed` | `n_posts, n_actions, n_deliveries` | last logical event of the round |
@@ -134,7 +135,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 
 **Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them and also drops `seq`, because operational events are appended as they happen and shift later sequence numbers. Acceptance tests compare logical views.
 
-**Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events are appended to the log immediately by the runner (never buffered), so an `inference_attempt` exists on disk before the model is called and spend survives an aborted round.
+**Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `round_resolved` (when `World.end_round` returned a dict), `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events are appended to the log immediately by the runner (never buffered), so an `inference_attempt` exists on disk before the model is called and spend survives an aborted round.
 
 `EventLog(path)`: `append(event) -> seq`, `__iter__`, `last_committed() -> (round, seq) | None`, `truncate_after(seq)`. One JSONL file, fsync on `round_committed`.
 
@@ -179,9 +180,12 @@ class World(Persistable, Plugin):
 
     def report_sections(self, arms: dict[str, list[Run]]) -> list[str]
                                                         # [] (default); Markdown lines for `swarmlab report`
+    def end_round(self, round) -> dict | None            # None; after the round's world commit (below)
     # snapshot()/restore() from Persistable: pickle of __dict__ minus `params`
 ```
 `@tool` params map an argument name to a JSON type name (`"integer"`) or a full property schema; every argument is required. `description`, `params`, or any single value of a `params` dict may also be a callable `(self) -> ...` of the world instance returning the same shape, so a schema can follow constructor config (`{"site": lambda self: {"type": "string", "enum": self.sites}}`). `World.tool_schema(name) -> ToolSchema` resolves one tool for the instance and is the one authoritative hook: `tool_schemas()` and the default `validate()` both call `self.tool_schema(name)`, so the model sees, and validation checks, the same required list and enums, including those of an override. The default `validate()` checks argument names (every required one present, no extras) and `enum` membership (a value outside a property's `enum` gives `Ack(ok=False, error="bad args: <name> must be one of [...]")`, so the action is never dispatched); JSON types, ranges and anything else remain the world author's job inside the action. Schema callables run whenever a schema is built (at least once per round for advertising, since the executor reads `tool_schemas()` once per round, and again on every `validate`), so they must be pure, side-effect-free functions of constructor config (and of state fixed at `reset`, which never changes within a run), never of per-round state; per-round schema changes are out of scope. Static parts are checked at decoration time, callable parts when the schema is built (an unknown JSON type raises `ValueError` in both cases). The tool name is always static.
+
+`end_round(round) -> dict | None` (default None) is called by the runner once per round immediately after the world commit: under `round_end` after `commit_world`, under `immediate` after the last turn's commit, at the same point of the round. It runs before the round's commit events are logged and before interventions, probes, metrics, the budget event and the snapshot; its `round_resolved` event is logged after the round's last `action_committed`, so a metric folding the log in order sees every committed action before the resolution. The world may mutate its state there (resolve the round from the committed actions); the snapshot that follows captures it. A returned JSON-able dict is logged as a `round_resolved` event (`data`) that metrics may fold; None logs nothing. It is evaluator-only (never shown to agents), round-end interventions are not visible to it, and `replay()` never calls it (it folds the logged event and restores the snapshot).
 
 Constructor kwargs are stored on `self.params` and returned by `spec()`. Nothing returned by `observe`, `validate`, `commit`, status tools, or tool schemas may reveal correctness; `score` and `verify` are called only by the runner.
 
@@ -272,8 +276,10 @@ for each agent concurrently (semaphore = options.concurrency):
     view = View(r, agent, world.observe(agent), outcomes_prev[agent], board.pushable(...) if push else [], executor.schemas(agent))
     run participant.turn(view, executor) with a per-agent event buffer; executor buffers posts and actions
 append each agent's buffered events in `order`
-posts, deliveries = board.commit(r, agents, derive(seed,"topology",r), blobs); log post*, delivery*
-outcomes = world.commit(actions in `order`, each agent's in call order); log action_committed*; outcomes_prev = by agent
+posts, deliveries = board.commit(r, agents, derive(seed,"topology",r), blobs)
+outcomes = world.commit(actions in `order`, each agent's in call order)
+resolved = world.end_round(r)
+log post*, delivery*, action_committed*; if resolved is a dict: log round_resolved(data=resolved); outcomes_prev = by agent
 fold metrics on this round's logical events; log metric*
 if r % snapshot_every == 0: write snapshot (so every committed round has one on disk); log round_committed; log snapshot
 ```

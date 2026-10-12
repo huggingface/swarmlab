@@ -36,9 +36,15 @@ Round `r` (phase-commit, `commit == "round_end"`):
    opposed to a busy turn of accepted calls; `RoundExecutor.rejected_calls`).
 3. After all turns, each agent's buffered events are appended in `order`.
 4. Buffered posts go to `board.buffer_post` in `order` (each agent's in call order), then
-   `board.commit(r, live, derive(seed, "topology", r), blobs)`; log `post*`, `delivery*`.
-5. `world.commit(actions in order)`; log `action_committed*`; outcomes become next round's
-   `View.outcomes` as `{"action_id", "tool", "accepted", "feedback"}` dicts.
+   `board.commit(r, live, derive(seed, "topology", r), blobs)` (its `post*`, `delivery*` events
+   are logged after step 5's commit).
+5. `world.commit(actions in order)`; then `world.end_round(r)` runs (both commit modes, at this
+   same point: after the last world commit, before any commit event is logged, before
+   interventions, probes, metrics, budget and the snapshot). Then log `post*`, `delivery*`,
+   `registry*`, `claim*`, `action_committed*`, and last the `round_resolved` event (`data`) when
+   `end_round` returned a dict (None logs nothing), so a metric folding the stream in order sees
+   every committed action before the resolution. Outcomes become next round's `View.outcomes` as
+   `{"action_id", "tool", "accepted", "feedback"}` dicts.
 5b. (M1b, WP7) Probes: for every probe due this round (`r % every == 0`) each live agent is
    probed after the commit and before the metrics, so `probe` events are part of the round,
    fed to metrics (probe-sourced belief metrics see round r's answers in round r), covered by
@@ -49,17 +55,18 @@ Round `r` (phase-commit, `commit == "round_end"`):
    the run then ends with `run_ended(hard_ceiling_probes)` at round r, so the end reason says
    the last round was committed, unlike `hard_ceiling`, which discards the round in flight.
 6. Metrics are folded over this round's logical events (every event from `round_started`
-   through the last `action_committed`, parsed back from JSON so live and replay feed identical
-   objects); log `metric*`.
+   through `round_resolved`, or the last `action_committed` when there is none, parsed back
+   from JSON so live and replay feed identical objects); log `metric*`.
 7. If `r % snapshot_every == 0` the snapshot manifest is written *before* `round_committed`
    (its `log_seq` is the seq that `round_committed` will get), so a committed round always has
    its snapshot on disk. Then `round_committed`, `run.json`, and the `snapshot` event
    (`manifest_path` is relative to the run dir, `snapshots/<round:06d>.json`).
 
 Immediate mode (`commit == "immediate"`) runs turns one at a time in `order`; each `post` and
-world action commits at once inside the executor. The resulting `post*`, `delivery*`,
-`action_committed*` events are logged after the turn events in application order, so the log has
-the same shape in both modes.
+world action commits at once inside the executor. After the last turn, `world.end_round(r)` runs;
+then the resulting `post*`, `delivery*`, `action_committed*` events are logged after the turn
+events in application order, followed by `round_resolved`, so the log has the same shape in both
+modes.
 
 Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else (M6)
 `options.stop_when` held at `consecutive` evaluations in a row (probe rounds when the run has
@@ -131,7 +138,10 @@ Replay (`replay()`) never calls participants or the world's mutating paths excep
 private copy (to obtain the truth for metrics) and `restore` (to recompute the score). It folds
 the metrics over the log's logical events and checks every logged `metric` event, then restores
 the world from the latest snapshot at or before the last committed round and checks `score()`
-against `run.json`. Any difference raises `ReplayMismatch`.
+against `run.json`. Any difference raises `ReplayMismatch`. It never calls `world.end_round`:
+the logged `round_resolved` events are folded into the metrics like any other logical event, and
+the state `end_round` left in the world comes back with the snapshot. Resume and fork restore the
+snapshot (taken after `end_round`) and continue with live rounds, which call it as usual.
 
 Fork (`fork(at_round, experiment=None, out=None)`): the child dir is
 `<out or parent's parent dir>/<parent_id>__f<at_round>_<n>` (first free n from 1). The parent's
@@ -214,6 +224,7 @@ from .events import (
     ProbeEvent,
     RegistryEvent,
     RoundCommittedEvent,
+    RoundResolvedEvent,
     RoundStartedEvent,
     RunEndedEvent,
     RunStartedEvent,
@@ -1321,6 +1332,11 @@ class Runner:
             posts, deliveries = ex.committed.posts, ex.committed.deliveries
             applied = ex.committed.actions
             reg, claims = ex.committed.registry, ex.committed.claims
+        # end_round runs right after the world commit; its event is logged after action_committed*
+        resolved = self.world.end_round(r)
+        if resolved is not None and not isinstance(resolved, dict):
+            raise TypeError(f"{type(self.world).__name__}.end_round must return a dict or None, "
+                            f"got {type(resolved).__name__}")
         for p in posts:
             self._append(PostEvent, r, p.agent, post_id=p.post_id,
                          provisional_id=provisional.get(p.post_id, p.post_id), channel=p.channel,
@@ -1342,6 +1358,8 @@ class Runner:
                          accepted=out.accepted, feedback=feedback)
             self.outcomes_prev.setdefault(a, []).append(
                 {"action_id": aid, "tool": act.name, "accepted": out.accepted, "feedback": feedback})
+        if resolved is not None:  # after every action_committed, so metrics see the votes first
+            self._append(RoundResolvedEvent, r, data=_jsonable(resolved))
         for o in reg:  # M3b
             self.outcomes_prev.setdefault(o.agent, []).append(_jsonable(o.view_outcome()))
         # interventions (M3a: after the commit, before probes, in spec order)

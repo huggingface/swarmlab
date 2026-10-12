@@ -14,6 +14,11 @@ Additions after M1a:
   denominator, label)`; the default is the single `(self.name, *self.value(), None)`. A metric
   with several outputs (`belief.state`: its state code with a string `label`, plus four one-hot
   series) overrides it; the runner logs one `metric` event per output and replay checks each.
+- `round_resolved` events: a world whose `end_round(r)` returns a dict has it logged as a
+  `round_resolved` event (after the round's `action_committed*`), and metrics are fed it like any
+  other logical event of the round. A metric that reports the world's per-round resolution folds
+  it (`event.type == "round_resolved"`, `event.data`) instead of recomputing it from the
+  `action_committed` events; replay feeds it the same logged event, so live and replay agree.
 """
 from __future__ import annotations
 
