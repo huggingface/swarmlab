@@ -300,3 +300,65 @@ def test_metric_sees_all_committed_votes_before_round_resolved(tmp_path, commit)
     assert res.exit_code == 0, res.output
     assert json.loads(res.stdout)["replay"] == "ok"
 
+
+class Crash(Exception):
+    pass
+
+
+@pytest.mark.parametrize("commit", ["round_end", "immediate"])
+def test_crash_after_round_resolved_resumes_without_double_resolution(tmp_path, commit,
+                                                                       monkeypatch):
+    """Crash once end_round has mutated the world and `round_resolved` is on disk, before
+    `round_committed`: recovery truncates the round and re-runs it from round 2's snapshot."""
+    from swarmlab.events import EventLog
+
+    ref = ballot().run(seed=6, max_rounds=5, commit=commit, out=tmp_path / "ref")
+
+    append = EventLog.append
+
+    def crashing(self, event):
+        seq = append(self, event)
+        if event.type == "round_resolved" and event.round == 3:
+            raise Crash
+        return seq
+
+    monkeypatch.setattr(EventLog, "append", crashing)
+    with pytest.raises(Crash):
+        ballot().run(seed=6, max_rounds=5, commit=commit, out=tmp_path / "crash")
+    monkeypatch.setattr(EventLog, "append", append)
+    run_dir = next((tmp_path / "crash").iterdir())
+    on_disk = [parse_event(ln) for ln in (run_dir / "events.jsonl").read_bytes().splitlines()]
+    assert on_disk[-1].type == "round_resolved" and on_disk[-1].round == 3
+    assert EventLog(run_dir / "events.jsonl").last_committed()[0] == 2
+
+    resumed = Run(run_dir).resume()
+    assert logical(resumed) == logical(ref) and resumed.score == ref.score
+    assert resumed.metrics == ref.metrics
+    resolved = [e for e in resumed.events if e["type"] == "round_resolved"]
+    assert [e["round"] for e in resolved] == [1, 2, 3, 4, 5]  # round 3's partial copy is gone
+    discarded = [json.loads(ln) for ln in (run_dir / "discarded.jsonl").read_text().splitlines()]
+    assert discarded and all(e["round"] == 3 for e in discarded)
+    assert any(e["type"] == "round_resolved" for e in discarded)
+    # world state after resume equals the uninterrupted run's (round 3 resolved exactly once)
+    for r in (3, 5):
+        worlds = []
+        for d in (ref.dir, run_dir):
+            store = SnapshotStore(d)
+            w = Ballot()
+            w.restore(store.load(store.read(r))["world"])
+            worlds.append(w.__dict__)
+        assert worlds[0] == worlds[1] and len(worlds[1]["winners"]) == r
+
+    calls = []
+    end_round = Ballot.end_round
+
+    def counting(self, round):
+        calls.append(round)
+        return end_round(self, round)
+
+    monkeypatch.setattr(Ballot, "end_round", counting)
+    Run.load(run_dir)
+    res = CliRunner().invoke(app, ["replay", str(run_dir), "--json"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["replay"] == "ok"
+    assert calls == []
