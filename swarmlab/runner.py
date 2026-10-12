@@ -577,7 +577,7 @@ class Runner:
         self.board.commit_mode = self.options.commit
         self.scheduler = build_scheduler(self.options.scheduler)  # M6: SeededShuffle by default
         listeners = getattr(self.scheduler, "listeners", None)
-        topo = getattr(self.board, "topology", None)
+        topo = self.board.topology
         if listeners is not None and isinstance(topo, Gossip) and topo.k != listeners:
             raise ValueError(f"scheduler listeners={listeners} but gossip k={topo.k}: the gossip "
                              "partner draw gives the listeners, so they must match")

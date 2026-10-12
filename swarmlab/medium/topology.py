@@ -1,5 +1,10 @@
 """Board topologies (docs/INTERFACE.md §9): who receives a post.
 
+Every topology carries the channel protocol of the `Topology` base class (`reset_agents`,
+`channels`, `channel_members`, `channel_permissions`, `default_channel`). `Broadcast`, `Gossip`,
+`Groups` and `Star` keep its defaults (no extra channels, no restrictions, posts default to
+`main`); `Tree` overrides all five.
+
 Decisions where the contract is silent:
 
 - `Gossip(k)` is directed: each author gets `k` partners for the round, drawn with
@@ -38,8 +43,8 @@ Decisions where the contract is silent:
   agent list given to `reset_agents` (the runner calls it via `roles.bind_roles` at bind, so
   killed agents never reshuffle groups); before that, from the agents passed to `recipients`.
   The layout is a cache, never snapshotted (the topology is a pure function of params and the
-  agent list). `channel_permissions(agent)` returns `(read, write)` channel lists, intersected
-  with the agent's role by `bind_roles`.
+  agent list). Tree's `channel_permissions(agent)` returns `(read, write)` channel lists (the
+  base default is None, unrestricted), intersected with the agent's role by `bind_roles`.
 """
 from __future__ import annotations
 

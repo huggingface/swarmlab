@@ -200,7 +200,15 @@ class Policy(Persistable, Plugin):
 class Topology(Persistable, Plugin):
     def recipients(self, post: "Post", agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
         return [a for a in agents if a != post.agent]   # default: broadcast
+    # channel protocol (added with Tree, M3c §2); `roles.bind_roles` and the executor call it on every topology
+    def reset_agents(self, agents: list[AgentId]) -> None: ...                  # default: no-op
+    def channels(self) -> list[str]: return []
+    def channel_members(self, channel: str) -> list[AgentId]: return []
+    def channel_permissions(self, agent: AgentId) -> tuple[list[str], list[str]] | None: return None
+    def default_channel(self, agent: AgentId) -> str | None: return "main"
 ```
+
+Topology channel protocol: `bind_roles` calls `reset_agents` once at bind with the run's full agent list and appends `channels()` to the board's channels. `channel_permissions(agent)` returning `(read, write)` is intersected with the agent's role lists (an agent without a role gets an anonymous role carrying only these limits); `None` means unrestricted, so a role, if any, applies alone. `default_channel(agent)` is where `post` without a `channel` goes; `None` means the agent must name one, and the executor answers `bad args: post needs a channel, one of [<writable channels>]`. `channel_members` lists a channel's agents. `Broadcast`, `Gossip`, `Groups`, `Star` keep the defaults; `Tree` overrides all five.
 
 `medium/board.py`:
 ```python

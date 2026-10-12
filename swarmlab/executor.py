@@ -81,10 +81,12 @@ Decisions where the contract is silent:
   advertises `fields` (optional, with enums) when the role has `post_fields`.
   `read_board()` without a channel returns only readable channels' items (oldest first, the
   limit applied after filtering); items on unreadable channels stay unread. `post` without a
-  channel goes to `board.topology.default_channel(agent)` when the topology has one (Tree),
-  else to `main`. A role `budget.max_calls` replaces `max_calls_per_turn` for that agent.
-  `turn_started.role` is the role's name (None for an agent without one). `pushable(agent,
-  limit)` is the push-delivery selection with the same channel filter.
+  channel goes to `board.topology.default_channel(agent)` (`main` unless the topology overrides
+  it, e.g. Tree); when that is None the call is `bad args: post needs a channel, one of [...]`
+  listing the agent's writable channels. A role `budget.max_calls` replaces
+  `max_calls_per_turn` for that agent. `turn_started.role` is the role's name (None for an
+  agent without one). `pushable(agent, limit)` is the push-delivery selection with the same
+  channel filter.
 - Concurrency: `call` contains no `await`, so under asyncio each call is atomic. During round_end
   turns it only reads shared world state and touches the calling agent's own board inbox
   (`board.read`), so concurrent turns cannot observe each other.
@@ -511,8 +513,10 @@ class RoundExecutor:
         extra = set(args) - {"channel", "text", "fields"}
         channel = args.get("channel")
         if channel is None:
-            default = getattr(self.board.topology, "default_channel", None)
-            channel = (default(agent) if callable(default) else None) or "main"
+            channel = self.board.topology.default_channel(agent)
+            if channel is None:
+                return self._err(call_id, "bad args: post needs a channel, one of "
+                                          f"{self._channels(agent, 'write')}")
         text = args.get("text")
         fields = args.get("fields") or {}
         if extra or not isinstance(text, str) or not isinstance(fields, dict):
