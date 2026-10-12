@@ -52,10 +52,14 @@ The user message says the board is "available through the read_board tool". Befo
 first call the transcript gets the worker's `read_board` call (an assistant message with one tool
 call, id `read_board_0`) and its result: a `tool` message whose text is exactly the board the
 `user` channel would show. The worker writes both itself (no executed `read_board` call, so the
-log's `reads` are unchanged); the export shows the call as a `swarmlab-participant` message. The model is offered `read_board` and `submit(board_post,
-interpretation)`, and the request forces `submit` (`tool_choice` naming it, through the request's
-`extra`; a text reply is still parsed as JSON). Plain JSON answers after a tool result were
-unreliable on Qwen3.8-27B (it re-called `read_board`, or replied empty or in prose).
+log's `reads` are unchanged); the export shows the call as a `swarmlab-participant` message. The
+model is offered `read_board` and `submit(board_post, interpretation)`, and the request requires
+`submit` through `ChatRequest.tool_choice = ToolChoice(name="submit")`; the provider's wire format
+is the adapter's (providers/base.py, Tool choice). A text reply is still parsed as JSON. Plain JSON
+answers after a tool result were unreliable on Qwen3.8-27B (it re-called `read_board`, or replied
+empty or in prose). A forced choice needs native tools, so `board_channel: tool` with
+`tool_protocol: json` is refused when the worker is built, by the request validation
+(`check_tool_choice`), rather than sending a forced choice the model is never offered.
 docs/guide/cascade.md has the details; give this arm `max_tokens: 2048`.
 
 Params, besides every `LLMAgent` param:
@@ -74,7 +78,8 @@ import re
 from typing import Any, ClassVar
 
 from ..probes import parse_json_object, strip_reasoning
-from ..providers.base import ChatMessage, ChatRequest, ChatResponse
+from ..providers import ChatMessage, ChatRequest, ChatResponse, ToolChoice
+from ..providers.base import check_tool_choice
 from ..tools import AgentTools, ToolCall, ToolSchema
 from ..view import View
 from ..world import cascade as cw
@@ -88,7 +93,7 @@ SUBMIT = ToolSchema(
         "board_post": {"type": "string", "description": "The message you post to the shared board."},
         "interpretation": {"type": "string", "enum": list(cw.INTERPRETATIONS)}}})
 READ_CALL_ID = "read_board_0"
-FORCE_SUBMIT = {"tool_choice": {"type": "function", "function": {"name": "submit"}}}
+SUBMIT_CHOICE = ToolChoice(name="submit")
 
 
 def normalize_interpretation(value: Any) -> str | None:
@@ -131,6 +136,13 @@ class CascadeWorker(LLMAgent):
             raise ValueError(f"reward_last must be in [1, n_workers={n_workers}], got {reward_last!r}")
         if board_channel not in ("user", "tool"):
             raise ValueError(f"board_channel must be 'user' or 'tool', got {board_channel!r}")
+        if board_channel == "tool":  # the forced submit needs native tools (check_tool_choice)
+            probe = ChatRequest(model=model, messages=[], tools=[READ_BOARD, SUBMIT],
+                                tool_protocol=self.tool_protocol)
+            try:
+                check_tool_choice(probe.model_copy(update={"tool_choice": SUBMIT_CHOICE}))
+            except ValueError as e:
+                raise ValueError(f"board_channel 'tool' forces the submit call: {e}") from None
         self.show_board = bool(show_board)
         self.board_rule = cw.QUOTE_RULE if board_rule == "quote" else board_rule
         self.disclose_belief = bool(disclose_belief)
@@ -201,8 +213,8 @@ class CascadeWorker(LLMAgent):
 
     def _request(self, tools: list[ToolSchema], attempt: int = 0) -> ChatRequest:
         req = super()._request(tools, attempt)
-        if tools:  # the tool channel: force the submit call
-            req.extra = {**req.extra, **FORCE_SUBMIT}
+        if tools:  # the tool channel: require the submit call (checked in __init__ and by adapters)
+            req = req.model_copy(update={"tool_choice": SUBMIT_CHOICE})
         return req
 
     async def _handle_response(self, resp: ChatResponse, view: View,

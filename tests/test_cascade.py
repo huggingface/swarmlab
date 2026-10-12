@@ -307,7 +307,7 @@ def test_tool_channel_prefills_read_board_and_forces_submit(tmp_path):
     assert result["content"].startswith("SHARED WORKER BOARD (posts by earlier workers")
     assert "W04: my probe said so" in result["content"]
     assert [t["name"] for t in first["tools"]] == ["read_board", "submit"]
-    assert first["extra"]["tool_choice"] == {"type": "function", "function": {"name": "submit"}}
+    assert first["tool_choice"] == {"name": "submit"} and "tool_choice" not in first["extra"]
     assert [m["role"] for m in retry["messages"]][4:] == ["assistant", "tool"]  # bad submit + its result
 
 
@@ -321,6 +321,25 @@ def test_tool_channel_board_text_matches_the_user_channel(tmp_path):
     assert board in user  # same posts, same header: only the channel differs
     assert [a["feedback"]["interpretation"] for a in commits(tool_run)] == \
         [a["feedback"]["interpretation"] for a in commits(user_run)]
+
+
+def test_tool_channel_requires_native_tools(tmp_path):
+    """The forced submit cannot be honoured under the json protocol (no native tools are sent):
+    the worker is refused when built, by the request's tool_choice validation, and no request
+    is sent."""
+    with pytest.raises(ValueError, match="board_channel 'tool'.*tool_choice requires tool_protocol native"):
+        worker(board_channel="tool", tool_protocol="json")
+    spec = dry_spec(tmp_path, "j", board_channel="tool", tool_protocol="json")
+    with pytest.raises(ValueError, match="tool_choice requires tool_protocol native"):
+        Experiment.from_yaml(spec, "j").run(seed=3, out=tmp_path / "runs")
+    assert not list((tmp_path / "runs").glob("*/blobs/*/*"))
+    assert worker(board_channel="user", tool_protocol="json").board_channel == "user"
+
+
+def test_user_channel_requests_carry_no_tool_choice(tmp_path):
+    run = Experiment.from_yaml(dry_spec(tmp_path, "u"), "u").run(seed=3, out=tmp_path / "runs")
+    first = requests_of(run, "a005")[0]
+    assert first["tools"] == [] and "tool_choice" not in first and "tool_choice" not in first["extra"]
 
 
 def script_text(request, rng):
