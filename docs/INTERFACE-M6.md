@@ -1,6 +1,6 @@
 # swarmlab M6 interface contract: faithful Flag Game replication (arXiv 2609.19124)
 
-Scope: run the paper's three protocols as specified in `docs/notes/flag-game-paper-setup.md` on open VLMs through the HF router. Builds on INTERFACE.md, M1b, M3a (interventions), M3c (roles, Tree/Star), M5 (image modality) and the manager-protocol branch (blind agents, Star topology, manager role). Nothing here changes the spec hash of existing specs.
+Scope: run the paper's three protocols as specified in `docs/flag-game-paper-setup.md` on open VLMs through the HF router. Builds on INTERFACE.md, M1b, M3a (interventions), M3c (roles, Tree/Star), M5 (image modality) and the manager-protocol branch (blind agents, Star topology, manager role). Nothing here changes the spec hash of existing specs.
 
 ## 1. World: real flags and name-only candidates
 
@@ -31,7 +31,7 @@ A built-in participant prompt variant `report_json=True` on `LLMAgent`: the agen
 
 ## 6. Spec and estimate
 
-`experiments/m6_flag_paper.yaml`: `flags: real, candidates: names, modality: image, canvas: [24, 16], crop: [6, 4]`, Gemma 4 26B-A4B on DeepInfra (`temperature: 0.2`, `max_tokens: 200/250`), arms `pairwise-{4,16,128}` (OneSpeaker, gossip k=1, immediate, received memory H=8, probes every N rounds, rounds_per_agent 10, stop_when 5 consecutive full-consensus probes), `broadcast-{4,16,128}` (round_end, broadcast, memory: window keeping own decisions, 10 rounds, probe every round) and `manager-{4,16,128}` (Star with blind a000 as manager role, 10 rounds). Seeds `[1]`, `budget.total_usd: 10`, per-arm hard caps from the cost note (`docs/notes/flag-game-paper-setup.md` section 8 of the design discussion: N=128 broadcast ≈ $1.5). `swarmlab estimate` must handle `OneSpeaker` (calls per round = 1 agent).
+`experiments/m6_flag_paper.yaml`: `flags: real, candidates: names, modality: image, canvas: [24, 16], crop: [6, 4]`, Gemma 4 26B-A4B on DeepInfra (`temperature: 0.2`, `max_tokens: 200/250`), arms `pairwise-{4,16,128}` (OneSpeaker, gossip k=1, immediate, received memory H=8, probes every N rounds, rounds_per_agent 10, stop_when 5 consecutive full-consensus probes), `broadcast-{4,16,128}` (round_end, broadcast, memory: window keeping own decisions, 10 rounds, probe every round) and `manager-{4,16,128}` (Star with blind a000 as manager role, 10 rounds). Seeds `[1]`, `budget.total_usd: 10`, per-arm hard caps from the cost note (`docs/flag-game-paper-setup.md` section 8 of the design discussion: N=128 broadcast ≈ $1.5). `swarmlab estimate` must handle `OneSpeaker` (calls per round = 1 agent).
 
 ## 7. Acceptance
 

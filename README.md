@@ -155,7 +155,7 @@ Every command takes `--json`. The full flag list is in [CLI and run directory](d
 
 ## Documentation
 
-The [documentation index](docs/README.md) links every page: [getting started](docs/guide/getting-started.md), [building experiments](docs/guide/building-experiments.md), [the Flag Game](docs/guide/flag-game.md), [real models and budgets](docs/guide/real-models.md), [spec reference](docs/guide/spec-reference.md), [CLI](docs/guide/cli.md) and [analysing and publishing](docs/guide/analysis.md). The design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md), and open problems are in [`docs/notes/known-issues.md`](docs/notes/known-issues.md).
+The [documentation index](docs/README.md) links every page: [getting started](docs/guide/getting-started.md), [building experiments](docs/guide/building-experiments.md), [the Flag Game](docs/guide/flag-game.md), [real models and budgets](docs/guide/real-models.md), [spec reference](docs/guide/spec-reference.md), [CLI](docs/guide/cli.md) and [analysing and publishing](docs/guide/analysis.md). The design rationale is in [`docs/DESIGN.md`](docs/DESIGN.md), and open problems are in [`docs/known-issues.md`](docs/known-issues.md).
 
 **Coding agents:** read [`AGENTS.md`](AGENTS.md) first. To run experiments, follow [`skill/SKILL.md`](skill/SKILL.md).
 
