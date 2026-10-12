@@ -14,13 +14,13 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
     - `arms.NAME.participants[].params`: `{...}` (optional): constructor params, e.g. `{model: "anthropic:claude-haiku-4-5", max_tokens: 1024}` for `llm`
     - `arms.NAME.participants[].role`: `str | null` (optional): role name (declared in `roles`, or a built-in: worker, coordinator, reviewer, skeptic, scribe, manager)
   - `arms.NAME.medium`: `{topology, delivery, push_limit, policies, channels, registry, claim_policy, push_consume}` (default: see keys): the message board: topology, policies, registry
-    - `arms.NAME.medium.topology`: `{type: NAME, params: {...}}` (default `broadcast`): who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per agent per round), `groups`, `star` (params `{center: a000}`: members reach only the center, the center reaches all), `tree`; e.g. `{type: gossip, params: {k: 2}}`
+    - `arms.NAME.medium.topology`: `{type: NAME, params: {...}}` (default `broadcast`): who receives a post, e.g. `broadcast`, `gossip` (params `{k: 1}`: partners per agent per round) or `star` (params `{center: a000}`); written `{type: gossip, params: {k: 2}}`; `swarmlab plugins topologies` lists all
     - `arms.NAME.medium.delivery`: `pull | push` (default `pull`): `pull` (agents call `read_board`) or `push` (deliveries come with the turn)
     - `arms.NAME.medium.push_limit`: `int` (default `20`): most items pushed per turn under `delivery: push`
     - `arms.NAME.medium.policies`: `[{type: NAME, params: {...}}, ...]` (optional): visibility policies applied in order, e.g. `[{type: delay, params: {rounds: 1}}]`
     - `arms.NAME.medium.channels`: `[str, ...]` (default `[main]`): board channels
     - `arms.NAME.medium.registry`: `bool` (default `false`): turn on the claim registry tools
-    - `arms.NAME.medium.claim_policy`: `{type: NAME, params: {...}}` (default `advisory`): `advisory` or `enforced` (registry claims checked against world actions)
+    - `arms.NAME.medium.claim_policy`: `{type: NAME, params: {...}}` (default `advisory`): how registry claims are checked, e.g. `advisory` or `enforced` (claims checked against world actions); `swarmlab plugins claim_policies` lists all
     - `arms.NAME.medium.push_consume`: `bool` (default `false`): with `delivery: push`: show the newest `push_limit` unread items and mark every pushed-up-to item read, so each item is pushed once
   - `arms.NAME.metrics`: `[{type: NAME, params: {...}}, ...]` (optional): metrics logged every round (`swarmlab metrics` lists them)
   - `arms.NAME.probes`: `[{type: NAME, params: {...}}, ...]` (optional): probes asked after every commit, e.g. `[belief]`
@@ -32,7 +32,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
     - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
     - `arms.NAME.options.concurrency`: `int` (default `32`): concurrent turns
     - `arms.NAME.options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
-    - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent in a random order), `fixed` (every live agent in agent order a000, a001, ...) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
+    - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round, e.g. `seeded_shuffle` (default, every live agent in a random order) or `fixed` (every live agent in agent order a000, a001, ...); `swarmlab plugins schedulers` lists all
     - `arms.NAME.options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
     - `arms.NAME.options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
       - `arms.NAME.options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
@@ -66,7 +66,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
   - `options.concurrency`: `int` (default `32`): concurrent turns
   - `options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
-  - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent in a random order), `fixed` (every live agent in agent order a000, a001, ...) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
+  - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round, e.g. `seeded_shuffle` (default, every live agent in a random order) or `fixed` (every live agent in agent order a000, a001, ...); `swarmlab plugins schedulers` lists all
   - `options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
   - `options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
     - `options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`

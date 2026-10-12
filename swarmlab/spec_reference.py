@@ -90,10 +90,9 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
                   "max_tokens: 1024}` for `llm`",
     },
     MediumSpec: {
-        "topology": "who receives a post: `broadcast`, `gossip` (params `{k: 1}`: partners per "
-                    "agent per round), `groups`, `star` (params `{center: a000}`: members reach only the "
-                    "center, the center reaches all), `tree`; e.g. "
-                    "`{type: gossip, params: {k: 2}}`",
+        "topology": "who receives a post, e.g. `broadcast`, `gossip` (params `{k: 1}`: partners "
+                    "per agent per round) or `star` (params `{center: a000}`); written "
+                    "`{type: gossip, params: {k: 2}}`; `swarmlab plugins topologies` lists all",
         "delivery": "`pull` (agents call `read_board`) or `push` (deliveries come with the turn)",
         "push_limit": "most items pushed per turn under `delivery: push`",
         "push_consume": "with `delivery: push`: show the newest `push_limit` unread items and mark "
@@ -102,7 +101,8 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
                     "{rounds: 1}}]`",
         "channels": "board channels",
         "registry": "turn on the claim registry tools",
-        "claim_policy": "`advisory` or `enforced` (registry claims checked against world actions)",
+        "claim_policy": "how registry claims are checked, e.g. `advisory` or `enforced` (claims "
+                        "checked against world actions); `swarmlab plugins claim_policies` lists all",
     },
     Budget: {
         "soft_usd": "end the run at the next round boundary once agent spend reaches this (0: off)",
@@ -121,10 +121,9 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
         "snapshot_every": "write a snapshot every N rounds",
         "concurrency": "concurrent turns",
         "repeat": "paired-run repeat index (0: a plain run)",
-        "scheduler": "turn order per round: `seeded_shuffle` (default, every live agent in a "
-                     "random order), `fixed` (every live agent in agent order a000, a001, ...) or "
-                     "`one_speaker` (one random live agent per round; pair with `gossip` k=1 and "
-                     "`commit: immediate` for the Flag Game paper's pairwise protocol)",
+        "scheduler": "turn order per round, e.g. `seeded_shuffle` (default, every live agent in a "
+                     "random order) or `fixed` (every live agent in agent order a000, a001, ...); "
+                     "`swarmlab plugins schedulers` lists all",
         "rounds_per_agent": "sugar: `max_rounds = rounds_per_agent x number of agents`",
         "stop_when": "`{metric, op, value, consecutive}`: end the run (`stop_condition`) when "
                      "the metric compares true at `consecutive` evaluations in a row (probe "
