@@ -1,0 +1,102 @@
+{
+ "json_always_bad": {
+  "logical": "f72bc9ac9d156b002dcc6ad48184f0727fa809ce2fe20d871371cbf7f3656ba8",
+  "n_requests": 2,
+  "requests": "ccfdda2a304a28d62676fafd2e6d346e03abb75e15fb328fcb270ae68d879f2e"
+ },
+ "json_bad_then_ok": {
+  "logical": "79c3136fc51a83e83db7f96e673ba355d0e154b81ec50feb257ac7ea16947618",
+  "n_requests": 4,
+  "requests": "6cf7ce5361c209e512c2b864e992479dea27968a76dd4d390eeaa69d70f98f53"
+ },
+ "json_reader": {
+  "logical": "adef63a932143be27ab78a99e50e8a62bdd2542fe3edfab0cc99d7dc99222d04",
+  "n_requests": 8,
+  "requests": "ede971fa2deda937a1001de34f02494e972ae44e935663653b9f77457f814840"
+ },
+ "native_end_turn_first": {
+  "logical": "f8ccc0b88bb58bdc10a59ced6ff324f088b22a37d3be118418ea2d5bc9006547",
+  "n_requests": 2,
+  "requests": "20a633a9e4bc870338f8960791d67c2315b07200c4e9a8fb54fd999e0183a9d0"
+ },
+ "native_max_calls": {
+  "logical": "8505f9835eefa64d39967febd15e31db7b58c99a8e1d448d58e70c044429d395",
+  "n_requests": 6,
+  "requests": "bf1655ad90de6c19e2951d24c574050493b8667fdb8d40a7d932c7495437712b"
+ },
+ "native_raw_args": {
+  "logical": "a6b9d99eda9a8c32d69dd5638902b25bb1396263f62d683591e130f6319bb5a5",
+  "n_requests": 2,
+  "requests": "3cd3b26a228e06faa41073ff0d2bafef56dc0b307c23187f55db5227fdea9aff"
+ },
+ "native_reader": {
+  "logical": "31c03e2048b229509054032d209959ee3c8324d8927964a17c9cc4f30ef1edaf",
+  "n_requests": 16,
+  "requests": "491ac2c5e34073185e4e40feb77d32baa032d23017f4b4110fd1a44d329ef022"
+ },
+ "refusal_exhausted": {
+  "logical": "9d45b09d4887fc61415f35ece757a07fe2b3dee6138eb3aa869ecd55046892b9",
+  "n_requests": 4,
+  "requests": "cf925e5b1281190075af4e15f0f13c1cd49a8e395a93b6f11f4b7ca166cb8527"
+ },
+ "refusal_json": {
+  "logical": "8f8b022dfd34ae3b5a036ae82a0f2c37f4edebba4b596f6a0bada2142d168203",
+  "n_requests": 6,
+  "requests": "3d575241ccf0c69750b6667c472d4e9d37583faf1a4003dd29033bb6fb8e9202"
+ },
+ "refusal_max_calls": {
+  "logical": "6d913fefab8f8918894ad00c7acee769c7cc08d8ea6186ead661c25720137359",
+  "n_requests": 2,
+  "requests": "23b9ddc72eca2a84cafc9e92ec82298f3188473edfc769a887f61a7ce1831bc4"
+ },
+ "refusal_retries": {
+  "logical": "6689ee5d18928c7280bc6910bc943a7544137ffd17a8b72e472e4677686f2039",
+  "n_requests": 24,
+  "requests": "b41cb877d8e9d5b30b7cfe247435579c27ca10acf2cb31acf7e95fc949e03c24"
+ },
+ "report_json": {
+  "logical": "002f705652df2a64cceafc55407f5a7c210144525ad80a01179b9f8ace08670a",
+  "n_requests": 6,
+  "requests": "ad37b55a03e261785895de9ed1f5592c820f8bb8824a1766f618d25645a5fcd4"
+ },
+ "report_json_failed": {
+  "logical": "318771b9f34693780c3e725617fc247bda0123b85211139e65258b5a4538f996",
+  "n_requests": 2,
+  "requests": "e9b16b3b3ca049c0ed6270021435da4f0b1419833dea05193f21f8508d31bfd3"
+ },
+ "report_json_json_protocol": {
+  "logical": "11644f5b0f05659fe7d6a6ff0b25cd2c3e3015e4542ce7daa56bec46fda22f78",
+  "n_requests": 2,
+  "requests": "2e1d3f054ec11fc770174ae3ad492a2371ef5c007bfd14914525cd35755ef411"
+ },
+ "report_json_native": {
+  "logical": "094067c53cb4492fd2b6daee254e99cc6b789499fcfca90c7250e6815fb683ed",
+  "n_requests": 1,
+  "requests": "2672707bca114e2d2e4285b6179e4fa0a222d5efad18332c5b74728e727cc869"
+ },
+ "report_json_one_call": {
+  "logical": "58ec57d201148b30f45916bb0f52e8a8b5cf6c36030ee9508e38d12bc503dee3",
+  "n_requests": 1,
+  "requests": "2672707bca114e2d2e4285b6179e4fa0a222d5efad18332c5b74728e727cc869"
+ },
+ "report_json_received": {
+  "logical": "8bf679e5ff2374d4c2a64460dd0eeba806206872c3733fdb5b001135d181be3d",
+  "n_requests": 4,
+  "requests": "17d70fd588eefbd9b2b90090bc8bcdd31f00f7f81d363e4620a1b8ed1f76e34e"
+ },
+ "report_json_refusal": {
+  "logical": "f28a8436c346aaa3f50dbdfabb3470c26f97da97e1aa3ee7f762858e39e5cc79",
+  "n_requests": 4,
+  "requests": "92e7c9f33569102f3bfd67025714d5b074f292d2b864cbc239f5fc4545f628d9"
+ },
+ "report_json_retry": {
+  "logical": "cea2eb5bd12cb5b07dbf645aa65e458eb95bffc3b62155f719ca05c7a2440372",
+  "n_requests": 2,
+  "requests": "c825bdc9b253b87141280f73b9ef3d913612d1fe5b5c75514dabed70da2fbebd"
+ },
+ "text_tool_fallback": {
+  "logical": "e990f0c7361a122b979866eb2088433d4d4e2ce0aeb6e1a3350f7ff75ca922e8",
+  "n_requests": 2,
+  "requests": "3050ac115611aa61dcb3160ed44443a7d91e53a8b10c0bafdea60fb9a98e6607"
+ }
+}

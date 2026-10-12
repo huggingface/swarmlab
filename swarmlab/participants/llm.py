@@ -73,8 +73,28 @@ parts unchanged (text and image parts pass through), then, when present, one tex
 (`- <tool> <action_id>: accepted|rejected <feedback JSON>`), and one text part
 `Delivered to you:` with a line per pushed item (`- <post_id> (round <eligible_round>): <content>`).
 
-**Loop** (one turn): build a `ChatRequest` (system + memory, `tools=view.tools`, the agent's
-settings), `await tools.infer(request)`, then
+**Turn loop.** `turn()` sets up memory (below), then runs one loop until the reply ends the turn
+or `calls_per_turn_cap` responses (`max_calls`; at most 2 under `report_json`) were acted on:
+
+    resp = await self._infer(view, tools, usage)          # one model call, refusals re-sent
+    n, ended = await self._handle_response(resp, view, tools)
+
+`_infer` checks kept thinking, enforces the context limit, builds the `ChatRequest` (system +
+memory, `tools=view.tools`, the agent's settings, `attempt`), `await tools.infer(request)`,
+records the finish reason (`length` noted) and runs the `refusal_retries` re-sends, so it returns
+the response to act on. `_handle_response` appends the assistant message and dispatches on the
+reply (the cases below, and `report_json`), returning (tool calls executed, turn ended). These two
+methods are the intended seam: a subclass overrides `_handle_response` to read replies its own
+way, or `_infer` to change what is sent (e.g. offer other tools through a view copy passed to
+`super()._infer`), and keeps everything else (memory, refusals, context limit, thinking, budgets);
+it overrides `turn_message`/`round_message` for prompt construction, not `turn()`. An override of
+`_handle_response` must still append the reply via `self._assistant(resp, ...)`, which keeps the
+response's thinking blocks (`provider_content`) and their binding. Turn state for overrides is
+`self._turn` (`TurnState`: the turn's `usage` for notes, `budget`, `calls` acted on so far,
+`refusals_resent`, `json_retried`; transient, not snapshotted). A turn-strategy plugin may replace
+this seam later; it will be introduced only when a third loop variant appears.
+
+The dispatch in `_handle_response`:
 
 - native: no tool calls -> the turn ends (`no_tool`; the assistant text, if non-empty, is kept).
   Otherwise the assistant message (text + tool calls) is appended and each call is executed in
@@ -231,6 +251,7 @@ import json
 import logging
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -239,7 +260,7 @@ from pydantic import Field
 
 from ..budget import MeasurementBudgetReached
 from ..probes import strip_reasoning
-from ..providers.base import ChatMessage, ChatRequest, split_model, text_of
+from ..providers.base import ChatMessage, ChatRequest, ChatResponse, split_model, text_of
 from ..spec import canonical_json
 from ..tools import AgentTools, ToolCall, ToolSchema
 from ..view import Part, View
@@ -466,6 +487,20 @@ class LLMTurnUsage(TurnUsage):
 
     finish_reasons: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+@dataclass
+class TurnState:
+    """Transient state of the turn in progress (`LLMAgent._turn`, not snapshotted): the
+    `LLMTurnUsage` the turn returns (for notes), the model-call budget (`calls_per_turn_cap`), the
+    responses acted on so far, the refusal re-sends made, and whether the json protocol's one
+    parse-error retry was used."""
+
+    usage: LLMTurnUsage
+    budget: int | None
+    calls: int = 0
+    refusals_resent: int = 0
+    json_retried: bool = False
 
 
 def _result_payload(res: Any) -> dict:
@@ -868,6 +903,9 @@ class LLMAgent(Participant):
         return resent < getattr(self, "refusal_retries", 0)
 
     async def turn(self, view: View, tools: AgentTools) -> LLMTurnUsage:
+        """Memory setup, then one loop: `_infer` a response, `_handle_response` it, until the
+        reply ends the turn or `calls_per_turn_cap` model calls were acted on (module doc,
+        Turn loop). Subclasses override those two steps, not this method."""
         if self.system is None:
             self.system = self._render_system(view)
         if self.memory == "window":
@@ -887,62 +925,85 @@ class LLMAgent(Participant):
             self._append(self.turn_message(view))
         usage = LLMTurnUsage()
         self._overflow_events = []
-        if self.report_json:
-            return await self._report_turn(view, tools, usage)
+        state = self._turn = TurnState(usage=usage, budget=self.calls_per_turn_cap)
         executed = 0
-        model_calls = 0
-        retried = False
-        resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
-        while self.max_calls is None or model_calls < self.max_calls:
-            self._check_reasoning_binding(view.tools)  # before estimating: only what is sent
-            await self._enforce_context_limit(view.tools, tools)  # M3a §3 context limit
-            resp = await tools.infer(self._request(view.tools, resend))
-            usage.finish_reasons.append(resp.finish_reason)
-            if resp.finish_reason == "length" and "length" not in usage.notes:
-                usage.notes.append("length")  # ran out of max_tokens (often mid-reasoning)
-            if self._resend_refused(resp, usage, resent):
-                resent += 1
-                resend += 1
-                continue
-            resend = 0
-            model_calls += 1
-            if self.tool_protocol == "native":
-                if not resp.tool_calls:
-                    text_calls = (parse_text_tool_calls(resp.text, view.tools)
-                                  if self.text_tool_fallback and resp.text else [])
-                    if resp.text:
-                        self._append(self._assistant(resp))
-                    if not text_calls:
-                        break
-                    log.info("%s round %s: text_tool_fallback parsed %d call(s): %s", self.agent,
-                             view.round, len(text_calls), [n for n, _ in text_calls])
-                    usage.notes.append(f"text_tool_fallback:{len(text_calls)}")
-                    n, ended = await self._run_json(text_calls, tools)
-                    executed += n
-                    if ended:
-                        break
-                    continue
-                self._append(self._assistant(resp, resp.tool_calls))
-                n, ended = await self._run_native(resp.tool_calls, tools)
-            else:
-                self._append(self._assistant(resp))
-                try:
-                    calls = parse_tool_json(resp.text)
-                except ToolJsonError as e:
-                    if retried:
-                        break
-                    retried = True
-                    self._append(ChatMessage(role="user", content=f"{RESULTS_PREFIX}\n" + json.dumps(
-                        [{"ok": False, "error": f"could not parse your tool calls: {e}"}])))
-                    continue
-                if not calls:
-                    break
-                n, ended = await self._run_json(calls, tools)
+        while state.budget is None or state.calls < state.budget:
+            resp = await self._infer(view, tools, usage)
+            state.calls += 1
+            n, ended = await self._handle_response(resp, view, tools)
             executed += n
             if ended:
                 break
         usage.calls = executed
         return usage
+
+    async def _infer(self, view: View, tools: AgentTools, usage: LLMTurnUsage) -> ChatResponse:
+        """One model call of the turn, as the response to act on (a seam: module doc, Turn loop).
+
+        Before each request: kept thinking is checked against the request prefix and the context
+        limit enforced; the request offers `view.tools`. The finish reason goes into `usage`
+        (`length` noted once). A refused response is noted and, while `refusal_retries` allows,
+        dropped and the same messages re-sent with `attempt` 1, 2, ...; the response returned is
+        the first one not dropped. A subclass may override this (e.g. to offer other tools, by
+        passing a view copy to `super()._infer`, or to change the request in `_request`)."""
+        state = getattr(self, "_turn", None)
+        if state is None:  # called outside `turn()`
+            state = self._turn = TurnState(usage=usage, budget=self.calls_per_turn_cap)
+        attempt = 0  # the re-send number of these messages
+        while True:
+            self._check_reasoning_binding(view.tools)  # before estimating: only what is sent
+            await self._enforce_context_limit(view.tools, tools)  # M3a §3 context limit
+            resp = await tools.infer(self._request(view.tools, attempt))
+            usage.finish_reasons.append(resp.finish_reason)
+            if resp.finish_reason == "length" and "length" not in usage.notes:
+                usage.notes.append("length")  # ran out of max_tokens (often mid-reasoning)
+            if not self._resend_refused(resp, usage, state.refusals_resent):
+                return resp
+            state.refusals_resent += 1
+            attempt += 1
+
+    async def _handle_response(self, resp: ChatResponse, view: View,
+                               tools: AgentTools) -> tuple[int, bool]:
+        """Act on one response: append the assistant message and dispatch; returns (tool calls
+        executed, turn ended). A seam for subclasses (module doc, Turn loop): an override must
+        still append the reply through `self._assistant(resp, ...)`, which keeps its thinking
+        blocks; `self._turn` (`TurnState`) holds the turn's usage (for notes) and counters.
+
+        - `report_json`: `_handle_report`.
+        - native, tool calls: executed in order (`_run_native`).
+        - native, no tool calls: the turn ends, unless `text_tool_fallback` finds calls written
+          in the text, which run as json-protocol calls (`_run_json`).
+        - json: `parse_tool_json`; a malformed reply gets one error-feedback retry per turn.
+        """
+        if self.report_json:
+            return await self._handle_report(resp, view, tools)
+        if self.tool_protocol == "native":
+            if resp.tool_calls:
+                self._append(self._assistant(resp, resp.tool_calls))
+                return await self._run_native(resp.tool_calls, tools)
+            text_calls = (parse_text_tool_calls(resp.text, view.tools)
+                          if self.text_tool_fallback and resp.text else [])
+            if resp.text:
+                self._append(self._assistant(resp))
+            if not text_calls:
+                return 0, True
+            log.info("%s round %s: text_tool_fallback parsed %d call(s): %s", self.agent,
+                     view.round, len(text_calls), [n for n, _ in text_calls])
+            self._turn.usage.notes.append(f"text_tool_fallback:{len(text_calls)}")
+            return await self._run_json(text_calls, tools)
+        self._append(self._assistant(resp))
+        try:
+            calls = parse_tool_json(resp.text)
+        except ToolJsonError as e:
+            if self._turn.json_retried:
+                return 0, True
+            self._turn.json_retried = True
+            self._append(ChatMessage(role="user", content=f"{RESULTS_PREFIX}\n" + json.dumps(
+                [{"ok": False, "error": f"could not parse your tool calls: {e}"}])))
+            return 0, False
+        if not calls:
+            return 0, True
+        return await self._run_json(calls, tools)
 
     async def _run_native(self, calls: list[ToolCall], tools: AgentTools) -> tuple[int, bool]:
         answered = 0
@@ -987,68 +1048,55 @@ class LLMAgent(Participant):
         return done, ended
 
     # ---- report_json (M6 §4) -------------------------------------------------------------------
-    async def _report_turn(self, view: View, tools: AgentTools, usage: LLMTurnUsage) -> LLMTurnUsage:
-        """One JSON answer -> `guess(<answer>)` + `post(text=<json>)` + `end_turn` (see module doc)."""
+    async def _handle_report(self, resp: ChatResponse, view: View,
+                             tools: AgentTools) -> tuple[int, bool]:
+        """`_handle_response` under `report_json`: one JSON answer -> `guess(<answer>)` +
+        `post(text=<json>)` + `end_turn` (see module doc); an unusable answer gets a corrective
+        message, and the turn loop's budget (`calls_per_turn_cap`) gives it one more call."""
+        usage = self._turn.usage
+        if self.tool_protocol == "native" and resp.tool_calls:  # the model used tools itself
+            self._append(self._assistant(resp, resp.tool_calls))
+            n, _ = await self._run_native(resp.tool_calls, tools)
+            usage.notes.append("report_json:native_tools")
+            return n, True
         offered = {t.name: t for t in view.tools}
-        attempts = self.calls_per_turn_cap or 2
         executed = 0
-        call = 0
-        resent = resend = 0  # refusal re-sends this turn; re-send number of these messages
-        while call < attempts:
-            self._check_reasoning_binding(view.tools)  # before estimating: only what is sent
-            await self._enforce_context_limit(view.tools, tools)
-            resp = await tools.infer(self._request(view.tools, resend))
-            usage.finish_reasons.append(resp.finish_reason)
-            if resp.finish_reason == "length" and "length" not in usage.notes:
-                usage.notes.append("length")
-            if self._resend_refused(resp, usage, resent):
-                resent += 1
-                resend += 1
-                continue
-            resend = 0
-            if self.tool_protocol == "native" and resp.tool_calls:  # the model used tools itself
-                self._append(self._assistant(resp, resp.tool_calls))
-                n, _ = await self._run_native(resp.tool_calls, tools)
-                usage.calls = executed + n
-                usage.notes.append("report_json:native_tools")
-                return usage
-            self._append(self._assistant(resp))
-            report, error = self._parse_report(resp.text or "")
-            results: list[dict] = []
-            if report is not None:
-                answer = report[self.report_fields[0]]
-                guess = offered.get("guess")
-                if guess is not None:
-                    arg = next(iter(guess.parameters.get("properties") or {"candidate": {}}))
-                    res = await tools.call("guess", {arg: answer})
+        self._append(self._assistant(resp))
+        report, error = self._parse_report(resp.text or "")
+        results: list[dict] = []
+        if report is not None:
+            answer = report[self.report_fields[0]]
+            guess = offered.get("guess")
+            if guess is not None:
+                arg = next(iter(guess.parameters.get("properties") or {"candidate": {}}))
+                res = await tools.call("guess", {arg: answer})
+                executed += 1
+                self._note_answer("guess", {arg: answer}, res.ok)
+                results.append({"name": "guess", **_result_payload(res)})
+                if not res.ok:
+                    error = f"answer {answer!r} was rejected: {res.error}"
+            else:  # no guess tool (e.g. a blind manager): the answer is still its decision
+                self._note_answer("guess", {"answer": answer}, True)
+            if error is None:
+                if "post" in offered:
+                    text = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+                    res = await tools.call("post", {"text": text})
                     executed += 1
-                    self._note_answer("guess", {arg: answer}, res.ok)
-                    results.append({"name": "guess", **_result_payload(res)})
-                    if not res.ok:
-                        error = f"answer {answer!r} was rejected: {res.error}"
-                else:  # no guess tool (e.g. a blind manager): the answer is still its decision
-                    self._note_answer("guess", {"answer": answer}, True)
-                if error is None:
-                    if "post" in offered:
-                        text = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
-                        res = await tools.call("post", {"text": text})
-                        executed += 1
-                        results.append({"name": "post", **_result_payload(res)})
-                    await tools.call("end_turn", {})
-                    executed += 1
-                    if self.memory != "received":
-                        self._append(ChatMessage(role="user", content=f"{RESULTS_PREFIX}\n"
-                                                 + json.dumps(results, sort_keys=True)))
-                    usage.calls = executed
-                    return usage
-            usage.notes.append(f"report_json:retry:{error}"[:120] if call + 1 < attempts
-                               else f"report_json:failed:{error}"[:120])
-            self._append(ChatMessage(role="user", content=(
-                f"Your reply could not be used: {error}. Answer with only the JSON object. "
-                + report_schema(self.report_fields))))
-            call += 1
-        usage.calls = executed
-        return usage
+                    results.append({"name": "post", **_result_payload(res)})
+                await tools.call("end_turn", {})
+                executed += 1
+                if self.memory != "received":
+                    self._append(ChatMessage(role="user", content=f"{RESULTS_PREFIX}\n"
+                                             + json.dumps(results, sort_keys=True)))
+                return executed, True
+        state = self._turn
+        last = state.budget is not None and state.calls >= state.budget
+        usage.notes.append(f"report_json:failed:{error}"[:120] if last
+                           else f"report_json:retry:{error}"[:120])
+        self._append(ChatMessage(role="user", content=(
+            f"Your reply could not be used: {error}. Answer with only the JSON object. "
+            + report_schema(self.report_fields))))
+        return executed, False
 
     def _canonical(self, answer: str) -> str:
         """`answer` spelled as in the observation's list of allowed names (FlagGame
