@@ -203,12 +203,12 @@ class Topology(Persistable, Plugin):
     # channel protocol (added with Tree, M3c §2); `roles.bind_roles` and the executor call it on every topology
     def reset_agents(self, agents: list[AgentId]) -> None: ...                  # default: no-op
     def channels(self) -> list[str]: return []
-    def channel_members(self, channel: str) -> list[AgentId]: return []
+    def channel_members(self, channel: str) -> list[AgentId]: return []             # descriptive; not enforced
     def channel_permissions(self, agent: AgentId) -> tuple[list[str], list[str]] | None: return None
     def default_channel(self, agent: AgentId) -> str | None: return "main"
 ```
 
-Topology channel protocol: `bind_roles` calls `reset_agents` once at bind with the run's full agent list and appends `channels()` to the board's channels. `channel_permissions(agent)` returning `(read, write)` is intersected with the agent's role lists (an agent without a role gets an anonymous role carrying only these limits); `None` means unrestricted, so a role, if any, applies alone. `default_channel(agent)` is where `post` without a `channel` goes; `None` means the agent must name one, and the executor answers `bad args: post needs a channel, one of [<writable channels>]`, and that agent's `post` tool schema lists `channel` as required. `channel_members` lists a channel's agents. `Broadcast`, `Gossip`, `Groups`, `Star` keep the defaults; `Tree` overrides all five.
+Topology channel protocol: `bind_roles` calls `reset_agents` once at bind with the run's full agent list and appends `channels()` to the board's channels. `channel_permissions(agent)` returning `(read, write)` is intersected with the agent's role lists (an agent without a role gets an anonymous role carrying only these limits); `None` means unrestricted, so a role, if any, applies alone. `default_channel(agent)` is where `post` without a `channel` goes; `None` means the agent must name one, and the executor answers `bad args: post needs a channel, one of [<writable channels>]`, and that agent's `post` tool schema lists `channel` as required. `channel_members` lists a channel's agents; it is descriptive only and nothing enforces it: overriding it alone changes neither delivery (`recipients`) nor read/write access (`channel_permissions`), so a topology that wants membership enforced uses it from those two, as `Tree` does. `Broadcast`, `Gossip`, `Groups`, `Star` keep the defaults; `Tree` overrides all five.
 
 `medium/board.py`:
 ```python

@@ -6,7 +6,9 @@ Besides `recipients`, `Topology` carries the channel protocol that `roles.bind_r
 executor call on every topology: `reset_agents`, `channels`, `channel_members`,
 `channel_permissions`, `default_channel`. The defaults describe a topology that adds no
 channels and restricts nobody, with posts going to `main` (Broadcast, Gossip, Groups, Star);
-`Tree` overrides them all.
+`Tree` overrides them all. Nothing enforces `channel_members` on its own: `recipients` decides
+who a post is delivered to and `channel_permissions` decides who may read and write each channel,
+so a topology that wants membership to matter must use it from those two (as `Tree` does).
 """
 from __future__ import annotations
 
@@ -43,7 +45,12 @@ class Topology(Persistable, Plugin):
         return []
 
     def channel_members(self, channel: str) -> list[AgentId]:
-        """The agents of one of this topology's channels. Default: none."""
+        """The agents of one of this topology's channels. Default: none.
+
+        Descriptive only: no caller enforces it. Overriding it alone changes neither routing nor
+        access; `recipients` decides delivery and `channel_permissions` decides read/write, so a
+        custom topology must consult its own membership from those (as `Tree` does).
+        """
         return []
 
     def channel_permissions(self, agent: AgentId) -> tuple[list[str], list[str]] | None:
