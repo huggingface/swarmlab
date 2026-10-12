@@ -2,8 +2,8 @@
 
 An allocation task with a strict information boundary. `n_sites` sites labelled A, B, C, ... have
 hidden success probabilities that stay fixed for the whole run. Every round each site offers one
-fresh discovery; after all agents have had their turn, every agent holding a site makes one
-independent attempt there, and the team scores one point per site where at least one attempt
+fresh discovery; at the end of the round every agent holding a site makes one independent
+attempt there, and the team scores one point per site where at least one attempt
 succeeded. More agents at a site raise its chance of scoring, with diminishing returns, so the
 team does best by spreading over the good sites rather than crowding the best one. Agents learn
 only their own attempts and the team's points; where the others are comes only through the board.
@@ -48,9 +48,9 @@ round**: a second call by the same agent in the same round is rejected with
 agents who chose is cleared by `begin_round`. An unknown site is rejected with
 `{"error": "unknown_site", "detail"}` and does not use up the choice. Accepted feedback is
 `{"position": <site>, "previous": <site or None>}` and nothing else. No status tools
-(`my_status`, `collective_status` stay None). The rule is per round, which is per turn under
-`commit: immediate` with the default scheduler (one turn per agent per round), which `requires`
-enforces.
+(`my_status`, `collective_status` stay None). The rule is per round whatever the scheduler: with
+the default scheduler (one turn per agent per round) it is one choice per turn; under `fixed`,
+`one_speaker` or another scheduler it still allows one accepted choice per agent per round.
 
 Information boundary
 --------------------
@@ -58,6 +58,13 @@ Agents never see: the probabilities or their order, which site is best, how many
 site, other agents' positions or attempts, expected points or any reference allocation. They see
 their own position, their own attempts and outcomes, and the team's points per resolved round and
 in total. The task text (`description()`) has no numbers at all and is identical across seeds.
+
+The task text is scheduler- and topology-neutral: it describes the task, the sites, the attempts,
+the one-choice-per-round rule, what an agent is told after each round and that the others'
+positions are learned only through the board. It says nothing about who takes turns, in which
+order, or who can read a post, because the scheduler and the board topology are legitimate
+variations that run with the same text. An experiment that wants agents told how its schedule and
+delivery work says so in `system_prompt_append` (as `examples/hidden_sites.yaml` does).
 
 Resolution and the trial stream
 -------------------------------
@@ -404,18 +411,15 @@ class HiddenSites(World):
         )
         operational = (
             f"There are {number_word(self.n_sites)} sites, named {self._site_range()}. All "
-            "agents start unassigned, and an unassigned agent makes no attempt. In each round the "
-            "agents take turns one at a time, in a random order that is drawn anew every round. "
-            "On your turn you may read the message board, keep your site or change it with "
-            "choose_site (at most one choice per turn; if you do not choose, you keep your "
-            "current site), and post. A post is readable by the agents whose turns come later in "
-            "the same round and by everyone in later rounds. Choosing a site is not an attempt: "
-            "after all agents have had their turn, every assigned agent makes exactly one "
-            "independent attempt at the site it holds at the end of the round. At the start of "
-            "the next round you are told privately whether your own attempt succeeded, and "
+            "agents start unassigned, and an unassigned agent makes no attempt. You can move to a "
+            "site with choose_site, at most once per round: after one accepted choice, another "
+            "call in the same round is rejected. If you do not choose, you keep your current "
+            "site. Choosing a site is not an attempt: at the end of each round, every "
+            "assigned agent makes exactly one independent attempt at the site it holds then. "
+            "After each round you are told privately whether your own attempt succeeded, and "
             "everyone is told the team's points for that round and the total so far. Nobody is "
             "told where the other agents are or how their attempts went, except through what "
-            "they post."
+            "they post on the message board."
         )
         return f"{common}\n\n{operational}"
 
@@ -445,7 +449,7 @@ class HiddenSites(World):
         return text_observation("\n".join(lines))
 
     @tool("choose_site", lambda self: f"Hold site {self._site_range()} from now on, or keep your "
-          "current one. At most one choice per turn; if you do not choose, you keep your site.",
+          "current one. At most one accepted choice per round; if you do not choose, you keep your site.",
           {"site": lambda self: {"type": "string", "enum": list(self.sites)}})
     def choose_site(self, agent: AgentId, site: str) -> Outcome:
         if site not in self.sites:

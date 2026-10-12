@@ -287,14 +287,20 @@ def test_description_has_common_text_and_no_probabilities_or_rankings():
     assert d.startswith(COMMON + "\n\n")
     op = d[len(COMMON) + 2:]
     for need in ("eight sites, named A to H", "start unassigned", "makes no attempt",
-                 "one at a time", "random order that is drawn anew every round", "choose_site",
-                 "at most one choice per turn", "keep your current site", "later in the same round",
-                 "everyone in later rounds", "Choosing a site is not an attempt",
-                 "exactly one independent attempt", "at the end of the round",
+                 "choose_site, at most once per round",
+                 "after one accepted choice, another call in the same round is rejected",
+                 "If you do not choose, you keep your current site",
+                 "Choosing a site is not an attempt", "at the end of each round",
+                 "exactly one independent attempt",
                  "told privately whether your own attempt succeeded", "team's points",
-                 "total so far", "Nobody is told where the other agents are"):
+                 "total so far",
+                 "Nobody is told where the other agents are", "post on the message board"):
         assert need in op, need
     low = d.lower()
+    # scheduler- and topology-neutral: nothing about turns, their order or who reads a post
+    for bad in ("turn", "order", "one at a time", "readable", "later in the same round",
+                "everyone in later rounds", "every agent has", "all agents have"):
+        assert bad not in low, bad
     for bad in ("optimal", "optimum", "0.", ".20", "60", "rank", "best site", "worst",
                 "highest", "lowest", "crowd", "%"):
         assert bad not in low, bad
@@ -574,6 +580,7 @@ def test_report_section_shows_references(tmp_path):
         assert row.endswith(f"| 3 | {sc['expected_cum']:.3f} | {sc['actual_cum']} | "
                             f"{ref['all_at_best']['W']:.3f} | {ref['random']['W']:.3f} | "
                             f"{ref['optimum']['W']:.3f} |")
+
 
 
 # ---- fork and resume under an edited world --------------------------------------------------
