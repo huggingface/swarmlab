@@ -10,7 +10,7 @@ from swarmlab.executor import RoundExecutor
 from swarmlab.ids import AgentId, agent_id
 from swarmlab.medium.base import Topology
 from swarmlab.medium.board import Post
-from swarmlab.medium.topology import Broadcast, Gossip, Groups, Star
+from swarmlab.medium.topology import Broadcast, Gossip, Groups, Star, Tree
 from swarmlab.rng import derive
 from swarmlab.roles import Role, bind_roles
 from swarmlab.world.flaggame import FlagGame
@@ -84,6 +84,31 @@ async def test_post_without_channel_needs_one_when_default_is_none(tmp_path):
     ex.begin_turn(b)  # a role narrows the list to the agent's writable channels
     assert (await ex.call(b, "post", {"text": "hi"})).error == \
         "bad args: post needs a channel, one of ['right']"
+
+
+def post_schema(ex: RoundExecutor, agent: AgentId) -> dict:
+    return next(s for s in ex.schemas(agent) if s.name == "post").parameters
+
+
+def test_post_schema_requires_channel_when_default_is_none(tmp_path):
+    board = Board(topology=Sides())
+    eff = bind_roles(board, {a: object() for a in AGENTS}, [])
+    params = post_schema(executor(tmp_path, board, eff), AGENTS[0])
+    assert params["required"] == ["channel", "text"]
+    assert params["properties"]["channel"]["enum"] == ["main", "left", "right"]
+    ex = executor(tmp_path, board, {AGENTS[1]: Role(name="r", channels_write=["right"])})
+    params = post_schema(ex, AGENTS[1])  # with a role: still required, enum narrowed
+    assert params["required"] == ["channel", "text"]
+    assert params["properties"]["channel"]["enum"] == ["right"]
+
+
+def test_post_schema_channel_optional_with_a_default(tmp_path):
+    board = Board(topology=Tree(groups=[AGENTS[:2], AGENTS[2:]]))
+    eff = bind_roles(board, {a: object() for a in AGENTS}, [])
+    assert board.topology.default_channel(AGENTS[0]) is not None
+    assert post_schema(executor(tmp_path, board, eff), AGENTS[0])["required"] == ["text"]
+    board = Board()
+    assert post_schema(executor(tmp_path, board, {}), AGENTS[0])["required"] == ["text"]
 
 
 class SidePoster(Participant):

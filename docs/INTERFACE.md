@@ -208,7 +208,7 @@ class Topology(Persistable, Plugin):
     def default_channel(self, agent: AgentId) -> str | None: return "main"
 ```
 
-Topology channel protocol: `bind_roles` calls `reset_agents` once at bind with the run's full agent list and appends `channels()` to the board's channels. `channel_permissions(agent)` returning `(read, write)` is intersected with the agent's role lists (an agent without a role gets an anonymous role carrying only these limits); `None` means unrestricted, so a role, if any, applies alone. `default_channel(agent)` is where `post` without a `channel` goes; `None` means the agent must name one, and the executor answers `bad args: post needs a channel, one of [<writable channels>]`. `channel_members` lists a channel's agents. `Broadcast`, `Gossip`, `Groups`, `Star` keep the defaults; `Tree` overrides all five.
+Topology channel protocol: `bind_roles` calls `reset_agents` once at bind with the run's full agent list and appends `channels()` to the board's channels. `channel_permissions(agent)` returning `(read, write)` is intersected with the agent's role lists (an agent without a role gets an anonymous role carrying only these limits); `None` means unrestricted, so a role, if any, applies alone. `default_channel(agent)` is where `post` without a `channel` goes; `None` means the agent must name one, and the executor answers `bad args: post needs a channel, one of [<writable channels>]`, and that agent's `post` tool schema lists `channel` as required. `channel_members` lists a channel's agents. `Broadcast`, `Gossip`, `Groups`, `Star` keep the defaults; `Tree` overrides all five.
 
 `medium/board.py`:
 ```python
