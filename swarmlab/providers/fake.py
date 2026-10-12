@@ -15,7 +15,7 @@ The provider fills in what the script leaves unset: `provider`, `model`, `latenc
 
 Built-in `flaggame_reader` (FlagGame text observations; in the image modality it needs
 `image_text_hint=True`, whose text parts joined with newlines form the same listing, and ignores
-the images; `FlagGame.check_participants` refuses it otherwise). Within one turn (the messages after the
+the images; `FlagGame.check_experiment` refuses it otherwise). Within one turn (the messages after the
 last `user` message that is not a json-protocol `[tool results]` message):
 
 1. If `read_board` is offered and has not been called this turn: call `post` with

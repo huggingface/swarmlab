@@ -4,7 +4,7 @@ All three draw randomness only from the rng passed to `bind` (the runner passes
 `derive(seed, "agent", agent)`), keep plain Python state (pickled by `Persistable`), and parse
 the world's observation with `swarmlab.world.flaggame.parse_observation` (the text parts joined
 with newlines). In FlagGame's image modality they need `image_text_hint=True` (M5): they set
-`reads_text_observation = True` and `FlagGame.check_participants` refuses them otherwise.
+`reads_text_observation = True` and `FlagGame.check_experiment` refuses them otherwise.
 
 - `Silent`: in round 1 guesses a candidate containing its crop (ties broken by its rng), then
   `end_turn`. Later rounds: `end_turn` only. Never reads or posts.

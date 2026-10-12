@@ -111,7 +111,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 
 from . import budget as budget_mod
 from ._io import atomic_write_bytes
@@ -167,7 +167,15 @@ class Experiment(BaseModel):
     _import_dir: str | None = PrivateAttr(default=None)  # the YAML's dir (registry.add_import_dir)
 
     def __init__(self, **data: Any) -> None:
-        super().__init__(**data)
+        try:
+            super().__init__(**data)
+        except ValidationError as e:
+            # the world's requirement check (`_check_world`) as its plain ValueError, not wrapped
+            # in a ValidationError that reprs the whole input
+            errs = e.errors()
+            if len(errs) == 1 and errs[0]["loc"] == () and errs[0]["type"] == "value_error":
+                raise errs[0]["ctx"]["error"] from None
+            raise
         self.probes = [p if isinstance(p, Probe) else build_probe(p) for p in self.probes]
         names = [p.name for p in self.probes]
         if len(set(names)) != len(names):
@@ -184,6 +192,36 @@ class Experiment(BaseModel):
                 row = ensure_pricing(provider, split_model(model)[0], mid)
                 if mid in catalog_priced(provider):
                     self._pin_price(split_model(model)[0], provider, mid, row)
+
+    @model_validator(mode="after")
+    def _check_world(self) -> Experiment:
+        """The world's declared requirements (`World.requires`, swarmlab/world/base.py), once per
+        construction (`check_run` with no overrides)."""
+        self.check_run()
+        return self
+
+    def _merged_options(self, max_rounds: int | None = None, **overrides: Any) -> dict:
+        """The run options a run with these overrides resolves (explicit argument, else
+        `options`; None = not given), `rounds_per_agent` resolved; no `RunOptions` defaults."""
+        merged = {k: v for k, v in self.options.items() if k != "seed"}
+        merged.update({k: v for k, v in overrides.items() if v is not None})
+        merged = resolve_rounds(merged, len(self.participants))  # M6: rounds_per_agent
+        if max_rounds is not None:
+            merged["max_rounds"] = max_rounds
+        return merged
+
+    def check_run(self, max_rounds: int | None = None, **overrides: Any) -> None:
+        """The world's declared requirements (`type(world).requires.check`) on the options a run
+        with these overrides would have (`run` resolution, no defaults filled in).
+
+        Raises the world's `ValueError`. Declarative only: it never calls `World.check_experiment`
+        or any participant hook, so it says nothing about participant compatibility; that is
+        checked at run initialisation (`Runner._init_fresh`), before any inference. Called at
+        construction (no overrides), by `estimate`, `run` and the CLI `estimate`/`run` commands.
+        """
+        options = self._merged_options(max_rounds, **overrides)
+        options.pop("rounds_per_agent", None)  # already resolved into max_rounds
+        type(self.world).requires.check(self.world, self.model_copy(update={"options": options}))
 
     def _pin_price(self, prefix: str, provider: Provider, mid: str, row: tuple) -> None:
         """Record a catalog price in the provider's params so `to_spec` carries it."""
@@ -209,6 +247,7 @@ class Experiment(BaseModel):
                  prompt_tokens: float = 3000, completion_tokens: float = 300,
                  seeds: list[int] | None = None, prompt_growth: float = 0,
                  probe_call_usd: float | None = None) -> dict:
+        self.check_run(max_rounds)  # the world's requirements, as `run` would see them
         rounds = range(1, max_rounds + 1)
         # sum over rounds of the prompt tokens of one call per round (flat and growth-adjusted)
         flat_tokens = prompt_tokens * max_rounds
@@ -277,11 +316,7 @@ class Experiment(BaseModel):
 
     # ---- running -----------------------------------------------------------------------------
     def _options(self, seed: int, max_rounds: int | None, **kw: Any) -> RunOptions:
-        merged = {k: v for k, v in self.options.items() if k != "seed"}
-        merged.update({k: v for k, v in kw.items() if v is not None})
-        merged = resolve_rounds(merged, len(self.participants))  # M6: rounds_per_agent
-        if max_rounds is not None:
-            merged["max_rounds"] = max_rounds
+        merged = self._merged_options(max_rounds, **kw)
         if "max_rounds" not in merged:
             raise ValueError("max_rounds is required (argument or experiment options)")
         return RunOptions(seed=seed, **merged)
@@ -303,6 +338,8 @@ class Experiment(BaseModel):
         """Run one seed into `out/<run_id>` (or exactly `run_dir` when given)."""
         options = self._options(seed, max_rounds, commit=commit, max_calls_per_turn=max_calls_per_turn,
                                 snapshot_every=snapshot_every, concurrency=concurrency, repeat=repeat)
+        self.check_run(max_rounds, commit=commit, max_calls_per_turn=max_calls_per_turn,
+                       snapshot_every=snapshot_every, concurrency=concurrency, repeat=repeat)
         rid = run_id or self.run_id(seed)
         target = Path(run_dir) if run_dir is not None else Path(out) / rid
         Runner(target, self, options, run_id=run_id).live()
@@ -463,10 +500,13 @@ class Experiment(BaseModel):
         )
 
     @classmethod
-    def from_spec(cls, spec: RunSpec) -> Experiment:
+    def from_spec(cls, spec: RunSpec, options: dict | None = None) -> Experiment:
         medium = spec.medium.model_dump(mode="json")
+        if options is None:  # the spec's run options (minus seed and defaults)
+            options = spec.options.model_dump(mode="json", exclude={"seed"}, exclude_defaults=True)
         return cls(
             name=spec.experiment,
+            options=options,
             arm=spec.arm,
             world=build(spec.world, "swarmlab.worlds"),
             participants=[assign(build(p, "swarmlab.participants"), r) for p, r in
@@ -492,8 +532,7 @@ class Experiment(BaseModel):
         options = resolve_rounds(options, n_agents)  # M6: rounds_per_agent -> max_rounds
         spec = arm_to_runspec(doc, arm, seed=0, max_rounds=options.get("max_rounds", 1))
         import_dir = add_import_dir(Path(path).resolve().parent)  # module:Class next to the YAML
-        exp = cls.from_spec(spec)
-        exp.options = options
+        exp = cls.from_spec(spec, options)
         exp._import_dir = import_dir
         return exp
 
