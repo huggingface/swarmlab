@@ -285,6 +285,22 @@ def test_unreadable_request_blob_does_not_duplicate_rounds(llm_run, tmp_path):
         [_flat(m["content"]) if m["role"] != "assistant" else m["content"] for m in full]
 
 
+def test_missing_response_blob_is_never_attributed_to_the_participant(tmp_path):
+    """A response blob is gone: the assistant message the next request (or the final memory)
+    holds is not the participant's (it carries no `author` marker), so it is left out as before,
+    not exported as a zero-usage `swarmlab-participant` message."""
+    run = llm_agent_experiment(1).run(seed=3, max_rounds=1, out=tmp_path / "runs")
+    full = _session(run.export(tmp_path / "full"), "a000")
+    lost = next(e for e in _events(run.dir) if e["type"] == "inference_response")
+    (Path(run.dir) / "blobs" / lost["response_hash"][:2] / lost["response_hash"]).unlink()
+    msgs = _session(export.export_run(run.dir, tmp_path / "export"), "a000")
+    assistants = [m for m in msgs if m["role"] == "assistant"]
+    assert assistants and all(m["provider"] == "fake" and m["api"] == "openai-completions"
+                              for m in assistants)
+    assert len(assistants) == len([m for m in full if m["role"] == "assistant"]) - 1
+    assert "swarmlab-participant" not in json.dumps(msgs)
+
+
 def test_validator_rejects_a_repeated_round_marker():
     from .pi_session import validate_lines
 

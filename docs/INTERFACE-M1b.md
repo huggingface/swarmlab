@@ -71,6 +71,8 @@ class ChatResponse: ... reasoning: str | None = None                  # reasonin
 ```
 Anthropic: `thinking` blocks' text joined is `reasoning` (`"summary"` with `display: "summarized"`, `"omitted"` and `""` under the default display); `provider_content` is every content block in order as a request block (thinking signatures included); `usage.reasoning_tokens = usage.output_tokens_details.thinking_tokens`. An assistant `ChatMessage` with `provider_content` is sent as exactly those blocks. OpenAI-compatible: `message.reasoning_content`, else `message.reasoning`, is `reasoning` (`"text"`), never sent back. Because `provider_content` is left out of the JSON when None, requests without reasoning hash as before; the response fields are part of the cached response, so replay reproduces them.
 
+(Provenance, additive) `ChatMessage.author: Literal["participant"] | None = None` marks a message the participant wrote into its own memory rather than one a model response produced (e.g. cascade_worker's `read_board` prefill, an assistant message with a tool call). It is left out of the JSON when None, so every other request hashes as before, and no adapter sends it to a provider (adapters build bodies from `role`, `content`, `tool_calls`, `tool_call_id`, `provider_content`). The export (INTERFACE-M4 §1, sessions) attributes an assistant message to the participant only when it carries this marker.
+
 (Tool choice, additive) A request can require one named tool call:
 
 ```python

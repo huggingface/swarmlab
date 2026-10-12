@@ -117,12 +117,15 @@ class ChatMessage(BaseModel):
     tool_calls: list[ToolCall] | None = None  # assistant messages
     tool_call_id: str | None = None  # tool messages
     provider_content: list[dict] | None = None  # assistant: provider blocks to send back as is
+    author: Literal["participant"] | None = None  # written by the participant, not a response
 
     @model_serializer(mode="wrap")
     def _drop_unset_provider_content(self, handler: Any) -> Any:
         data = handler(self)
-        if isinstance(data, dict) and data.get("provider_content", 0) is None:
-            data.pop("provider_content")  # so requests without reasoning hash as before
+        if isinstance(data, dict):
+            for key in ("provider_content", "author"):  # unset: requests hash as before
+                if key in data and data[key] is None:
+                    data.pop(key)
         return data
 
 

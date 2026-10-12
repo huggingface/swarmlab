@@ -483,7 +483,9 @@ def script_submit_ok(request, rng):
                                              "interpretation": "reads_transcript"})])
 
 
-def exported_session(tmp_path, arm: str, agent: str = "a005", **params) -> list[dict]:
+def exported_session(tmp_path, arm: str, agent: str = "a005", lose=None, **params) -> list[dict]:
+    """Run the arm, then export it through `swarmlab export`; `lose(run_dir)`, when given,
+    damages the run's artifacts (deletes a blob) before the export."""
     from typer.testing import CliRunner
 
     from swarmlab.cli import app
@@ -491,6 +493,8 @@ def exported_session(tmp_path, arm: str, agent: str = "a005", **params) -> list[
     from .pi_session import validate_file
 
     run = Experiment.from_yaml(dry_spec(tmp_path, arm, **params), arm).run(seed=3, out=tmp_path / "runs")
+    if lose is not None:
+        lose(Path(run.dir))
     out = tmp_path / f"export-{arm}"
     res = CliRunner().invoke(app, ["export", str(run.dir), "--out", str(out)])
     assert res.exit_code == 0, res.output
@@ -545,3 +549,47 @@ def test_export_of_the_user_channel_is_clean(tmp_path):
     msgs = exported_session(tmp_path, "user")
     assert [m["role"] for m in msgs] == ["system", "user", "assistant"]
     assert pairs(msgs) == [] and "not found in the log" not in json.dumps(msgs)
+
+
+def test_the_prefill_is_marked_and_the_marker_never_reaches_a_provider(tmp_path):
+    from swarmlab.providers import anthropic, openai_compat
+    from swarmlab.providers.base import ChatMessage, ChatRequest, ToolCall
+
+    run = Experiment.from_yaml(tool_arm_spec(tmp_path, "fake:tests.test_cascade:script_submit_ok"),
+                               "t").run(seed=3, out=tmp_path / "runs")
+    prefill = [m for m in requests_of(run, "a000")[0]["messages"] if m["role"] == "assistant"]
+    assert [m.get("author") for m in prefill] == ["participant"]
+    plain = ChatMessage(role="assistant", content="", tool_calls=[ToolCall(call_id="c", name="t", args={})])
+    assert "author" not in plain.model_dump(mode="json")  # unmarked messages hash as before
+    marked = plain.model_copy(update={"author": "participant"})
+    for model, build in (("openai:m", openai_compat.build_body), ("anthropic:m", anthropic.build_kwargs)):
+        reqs = [ChatRequest(model=model, messages=[ChatMessage(role="user", content="hi"), m])
+                for m in (plain, marked)]
+        assert build(reqs[0]) == build(reqs[1]) and "author" not in json.dumps(build(reqs[1]))
+
+
+def lose_first_request(agent: str):
+    def lose(run_dir: Path) -> None:
+        evs = [json.loads(x) for x in (run_dir / "events.jsonl").read_text().splitlines()]
+        h = next(e["request_hash"] for e in evs if e["type"] == "inference_attempt" and e["agent"] == agent)
+        (run_dir / "blobs" / h[:2] / h).unlink()
+    return lose
+
+
+def test_export_with_a_lost_request_keeps_the_prefill_and_the_model_submits_apart(tmp_path):
+    """The first request blob is gone, so the first submit's response is deferred to the next
+    readable request: it must not take the prefill's place (the prefill's provenance is its
+    `author` marker), and it is not emitted a second time as a participant message."""
+    msgs = exported_session(tmp_path, "lost", agent="a000", lose=lose_first_request("a000"),
+                            model="fake:tests.test_cascade:script_submit", board_channel="tool")
+    prefill, bad, good = pairs(msgs)  # pairs() checks every toolResult's toolName
+    assert prefill[:3] == ("read_board", "swarmlab", False) and "no posts yet" in prefill[3]
+    assert bad[:3] == ("submit", "fake", False) and bad[3].startswith("Your submit call could not be used")
+    assert good[:3] == ("submit", "fake", False) and json.loads(good[3])["result"]["committed"] is True
+    assistants = [m for m in msgs if m["role"] == "assistant"]
+    assert [(m["provider"], m["api"]) for m in assistants] == [
+        ("swarmlab", "swarmlab-participant"), ("fake", "openai-completions"),
+        ("fake", "openai-completions")]
+    read = next(m for m in msgs if m["role"] == "toolResult" and m["toolCallId"] == "read_board_0")
+    assert read["toolName"] == "read_board"
+    assert assistants[1]["usage"]["totalTokens"] > 0

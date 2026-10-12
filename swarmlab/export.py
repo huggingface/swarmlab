@@ -82,11 +82,13 @@ Decisions where the contract is silent:
     its real result, and the cursor does not move, so a result is never shifted onto another call.
     A participant that handles a call itself (cascade_worker carries out `submit` with `guess` and
     `post`) writes its own `tool` message for it, and that result is exported as written (its
-    `isError` from the payload's `ok`, like every result). An assistant message with tool calls
-    that no response produced (the participant wrote it into its memory, e.g. cascade_worker's
-    `read_board` prefill) is exported in its place as an assistant message with provider
-    `swarmlab`, api `swarmlab-participant`, model the participant type and zero usage; an
-    assistant message without tool calls that no response produced is still left out. Probe (`measurement`) calls are not part of the
+    `isError` from the payload's `ok`, like every result). An assistant message the participant
+    wrote into its memory (marked `author: "participant"`, e.g. cascade_worker's `read_board`
+    prefill) is exported in its place as an assistant message with provider `swarmlab`, api
+    `swarmlab-participant`, model the participant type and zero usage; it never takes a model
+    response's position (skipped, deferred). Provenance comes only from that marker: an
+    unmarked assistant message that no readable response produced (its response blob is
+    missing) is left out, never attributed to the participant. Probe (`measurement`) calls are not part of the
     agent's conversation and are left out (they are in `tables/probes` and `inference`).
     A request blob that cannot be read (deleted, or an I/O error on a bucket mount) adds
     nothing and leaves the overlap reference at the last readable request, so the next request
@@ -698,7 +700,8 @@ def _final_memory(run_dir: Path, blobs: _Blobs, agent: str) -> list[dict] | None
 def _norm(m: dict) -> dict:
     """Comparable form of a ChatMessage dict (request blobs and memory dumps agree on it)."""
     return {"role": m.get("role"), "content": m.get("content"),
-            "tool_calls": m.get("tool_calls") or None, "tool_call_id": m.get("tool_call_id")}
+            "tool_calls": m.get("tool_calls") or None, "tool_call_id": m.get("tool_call_id"),
+            "author": m.get("author")}
 
 
 def _payload_text(ret: dict | None) -> str:
@@ -724,10 +727,10 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
     Native tool calls of each response are matched, in order, to the executor's `tool_called`
     events of that round; when a call's result never shows up in a later request or in the
     final memory (window memory drops it at the next round), the result is taken from the
-    matching `tool_returned` event. An assistant message with tool calls that no response
-    produced (the participant wrote it, e.g. cascade_worker's `read_board` prefill) is emitted
-    with provider `swarmlab`, api `swarmlab-participant` and model `author` (the participant
-    type); its results are the participant's own `tool` messages.
+    matching `tool_returned` event. An assistant message marked `author: "participant"` (the
+    participant wrote it, e.g. cascade_worker's `read_board` prefill) is emitted with provider
+    `swarmlab`, api `swarmlab-participant` and model `author` (the participant type); its
+    results are the participant's own `tool` messages.
     """
     prev: list[dict] = []
     first = True
@@ -785,16 +788,16 @@ def _llm_session(sess: _Session, calls: list[tuple[dict, dict | None]], blobs: _
         for m in msgs:
             role = m["role"]
             if role == "assistant":
-                if skip:
+                if m.get("author") == "participant":  # the participant wrote it: no response
+                    flush(ts)  # (never takes a response's place, so never skipped or deferred)
+                    sess.assistant(_text_of(m["content"]), list(m.get("tool_calls") or []),
+                                   provider=PARTICIPANT_PROVIDER, model=author,
+                                   api=PARTICIPANT_API, usage=_usage(None, 0.0), finish=None, ts=ts)
+                elif skip:
                     skip -= 1  # already emitted from its response blob, with usage
                 elif deferred:
                     answer(*deferred.pop(0))
                     unseen = 0  # it is in this segment, not in the next request's
-                elif m.get("tool_calls"):  # written by the participant itself, no response
-                    flush(ts)
-                    sess.assistant(_text_of(m["content"]), list(m["tool_calls"]),
-                                   provider=PARTICIPANT_PROVIDER, model=author,
-                                   api=PARTICIPANT_API, usage=_usage(None, 0.0), finish=None, ts=ts)
                 continue
             if role == "tool":
                 cid = str(m.get("tool_call_id"))

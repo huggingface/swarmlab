@@ -52,8 +52,9 @@ The user message says the board is "available through the read_board tool". Befo
 first call the transcript gets the worker's `read_board` call (an assistant message with one tool
 call, id `read_board_0`) and its result: a `tool` message whose text is exactly the board the
 `user` channel would show. The worker writes both itself (no executed `read_board` call, so the
-log's `reads` are unchanged); the export shows the call as a `swarmlab-participant` message. The
-model is offered `read_board` and `submit(board_post, interpretation)`, and the request requires
+log's `reads` are unchanged; the call is marked `author="participant"`, which the export shows as a
+`swarmlab-participant` message). The model is offered `read_board` and
+`submit(board_post, interpretation)`, and the request requires
 `submit` through `ChatRequest.tool_choice = ToolChoice(name="submit")`; the provider's wire format
 is the adapter's (providers/base.py, Tool choice). A text reply is still parsed as JSON. Plain JSON
 answers after a tool result were unreliable on Qwen3.8-27B (it re-called `read_board`, or replied
@@ -204,8 +205,9 @@ class CascadeWorker(LLMAgent):
         if self.board_channel == "tool":
             msgs = self.rounds[-1]["messages"]
             if not any(m.get("tool_call_id") == READ_CALL_ID for m in msgs):  # first call: pre-fill
-                self._append(ChatMessage(role="assistant", content="", tool_calls=[
-                    ToolCall(call_id=READ_CALL_ID, name="read_board", args={})]))
+                self._append(ChatMessage(role="assistant", content="", author="participant",
+                                         tool_calls=[ToolCall(call_id=READ_CALL_ID,
+                                                              name="read_board", args={})]))
                 self._append(ChatMessage(role="tool", content=self.board_text(view),
                                          tool_call_id=READ_CALL_ID))
         offered = self.offered_tools()
