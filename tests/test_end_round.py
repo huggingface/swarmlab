@@ -119,12 +119,12 @@ def test_round_resolved_logged_once_per_round(tmp_path, commit):
     # first ticker is the first agent of the round's order (actions commit in order)
     orders = {e["round"]: e["order"] for e in of_type(run, "round_started")}
     assert all(e["data"]["first"] == orders[e["round"]][0] for e in resolved)
-    # position: right after the turn events, before the commit events and the round's tail
+    # position: right after the last action_committed, before the round's tail
     for r in range(1, 6):
         types = [e["type"] for e in run.events if e["round"] == r]
         i = types.index("round_resolved")
-        assert types[i - 1] == "turn_ended"
-        assert types.index("action_committed") > i and types.index("metric") > i
+        assert types[i - 1] == "action_committed" and "action_committed" not in types[i:]
+        assert types.index("turn_ended") < i and types.index("metric") > i
     assert run.score == {"total": sum(expected_n(r) for r in range(1, 6))}
 
 
@@ -220,3 +220,83 @@ def test_export_puts_round_resolved_in_other(tmp_path):
     payload = json.loads(rows[0]["payload"])
     assert set(payload) == {"data"}
     assert payload["data"]["n"] == payload["data"]["total"] == expected_n(1)
+
+
+class Ballot(World):
+    """Agents `vote` for a/b/c; `end_round` resolves the round to the majority (ties: first name)."""
+
+    def reset(self, rng, agents):
+        self.agents = list(agents)
+        self.ballots: dict[str, int] = {}
+        self.winners: list[str] = []
+
+    def observe(self, agent):
+        return text_observation(f"winners {self.winners}")
+
+    @tool("vote", "Vote for a choice.", {"choice": {"type": "string", "enum": ["a", "b", "c"]}})
+    def vote(self, agent, choice):
+        self.ballots[choice] = self.ballots.get(choice, 0) + 1
+        return Outcome(accepted=True)
+
+    def end_round(self, round):
+        counts, self.ballots = dict(sorted(self.ballots.items())), {}
+        winner = max(counts, key=lambda c: (counts[c], -ord(c)))
+        self.winners.append(winner)
+        return {"counts": counts, "winner": winner}
+
+    def score(self):
+        return {"a_wins": self.winners.count("a"), "rounds": len(self.winners)}
+
+
+class Voter(Participant):
+    """Votes once or twice, the choice following agent index and round."""
+
+    async def turn(self, view, tools):
+        i = int(str(self.agent)[1:])
+        k = 1 + (i * view.round) % 2
+        for j in range(k):
+            await tools.call("vote", {"choice": "abc"[(i + j + view.round * (i % 2)) % 3]})
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=k + 1)
+
+
+class MajorityCheck(Metric):
+    """Accumulates the round's committed votes from `action_committed`; on `round_resolved` checks
+    they are complete (equal to the resolution's counts) and that the winner is their majority."""
+
+    entry_point = None
+    name = "ballot.checked"
+
+    def __init__(self) -> None:
+        self.votes: dict[str, int] = {}
+        self.checked = 0
+
+    def update(self, event):
+        if event.type == "action_committed" and event.action["name"] == "vote" and event.accepted:
+            c = event.action["args"]["choice"]
+            self.votes[c] = self.votes.get(c, 0) + 1
+        elif event.type == "round_resolved":
+            votes, self.votes = dict(sorted(self.votes.items())), {}
+            assert votes == event.data["counts"], (votes, event.data)
+            assert event.data["winner"] == max(votes, key=lambda c: (votes[c], -ord(c)))
+            self.checked += 1
+
+    def value(self):
+        return float(self.checked), self.checked
+
+
+def ballot(n=5):
+    return Experiment(name="ballot", world=Ballot(), participants=[Voter()] * n,
+                      medium=Board(topology="broadcast"), metrics=[MajorityCheck()])
+
+
+@pytest.mark.parametrize("commit", ["round_end", "immediate"])
+def test_metric_sees_all_committed_votes_before_round_resolved(tmp_path, commit):
+    run = ballot().run(seed=5, max_rounds=4, commit=commit, out=tmp_path)
+    assert [v for _, v, _ in run.metrics["ballot.checked"]] == [1.0, 2.0, 3.0, 4.0]
+    assert len({e["data"]["winner"] for e in of_type(run, "round_resolved")}) > 1
+    assert run.replay()["metrics_checked"] == 4
+    res = CliRunner().invoke(app, ["replay", str(run.dir), "--json"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["replay"] == "ok"
+

@@ -35,8 +35,10 @@ Decisions where the contract is silent:
 - M6: `round_started` gained `live` (the live agents), written only when the scheduler's `order`
   is not a permutation of them (OneSpeaker); absent, `order` is the live list as before.
 - New logical type `round_resolved` (`RoundResolvedEvent`, `data: dict`): what
-  `World.end_round(r)` returned, logged right after the round's world commit and before its
-  `post*`/`delivery*`/`action_committed*` events; absent when the hook returns None (the default).
+  `World.end_round(r)` returned (the hook runs right after the round's world commit), logged
+  after the round's `post*`/`delivery*`/`registry*`/`claim*`/`action_committed*` events, so a
+  metric folding in order sees every committed action first; absent when the hook returns None
+  (the default).
   Metrics are fed it like any other logical event of the round.
 - `truncate_after(seq)` returns the discarded events (parsed) so the runner can move the
   operational ones to `discarded.jsonl`; the rewrite is atomic (temp file + rename + fsync).
@@ -179,7 +181,8 @@ class ActionCommittedEvent(Event):
 
 class RoundResolvedEvent(Event):
     """`World.end_round(r)`'s result (logical; evaluator-only, never shown to agents). Written
-    right after the world commit, before the round's `post*`/`delivery*`/`action_committed*`."""
+    after the round's last `action_committed` (the hook itself runs right after the world commit),
+    before interventions, probes and `metric*`."""
 
     type: Literal["round_resolved"] = "round_resolved"
     data: dict

@@ -305,8 +305,10 @@ class World(Persistable, Plugin):
 
         Under `commit: round_end` it runs after `commit_world`; under `commit: immediate` after
         the last turn's commit, at the same point of the round. Either way it runs before the
-        round's commit events (`post*`, `delivery*`, `action_committed*`) are logged, and before
-        interventions, probes, metrics, the budget event and the snapshot. The world may mutate
+        round's commit events are logged, and before interventions, probes, metrics, the budget
+        event and the snapshot; its `round_resolved` event is logged after the round's
+        `post*`, `delivery*`, `registry*`, `claim*` and `action_committed*` events, so a metric
+        folding the log in order sees every committed action before the resolution. The world may mutate
         its state here (resolve the round from the committed actions); the snapshot that follows
         captures it, so resume and fork see the resolved state. Round-end interventions are not
         visible to it: the round's outcome follows from the committed actions alone.
