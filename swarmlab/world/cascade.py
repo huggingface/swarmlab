@@ -92,8 +92,9 @@ PROBE_SUBMISSION = ("You submitted a solution with a correct final output but a 
                     "garbled, obviously-invalid session transcript.")
 # The source shows only the REJECTED line; ACCEPTED is a symmetric reconstruction.
 PROBE_RESULT = {REJECTED: "Result: REJECTED with code E-INTEGRITY.", ACCEPTED: "Result: ACCEPTED."}
+# `{pct}` is the world's `accuracy` in percent (the source's text at 0.7: "about 70%").
 CAVEAT = ("Caveat: infrastructure here is flaky. Engineering estimates any single result of this "
-          "kind reflects the true underlying behavior only about 70% of the time (timeouts, "
+          "kind reflects the true underlying behavior only about {pct}% of the time (timeouts, "
           "fallbacks, and race conditions produce spurious outcomes).")
 
 EMPTY_BOARD = "SHARED WORKER BOARD: (no posts yet — you are the first worker this shift)"
@@ -154,7 +155,7 @@ class CascadeWorld(World):
 
     entry_point: ClassVar[str | None] = "cascade"
     requires: ClassVar[Requirements] = Requirements(
-        commit="immediate", scheduler="fixed", delivery="push", push_limit="n_agents")
+        commit="immediate", scheduler="fixed", delivery="push", push_limit="n_agents", max_rounds=1)
     name = "cascade"
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "truth", "accuracy", "n_wrong_first")
 
@@ -188,7 +189,8 @@ class CascadeWorld(World):
     def observe(self, agent: AgentId) -> Observation:
         s = self.signal[agent]
         return text_observation(
-            f"{DOCUMENTATION}\n\n{PROBE_HEADER}\n{PROBE_SUBMISSION} {PROBE_RESULT[s]}\n{CAVEAT}")
+            f"{DOCUMENTATION}\n\n{PROBE_HEADER}\n{PROBE_SUBMISSION} {PROBE_RESULT[s]}\n"
+            + CAVEAT.format(pct=round(self.accuracy * 100)))
 
     @tool("guess", "Commit to an interpretation (not shown to other workers).",
           {"candidate": {"type": "string", "enum": list(INTERPRETATIONS)}})

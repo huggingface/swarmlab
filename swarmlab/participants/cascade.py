@@ -56,6 +56,7 @@ Params, besides every `LLMAgent` param:
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, ClassVar
 
@@ -64,7 +65,7 @@ from ..providers.base import ChatMessage, ChatRequest, ChatResponse
 from ..tools import AgentTools, ToolCall, ToolSchema
 from ..view import View
 from ..world import cascade as cw
-from .llm import LLMAgent, LLMTurnUsage
+from .llm import LLMAgent, LLMTurnUsage, render_system_prompt
 
 READ_BOARD = ToolSchema(name="read_board", description="Read the shared worker board.",
                         parameters={"type": "object", "properties": {}})
@@ -130,8 +131,27 @@ class CascadeWorker(LLMAgent):
     def calls_per_turn_cap(self) -> int | None:
         return min(self.max_calls or 2, 2)
 
+    def offered_tools(self) -> list[ToolSchema]:
+        """The tools the worker offers the model: none (`user`), `read_board` + `submit` (`tool`)."""
+        return [READ_BOARD, SUBMIT] if self.board_channel == "tool" else []
+
     def _render_system(self, view: View) -> str:
-        return cw.SYSTEM.format(wid=cw.worker_id(self.agent))
+        """SYSTEM with the worker id; a set `system_prompt` replaces it (rendered like LLMAgent's,
+        plus the variable `wid`); `system_prompt_append` and a role's `prompt_append` follow."""
+        wid = cw.worker_id(self.agent)
+        if self.system_prompt is None:
+            text = cw.SYSTEM.format(wid=wid)
+            extra = (self.system_prompt_append or "").strip()
+            if extra:
+                text += "\n\n" + extra
+        else:
+            text = render_system_prompt(self.system_prompt, agent=str(self.agent), role=self.role,
+                                        description=view.description, tools=self.offered_tools(),
+                                        append=self.system_prompt_append, wid=wid)
+        role_append = getattr(self, "_role_prompt_append", None)
+        if role_append:
+            text += "\n\n" + role_append.strip()
+        return text
 
     def board_text(self, view: View) -> str:
         """The board as the `user` channel shows it (and the `tool` channel returns it)."""
@@ -156,7 +176,6 @@ class CascadeWorker(LLMAgent):
         return self.round_message(view)
 
     async def _infer(self, view: View, tools: AgentTools, usage: LLMTurnUsage) -> ChatResponse:
-        offered: list[ToolSchema] = []
         if self.board_channel == "tool":
             msgs = self.rounds[-1]["messages"]
             if not any(m.get("tool_call_id") == READ_CALL_ID for m in msgs):  # first call: pre-fill
@@ -164,7 +183,7 @@ class CascadeWorker(LLMAgent):
                     ToolCall(call_id=READ_CALL_ID, name="read_board", args={})]))
                 self._append(ChatMessage(role="tool", content=self.board_text(view),
                                          tool_call_id=READ_CALL_ID))
-            offered = [READ_BOARD, SUBMIT]
+        offered = self.offered_tools()
         return await super()._infer(view.model_copy(update={"tools": offered}), tools, usage)
 
     def _request(self, tools: list[ToolSchema], attempt: int = 0) -> ChatRequest:
@@ -176,22 +195,32 @@ class CascadeWorker(LLMAgent):
     async def _handle_response(self, resp: ChatResponse, view: View,
                                tools: AgentTools) -> tuple[int, bool]:
         self._append(self._assistant(resp, resp.tool_calls or None))
+        sub: ToolCall | None = None
         if resp.tool_calls:
             sub = next((c for c in resp.tool_calls if c.name == "submit"), None)
             reply, error = (parse_fields(sub.args) if sub is not None and "_raw" not in sub.args
                             else (None, "no valid submit call"))
         else:
             reply, error = parse_reply(resp.text or "")
-        executed = 0
         if reply is not None:
-            res, executed = await tools.call("guess", {"candidate": reply["interpretation"]}), 1
-            if res.ok:
+            res = await tools.call("guess", {"candidate": reply["interpretation"]})
+            outcome = res.result or {}
+            feedback = outcome.get("feedback") or {}
+            if res.ok and outcome.get("accepted", True) and "error" not in feedback:
                 tag = f" [committed: {reply['interpretation']}]" if self.disclose_belief else ""
                 text = f"{cw.worker_id(self.agent)}{tag}: {reply['board_post']}"
-                await tools.call("post", {"text": text})
+                posted = await tools.call("post", {"text": text})
                 await tools.call("end_turn", {})
+                self._answer_calls(resp, sub, json.dumps({"ok": True, "error": None, "result": {
+                    "interpretation": reply["interpretation"], "committed": True,
+                    "posted": text if posted.ok else None}}, sort_keys=True))
                 return 3, True
-            error = f"commit rejected: {res.error}"
+            # a refused commitment is final: no post, no retry (the world has decided)
+            error = f"commit rejected: {feedback.get('error') or res.error or 'not accepted'}"
+            self._turn.usage.notes.append(f"cascade:failed:{error}"[:120])
+            self._answer_calls(resp, sub, json.dumps({"ok": False, "result": {}, "error": error},
+                                                     sort_keys=True))
+            return 1, True
         state = self._turn
         last = state.budget is not None and state.calls >= state.budget
         state.usage.notes.append(f"cascade:{'failed' if last else 'retry'}:{error}"[:120])
@@ -201,4 +230,13 @@ class CascadeWorker(LLMAgent):
                                      content=f"Your submit call could not be used: {error}. {fmt}"))
         if not resp.tool_calls:
             self._append(ChatMessage(role="user", content=f"Your reply could not be used: {error}. {fmt}"))
-        return executed, False
+        return 0, False
+
+    def _answer_calls(self, resp: ChatResponse, sub: ToolCall | None, content: str) -> None:
+        """A `tool` result for every call of `resp`: `content` for the submit call that was used
+        (the outcome of the guess/post it was carried out with), a note for any other."""
+        for c in resp.tool_calls:
+            text = content if c is sub else json.dumps(
+                {"ok": False, "result": {}, "error": "not executed: the turn was carried out with the submit call"},
+                sort_keys=True)
+            self._append(ChatMessage(role="tool", tool_call_id=c.call_id, content=text))

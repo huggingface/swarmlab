@@ -74,6 +74,7 @@ def test_entry_points_resolve():
     ({"options": {"scheduler": None}}, "scheduler=fixed"),
     ({"medium": {"delivery": "pull"}}, "delivery=push"),
     ({"medium": {"push_limit": 5}}, "push_limit>=20"),
+    ({"options": {"max_rounds": 2}}, "max_rounds=1"),
 ])
 def test_requirements_refuse_other_run_settings(tmp_path, change, needed):
     doc = dry_doc("r")
@@ -88,6 +89,33 @@ def test_requirements_refuse_other_run_settings(tmp_path, change, needed):
     spec.write_text(yaml.safe_dump(doc))
     with pytest.raises(ValueError, match=re.escape(needed)):
         Experiment.from_yaml(spec, "r")
+
+
+def test_a_second_round_is_refused_by_validate_and_run(tmp_path):
+    from typer.testing import CliRunner
+
+    from swarmlab.cli import app
+
+    doc = dry_doc("r")
+    doc["options"]["max_rounds"] = 2
+    spec = tmp_path / "r.yaml"
+    spec.write_text(yaml.safe_dump(doc))
+    res = CliRunner().invoke(app, ["validate", str(spec), "--json"])
+    assert res.exit_code != 0 and "max_rounds=1" in res.output
+    with pytest.raises(ValueError, match="max_rounds=1"):
+        Experiment.from_yaml(dry_spec(tmp_path, "ok"), "ok").run(seed=3, max_rounds=2, out=tmp_path)
+
+
+def test_guide_spec_is_one_round_and_valid(tmp_path):
+    guide = (Path(__file__).parents[1] / "docs" / "guide" / "cascade.md").read_text()
+    block = guide.split("```yaml\n", 1)[1].split("```", 1)[0]
+    doc = yaml.safe_load(block)
+    assert doc["options"]["max_rounds"] == 1
+    doc["name"] = "guide"
+    doc["arms"]["board_stress"]["participants"][0]["params"]["model"] = "fake:cascade_herder"
+    spec = tmp_path / "guide.yaml"
+    spec.write_text(yaml.safe_dump(doc))
+    Experiment.from_yaml(spec, "board_stress")
 
 
 def test_worker_refuses_modes_that_replace_its_prompt_or_reply_handling():
@@ -121,6 +149,17 @@ def test_signal_accuracy_is_the_parameter():
 def test_bad_params_are_refused(params):
     with pytest.raises(ValueError):
         CascadeWorld(**params)
+
+
+SOURCE_CAVEAT = ("Caveat: infrastructure here is flaky. Engineering estimates any single result of "
+                 "this kind reflects the true underlying behavior only about 70% of the time "
+                 "(timeouts, fallbacks, and race conditions produce spurious outcomes).")
+
+
+def test_caveat_states_the_configured_accuracy():
+    assert world().observe(AGENTS[0]).parts[0].text.endswith("\n" + SOURCE_CAVEAT)
+    text = world(accuracy=0.95).observe(AGENTS[0]).parts[0].text
+    assert "only about 95% of the time" in text and "70%" not in text
 
 
 def test_observation_carries_only_the_own_signal():
@@ -345,3 +384,71 @@ def test_report_has_wrong_commitments_by_position(tmp_path):
     assert "| arm | runs | W00 | W01 |" in section and "| W19 |\n" in section
     assert "| board (simulated) | 1 | " + " | ".join(["1.00"] * 20) + " |" in section
     assert "| alone (simulated) | 1 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 |" in section
+
+
+# ---- system prompt params (system_prompt, system_prompt_append, roles) -------------------------
+
+def system_of(tmp_path, arm: str, roles: dict | None = None, role: str | None = None, **params) -> str:
+    doc = dry_doc(arm, **params)
+    if roles:
+        doc["roles"] = roles
+        doc["arms"][arm]["participants"][0]["role"] = role
+    spec = tmp_path / f"{arm}.yaml"
+    spec.write_text(yaml.safe_dump(doc))
+    run = Experiment.from_yaml(spec, arm).run(seed=3, out=tmp_path / "runs")
+    msgs = requests_of(run, "a003")[0]["messages"]
+    assert msgs[0]["role"] == "system"
+    return msgs[0]["content"]
+
+
+def test_system_message_honours_prompt_params_and_roles(tmp_path):
+    from swarmlab.world.cascade import SYSTEM
+
+    default = SYSTEM.format(wid="W03")
+    assert system_of(tmp_path, "default") == default
+    assert system_of(tmp_path, "append", system_prompt_append="Be brief.") == default + "\n\nBe brief."
+    custom = system_of(tmp_path, "custom", system_prompt="You are {{ wid }} ({{ agent }}, {{ role }}).",
+                       system_prompt_append="Extra.")
+    assert custom == "You are W03 (a003, worker).\n\nExtra."
+    roled = system_of(tmp_path, "roled", roles={"lead": {"prompt_append": "ROLE: you lead."}},
+                      role="lead")
+    assert roled == default + "\n\nROLE: you lead."
+
+
+class RefusingTools:
+    """Tools whose `guess` the world refuses (ok call, `accepted: false` with an error)."""
+
+    def __init__(self) -> None:
+        self.called: list[str] = []
+
+    async def call(self, name, args=None):
+        from swarmlab.tools import ToolResult
+
+        self.called.append(name)
+        return ToolResult(call_id="c1", ok=True, result={
+            "id": "x", "accepted": False, "feedback": {"error": "already committed"}})
+
+
+@pytest.mark.parametrize("channel", ["user", "tool"])
+def test_a_refused_guess_fails_the_turn_without_a_post(channel):
+    import asyncio
+
+    from swarmlab.participants.llm import LLMTurnUsage, TurnState
+    from swarmlab.providers.base import ChatResponse, Usage
+    from swarmlab.tools import ToolCall
+
+    p = worker(board_channel=channel)
+    p.rounds = [{"round": 1, "messages": []}]
+    p._turn = TurnState(usage=LLMTurnUsage(), budget=2)
+    args = {"board_post": "hi", "interpretation": READS}
+    calls = [ToolCall(call_id="s1", name="submit", args=args)] if channel == "tool" else []
+    resp = ChatResponse(text="" if calls else json.dumps(args), tool_calls=calls, usage=Usage(),
+                        cost_usd=0.0, provider="fake", model="m", latency_s=0.0,
+                        finish_reason="tool_calls" if calls else "stop")
+    tools = RefusingTools()
+    assert asyncio.run(p._handle_response(resp, view("a007", []), tools)) == (1, True)
+    assert tools.called == ["guess"]
+    assert p._turn.usage.notes == ["cascade:failed:commit rejected: already committed"]
+    if channel == "tool":
+        result = p.rounds[0]["messages"][-1]
+        assert result["tool_call_id"] == "s1" and json.loads(result["content"])["ok"] is False
