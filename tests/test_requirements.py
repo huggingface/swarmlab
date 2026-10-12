@@ -9,6 +9,8 @@ from typer.testing import CliRunner
 from swarmlab import Board, Experiment, Requirements, Run
 from swarmlab.cli import app
 from swarmlab.participants import EvidenceAggregator
+from swarmlab.participants.base import Participant, TurnUsage
+from swarmlab.roles import assign
 from swarmlab.worlds import FlagGame
 
 
@@ -188,7 +190,9 @@ def role_exp(proto_model: str, role_model: str) -> Experiment:
 def test_a_role_model_that_fixes_a_rejected_prototype_is_accepted(tmp_path):
     good = role_exp("fake:reader", VISION)
     assert [p.model for p in good.participants] == ["fake:reader"] * 2  # prototypes untouched
-    assert [p.model for p in good.effective_participants()] == [VISION] * 2
+    from swarmlab.roles import effective_model
+
+    assert [effective_model(p, r) for p, r in good.participants_with_roles()] == [VISION] * 2
     assert good.run(seed=1, max_rounds=1, out=tmp_path).status == "ended"
 
 
@@ -203,6 +207,37 @@ def test_a_role_model_that_breaks_an_accepted_prototype_fails_like_run_start(tmp
     with pytest.raises(ValueError) as at_start:
         sneaked.run(seed=1, max_rounds=1, out=tmp_path)
     assert str(at_start.value) == str(built.value)
+
+
+class NeedsBinding(Participant):
+    """A valid participant whose `apply_role` needs binding state (`self.agent`)."""
+
+    labels: ClassVar[list] = []
+
+    def apply_role(self, role):
+        self.label = f"{self.agent}:{role.name}"
+        NeedsBinding.labels.append(self.label)
+
+    async def turn(self, view, tools):
+        await tools.call("end_turn", {})
+        return TurnUsage()
+
+
+@pytest.mark.parametrize("world", [FlagGame(), PushWorld()], ids=["flaggame", "requires"])
+def test_construction_never_calls_apply_role_before_bind(tmp_path, world):
+    NeedsBinding.labels.clear()
+    push = isinstance(world, PushWorld)
+    built = Experiment(name="custom", world=world,
+                       participants=[assign(NeedsBinding(), "worker") for _ in range(2)],
+                       medium=Board(delivery="push", push_limit=2) if push else Board(),
+                       options={"commit": "immediate"} if push else {})
+    assert NeedsBinding.labels == []  # construction read the roles declaratively
+    assert all(not hasattr(p, "label") for p in built.participants)
+    assert [r.name for _, r in built.participants_with_roles()] == ["worker"] * 2
+    built.check_run(max_rounds=2)
+    assert NeedsBinding.labels == []
+    assert built.run(seed=1, max_rounds=2, out=tmp_path).status == "ended"
+    assert NeedsBinding.labels == ["a000:worker", "a001:worker"]  # set at bind, from the agent id
 
 
 # ---- estimate and run check the effective settings, overrides included ---------------------------

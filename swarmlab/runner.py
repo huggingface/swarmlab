@@ -619,9 +619,11 @@ class Runner:
             p.bind(a, agent_stream(seed, a, self.options.repeat))
         self.roles = bind_roles(self.board, self.participants, agent_roles(  # M3c
             self.spec.roles, self.spec.participant_roles, len(self.agents)))
-        self.world.check_experiment(self.experiment.model_copy(update={  # world requirements
+        view = self.experiment.model_copy(update={  # world requirements
             "options": self.options.model_dump(mode="json", exclude={"seed", "rounds_per_agent"}),
-            "participants": list(self.participants.values())}))
+            "participants": list(self.participants.values())})
+        view._roles_applied = True  # participants_with_roles: roles are already applied
+        self.world.check_experiment(view)
         self.world.reset(derive(seed, "world"), list(self.agents))
         self._set_truth()
         self._set_agents()

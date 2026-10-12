@@ -241,6 +241,17 @@ def agent_roles(roles: Mapping[str, Mapping[str, Any]], names: Sequence[str | No
     return [built[n] if n else None for n in names[:n_agents]]
 
 
+def effective_model(participant: Any, role: Role | None) -> str | None:
+    """The model a participant runs with once `role` applies, read declaratively: the role's
+    `model` override when set, else the participant's own `model` attribute (None when it has
+    none). Mirrors `LLMAgent.apply_role`; never calls `apply_role`, so it is safe on unbound
+    prototypes (construction-time checks). The run-start check on the bound participants stays
+    authoritative for custom `apply_role` hooks that do more."""
+    if role is not None and role.model is not None:
+        return role.model
+    return getattr(participant, "model", None)
+
+
 def _intersect(a: list[str] | None, b: list[str] | None) -> list[str] | None:
     if a is None:
         return None if b is None else list(b)

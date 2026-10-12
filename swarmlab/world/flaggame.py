@@ -92,7 +92,10 @@ Decisions where the contract is silent
 - `check_experiment(experiment)` (`World.check_experiment`: at `Experiment` construction and again
   at run start on the bound participants) raises `ValueError` in image mode without
   `image_text_hint` when a participant reads the text grids: scripted FlagGame participants (`reads_text_observation = True`) and `LLMAgent`s
-  whose model resolves to the fake provider's `flaggame_reader` script.
+  whose model resolves to the fake provider's `flaggame_reader` script. At construction the
+  participants are unbound prototypes and a role's `model` override is read declaratively
+  (`Experiment.participants_with_roles`, `roles.effective_model`); at run start the bound,
+  role-applied participants are checked as they are.
 - Guesses for unknown candidates and guesses beyond `guess_limit` are rejected by `validate`; the
   `guess` method re-checks both (returning `accepted=False`). Under round_end the executor passes
   the agent's buffered actions as `validate(..., pending=...)`, and a guess is refused at call
@@ -816,8 +819,11 @@ class FlagGame(World):
         super().check_experiment(experiment)
         if getattr(self, "modality", "text") != "image" or self.image_text_hint:
             return
-        bad = [str(agent_id(i)) for i, p in enumerate(experiment.participants)
-               if reads_text_grids(p, experiment)]
+        with_roles = getattr(experiment, "participants_with_roles", None)
+        pairs = (with_roles() if callable(with_roles)
+                 else [(p, None) for p in experiment.participants])
+        bad = [str(agent_id(i)) for i, (p, role) in enumerate(pairs)
+               if reads_text_grids(p, experiment, role)]
         if bad:
             raise ValueError(
                 f"FlagGame(modality='image') without image_text_hint=True gives no text grids, but "
@@ -870,13 +876,16 @@ class FlagGame(World):
         return out
 
 
-def reads_text_grids(participant: Any, experiment: Any = None) -> bool:
+def reads_text_grids(participant: Any, experiment: Any = None, role: Any = None) -> bool:
     """True for a participant that can only play FlagGame from the text grids: scripted FlagGame
     participants (`reads_text_observation = True`) and model participants whose model resolves to
-    the fake provider's `flaggame_reader` script."""
+    the fake provider's `flaggame_reader` script. `role` is a role still to apply (construction):
+    its `model` override counts, read declaratively (`roles.effective_model`)."""
     if getattr(participant, "reads_text_observation", False):
         return True
-    model = getattr(participant, "model", None)
+    from ..roles import effective_model
+
+    model = effective_model(participant, role)
     if not isinstance(model, str) or ":" not in model:
         return False
     from ..providers.base import ChatMessage, ChatRequest
