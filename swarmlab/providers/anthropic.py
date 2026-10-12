@@ -18,8 +18,13 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   `"strict": True` only when the normalised schema has no `strict_violations()` at any depth. (The
   2026-10-06 smoke got `400 tools.4.custom: For 'object' type, 'additionalProperties' must be
   explicitly set to false` because `post` was sent strict while its nested `fields: {"type":
-  "object"}` was open; a schema with a free-form nested object is now sent non-strict.) `tool_choice` is always `{"type": "auto"}`
-  (sent only when tools are present). `tool_protocol == "json"` sends no tools.
+  "object"}` was open; a schema with a free-form nested object is now sent non-strict.) `tool_choice` is `{"type": "auto"}` (sent only when tools
+  are present), or `{"type": "tool", "name": <name>}` when `ChatRequest.tool_choice` names a tool
+  (checked by `base.check_tool_choice`: the tool must be offered and the protocol native). Forced
+  tool choice is rejected with HTTP 400 by Claude Opus 5.5, Sonnet 5.5 and Fable 5.1 (the error
+  propagates; no model list is kept here) and by any model with extended thinking on, so a request
+  with both `tool_choice` and a `thinking_budget` that this adapter turns into thinking raises
+  `ValueError` before sending. `tool_protocol == "json"` sends no tools.
 - `thinking_budget` -> `thinking={"type": "enabled", "budget_tokens": N}` only for models in
   `THINKING_BUDGET_MODELS` (Haiku 4.5); omitted otherwise. When thinking is enabled,
   `temperature`/`top_p` are not sent (the API does not accept sampling changes with thinking).
@@ -83,6 +88,7 @@ from .base import (
     ProviderError,
     Refusal,
     Usage,
+    check_tool_choice,
     model_id,
     parse_json_args,
     text_of,
@@ -126,6 +132,7 @@ def _blocks(m: ChatMessage) -> list[dict]:
 def build_kwargs(request: ChatRequest) -> dict:
     """The `messages.create` keyword arguments for `request` (pure; unit-tested)."""
     mid = model_id(request)
+    forced = check_tool_choice(request)
     system = "\n\n".join(text_of(m.content) for m in request.messages if m.role == "system")
     messages: list[dict] = []
     for m in request.messages:
@@ -142,8 +149,12 @@ def build_kwargs(request: ChatRequest) -> dict:
         kw["system"] = system
     if request.tools and request.tool_protocol == "native":
         kw["tools"] = [tool_definition(t) for t in request.tools]
-        kw["tool_choice"] = {"type": "auto"}
+        kw["tool_choice"] = {"type": "tool", "name": forced} if forced else {"type": "auto"}
     thinking = request.thinking_budget is not None and mid in THINKING_BUDGET_MODELS
+    if thinking and forced:
+        raise ValueError(f"tool_choice ({forced!r}) cannot be combined with thinking on Anthropic "
+                         "(the API rejects forced tool use with extended thinking); drop "
+                         "thinking_budget or tool_choice")
     if thinking:
         kw["thinking"] = {"type": "enabled", "budget_tokens": int(request.thinking_budget or 0)}
     else:

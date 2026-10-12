@@ -25,7 +25,9 @@ Mapping:
   (content None when empty). Tool messages -> `{"role": "tool", "tool_call_id", "content": <text>}`.
 - `tools: [{"type": "function", "function": {"name", "description", "parameters"}}]` (parameters
   from `ToolSchema.normalized()`) and `tool_choice: "auto"` when `tool_protocol == "native"` and
-  tools are present.
+  tools are present; `tool_choice: {"type": "function", "function": {"name": <name>}}` instead
+  when `ChatRequest.tool_choice` names a tool (checked by `base.check_tool_choice`: the tool must
+  be offered, the protocol native, and `extra` must not carry its own `tool_choice`).
 - `max_tokens`, `temperature`, `top_p`, `seed` when given; `thinking_budget` is ignored; `extra`
   is merged into the body last, as top-level body fields. This is the provider passthrough:
   Qwen3 on DeepInfra/vLLM/SGLang turns thinking off with
@@ -79,6 +81,7 @@ from .base import (
     ProviderError,
     Refusal,
     Usage,
+    check_tool_choice,
     model_id,
     parse_json_args,
     text_of,
@@ -117,6 +120,7 @@ def _message(m: ChatMessage) -> dict:
 
 
 def build_body(request: ChatRequest) -> dict:
+    forced = check_tool_choice(request)
     body: dict[str, Any] = {
         "model": model_id(request),
         "messages": [_message(m) for m in request.messages],
@@ -126,7 +130,8 @@ def build_body(request: ChatRequest) -> dict:
         body["tools"] = [{"type": "function", "function": {
             "name": t.name, "description": t.description, "parameters": t.parameters}}
             for t in (s.normalized() for s in request.tools)]
-        body["tool_choice"] = "auto"
+        body["tool_choice"] = ({"type": "function", "function": {"name": forced}} if forced
+                               else "auto")
     for key in ("temperature", "top_p", "seed"):
         value = getattr(request, key)
         if value is not None:
