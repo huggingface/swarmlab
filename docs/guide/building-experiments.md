@@ -83,6 +83,12 @@ To use it from YAML, save it as `myworld.py` next to the spec and write `world: 
 ## Writing a world
 
 - Required: `reset(rng, agents)`, `observe(agent)`, `score()` and at least one `@tool` action returning an `Outcome` (example 3). A world in your own module is used from YAML as `world: {type: "mymodule:MyWorld", params: {...}}`.
+- A tool's `params` (or any one param, or its `description`) may be a function of the world instance, so the schema follows constructor config and `validate` checks the same thing:
+
+  ```python
+  @tool("choose_site", "Hold a site", {"site": lambda self: {"type": "string", "enum": self.sites}})
+  def choose_site(self, agent, site): ...
+  ```
 - State in ordinary attributes is snapshotted every round (a pickle of the instance's attributes minus `params` and `_`-prefixed ones), so resume, replay and fork need no world code.
 - Optional hooks (defaults in `swarmlab/world/base.py`): `description()` (task text for prompts), `validate` and `commit` (refusals and conflict rules), `begin_round(round)`, `terminal()`, `my_status`/`collective_status`, `verify()` (evaluator-only truth for metrics, see [Analysis patterns](analysis.md#analysis-patterns)), `claim_key`, `killed_at`, and `render_state()`.
 - `Outcome.feedback` reaches the agent and the `actions` table: put there what you will analyse per decision, never correctness.

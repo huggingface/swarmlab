@@ -7,11 +7,23 @@ evaluator-only and called by the runner alone.
 `swarmlab plugins` shows the first line of a world class's docstring: `World` cannot carry the
 `description` class attribute other plugin bases have, because `description()` is the
 agent-facing task text (M1b). Give every world class a one-line docstring summary.
+
+Tool schemas. `@tool` stores a `_ToolSpec(name, description, params)` on the method as
+`__swarmlab_tool__`. The name is always static (it is what `_actions()` keys on); `description`,
+`params` as a whole, or any single param value may be a callable of the world instance, so a
+schema can follow constructor config (an enum of `n` sites). `World.tool_schema(name)` resolves a
+spec into a normalized `ToolSchema` for this instance; `tool_schemas()` and the default
+`validate()` both go through it, so what the model is shown and what is checked cannot drift.
+A fully static spec is resolved (and its JSON types checked) once, at decoration time; a dynamic
+one is resolved on every call and checked then. Nothing is cached per instance: the executor reads
+the schemas once per round.
 """
 from __future__ import annotations
 
 import random
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -48,25 +60,67 @@ NO_ARGS: dict = {"type": "object", "properties": {}, "required": [], "additional
 _JSON_TYPES = {"integer", "number", "string", "boolean", "array", "object"}
 
 
-def tool(name: str, description: str, params: dict[str, str | dict] | None = None) -> Callable:
+ParamValue = str | dict | Callable[[Any], str | dict]
+Params = dict[str, ParamValue] | Callable[[Any], dict[str, str | dict]]
+
+
+def _property(key: str, value: str | dict) -> dict:
+    if isinstance(value, str):
+        if value not in _JSON_TYPES:
+            raise ValueError(f"unknown JSON type {value!r} for param {key!r}")
+        return {"type": value}
+    return dict(value)
+
+
+@dataclass(frozen=True)
+class _ToolSpec:
+    """What `@tool` records on a method; `schema(world)` resolves it for one instance."""
+
+    name: str
+    description: str | Callable[[Any], str]
+    params: Params | None
+    static: ToolSchema | None = None  # the resolved schema when nothing is callable
+
+    def schema(self, world: Any) -> ToolSchema:
+        if self.static is not None:
+            return self.static
+        desc = self.description(world) if callable(self.description) else self.description
+        params = self.params(world) if callable(self.params) else (self.params or {})
+        props = {k: _property(k, v(world) if callable(v) else v) for k, v in params.items()}
+        return ToolSchema(
+            name=self.name,
+            description=desc,
+            parameters={"type": "object", "properties": props, "required": list(props),
+                        "additionalProperties": False},
+        ).normalized()
+
+
+def tool(name: str, description: str | Callable[[Any], str], params: Params | None = None) -> Callable:
     """Mark a World method as an agent-callable action.
 
-    `params` maps argument name to a JSON-schema type name ("integer") or a full property schema.
-    The decorated method has signature (self, agent: AgentId, **args) -> Outcome.
+    `params` maps argument name to a JSON-schema type name ("integer") or a full property schema;
+    every argument is required. The decorated method has signature
+    (self, agent: AgentId, **args) -> Outcome.
+
+    `description`, `params`, or any single value of a `params` dict may instead be a callable
+    taking the world instance (`self`) and returning the same shape, for schemas that depend on
+    constructor config: `{"site": lambda self: {"type": "string", "enum": self.sites}}`. Static
+    parts are checked here (an unknown JSON type raises ValueError); callable parts are checked
+    when the schema is built (`World.tool_schema`), with the same error.
     """
-    props: dict[str, dict] = {}
-    for k, v in (params or {}).items():
-        props[k] = {"type": v} if isinstance(v, str) else dict(v)
-        if isinstance(v, str) and v not in _JSON_TYPES:
-            raise ValueError(f"unknown JSON type {v!r} for param {k!r}")
-    schema = ToolSchema(
-        name=name,
-        description=description,
-        parameters={"type": "object", "properties": props, "required": list(props), "additionalProperties": False},
-    ).normalized()
+    dynamic = callable(description) or callable(params)
+    if not callable(params):
+        for k, v in (params or {}).items():
+            if callable(v):
+                dynamic = True
+            else:
+                _property(k, v)
+    spec = _ToolSpec(name, description, params)
+    if not dynamic:
+        spec = _ToolSpec(name, description, params, static=spec.schema(None))
 
     def deco(fn: Callable) -> Callable:
-        fn.__swarmlab_tool__ = schema  # type: ignore[attr-defined]
+        fn.__swarmlab_tool__ = spec  # type: ignore[attr-defined]
         return fn
 
     return deco
@@ -95,8 +149,13 @@ class World(Persistable, Plugin):
                     out[schema.name] = getattr(self, attr)
         return out
 
+    def tool_schema(self, name: str) -> ToolSchema:
+        """The normalized schema of world tool `name` for this instance (KeyError if unknown)."""
+        return self._actions()[name].__swarmlab_tool__.schema(self)  # type: ignore[attr-defined]
+
     def tool_schemas(self) -> list[ToolSchema]:
-        schemas = [fn.__swarmlab_tool__ for fn in self._actions().values()]  # type: ignore[attr-defined]
+        schemas = [fn.__swarmlab_tool__.schema(self)  # type: ignore[attr-defined]
+                   for fn in self._actions().values()]
         if self.my_status(AgentId("a000")) is not None:
             schemas.append(ToolSchema(name="my_status", description="Status of your own work.",
                                       parameters=NO_ARGS))
@@ -117,7 +176,7 @@ class World(Persistable, Plugin):
         fn = self._actions().get(action.name)
         if fn is None:
             return Ack(ok=False, error=f"unknown action {action.name!r}")
-        schema = fn.__swarmlab_tool__.parameters  # type: ignore[attr-defined]
+        schema = fn.__swarmlab_tool__.schema(self).parameters  # type: ignore[attr-defined]
         missing = [k for k in schema.get("required", []) if k not in action.args]
         extra = [k for k in action.args if k not in schema.get("properties", {})]
         if missing or extra:

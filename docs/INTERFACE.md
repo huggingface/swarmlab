@@ -175,8 +175,11 @@ class World(Persistable, Plugin):
     def terminal(self) -> bool                          # False
     def verify(self) -> dict                            # {}
     def tool_schemas(self) -> list[ToolSchema]          # from @tool decorations plus enabled status tools
+    def tool_schema(self, name) -> ToolSchema           # one @tool schema resolved for this instance
     # snapshot()/restore() from Persistable: pickle of __dict__ minus `params`
 ```
+`@tool` params map an argument name to a JSON type name (`"integer"`) or a full property schema; every argument is required. `description`, `params`, or any single value of a `params` dict may also be a callable `(self) -> ...` of the world instance returning the same shape, so a schema can follow constructor config (`{"site": lambda self: {"type": "string", "enum": self.sites}}`). `World.tool_schema(name) -> ToolSchema` resolves one tool for the instance; `tool_schemas()` and the default `validate()` go through it, so the model sees and validation checks the same enum and required list. Static parts are checked at decoration time, callable parts when the schema is built (an unknown JSON type raises `ValueError` in both cases). The tool name is always static.
+
 Constructor kwargs are stored on `self.params` and returned by `spec()`. Nothing returned by `observe`, `validate`, `commit`, status tools, or tool schemas may reveal correctness; `score` and `verify` are called only by the runner.
 
 ### FlagGame (text variant)
