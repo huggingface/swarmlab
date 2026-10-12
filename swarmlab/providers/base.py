@@ -33,6 +33,24 @@ Decisions where the contract is silent:
   `.attempts`. Both knobs are constructor kwargs of the real providers, so they are part of the
   provider spec (YAML `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 60,
   max_retries: 3}}}`).
+- Refusals (additive, docs/INTERFACE-M1b.md §1 amendment): a safety decline is a successful
+  response with `finish_reason == "refusal"` and `ChatResponse.refusal = Refusal(category,
+  explanation)` (both may be None). Adapters set the two together, so `refusal is not None` iff
+  `finish_reason == "refusal"`. `ChatRequest.attempt` (default 0) is a cache key for re-sending a
+  refused request: it is in `request_bytes`/`request_hash` only when non-zero (so every hash
+  from before the field existed is unchanged), and no adapter sends it to a provider.
+- Reasoning (additive, docs/INTERFACE-M1b.md §1 amendment): `ChatResponse.reasoning` is the
+  model's reasoning text as returned (None when the response carried none), `reasoning_kind`
+  says what it is (`"summary"`: Anthropic thinking blocks with text, `display: "summarized"`;
+  `"omitted"`: thinking blocks whose text is empty, Anthropic's default display, reasoning
+  `""`; `"text"`: an OpenAI-compatible server's `reasoning_content`/`reasoning`), and
+  `reasoning_redacted` counts Anthropic `redacted_thinking` blocks. `provider_content` is the
+  assistant content exactly as an adapter must send it back (Anthropic content blocks, in
+  order, thinking signatures included), set only when the response carried thinking blocks;
+  `LLMAgent` copies it onto the assistant `ChatMessage.provider_content`, which the adapter
+  that produced it sends verbatim in place of text + tool calls. `ChatMessage` leaves
+  `provider_content` out of its JSON when None, so a request without reasoning hashes exactly
+  as before.
 """
 from __future__ import annotations
 
@@ -45,7 +63,7 @@ import random
 import struct
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_serializer
 
 from ..base import Plugin
 from ..spec import canonical_json
@@ -86,6 +104,14 @@ class ChatMessage(BaseModel):
     content: list[Part] | str
     tool_calls: list[ToolCall] | None = None  # assistant messages
     tool_call_id: str | None = None  # tool messages
+    provider_content: list[dict] | None = None  # assistant: provider blocks to send back as is
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_provider_content(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("provider_content", 0) is None:
+            data.pop("provider_content")  # so requests without reasoning hash as before
+        return data
 
 
 class ChatRequest(BaseModel):
@@ -99,6 +125,14 @@ class ChatRequest(BaseModel):
     seed: int | None = None
     thinking_budget: int | None = None
     extra: dict = {}
+    attempt: int = 0  # re-send number after refusals: in the request hash when > 0, never sent
+
+
+class Refusal(BaseModel):
+    """Why a provider declined (Anthropic `stop_details`; None fields when it did not say)."""
+
+    category: str | None = None  # e.g. "cyber", "bio", "frontier_llm", "reasoning_extraction"
+    explanation: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -114,6 +148,11 @@ class ChatResponse(BaseModel):
     cached: bool = False
     attempts: int = 1  # provider attempts this response took (1 = no retry)
     retried_after_timeout: bool = False  # at least one failed attempt was a timeout
+    refusal: Refusal | None = None  # set iff finish_reason == "refusal"
+    reasoning: str | None = None  # reasoning text as returned; "" when hidden (kind "omitted")
+    reasoning_kind: Literal["summary", "omitted", "text"] | None = None
+    reasoning_redacted: int = 0  # Anthropic redacted_thinking blocks
+    provider_content: list[dict] | None = None  # content to send back (Anthropic, with thinking)
 
 
 def split_model(model: str) -> tuple[str, str]:
@@ -128,7 +167,10 @@ def model_id(request: ChatRequest) -> str:
 
 
 def request_bytes(request: ChatRequest) -> bytes:
-    return canonical_json(request.model_dump(mode="json")).encode()
+    data = request.model_dump(mode="json")
+    if not data.get("attempt"):  # attempt 0 is left out, so pre-`attempt` hashes still hold
+        data.pop("attempt", None)
+    return canonical_json(data).encode()
 
 
 def request_hash(request: ChatRequest) -> str:

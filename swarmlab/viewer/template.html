@@ -75,6 +75,11 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
 .wgrid .lbl { color: var(--muted); font-size: 12px; }
 .grid.big i { width: 16px; height: 16px; outline: 1px solid var(--cell-border); outline-offset: -1px; }
 .kv td:first-child { color: var(--muted); white-space: nowrap; width: 1%; }
+.call { border-bottom: 1px solid var(--line); padding: 5px 0; }
+.call:last-child { border-bottom: 0; }
+.call details { margin-top: 3px; }
+.call summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.call .reasoning { color: var(--muted); border-left: 2px solid var(--line); padding-left: 8px; }
 </style>
 </head>
 <body>
@@ -123,6 +128,10 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
       <h2>Action queue <span class="hint">tool calls per agent, in turn order</span></h2>
       <div class="scroll"><table id="queue"></table></div>
     </section>
+    <section>
+      <h2>Model calls <span class="hint" id="callsHint">the selected agent's calls this round, with reasoning</span></h2>
+      <div class="scroll" id="calls"></div>
+    </section>
   </div>
 </main>
 <script type="application/json" id="swarmlab-data">__DATA__</script>
@@ -133,7 +142,8 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
   var M = D.meta, EV = D.events, LAST = M.last_round || 0;
   var COLOURS = __COLOURS__;  /* swarmlab/colors.py PALETTE_HEX, injected by build.py */
   var isFlag = !!(D.world && D.world.kind === "flaggame");
-  var byRound = {}, postAuthor = {};
+  var byRound = {}, postAuthor = {}, callsByRound = {};
+  (D.calls || []).forEach(function (c) { (callsByRound[c.round] = callsByRound[c.round] || []).push(c); });
   EV.forEach(function (e) {
     (byRound[e.round] = byRound[e.round] || []).push(e);
     if (e.type === "post") postAuthor[e.post_id] = e.agent;
@@ -352,6 +362,26 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
         (calls || '<span class="empty">no calls</span>') + "</td><td>" + y + "</td></tr>";
     }).join("");
   }
+  function renderCalls(r) {
+    var calls = (callsByRound[r] || []).filter(function (c) { return c.agent === state.agent; });
+    if (!calls.length) { $("calls").innerHTML = '<span class="empty">no model calls by ' + esc(state.agent || "?") + " this round</span>"; return; }
+    $("calls").innerHTML = calls.map(function (c, i) {
+      var bits = [c.model, c.category, c.finish].filter(Boolean).map(esc);
+      if (c.cached) bits.push('<span class="muted">cached</span>');
+      if (c.refusal || c.finish === "refusal") bits.push('<span class="bad">refused' + (c.refusal ? " (" + esc(c.refusal) + ")" : "") + "</span>");
+      if (c.tools && c.tools.length) bits.push("→ " + esc(c.tools.join(", ")));
+      var why = "";
+      if (c.reasoning !== null && c.reasoning !== undefined) {
+        var label = c.reasoning_kind === "omitted" ? "reasoning hidden by the provider (display omitted)" :
+          "reasoning" + (c.reasoning_kind === "summary" ? " (summary)" : "") + ", " + c.reasoning.length + " chars";
+        if (c.reasoning_redacted) label += ", " + c.reasoning_redacted + " redacted block" + (c.reasoning_redacted > 1 ? "s" : "");
+        why = c.reasoning ? "<details open><summary>" + esc(label) + '</summary><pre class="reasoning">' + esc(c.reasoning) + "</pre></details>" :
+          '<div class="muted" style="font-size:12px">' + esc(label) + "</div>";
+      }
+      var text = c.text ? "<pre>" + esc(c.text) + "</pre>" : (c.text === null ? '<span class="empty">response not available</span>' : "");
+      return '<div class="call"><span class="mono muted">#' + (i + 1) + "</span> " + bits.join(" · ") + why + text + "</div>";
+    }).join("");
+  }
   function render() {
     var r = state.round;
     $("slider").value = r;
@@ -361,7 +391,7 @@ select { font: inherit; background: var(--chip); color: var(--fg); border: 1px s
     renderHeader(); renderMetrics(r);
     if (isFlag) renderFlag(r);
     if (WS) renderWorldState(r);
-    renderActions(r); renderPosts(r); renderInbox(r); renderQueue(r);
+    renderActions(r); renderPosts(r); renderInbox(r); renderQueue(r); renderCalls(r);
   }
   function go(r) { state.round = Math.min(Math.max(1, r), Math.max(1, LAST)); render(); }
 

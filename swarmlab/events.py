@@ -34,6 +34,10 @@ Decisions where the contract is silent:
 - M6: `metric` gained `label` (a string, e.g. `belief.state`'s class), omitted when None.
 - M6: `round_started` gained `live` (the live agents), written only when the scheduler's `order`
   is not a permutation of them (OneSpeaker); absent, `order` is the live list as before.
+- Refusals: `inference_attempt` gained `attempt` (`ChatRequest.attempt`, the re-send number
+  of a refused request; omitted when 0, so it marks exactly the re-sends), and
+  `inference_response` gained `refusal_category` (the response's
+  `Refusal.category` when `finish_reason == "refusal"`), omitted when None.
 - New logical type `round_resolved` (`RoundResolvedEvent`, `data: dict`): what
   `World.end_round(r)` returned (the hook runs right after the round's world commit), logged
   after the round's `post*`/`delivery*`/`registry*`/`claim*`/`action_committed*` events, so a
@@ -125,6 +129,14 @@ class InferenceAttemptEvent(Event):
     request_hash: str
     reserved_usd: float = 0.0
     category: Literal["swarm", "measurement"] = "swarm"
+    attempt: int = 0  # the request's re-send number after a refusal; omitted when 0
+
+    @model_serializer(mode="wrap")
+    def _drop_zero_attempt(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("attempt", 1) == 0:
+            data.pop("attempt")
+        return data
 
 
 class InferenceResponseEvent(Event):
@@ -138,6 +150,14 @@ class InferenceResponseEvent(Event):
     finish_reason: str = ""
     cached: bool = False
     attempts: int = 1  # provider attempts (retries + 1); 1 on cache hits
+    refusal_category: str | None = None  # a refusal's category; omitted when None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_refusal(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("refusal_category", 0) is None:
+            data.pop("refusal_category")
+        return data
 
 
 class TurnEndedEvent(Event):
