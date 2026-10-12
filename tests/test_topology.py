@@ -1,6 +1,10 @@
+from importlib.metadata import entry_points
+
 from swarmlab.ids import agent_id
+from swarmlab.medium import topology as topology_module
+from swarmlab.medium.base import Topology
 from swarmlab.medium.board import Post
-from swarmlab.medium.topology import TOPOLOGIES, Broadcast, Gossip, Groups
+from swarmlab.medium.topology import Broadcast, Gossip, Groups
 from swarmlab.rng import derive
 
 AGENTS = [agent_id(i) for i in range(8)]
@@ -87,4 +91,11 @@ def test_specs_and_registry():
     assert Broadcast().spec() == {"type": "broadcast", "params": {}}
     assert Gossip().spec() == {"type": "gossip", "params": {"k": 1}}
     assert Groups(size=4).spec() == {"type": "groups", "params": {"size": 4}}
-    assert set(TOPOLOGIES) == {"broadcast", "gossip", "groups", "star", "tree"}
+    # every topology class defined in swarmlab.medium.topology is registered under its own
+    # entry_point name, and every swarmlab.topologies entry point loads one of them
+    defined = {c for c in vars(topology_module).values()
+               if isinstance(c, type) and issubclass(c, Topology) and c is not Topology
+               and c.__module__ == topology_module.__name__}
+    loaded = {ep.name: ep.load() for ep in entry_points(group="swarmlab.topologies")}
+    assert set(loaded.values()) == defined
+    assert all(loaded[c.entry_point] is c for c in defined)

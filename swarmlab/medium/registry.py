@@ -262,12 +262,15 @@ class Registry(Persistable, Plugin):
 class ClaimPolicy(Persistable, Plugin):
     """Decides whether a world action on a claimable resource may proceed."""
 
+    description: ClassVar[str] = ""  # one line for `swarmlab plugins` (swarmlab/registry.py)
+
     def allows(self, agent: AgentId, key: str, owner: AgentId | None) -> bool:
         raise NotImplementedError
 
 
 class Advisory(ClaimPolicy):
     entry_point: ClassVar[str | None] = "advisory"
+    description: ClassVar[str] = "Claims are advisory: any agent may act on any resource"
 
     def allows(self, agent: AgentId, key: str, owner: AgentId | None) -> bool:
         return True
@@ -275,12 +278,10 @@ class Advisory(ClaimPolicy):
 
 class Enforced(ClaimPolicy):
     entry_point: ClassVar[str | None] = "enforced"
+    description: ClassVar[str] = "Claims are enforced: only the claim's owner may act on a resource"
 
     def allows(self, agent: AgentId, key: str, owner: AgentId | None) -> bool:
         return owner == agent
-
-
-CLAIM_POLICIES: dict[str, type[ClaimPolicy]] = {"advisory": Advisory, "enforced": Enforced}
 
 
 def build_claim_policy(spec: Any) -> ClaimPolicy:
@@ -291,9 +292,9 @@ def build_claim_policy(spec: Any) -> ClaimPolicy:
         spec = {"type": spec, "params": {}}
     elif not isinstance(spec, dict):
         spec = {"type": spec.type, "params": dict(spec.params)}
-    from .board import build_plugin
+    from ..registry import build
 
-    policy = build_plugin(spec, CLAIM_POLICIES, "swarmlab.claim_policies")
+    policy = build(spec, "swarmlab.claim_policies")
     if not isinstance(policy, ClaimPolicy):
         raise TypeError(f"{spec['type']!r} is not a ClaimPolicy")
     return policy

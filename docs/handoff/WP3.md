@@ -8,8 +8,10 @@ other WP would do).
 ## Signatures WP4 needs
 
 ```python
-from swarmlab.medium.board import Board, Post, Delivery, DelayPolicy, BlobStoreLike, build_plugin
-from swarmlab.medium.topology import Broadcast, Gossip, Groups, TOPOLOGIES
+from swarmlab.medium.board import Board, Post, Delivery, DelayPolicy, BlobStoreLike
+from swarmlab.medium.topology import Broadcast, Gossip, Groups
+# Later: `build_plugin` and the `TOPOLOGIES` / `POLICIES` name tables were removed; topologies
+# and policies resolve through `swarmlab.registry.build` (entry points, then module:Class).
 
 class Post(BaseModel):     post_id: PostId; round: int; agent: AgentId; channel: str; text: str; fields: dict = {}
 class Delivery(BaseModel): delivery_id: DeliveryId; post_id: PostId; recipient: AgentId

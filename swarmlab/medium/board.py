@@ -23,9 +23,10 @@ Decisions where the contract is silent:
   `board.commit_mode`, and `spec()` omits it.
 - `spec()` always emits the topology as a nested plugin spec (`{"type", "params"}`), even when the
   board was built from a name, and policies as a list of nested specs, matching `MediumSpec`.
-  `Board.from_spec` rebuilds nested plugins from those specs (local names first, then the
-  `swarmlab.topologies` / `swarmlab.policies` entry points, then `module:Class` import). The
-  constructor also accepts such a dict for `topology` and for each policy.
+  `Board.from_spec` rebuilds nested plugins from those specs (the `swarmlab.topologies` /
+  `swarmlab.policies` entry points, then `module:Class` import, via `swarmlab.registry.build`;
+  there is no local name table). The constructor also accepts such a dict for `topology` and for
+  each policy, and a topology name (an entry point or `module:Class`) as a string.
 - Channels. `buffer_post` and `read` raise `ValueError` for an unknown channel. A delivery's
   channel is the channel of its post, tracked in an internal map so that `Delivery` keeps exactly
   the contract's fields.
@@ -67,19 +68,17 @@ claim policy without the registry is a `ValueError`.
 """
 from __future__ import annotations
 
-import importlib
 import pickle
 import random
 from collections.abc import Mapping, Sequence
-from importlib.metadata import entry_points
 from typing import Any, ClassVar, Literal, Protocol
 
 from pydantic import BaseModel
 
 from ..base import Persistable, Plugin
 from ..ids import AgentId, DeliveryId, PostId
+from ..registry import build
 from .base import Policy, Topology
-from .topology import TOPOLOGIES
 
 
 class BlobStoreLike(Protocol):
@@ -111,6 +110,9 @@ class DelayPolicy(Policy):
     """Delay posts by `rounds` extra rounds for `readers` (all readers when None)."""
 
     entry_point: ClassVar[str | None] = "delay"
+    description: ClassVar[str] = (
+        "Delay posts by `rounds` extra rounds for `readers` (all readers when None)"
+    )
 
     def __init__(self, rounds: int, readers: list[AgentId] | None = None) -> None:
         if rounds < 0:
@@ -124,42 +126,18 @@ class DelayPolicy(Policy):
         return super().apply(reader, post, round)
 
 
-POLICIES: dict[str, type[Policy]] = {"delay": DelayPolicy}
-
-
-def build_plugin(spec: Mapping[str, Any], local: Mapping[str, type], group: str) -> Any:
-    """Instantiate `{"type", "params"}` via a local name, an entry point, or `module:Class`."""
-    type_name = spec["type"]
-    params = dict(spec.get("params", {}))
-    cls: Any = local.get(type_name)
-    if cls is None:
-        found = [ep for ep in entry_points(group=group) if ep.name == type_name]
-        if found:
-            cls = found[0].load()
-        elif ":" in type_name:
-            module, _, qualname = type_name.partition(":")
-            cls = importlib.import_module(module)
-            for part in qualname.split("."):
-                cls = getattr(cls, part)
-        else:
-            raise ValueError(f"unknown {group} plugin {type_name!r}")
-    return cls(**params)
-
-
 def _topology(value: str | Topology | Mapping[str, Any]) -> Topology:
     if isinstance(value, Topology):
         return value
     if isinstance(value, str):
-        if value not in TOPOLOGIES:
-            raise ValueError(f"unknown topology {value!r}; known: {sorted(TOPOLOGIES)}")
-        return TOPOLOGIES[value]()
-    return build_plugin(value, TOPOLOGIES, "swarmlab.topologies")
+        value = {"type": value, "params": {}}
+    return build(value, "swarmlab.topologies")
 
 
 def _policy(value: Policy | Mapping[str, Any]) -> Policy:
     if isinstance(value, Policy):
         return value
-    return build_plugin(value, POLICIES, "swarmlab.policies")
+    return build(value, "swarmlab.policies")
 
 
 class Board(Persistable, Plugin):
