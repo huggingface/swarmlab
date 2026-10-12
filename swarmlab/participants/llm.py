@@ -73,8 +73,28 @@ parts unchanged (text and image parts pass through), then, when present, one tex
 (`- <tool> <action_id>: accepted|rejected <feedback JSON>`), and one text part
 `Delivered to you:` with a line per pushed item (`- <post_id> (round <eligible_round>): <content>`).
 
-**Loop** (one turn): build a `ChatRequest` (system + memory, `tools=view.tools`, the agent's
-settings), `await tools.infer(request)`, then
+**Turn loop.** `turn()` sets up memory (below), then runs one loop until the reply ends the turn
+or `calls_per_turn_cap` responses (`max_calls`; at most 2 under `report_json`) were acted on:
+
+    resp = await self._infer(view, tools, usage)          # one model call, refusals re-sent
+    n, ended = await self._handle_response(resp, view, tools)
+
+`_infer` checks kept thinking, enforces the context limit, builds the `ChatRequest` (system +
+memory, `tools=view.tools`, the agent's settings, `attempt`), `await tools.infer(request)`,
+records the finish reason (`length` noted) and runs the `refusal_retries` re-sends, so it returns
+the response to act on. `_handle_response` appends the assistant message and dispatches on the
+reply (the cases below, and `report_json`), returning (tool calls executed, turn ended). These two
+methods are the intended seam: a subclass overrides `_handle_response` to read replies its own
+way, or `_infer` to change what is sent (e.g. offer other tools through a view copy passed to
+`super()._infer`), and keeps everything else (memory, refusals, context limit, thinking, budgets);
+it overrides `turn_message`/`round_message` for prompt construction, not `turn()`. An override of
+`_handle_response` must still append the reply via `self._assistant(resp, ...)`, which keeps the
+response's thinking blocks (`provider_content`) and their binding. Turn state for overrides is
+`self._turn` (`TurnState`: the turn's `usage` for notes, `budget`, `calls` acted on so far,
+`refusals_resent`, `json_retried`; transient, not snapshotted). A turn-strategy plugin may replace
+this seam later; it will be introduced only when a third loop variant appears.
+
+The dispatch in `_handle_response`:
 
 - native: no tool calls -> the turn ends (`no_tool`; the assistant text, if non-empty, is kept).
   Otherwise the assistant message (text + tool calls) is appended and each call is executed in
