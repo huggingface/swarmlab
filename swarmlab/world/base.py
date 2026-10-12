@@ -33,7 +33,7 @@ from __future__ import annotations
 import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
@@ -42,6 +42,9 @@ from ..ids import ActionId, AgentId
 from ..interventions import NotSupported
 from ..tools import ToolSchema
 from ..view import Observation
+
+if TYPE_CHECKING:  # swarmlab.experiment imports this module
+    from ..experiment import Run
 
 
 class Action(BaseModel):
@@ -260,6 +263,21 @@ class World(Persistable, Plugin):
         - a scalar: a key/value row; anything else: JSON text.
         """
         return None
+
+    def report_sections(self, arms: dict[str, list[Run]]) -> list[str]:
+        """Evaluator-side Markdown lines appended to `swarmlab report` after its generic
+        "Final score" table (which already lists every scalar key of the recorded `score()`).
+
+        Called once per world type in the report: runs are grouped by `run.spec.world.type`,
+        and this world is built (not reset, so use constructor config only) from the first
+        reconstructed run of its group. `arms` maps arm name to that arm's finished runs of this
+        world type only (`Run`: `score`, `metrics`, `events`, `spec`, ...; an arm without such a
+        run is absent); read per-run state from the runs. A run whose plugins did not import
+        when the report was built is a plain `Run` read from run.json (no replay; its
+        `experiment` cannot be built). With several world types in one report, the lines are
+        placed under a `### World <type>` heading. Default: no lines.
+        """
+        return []
 
     # ---- per-agent hooks (WP16: Flag Game blind agents) ----------------------------------------
     def allows_tool(self, agent: AgentId, name: str) -> bool:

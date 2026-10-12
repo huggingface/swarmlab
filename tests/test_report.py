@@ -170,8 +170,8 @@ def test_init_starter_describes_gossip_as_one_partner(tmp_path):
 
 
 def test_protocol_health_and_metrics_for_a_custom_world(tmp_path):
-    """Any world gets the protocol-health section and every logged metric; world-specific
-    sections appear only for their world type."""
+    """Any world gets the protocol-health section, every logged metric and the final score;
+    the Flag Game sections appear only for runs with guesses or a verifiable truth."""
     from .helpers import site_experiment
 
     out = tmp_path / "runs"
@@ -180,8 +180,9 @@ def test_protocol_health_and_metrics_for_a_custom_world(tmp_path):
     for section in ("## Trajectories (mean over seeds)", "## Tool protocol health",
                     "## Protocol health"):
         assert section in text
-    for section in ("## Where the swarm went", "## Probe vs world belief", "## Coloring"):
+    for section in ("## Where the swarm went", "## Probe vs world belief"):
         assert section not in text
+    assert "| run | rounds | A | B | C | D |" in text.split("## Final score")[1]  # SiteWorld.score()
     traj = text.split("## Trajectories")[1].split("## ")[0]
     assert "| sites.max_share | " in traj and "| accuracy |" not in traj  # not a fixed list
     health = text.split("## Protocol health")[1]
@@ -197,11 +198,16 @@ def test_protocol_health_and_metrics_for_a_custom_world(tmp_path):
     assert "| probes skipped | no probes |" in health
     assert "| cost per round, swarm + measurement (mean / max) | $0." in health
 
-    # a coloring run in the same dir adds the coloring section, still no Flag Game sections
+    # a coloring run in the same dir adds its score keys to the table, still no Flag Game sections
     Experiment.from_yaml(REPO / "examples" / "coloring_s0.yaml", "row_major").run_all(
         [1], max_rounds=2, out=out)
     text = build_report(out, include_fake=True)
-    assert "## Coloring (final grid)" in text and "coloring-s0__row_major__s1" in text
+    final = text.split("## Final score")[1]
+    assert "coloring-s0__row_major__s1" in final
+    head = next(ln for ln in final.splitlines() if ln.startswith("| run "))
+    for key in ("coverage", "correct", "wrong", "unpainted", "paints", "useful_paints",
+                "duplicate_paints", "wrong_paints", "overwritten_paints", "wasted_paints"):
+        assert f"| {key} |" in head or head.endswith(f"| {key} |"), key
     assert "| coloring.coverage |" in text and "## Where the swarm went" not in text
 
 
