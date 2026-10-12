@@ -184,13 +184,13 @@ derived from `derive(seed, "repeat", i, "agent", a, call_id)` (`RepeatSeeded`), 
 seeded providers, the fake provider and the request cache differ per repeat. World, schedule and
 topology streams never depend on the repeat.
 
-World requirement check: on a fresh run, a fork and a resume, right after the participants are
-bound and roles applied and before `world.reset`, the runner calls
+World compatibility check: on a fresh run, a fork and a resume, right after the participants are
+bound and roles applied and before `world.reset` (so before any model call), the runner calls
 `world.check_experiment(view)`, where `view` is a copy of the experiment whose `options` are this
-run's resolved `RunOptions` and whose `participants` are the bound participants, in agent order.
-`Experiment` construction has already checked what it knows (swarmlab/world/base.py); this call
-adds what only the run knows: `run(commit=..., max_rounds=...)` overrides, a fork's `max_rounds`,
-role-applied participants. FlagGame's image modality check (M5) is part of its `check_experiment`.
+run's resolved `RunOptions` and whose `participants` are the bound, role-applied participants, in
+agent order. This is the runtime hook (swarmlab/world/base.py): `Experiment` construction checked
+only the declared `requires`; this call checks them again on the resolved options and runs the
+world's participant-dependent checks (FlagGame's image modality check, M5).
 """
 from __future__ import annotations
 
@@ -619,10 +619,9 @@ class Runner:
             p.bind(a, agent_stream(seed, a, self.options.repeat))
         self.roles = bind_roles(self.board, self.participants, agent_roles(  # M3c
             self.spec.roles, self.spec.participant_roles, len(self.agents)))
-        view = self.experiment.model_copy(update={  # world requirements
+        view = self.experiment.model_copy(update={  # runtime world check, before any model call
             "options": self.options.model_dump(mode="json", exclude={"seed", "rounds_per_agent"}),
             "participants": list(self.participants.values())})
-        view._roles_applied = True  # participants_with_roles: roles are already applied
         self.world.check_experiment(view)
         self.world.reset(derive(seed, "world"), list(self.agents))
         self._set_truth()

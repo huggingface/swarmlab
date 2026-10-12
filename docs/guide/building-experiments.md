@@ -89,7 +89,7 @@ To use it from YAML, save it as `myworld.py` next to the spec and write `world: 
   @tool("choose_site", "Hold a site", {"site": lambda self: {"type": "string", "enum": self.sites}})
   def choose_site(self, agent, site): ...
   ```
-- Declare the run settings the world needs, and a spec that breaks them fails at construction (`validate`, `run`, `prompts`, `estimate`) instead of producing meaningless numbers; override `check_experiment(experiment)` (calling `super()`) for checks that need code ([INTERFACE §8](../INTERFACE.md#8-world)):
+- Declare the run settings the world needs, and a spec that breaks them fails at construction (`validate`, `run`, `prompts`, `estimate`) instead of producing meaningless numbers. Checks that depend on the participants (what a model or custom agent can read, after roles apply) go in a `check_experiment(experiment)` override (calling `super()`): the runner calls it at run initialisation on the bound, role-applied participants, before any inference, so `validate` and `estimate` may accept a spec that it then refuses ([INTERFACE §8](../INTERFACE.md#8-world)):
 
   ```python
   class MyWorld(World):

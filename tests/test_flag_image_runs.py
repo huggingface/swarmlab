@@ -40,15 +40,17 @@ def strip(evs):
     return [{k: v for k, v in e.items() if k != "run"} for e in evs]
 
 
-# ---- refusals at construction (World.check_experiment) --------------------------------------
+# ---- refusals at run initialisation (World.check_experiment), before any inference ----------
 @pytest.mark.parametrize("participant", [Silent(), EvidenceAggregator(), Enumerator(),
                                          LLMAgent(model="fake:reader"),
                                          LLMAgent(model="fake:flaggame_reader")])
-def test_text_readers_need_the_hint(tmp_path, participant):
+def test_text_readers_need_the_hint(tmp_path, participant, requests_seen):
+    exp = Experiment(name="img", world=FlagGame(modality="image"), participants=[participant] * 2,
+                     medium=Board(topology="broadcast"),
+                     providers={"fake": FakeProvider(pricing=TEST_PRICING)})  # construction accepts
     with pytest.raises(ValueError, match=r"participants \['a000', 'a001'\].*image_text_hint=True"):
-        Experiment(name="img", world=FlagGame(modality="image"), participants=[participant] * 2,
-                   medium=Board(topology="broadcast"),
-                   providers={"fake": FakeProvider(pricing=TEST_PRICING)})
+        exp.run(seed=1, max_rounds=1, out=tmp_path / "refused")
+    assert requests_seen == []  # refused before any provider call
     # the same participants are fine with the hint, and in text mode
     for world in (FlagGame(modality="image", image_text_hint=True), FlagGame()):
         ok = Experiment(name="img", world=world, participants=[participant] * 2,

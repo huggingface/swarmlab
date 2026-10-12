@@ -1,5 +1,7 @@
-"""World requirements (`Requirements`, `World.requires`, `World.check_experiment`): checked at
-`Experiment` construction and again at run start with the resolved run options."""
+"""World requirements: the declared `Requirements` (`World.requires`) are checked early (at
+`Experiment` construction, `check_run`, estimate, CLI estimate/run) and again at run start; the
+runtime hook `World.check_experiment` (participant-dependent checks) runs only at run start, after
+bind and roles, before any inference."""
 import json
 from typing import Any, ClassVar
 
@@ -115,14 +117,17 @@ def test_scheduler_is_matched_by_resolved_class(tmp_path):
             exp(world)
 
 
-def test_an_override_adds_its_own_check_and_runs_once_per_construction():
+def test_an_override_runs_at_run_start_only(tmp_path):
     EvenWorld.calls.clear()
-    push_ok(EvenWorld(), 4)
-    assert EvenWorld.calls == [4]  # exactly once per construction
+    odd = push_ok(EvenWorld(), 3)  # construction checks the declared requirements only
+    odd.check_run(max_rounds=2)
+    assert EvenWorld.calls == []
     with pytest.raises(ValueError, match="even number"):
-        push_ok(EvenWorld(), 3)
-    with pytest.raises(ValueError, match="requires commit=immediate"):  # super() still checks
+        odd.run(seed=1, max_rounds=2, out=tmp_path / "odd")
+    assert EvenWorld.calls == [3]
+    with pytest.raises(ValueError, match="requires commit=immediate"):  # declared: early
         exp(EvenWorld(), 4, Board(delivery="push", push_limit=4))
+    assert push_ok(EvenWorld(), 4).run(seed=1, max_rounds=2, out=tmp_path / "even").status == "ended"
 
 
 def test_from_spec_checks_and_round_trips(tmp_path):
@@ -170,7 +175,7 @@ def test_validate_cli_runs_the_requirement_check(tmp_path):
     assert res.exit_code == 0, res.output
 
 
-# ---- role overrides are checked as the run applies them -----------------------------------------
+# ---- participant compatibility is checked on the bound, role-applied participants -----------------
 VISION = "fake:tests.helpers:script_end_turn_first"  # a fake script that does not read text grids
 
 
@@ -187,26 +192,36 @@ def role_exp(proto_model: str, role_model: str) -> Experiment:
                       providers={"fake": FakeProvider(pricing=TEST_PRICING)})
 
 
-def test_a_role_model_that_fixes_a_rejected_prototype_is_accepted(tmp_path):
+@pytest.fixture
+def inference_calls(monkeypatch):
+    from swarmlab.providers.fake import FakeProvider
+
+    seen: list = []
+    original = FakeProvider.complete
+
+    async def recording(self, request):
+        seen.append(request)
+        return await original(self, request)
+
+    monkeypatch.setattr(FakeProvider, "complete", recording)
+    return seen
+
+
+def test_a_role_model_that_fixes_a_rejected_prototype_runs(tmp_path, inference_calls):
     good = role_exp("fake:reader", VISION)
-    assert [p.model for p in good.participants] == ["fake:reader"] * 2  # prototypes untouched
-    from swarmlab.roles import effective_model
-
-    assert [effective_model(p, r) for p, r in good.participants_with_roles()] == [VISION] * 2
+    good.check_run(max_rounds=1)
     assert good.run(seed=1, max_rounds=1, out=tmp_path).status == "ended"
+    assert [p.model for p in good.participants] == ["fake:reader"] * 2  # prototypes untouched
+    assert inference_calls  # it really ran
 
 
-def test_a_role_model_that_breaks_an_accepted_prototype_fails_like_run_start(tmp_path, monkeypatch):
-    with pytest.raises(ValueError, match=r"participants \['a000', 'a001'\]") as built:
-        role_exp(VISION, "fake:reader")
-    # the same experiment past construction: run start (bound participants) gives the same error
-    sneaked = role_exp(VISION, VISION)
-    from swarmlab.roles import Role
-    sneaked = sneaked.model_copy(update={"roles": {"seer": Role(name="seer", model="fake:reader")}})
-    monkeypatch.setattr(Experiment, "check_run", lambda self, *a, **k: None)
-    with pytest.raises(ValueError) as at_start:
-        sneaked.run(seed=1, max_rounds=1, out=tmp_path)
-    assert str(at_start.value) == str(built.value)
+def test_a_role_model_that_breaks_an_accepted_prototype_is_refused_at_run_start(tmp_path, inference_calls):
+    bad = role_exp(VISION, "fake:reader")  # construction checks declared settings only
+    bad.check_run(max_rounds=1)
+    with pytest.raises(ValueError, match=r"participants \['a000', 'a001'\].*image_text_hint=True"):
+        bad.run(seed=1, max_rounds=1, out=tmp_path)
+    assert inference_calls == []  # refused before any provider call
+    assert [p.model for p in bad.participants] == [VISION] * 2  # prototypes untouched
 
 
 class NeedsBinding(Participant):
@@ -216,7 +231,7 @@ class NeedsBinding(Participant):
 
     def apply_role(self, role):
         self.label = f"{self.agent}:{role.name}"
-        NeedsBinding.labels.append(self.label)
+        NeedsBinding.labels.append((self.label, self.rng.random()))
 
     async def turn(self, view, tools):
         await tools.call("end_turn", {})
@@ -224,20 +239,21 @@ class NeedsBinding(Participant):
 
 
 @pytest.mark.parametrize("world", [FlagGame(), PushWorld()], ids=["flaggame", "requires"])
-def test_construction_never_calls_apply_role_before_bind(tmp_path, world):
+def test_apply_role_runs_only_after_bind(tmp_path, world):
     NeedsBinding.labels.clear()
     push = isinstance(world, PushWorld)
     built = Experiment(name="custom", world=world,
                        participants=[assign(NeedsBinding(), "worker") for _ in range(2)],
                        medium=Board(delivery="push", push_limit=2) if push else Board(),
                        options={"commit": "immediate"} if push else {})
-    assert NeedsBinding.labels == []  # construction read the roles declaratively
-    assert all(not hasattr(p, "label") for p in built.participants)
-    assert [r.name for _, r in built.participants_with_roles()] == ["worker"] * 2
     built.check_run(max_rounds=2)
-    assert NeedsBinding.labels == []
+    assert NeedsBinding.labels == []  # construction and check_run never call participant hooks
+    assert all(not hasattr(p, "label") for p in built.participants)
     assert built.run(seed=1, max_rounds=2, out=tmp_path).status == "ended"
-    assert NeedsBinding.labels == ["a000:worker", "a001:worker"]  # set at bind, from the agent id
+    from swarmlab.runner import agent_stream
+
+    # called once per agent after bind: the real agent id and its own rng stream
+    assert NeedsBinding.labels == [(f"{a}:worker", agent_stream(1, a).random()) for a in ("a000", "a001")]
 
 
 # ---- estimate and run check the effective settings, overrides included ---------------------------

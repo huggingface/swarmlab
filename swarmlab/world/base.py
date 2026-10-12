@@ -28,25 +28,29 @@ Default validation checks argument names (required and no extras) and, for every
 resolved schema with an `enum`, that the value is one of it. JSON types, ranges and anything else
 are the world author's job inside the action.
 
-Requirements. A world declares the run settings it needs as data, `requires: ClassVar[Requirements]`
-(every field optional; unset = no requirement), and `check_experiment(experiment)` checks them. It
-is called at two points, with the same method:
+Requirements. Two checks, at two points, with a deliberate boundary between them:
 
-- at `Experiment` construction (a model validator, so the Python constructor, `from_spec`,
-  `from_yaml` and every CLI command that builds the experiment: `validate`, `run`, `prompts`,
-  `estimate`), and again by `Experiment.estimate`/`run` and the CLI `estimate`/`run` with their
-  overrides (`Experiment.check_run`, swarmlab/experiment.py). Its participants are the unbound
-  prototypes; `experiment.participants_with_roles()` pairs each with the role a run will apply,
-  for checks that read role settings declaratively (`roles.effective_model`); no `apply_role` or
-  other participant hook runs before binding. It sees `experiment.options` as declared: an unset `commit` or `scheduler` counts as
-  its default (`round_end`, `SeededShuffle`); `max_rounds` (no default) is checked only when the
-  options carry it (or `rounds_per_agent`), since `run(max_rounds=...)` may give it later.
-  `delivery` and `push_limit` come from `experiment.medium`, `n_agents` from the participants.
-- at run start (`Runner._init_fresh`: fresh runs, forks, resume), on a copy of the experiment whose
-  `options` are the resolved `RunOptions` (so `run(commit=..., max_rounds=...)` overrides and a
-  fork's `max_rounds` are checked) and whose `participants` are the bound ones, roles applied (`participants_with_roles()`
-  then pairs each with None). This check is authoritative for anything that depends on runtime
-  state, e.g. a custom `apply_role`.
+- Early validation establishes the declared configuration constraints. A world declares the run
+  settings it needs as data, `requires: ClassVar[Requirements]` (every field optional; unset = no
+  requirement), and `type(world).requires.check(world, experiment)` checks them at `Experiment`
+  construction (a model validator: the Python constructor, `from_spec`, `from_yaml` and every CLI
+  command that builds the experiment: `validate`, `run`, `prompts`, `estimate`) and again by
+  `Experiment.estimate`/`run` and the CLI `estimate`/`run` with their overrides
+  (`Experiment.check_run`, swarmlab/experiment.py). It reads only options, medium and participant
+  count, never a participant: an unset `commit` or `scheduler` counts as its default (`round_end`,
+  `SeededShuffle`); `max_rounds` (no default) is checked only when the options carry it (or
+  `rounds_per_agent`), since `run(max_rounds=...)` may give it later.
+- Runtime initialisation establishes participant-dependent compatibility.
+  `check_experiment(experiment)` is the runtime hook: the runner calls it in `Runner._init_fresh`
+  (fresh runs, forks, resume) after `bind` and roles are applied, before `world.reset` and any model call, on a
+  copy of the experiment whose `options` are the resolved `RunOptions` and whose `participants`
+  are the bound, role-applied ones. The default runs `requires.check` again (catching
+  `run(commit=...)` overrides and a fork's `max_rounds`); a world overrides it for imperative
+  checks, calling `super()` (FlagGame's image-modality text-reader check).
+
+So `validate` and `estimate` may accept settings that a participant compatibility check rejects at
+run initialisation, before inference: early validation cannot know what a custom participant or
+`apply_role` hook will do.
 
 `Requirements.check` raises one `ValueError` naming every violated field.
 """
@@ -374,10 +378,10 @@ class World(Persistable, Plugin):
     def check_experiment(self, experiment: Any) -> None:
         """Refuse an experiment this world cannot run meaningfully (raise `ValueError`).
 
-        Default: `type(self).requires.check(self, experiment)`. Called at `Experiment`
-        construction and again at run start with the resolved run options and bound participants
-        (see the module docstring for what each call sees). A world may override it for
-        imperative checks; the override should call `super().check_experiment(experiment)`.
+        The runtime hook: called by the runner after bind and roles, before any model call, with
+        the resolved run options and the bound, role-applied participants (module docstring).
+        Default: `type(self).requires.check(self, experiment)`. Override it for imperative,
+        participant-dependent checks and call `super().check_experiment(experiment)`.
         """
         type(self).requires.check(self, experiment)
 

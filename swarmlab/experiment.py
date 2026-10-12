@@ -127,7 +127,7 @@ from .providers import catalog_priced, ensure_pricing
 from .providers import resolve as resolve_provider
 from .providers.base import Provider, split_model
 from .registry import add_import_dir, build
-from .roles import Role, agent_roles, assign, role_name, roles_from_spec, spec_roles
+from .roles import Role, assign, role_name, roles_from_spec, spec_roles
 from .runner import Runner
 from .scheduler import build_scheduler
 from .spec import (
@@ -165,8 +165,6 @@ class Experiment(BaseModel):
     roles: dict[str, Role] = {}  # M3c: swarmlab/roles.py (assign agents with roles.assign)
     _resolved: dict[str, Provider] = PrivateAttr(default_factory=dict)
     _import_dir: str | None = PrivateAttr(default=None)  # the YAML's dir (registry.add_import_dir)
-    # True only on the runner's run-start check view: participants bound, roles applied
-    _roles_applied: bool = PrivateAttr(default=False)
 
     def __init__(self, **data: Any) -> None:
         try:
@@ -197,33 +195,10 @@ class Experiment(BaseModel):
 
     @model_validator(mode="after")
     def _check_world(self) -> Experiment:
-        """The world's requirements (`World.check_experiment`, swarmlab/world/base.py), once per
-        construction (`check_run` with no overrides); the runner checks again at run start."""
+        """The world's declared requirements (`World.requires`, swarmlab/world/base.py), once per
+        construction (`check_run` with no overrides)."""
         self.check_run()
         return self
-
-    def participants_with_roles(self) -> list[tuple[Participant, Role | None]]:
-        """Each participant with the role a run would still apply to it (None = no role).
-
-        A pure, declarative view for construction-time checks (`check_run`, the world's
-        `check_experiment`): the prototypes, untouched, with their resolved `Role`s. Nothing is
-        copied, bound or `apply_role`d, since participants may only be ready for `apply_role` after
-        `bind` (the runner's order). Answer questions about the effective settings with the
-        declarative helpers in swarmlab/roles.py (`effective_model`). When the roles do not resolve
-        (an unknown role name, reported by `to_spec`), every role is None. On the runner's
-        run-start view, whose participants are bound with their roles already applied, every role
-        is None too: that check sees the real participants and stays the authoritative one for
-        anything that depends on runtime state.
-        """
-        if self._roles_applied:
-            return [(p, None) for p in self.participants]
-        names = [role_name(p) for p in self.participants]
-        try:
-            roles, names = spec_roles(self.roles, names)
-        except ValueError:
-            return [(p, None) for p in self.participants]
-        return list(zip(self.participants, agent_roles(roles, names, len(self.participants)),
-                        strict=True))
 
     def _merged_options(self, max_rounds: int | None = None, **overrides: Any) -> dict:
         """The run options a run with these overrides resolves (explicit argument, else
@@ -236,18 +211,17 @@ class Experiment(BaseModel):
         return merged
 
     def check_run(self, max_rounds: int | None = None, **overrides: Any) -> None:
-        """`world.check_experiment` on the settings a run with these overrides would have.
+        """The world's declared requirements (`type(world).requires.check`) on the options a run
+        with these overrides would have (`run` resolution, no defaults filled in).
 
-        Raises the world's `ValueError`. The view is a copy of this experiment whose `options`
-        are the merged options (`run` resolution, no defaults filled in); its participants are the
-        unbound prototypes, and role effects are read declaratively (`participants_with_roles`,
-        `roles.effective_model`), never by calling `apply_role`. Called at construction (no overrides), by `estimate`,
-        `run` and the CLI `estimate`/`run` commands before anything starts; the runner's check at
-        run start (resolved `RunOptions`, bound participants) stays the authoritative one.
+        Raises the world's `ValueError`. Declarative only: it never calls `World.check_experiment`
+        or any participant hook, so it says nothing about participant compatibility; that is
+        checked at run initialisation (`Runner._init_fresh`), before any inference. Called at
+        construction (no overrides), by `estimate`, `run` and the CLI `estimate`/`run` commands.
         """
         options = self._merged_options(max_rounds, **overrides)
         options.pop("rounds_per_agent", None)  # already resolved into max_rounds
-        self.world.check_experiment(self.model_copy(update={"options": options}))
+        type(self.world).requires.check(self.world, self.model_copy(update={"options": options}))
 
     def _pin_price(self, prefix: str, provider: Provider, mid: str, row: tuple) -> None:
         """Record a catalog price in the provider's params so `to_spec` carries it."""
