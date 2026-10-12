@@ -27,15 +27,31 @@ advertised and the one validated could differ. Per-round schema changes are not 
 Default validation checks argument names (required and no extras) and, for every property of the
 resolved schema with an `enum`, that the value is one of it. JSON types, ranges and anything else
 are the world author's job inside the action.
+
+Requirements. A world declares the run settings it needs as data, `requires: ClassVar[Requirements]`
+(every field optional; unset = no requirement), and `check_experiment(experiment)` checks them. It
+is called at two points, with the same method:
+
+- at `Experiment` construction (a model validator, so the Python constructor, `from_spec`,
+  `from_yaml` and every CLI command that builds the experiment: `validate`, `run`, `prompts`,
+  `estimate`). It sees `experiment.options` as declared: an unset `commit` or `scheduler` counts as
+  its default (`round_end`, `SeededShuffle`); `max_rounds` (no default) is checked only when the
+  options carry it (or `rounds_per_agent`), since `run(max_rounds=...)` may give it later.
+  `delivery` and `push_limit` come from `experiment.medium`, `n_agents` from the participants.
+- at run start (`Runner._init_fresh`: fresh runs, forks, resume), on a copy of the experiment whose
+  `options` are the resolved `RunOptions` (so `run(commit=..., max_rounds=...)` overrides and a
+  fork's `max_rounds` are checked) and whose `participants` are the bound ones, roles applied.
+
+`Requirements.check` raises one `ValueError` naming every violated field.
 """
 from __future__ import annotations
 
 import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from ..base import Persistable, Plugin
 from ..ids import ActionId, AgentId
@@ -144,8 +160,78 @@ def tool(name: str, description: str | Callable[[Any], str], params: Params | No
     return deco
 
 
+class Requirements(BaseModel):
+    """Run settings a world needs (see the module docstring); every field is optional.
+
+    - `commit`, `delivery`: the exact value.
+    - `push_limit`: a minimum; `"n_agents"` means at least the participant count.
+    - `scheduler`: an entry-point name (`"one_speaker"`) or `module:Class`; it matches when it
+      resolves (`registry.resolve(name, "swarmlab.schedulers")`) to the class of the experiment's
+      scheduler (an unset `scheduler` option is `SeededShuffle`).
+    - `max_rounds`: an int, or the name of a world attribute `max_rounds` must equal (`"rounds"`).
+    - `n_agents`: `(min, max)`, either bound `None` for open.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    commit: Literal["round_end", "immediate"] | None = None
+    delivery: Literal["pull", "push"] | None = None
+    push_limit: int | Literal["n_agents"] | None = None
+    scheduler: str | None = None
+    max_rounds: int | str | None = None
+    n_agents: tuple[int | None, int | None] | None = None
+
+    def check(self, world: Any, experiment: Any) -> None:
+        """Raise `ValueError` listing every requirement `experiment` violates (None if all hold)."""
+        from ..registry import resolve
+        from ..scheduler import build_scheduler
+        from ..spec import resolve_rounds
+
+        n = len(experiment.participants)
+        options = resolve_rounds(dict(experiment.options or {}), n)
+        medium = experiment.medium
+        bad: list[tuple[str, Any]] = []  # (field, relation and wanted value; actual value)
+        if self.commit is not None:
+            got = options.get("commit") or "round_end"
+            if got != self.commit:
+                bad.append((f"commit={self.commit}", got))
+        if self.delivery is not None:
+            got = getattr(medium, "delivery", None)
+            if got != self.delivery:
+                bad.append((f"delivery={self.delivery}", got))
+        if self.push_limit is not None:
+            least = n if self.push_limit == "n_agents" else self.push_limit
+            got = getattr(medium, "push_limit", None)
+            if not isinstance(got, int) or got < least:
+                what = f"{least} (n_agents)" if self.push_limit == "n_agents" else str(least)
+                bad.append((f"push_limit>={what}", got))
+        if self.scheduler is not None:
+            want = resolve(self.scheduler, "swarmlab.schedulers")
+            got_cls = type(build_scheduler(options.get("scheduler")))
+            if got_cls is not want:
+                bad.append((f"scheduler={self.scheduler}",
+                            f"{got_cls.__module__}:{got_cls.__qualname__}"))
+        if self.max_rounds is not None and options.get("max_rounds") is not None:
+            if isinstance(self.max_rounds, str):
+                want_r, label = getattr(world, self.max_rounds), f" (world.{self.max_rounds})"
+            else:
+                want_r, label = self.max_rounds, ""
+            if options["max_rounds"] != want_r:
+                bad.append((f"max_rounds={want_r}{label}", options["max_rounds"]))
+        if self.n_agents is not None:
+            lo, hi = self.n_agents
+            if (lo is not None and n < lo) or (hi is not None and n > hi):
+                want_n = (f"n_agents in [{lo}, {hi}]" if lo is not None and hi is not None
+                          else f"n_agents>={lo}" if lo is not None else f"n_agents<={hi}")
+                bad.append((want_n, n))
+        if bad:
+            name = type(world).__name__
+            raise ValueError("; ".join(f"world {name} requires {w}, got {g}" for w, g in bad))
+
+
 class World(Persistable, Plugin):
     name: str = "world"
+    requires: ClassVar[Requirements] = Requirements()  # run settings this world needs
 
     # ---- required -------------------------------------------------------------------------
     def reset(self, rng: random.Random, agents: list[AgentId]) -> None:
@@ -278,6 +364,16 @@ class World(Persistable, Plugin):
         placed under a `### World <type>` heading. Default: no lines.
         """
         return []
+
+    def check_experiment(self, experiment: Any) -> None:
+        """Refuse an experiment this world cannot run meaningfully (raise `ValueError`).
+
+        Default: `type(self).requires.check(self, experiment)`. Called at `Experiment`
+        construction and again at run start with the resolved run options and bound participants
+        (see the module docstring for what each call sees). A world may override it for
+        imperative checks; the override should call `super().check_experiment(experiment)`.
+        """
+        type(self).requires.check(self, experiment)
 
     # ---- per-agent hooks (WP16: Flag Game blind agents) ----------------------------------------
     def allows_tool(self, agent: AgentId, name: str) -> bool:

@@ -89,9 +89,9 @@ Decisions where the contract is silent
   text mode (allowed, so an arm grid can vary `modality` alone).
 - Images are base64 PNG (`Part.image_png_b64`); rendered PNGs are cached per grid in a transient
   attribute (`_png_cache`, never snapshotted).
-- `check_participants(participants, experiment)` (called by the runner after bind, fresh runs and
-  forks) raises `ValueError` in image mode without `image_text_hint` when a participant reads the
-  text grids: scripted FlagGame participants (`reads_text_observation = True`) and `LLMAgent`s
+- `check_experiment(experiment)` (`World.check_experiment`: at `Experiment` construction and again
+  at run start on the bound participants) raises `ValueError` in image mode without
+  `image_text_hint` when a participant reads the text grids: scripted FlagGame participants (`reads_text_observation = True`) and `LLMAgent`s
   whose model resolves to the fake provider's `flaggame_reader` script.
 - Guesses for unknown candidates and guesses beyond `guess_limit` are rejected by `validate`; the
   `guess` method re-checks both (returning `accepted=False`). Under round_end the executor passes
@@ -167,7 +167,7 @@ import string
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
-from ..ids import AgentId
+from ..ids import AgentId, agent_id
 from ..rng import derive
 from ..view import Observation, Part, text_observation
 from .base import Ack, Action, Outcome, World, tool
@@ -810,11 +810,14 @@ class FlagGame(World):
         )
 
     # ---- M5: participants that read the text grids ------------------------------------------------
-    def check_participants(self, participants: dict, experiment: Any = None) -> None:
-        """Image mode without `image_text_hint`: refuse participants that read the text grids."""
+    def check_experiment(self, experiment: Any) -> None:
+        """`World.check_experiment`, then, in image mode without `image_text_hint`, refuse
+        participants that read the text grids (named by agent id, in participant order)."""
+        super().check_experiment(experiment)
         if getattr(self, "modality", "text") != "image" or self.image_text_hint:
             return
-        bad = sorted(str(a) for a, p in participants.items() if reads_text_grids(p, experiment))
+        bad = [str(agent_id(i)) for i, p in enumerate(experiment.participants)
+               if reads_text_grids(p, experiment)]
         if bad:
             raise ValueError(
                 f"FlagGame(modality='image') without image_text_hint=True gives no text grids, but "

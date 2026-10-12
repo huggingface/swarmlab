@@ -62,7 +62,7 @@ exp = Experiment(..., medium=Board(topology="broadcast", policies=[OddAgentsSeeN
 
 **3. A new task with the smallest World interface** (`examples/03_new_world.py`)
 ```python
-from swarmlab import World, Outcome, text_observation, tool
+from swarmlab import World, Outcome, Requirements, text_observation, tool
 
 class Counter(World):
     def reset(self, rng, agents):
@@ -88,6 +88,12 @@ To use it from YAML, save it as `myworld.py` next to the spec and write `world: 
   ```python
   @tool("choose_site", "Hold a site", {"site": lambda self: {"type": "string", "enum": self.sites}})
   def choose_site(self, agent, site): ...
+  ```
+- Declare the run settings the world needs, and a spec that breaks them fails at construction (`validate`, `run`, `prompts`, `estimate`) instead of producing meaningless numbers; override `check_experiment(experiment)` (calling `super()`) for checks that need code ([INTERFACE §8](../INTERFACE.md#8-world)):
+
+  ```python
+  class MyWorld(World):
+      requires = Requirements(commit="immediate", delivery="push", push_limit="n_agents", max_rounds="rounds")
   ```
 - State in ordinary attributes is snapshotted every round (a pickle of the instance's attributes minus `params` and `_`-prefixed ones), so resume, replay and fork need no world code.
 - Optional hooks (defaults in `swarmlab/world/base.py`): `description()` (task text for prompts), `validate` and `commit` (refusals and conflict rules), `begin_round(round)`, `end_round(round)` (resolve the round after its commit; a returned dict is logged as a `round_resolved` event that metrics can fold), `terminal()`, `my_status`/`collective_status`, `verify()` (evaluator-only truth for metrics, see [Analysis patterns](analysis.md#analysis-patterns)), `claim_key`, `killed_at`, `render_state()`, and `report_sections(arms)`.

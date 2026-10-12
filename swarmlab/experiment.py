@@ -111,7 +111,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, model_validator
 
 from . import budget as budget_mod
 from ._io import atomic_write_bytes
@@ -167,7 +167,15 @@ class Experiment(BaseModel):
     _import_dir: str | None = PrivateAttr(default=None)  # the YAML's dir (registry.add_import_dir)
 
     def __init__(self, **data: Any) -> None:
-        super().__init__(**data)
+        try:
+            super().__init__(**data)
+        except ValidationError as e:
+            # the world's requirement check (`_check_world`) as its plain ValueError, not wrapped
+            # in a ValidationError that reprs the whole input
+            errs = e.errors()
+            if len(errs) == 1 and errs[0]["loc"] == () and errs[0]["type"] == "value_error":
+                raise errs[0]["ctx"]["error"] from None
+            raise
         self.probes = [p if isinstance(p, Probe) else build_probe(p) for p in self.probes]
         names = [p.name for p in self.probes]
         if len(set(names)) != len(names):
@@ -184,6 +192,13 @@ class Experiment(BaseModel):
                 row = ensure_pricing(provider, split_model(model)[0], mid)
                 if mid in catalog_priced(provider):
                     self._pin_price(split_model(model)[0], provider, mid, row)
+
+    @model_validator(mode="after")
+    def _check_world(self) -> Experiment:
+        """The world's requirements (`World.check_experiment`, swarmlab/world/base.py), once per
+        construction; the runner checks again at run start with the resolved run options."""
+        self.world.check_experiment(self)
+        return self
 
     def _pin_price(self, prefix: str, provider: Provider, mid: str, row: tuple) -> None:
         """Record a catalog price in the provider's params so `to_spec` carries it."""
@@ -463,10 +478,13 @@ class Experiment(BaseModel):
         )
 
     @classmethod
-    def from_spec(cls, spec: RunSpec) -> Experiment:
+    def from_spec(cls, spec: RunSpec, options: dict | None = None) -> Experiment:
         medium = spec.medium.model_dump(mode="json")
+        if options is None:  # the spec's run options (minus seed and defaults)
+            options = spec.options.model_dump(mode="json", exclude={"seed"}, exclude_defaults=True)
         return cls(
             name=spec.experiment,
+            options=options,
             arm=spec.arm,
             world=build(spec.world, "swarmlab.worlds"),
             participants=[assign(build(p, "swarmlab.participants"), r) for p, r in
@@ -492,8 +510,7 @@ class Experiment(BaseModel):
         options = resolve_rounds(options, n_agents)  # M6: rounds_per_agent -> max_rounds
         spec = arm_to_runspec(doc, arm, seed=0, max_rounds=options.get("max_rounds", 1))
         import_dir = add_import_dir(Path(path).resolve().parent)  # module:Class next to the YAML
-        exp = cls.from_spec(spec)
-        exp.options = options
+        exp = cls.from_spec(spec, options)
         exp._import_dir = import_dir
         return exp
 

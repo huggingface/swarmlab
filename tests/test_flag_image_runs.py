@@ -40,16 +40,15 @@ def strip(evs):
     return [{k: v for k, v in e.items() if k != "run"} for e in evs]
 
 
-# ---- refusals at bind ------------------------------------------------------------------------
+# ---- refusals at construction (World.check_experiment) --------------------------------------
 @pytest.mark.parametrize("participant", [Silent(), EvidenceAggregator(), Enumerator(),
                                          LLMAgent(model="fake:reader"),
                                          LLMAgent(model="fake:flaggame_reader")])
 def test_text_readers_need_the_hint(tmp_path, participant):
-    exp = Experiment(name="img", world=FlagGame(modality="image"), participants=[participant] * 2,
-                     medium=Board(topology="broadcast"),
-                     providers={"fake": FakeProvider(pricing=TEST_PRICING)})
-    with pytest.raises(ValueError, match="image_text_hint=True"):
-        exp.run(seed=1, max_rounds=1, out=tmp_path)
+    with pytest.raises(ValueError, match=r"participants \['a000', 'a001'\].*image_text_hint=True"):
+        Experiment(name="img", world=FlagGame(modality="image"), participants=[participant] * 2,
+                   medium=Board(topology="broadcast"),
+                   providers={"fake": FakeProvider(pricing=TEST_PRICING)})
     # the same participants are fine with the hint, and in text mode
     for world in (FlagGame(modality="image", image_text_hint=True), FlagGame()):
         ok = Experiment(name="img", world=world, participants=[participant] * 2,
@@ -59,13 +58,15 @@ def test_text_readers_need_the_hint(tmp_path, participant):
 
 
 def test_vision_models_and_other_fake_scripts_pass_the_check():
-    exp = image_exp(2, hint=False)
+    exp = image_exp(2)  # its providers resolve the models below
     assert not reads_text_grids(LLMAgent(model="anthropic:claude-haiku-4-5"), exp)
     assert not reads_text_grids(LLMAgent(model="fake:tests.helpers:script_end_turn_first"), exp)
     assert reads_text_grids(LLMAgent(model="fake:reader"), exp)
     assert reads_text_grids(LLMAgent(model="fake:reader"))  # no experiment: default fake
-    w = FlagGame(modality="image")
-    w.check_participants({"a000": LLMAgent(model="anthropic:claude-haiku-4-5")}, exp)
+    vision = exp.model_copy(update={"participants": [LLMAgent(model="anthropic:claude-haiku-4-5")]})
+    FlagGame(modality="image").check_experiment(vision)  # no text readers: passes
+    with pytest.raises(ValueError, match=r"participants \['a000', 'a001'\]"):
+        FlagGame(modality="image").check_experiment(exp)
 
 
 # ---- acceptance 4: fake:reader with the hint -------------------------------------------------

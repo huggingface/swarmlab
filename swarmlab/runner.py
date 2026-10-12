@@ -184,10 +184,13 @@ derived from `derive(seed, "repeat", i, "agent", a, call_id)` (`RepeatSeeded`), 
 seeded providers, the fake provider and the request cache differ per repeat. World, schedule and
 topology streams never depend on the repeat.
 
-World participant check (M5): on a fresh run (and a fork at round 0), right after the participants
-are bound and roles applied and before `world.reset`, the runner calls
-`world.check_participants(participants, experiment)` when the world defines it; FlagGame's image
-modality uses it to refuse text-grid readers without `image_text_hint` (a `ValueError`).
+World requirement check: on a fresh run, a fork and a resume, right after the participants are
+bound and roles applied and before `world.reset`, the runner calls
+`world.check_experiment(view)`, where `view` is a copy of the experiment whose `options` are this
+run's resolved `RunOptions` and whose `participants` are the bound participants, in agent order.
+`Experiment` construction has already checked what it knows (swarmlab/world/base.py); this call
+adds what only the run knows: `run(commit=..., max_rounds=...)` overrides, a fork's `max_rounds`,
+role-applied participants. FlagGame's image modality check (M5) is part of its `check_experiment`.
 """
 from __future__ import annotations
 
@@ -616,9 +619,9 @@ class Runner:
             p.bind(a, agent_stream(seed, a, self.options.repeat))
         self.roles = bind_roles(self.board, self.participants, agent_roles(  # M3c
             self.spec.roles, self.spec.participant_roles, len(self.agents)))
-        check = getattr(self.world, "check_participants", None)  # M5: FlagGame image modality
-        if callable(check):
-            check(self.participants, self.experiment)
+        self.world.check_experiment(self.experiment.model_copy(update={  # world requirements
+            "options": self.options.model_dump(mode="json", exclude={"seed", "rounds_per_agent"}),
+            "participants": list(self.participants.values())}))
         self.world.reset(derive(seed, "world"), list(self.agents))
         self._set_truth()
         self._set_agents()
