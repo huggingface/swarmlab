@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+from typing import ClassVar
 
 from pydantic import BaseModel
 
@@ -20,6 +21,7 @@ class TurnUsage(BaseModel):
 
 
 class Participant(Persistable, Plugin):
+    description: ClassVar[str] = ""  # one line for `swarmlab plugins` (swarmlab/registry.py)
     agent: AgentId
     rng: random.Random
 

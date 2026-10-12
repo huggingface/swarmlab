@@ -1,5 +1,10 @@
 """Board topologies (docs/INTERFACE.md §9): who receives a post.
 
+Every topology carries the channel protocol of the `Topology` base class (`reset_agents`,
+`channels`, `channel_members`, `channel_permissions`, `default_channel`). `Broadcast`, `Gossip`,
+`Groups` and `Star` keep its defaults (no extra channels, no restrictions, posts default to
+`main`); `Tree` overrides all five.
+
 Decisions where the contract is silent:
 
 - `Gossip(k)` is directed: each author gets `k` partners for the round, drawn with
@@ -38,8 +43,8 @@ Decisions where the contract is silent:
   agent list given to `reset_agents` (the runner calls it via `roles.bind_roles` at bind, so
   killed agents never reshuffle groups); before that, from the agents passed to `recipients`.
   The layout is a cache, never snapshotted (the topology is a pure function of params and the
-  agent list). `channel_permissions(agent)` returns `(read, write)` channel lists, intersected
-  with the agent's role by `bind_roles`.
+  agent list). Tree's `channel_permissions(agent)` returns `(read, write)` channel lists (the
+  base default is None, unrestricted), intersected with the agent's role by `bind_roles`.
 """
 from __future__ import annotations
 
@@ -57,6 +62,7 @@ class Broadcast(Topology):
     """Everyone but the author (the base-class default)."""
 
     entry_point: ClassVar[str | None] = "broadcast"
+    description: ClassVar[str] = "Every post reaches everyone but its author"
 
     def __init__(self) -> None:
         pass
@@ -66,6 +72,7 @@ class Gossip(Topology):
     """Per round, each author's posts go to `k` partners drawn from the round's topology rng."""
 
     entry_point: ClassVar[str | None] = "gossip"
+    description: ClassVar[str] = "Each round, each author's posts go to k partners drawn at random"
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "_schedule")
 
     def __init__(self, k: int = 1) -> None:
@@ -98,6 +105,7 @@ class Groups(Topology):
     """Fixed groups by agent index; a post reaches the author's group minus the author."""
 
     entry_point: ClassVar[str | None] = "groups"
+    description: ClassVar[str] = "Fixed groups by agent index; a post reaches the author's group"
 
     def __init__(self, size: int) -> None:
         if size < 1:
@@ -116,6 +124,9 @@ class Star(Topology):
     """Hub and spokes: members' posts reach only the center; the center's posts reach everyone."""
 
     entry_point: ClassVar[str | None] = "star"
+    description: ClassVar[str] = (
+        "Hub and spokes: members reach only the center, the center reaches all"
+    )
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "center")
 
     def __init__(self, center: str = "a000") -> None:
@@ -133,6 +144,9 @@ class Tree(Topology):
     """Groups with coordinators and an optional coordinator-of-coordinators (`top`)."""
 
     entry_point: ClassVar[str | None] = "tree"
+    description: ClassVar[str] = (
+        "Groups with coordinators and an optional coordinator-of-coordinators"
+    )
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "groups", "coordinators", "top")
 
     def __init__(self, groups: list[list[AgentId]] | int,
@@ -238,12 +252,3 @@ class Tree(Topology):
             return []
         members = set(self.channel_members(channel))
         return [a for a in agents if a != post.agent and a in members]
-
-
-TOPOLOGIES: dict[str, type[Topology]] = {
-    "broadcast": Broadcast,
-    "gossip": Gossip,
-    "groups": Groups,
-    "star": Star,
-    "tree": Tree,
-}

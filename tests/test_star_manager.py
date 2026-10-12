@@ -8,8 +8,9 @@ from swarmlab.blobs import BlobStore
 from swarmlab.executor import RoundExecutor
 from swarmlab.ids import agent_id
 from swarmlab.medium.board import Post
-from swarmlab.medium.topology import TOPOLOGIES, Gossip, Star
+from swarmlab.medium.topology import Gossip, Star
 from swarmlab.participants import EvidenceAggregator
+from swarmlab.registry import resolve
 from swarmlab.rng import derive
 from swarmlab.roles import BUILTIN_ROLES, MANAGER, assign, resolve_role
 from swarmlab.world.flaggame import FlagGame
@@ -35,7 +36,7 @@ def test_star_recipients():
     # center not live: members reach nobody; dead members are not delivered to
     assert s.recipients(post("a002"), AGENTS[1:], 1, rng) == []
     assert s.recipients(post("a000"), ["a000", "a002"], 1, rng) == ["a002"]
-    assert TOPOLOGIES["star"] is Star
+    assert resolve("star", "swarmlab.topologies") is Star
     assert Board(topology="star").spec()["params"]["topology"] == {"type": "star",
                                                                    "params": {"center": "a000"}}
 

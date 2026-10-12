@@ -9,7 +9,8 @@ from swarmlab import Board, Experiment, Participant, Run, TurnUsage
 from swarmlab.events import parse_event
 from swarmlab.ids import agent_id
 from swarmlab.medium.board import Post
-from swarmlab.medium.topology import TOPOLOGIES, Tree
+from swarmlab.medium.topology import Tree
+from swarmlab.registry import resolve
 from swarmlab.rng import derive
 from swarmlab.roles import assign
 from swarmlab.spec import load_experiment_yaml
@@ -72,7 +73,7 @@ def test_explicit_groups_and_validation():
         Tree(groups=[["a000"], ["a001"]], coordinators=["a001", "a000"])
     with pytest.raises(ValueError):
         Tree(groups=0)
-    assert TOPOLOGIES["tree"] is Tree
+    assert resolve("tree", "swarmlab.topologies") is Tree
 
 
 def test_spec_is_snapshot_free_and_rebuilds():

@@ -4,7 +4,7 @@ All three draw randomness only from the rng passed to `bind` (the runner passes
 `derive(seed, "agent", agent)`), keep plain Python state (pickled by `Persistable`), and parse
 the world's observation with `swarmlab.world.flaggame.parse_observation` (the text parts joined
 with newlines). In FlagGame's image modality they need `image_text_hint=True` (M5): they set
-`reads_text_observation = True` and `FlagGame.check_participants` refuses them otherwise.
+`reads_text_observation = True` and `FlagGame.check_experiment` refuses them otherwise.
 
 - `Silent`: in round 1 guesses a candidate containing its crop (ties broken by its rng), then
   `end_turn`. Later rounds: `end_turn` only. Never reads or posts.
@@ -43,6 +43,9 @@ def _observation_text(view: View) -> str:
 
 class Silent(Participant):
     entry_point: ClassVar[str | None] = "silent"
+    description: ClassVar[str] = (
+        "FlagGame: guesses from its own crop in round 1; never reads or posts"
+    )
     reads_text_observation: ClassVar[bool] = True  # M5: needs image_text_hint in image mode
 
     async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
@@ -58,6 +61,9 @@ class Silent(Participant):
 
 class EvidenceAggregator(Participant):
     entry_point: ClassVar[str | None] = "evidence_aggregator"
+    description: ClassVar[str] = (
+        "FlagGame: posts its crop, reads crops, guesses the best-matching candidate"
+    )
     reads_text_observation: ClassVar[bool] = True
 
     def bind(self, agent: Any, rng: Any) -> None:
@@ -96,6 +102,9 @@ def _bare(name: str, text: str) -> bool:
 
 class Enumerator(Participant):
     entry_point: ClassVar[str | None] = "enumerator"
+    description: ClassVar[str] = (
+        "FlagGame test oracle: cycles guesses, fails if anything reveals the truth"
+    )
     reads_text_observation: ClassVar[bool] = True
 
     def __init__(self, truth_name: str | None = None) -> None:
@@ -183,6 +192,7 @@ def _cell_key(x: int, y: int, h: int, w: int, zones: tuple[int, int] | None) -> 
 
 class RowMajorPainter(Participant):
     entry_point: ClassVar[str | None] = "row_major_painter"
+    description: ClassVar[str] = "ColoringGrid: paints the first `paints` wrong cells, row by row"
 
     def __init__(self, paints: int = 1) -> None:
         self.paints = paints
@@ -201,6 +211,9 @@ class RowMajorPainter(Participant):
 
 class QueuePainter(Participant):
     entry_point: ClassVar[str | None] = "queue_painter"
+    description: ClassVar[str] = (
+        "ColoringGrid: claims random wrong cells in the registry, then paints"
+    )
 
     def __init__(self, paints: int = 1, ttl_rounds: int = 1, max_checks: int = 4) -> None:
         self.paints = paints
@@ -238,6 +251,7 @@ class QueuePainter(Participant):
 
 class RandomPainter(Participant):
     entry_point: ClassVar[str | None] = "random_painter"
+    description: ClassVar[str] = "ColoringGrid: paints `paints` random cells with random colours"
 
     def __init__(self, paints: int = 1) -> None:
         self.paints = paints

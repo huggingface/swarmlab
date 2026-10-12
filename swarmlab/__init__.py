@@ -8,10 +8,10 @@ from .participants.base import Participant, TurnUsage
 from .spec import Budget
 from .tools import AgentTools
 from .view import Observation, Part, View, text_observation
-from .world.base import Ack, Action, Outcome, World, tool
+from .world.base import Ack, Action, Outcome, Requirements, World, tool
 
 __all__ = [
     "Ack", "Action", "AgentTools", "Board", "Budget", "DelayPolicy", "Experiment", "Metric", "Observation",
-    "Outcome", "Part", "Participant", "Persistable", "Plugin", "Policy", "Run", "Topology",
+    "Outcome", "Part", "Participant", "Persistable", "Plugin", "Policy", "Requirements", "Run", "Topology",
     "TurnUsage", "View", "World", "text_observation", "tool",
 ]

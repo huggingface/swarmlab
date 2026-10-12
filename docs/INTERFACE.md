@@ -42,9 +42,11 @@ class Run:
     def load(cls, dir) -> "Run": ...            # replays the log; never calls plugins' mutating paths
 ```
 
-`participants=[EvidenceAggregator()] * 16` is valid: the runner deep-copies each prototype per agent and calls `bind`. Every plugin instance exposes `spec() -> dict` as `{"type": <entry-point name>, "params": {...}}` built from its constructor kwargs; `to_spec` serialises the experiment from those, and `from_spec` rebuilds it through entry points. A plugin defined inline in a script (no entry point) is allowed for Python use; `to_spec` records `type` as `module:Class` and `from_spec` imports it, so identity and replay still work on the same code tree.
+`participants=[EvidenceAggregator()] * 16` is valid: the runner deep-copies each prototype per agent and calls `bind`. Every plugin instance exposes `spec() -> dict` as `{"type": <entry-point name>, "params": {...}}` built from its constructor kwargs; `to_spec` serialises the experiment from those, and `from_spec` rebuilds it through entry points. A plugin defined inline in a script (no entry point) is allowed for Python use; `to_spec` records `type` as `module:Class` and `from_spec` imports it, so identity and replay still work on the same code tree. `swarmlab.registry.normalize(spec, group)` only flattens legacy nested `**kwargs` params; it keeps the given `type` spelling (entry-point name or `module:Class`) and omitted defaults, so it is not a canonical form, need not equal `Plugin.spec()`, and is used only for the fork's comparison of a stored participant spec with the same spec re-stated, not for general equality or hashing.
 
 YAML is the serialised `Experiment` plus arms: `Experiment.from_yaml(path, arm)` and the CLI build the same object and call `run`.
+
+Plugin listing (additive): every plugin base class (`Topology`, `Policy`, `Participant`, `Scheduler`, `Probe`, `Intervention`, `ClaimPolicy`; `Metric` already had it) has `description: ClassVar[str] = ""`, one line saying what the plugin does; every built-in entry point sets it (tested). `World` cannot, because `World.description()` is the agent-facing task text, so a world's line is the first line of its class docstring; a fake script (a function) likewise uses its docstring's first line. Entry points are the only name registry: there is no hand-kept name-to-class dict (`TOPOLOGIES`, `POLICIES`, `CLAIM_POLICIES` are gone), and nested medium plugins resolve like every other plugin (entry point, then `module:Class`). `swarmlab.registry.catalog(group) -> list[(name, description, "module:Class")]` lists one group (`swarmlab.worlds` or `worlds`); `swarmlab.metrics.base.catalog()` is its metrics view. `swarmlab plugins [GROUP] [--json]` prints every group in `swarmlab.registry.GROUPS` (worlds, topologies, policies, participants, metrics, claim_policies, schedulers, probes, interventions, fake_scripts); `--json` is `{"ok": true, "plugins": {group: [{"name", "description", "target"}]}}`. A plugin that fails to load is listed with `(cannot load: ...)` as its description.
 
 ## 1. Package layout
 
@@ -124,6 +126,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 | `post` | `post_id, provisional_id, channel, text, fields` | at commit, per accepted post |
 | `delivery` | `post_id, recipient, delivery_id, eligible_round, content_hash` | at commit, per fan-out |
 | `action_committed` | `action_id, action, accepted, feedback` | at commit, per buffered action |
+| `round_resolved` | `data: dict` (what `World.end_round(r)` returned; evaluator-only) | at commit, after the last `action_committed`; only when the hook returns a dict |
 | `world_changed` | `payload` (opaque) | at commit, optional |
 | `metric` | `name, value, denominator` | after fold, per metric |
 | `round_committed` | `n_posts, n_actions, n_deliveries` | last logical event of the round |
@@ -132,7 +135,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 
 **Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them and also drops `seq`, because operational events are appended as they happen and shift later sequence numbers. Acceptance tests compare logical views.
 
-**Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events are appended to the log immediately by the runner (never buffered), so an `inference_attempt` exists on disk before the model is called and spend survives an aborted round.
+**Order rule.** Turns run concurrently in live mode, but their events are buffered per agent and appended at commit in the round's seeded order, each agent's events in call order; then `post*`, `delivery*`, `action_committed*`, `round_resolved` (when `World.end_round` returned a dict), `world_changed`, `metric*`, `round_committed`, `snapshot`. Operational events are appended to the log immediately by the runner (never buffered), so an `inference_attempt` exists on disk before the model is called and spend survives an aborted round.
 
 `EventLog(path)`: `append(event) -> seq`, `__iter__`, `last_committed() -> (round, seq) | None`, `truncate_after(seq)`. One JSONL file, fsync on `round_committed`.
 
@@ -173,9 +176,29 @@ class World(Persistable, Plugin):
     def terminal(self) -> bool                          # False
     def verify(self) -> dict                            # {}
     def tool_schemas(self) -> list[ToolSchema]          # from @tool decorations plus enabled status tools
+    def tool_schema(self, name) -> ToolSchema           # one @tool schema resolved for this instance
+
+    def report_sections(self, arms: dict[str, list[Run]]) -> list[str]
+                                                        # [] (default); Markdown lines for `swarmlab report`
+    def end_round(self, round) -> dict | None            # None; after the round's world commit (below)
+    requires: ClassVar[Requirements] = Requirements()   # run settings the world needs (below)
+    def check_experiment(self, experiment) -> None      # runtime hook; default requires.check; ValueError if unmet
     # snapshot()/restore() from Persistable: pickle of __dict__ minus `params`
 ```
+`@tool` params map an argument name to a JSON type name (`"integer"`) or a full property schema; every argument is required. `description`, `params`, or any single value of a `params` dict may also be a callable `(self) -> ...` of the world instance returning the same shape, so a schema can follow constructor config (`{"site": lambda self: {"type": "string", "enum": self.sites}}`). `World.tool_schema(name) -> ToolSchema` resolves one tool for the instance and is the one authoritative hook: `tool_schemas()` and the default `validate()` both call `self.tool_schema(name)`, so the model sees, and validation checks, the same required list and enums, including those of an override. The default `validate()` checks argument names (every required one present, no extras) and `enum` membership (a value outside a property's `enum` gives `Ack(ok=False, error="bad args: <name> must be one of [...]")`, so the action is never dispatched); JSON types, ranges and anything else remain the world author's job inside the action. Schema callables run whenever a schema is built (at least once per round for advertising, since the executor reads `tool_schemas()` once per round, and again on every `validate`), so they must be pure, side-effect-free functions of constructor config (and of state fixed at `reset`, which never changes within a run), never of per-round state; per-round schema changes are out of scope. Static parts are checked at decoration time, callable parts when the schema is built (an unknown JSON type raises `ValueError` in both cases). The tool name is always static.
+
+`end_round(round) -> dict | None` (default None) is called by the runner once per round immediately after the world commit: under `round_end` after `commit_world`, under `immediate` after the last turn's commit, at the same point of the round. It runs before the round's commit events are logged and before interventions, probes, metrics, the budget event and the snapshot; its `round_resolved` event is logged after the round's last `action_committed`, so a metric folding the log in order sees every committed action before the resolution. The world may mutate its state there (resolve the round from the committed actions); the snapshot that follows captures it. A returned JSON-able dict is logged as a `round_resolved` event (`data`) that metrics may fold; None logs nothing. It is evaluator-only (never shown to agents), round-end interventions are not visible to it, and `replay()` never calls it (it folds the logged event and restores the snapshot).
+
+World requirements. `Requirements` (frozen pydantic model in `world/base.py`, every field optional, unset = no requirement): `commit: "round_end" | "immediate"`, `delivery: "pull" | "push"`, `push_limit: int | "n_agents"` (a minimum; `"n_agents"` = at least the participant count), `scheduler: str` (entry-point name or `module:Class`, matched by the class `registry.resolve(name, "swarmlab.schedulers")` returns against the class of the experiment's scheduler; an unset `scheduler` option is `SeededShuffle`), `max_rounds: int | str` (an int, or the name of a world attribute that `max_rounds` must equal, e.g. `"rounds"`), `n_agents: (min, max)` (either bound `None`). `Requirements.check(world, experiment)` raises one `ValueError` naming every violated field as `world <Name> requires <field>=<wanted>, got <actual>` (`push_limit>=`, `n_agents>=`/`<=` for bounds), joined by `; `. A world declares `requires = Requirements(...)` on the class. The two checks sit on either side of a deliberate boundary: early validation establishes the declared configuration constraints; runtime initialisation establishes participant-dependent compatibility.
+
+- Early (declarative only): `Experiment` construction (a model validator: the Python constructor, `from_spec`, `from_yaml`, so every CLI command that builds the experiment, `validate`, `run`, `prompts`, `estimate`, fails before anything runs) calls `Experiment.check_run(max_rounds=None, **overrides)`, which calls `type(world).requires.check(world, view)` on a copy of the experiment whose `options` are what `run` would merge (explicit overrides, else `options`; `rounds_per_agent` resolved; no `RunOptions` defaults filled in). `Experiment.estimate(seed, max_rounds)` and `Experiment.run(...)` call `check_run` with their arguments first, and the CLI `estimate` and `run` call it with `--max-rounds` for every arm before estimating or printing anything (exit 2). The experiment's `options` count as declared: unset `commit` is `round_end` and unset `scheduler` is `SeededShuffle`; `max_rounds` (no default) is checked only when `options` carries it or `rounds_per_agent`. `delivery`/`push_limit` come from `experiment.medium`, `n_agents` from `len(participants)`. No participant hook (`apply_role`, `check_experiment`) runs here. The error is the world's plain `ValueError`, not a pydantic `ValidationError`. `from_spec(spec, options=None)` takes the spec's run options (minus `seed` and defaults) as `options` so the check sees them.
+- Runtime: `World.check_experiment(experiment)` is the runtime hook. `Runner._init_fresh` (fresh runs, forks, resume) calls it after the participants are bound and roles applied, before `reset` and before any model call, on a copy of the experiment whose `options` are the run's resolved `RunOptions` and whose `participants` are the bound, role-applied ones, in agent order. The default calls `requires.check` again (catching `run(commit=..., max_rounds=...)` overrides, a `max_rounds` given only to `run`, and a fork's `max_rounds`); a world overrides it for imperative, participant-dependent checks, calling `super().check_experiment(experiment)` first (FlagGame's image-modality text-reader check).
+
+So `validate` and `estimate` may accept settings that a participant compatibility check rejects at run initialisation, before inference; early validation does not establish what a custom participant or `apply_role` hook will do.
+
 Constructor kwargs are stored on `self.params` and returned by `spec()`. Nothing returned by `observe`, `validate`, `commit`, status tools, or tool schemas may reveal correctness; `score` and `verify` are called only by the runner.
+
+`report_sections` (added with the generic report, additive) is evaluator-side: `swarmlab report` appends its lines after the generic "Final score" table (every scalar key of each run's recorded `score()`). It is called once per world type: the report groups runs by `run.spec.world.type` (the spec's type string) and, in sorted order of that string, builds one world from the group's first reconstructed run (not reset; constructor config only) and passes `arms` restricted to that group, mapping arm name to that arm's finished `Run`s of this type (an arm with no run of the type is absent). When the report has more than one world type, each group's lines are preceded by a `### World <type>` heading; with one type there is no heading. If a group's world cannot be built or its hook raises, the report carries a one-line `(world report sections unavailable: <error>)` note for that group instead. A run whose plugins do not import where the report is built is still reported from its recorded run.json (no replay; header line `reconstruction unavailable for <run_id>: <ErrorType>: <msg>`), is passed to its group's hook like any other run, and never hosts the world.
 
 ### FlagGame (text variant)
 
@@ -200,7 +223,15 @@ class Policy(Persistable, Plugin):
 class Topology(Persistable, Plugin):
     def recipients(self, post: "Post", agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
         return [a for a in agents if a != post.agent]   # default: broadcast
+    # channel protocol (added with Tree, M3c §2); `roles.bind_roles` and the executor call it on every topology
+    def reset_agents(self, agents: list[AgentId]) -> None: ...                  # default: no-op
+    def channels(self) -> list[str]: return []
+    def channel_members(self, channel: str) -> list[AgentId]: return []             # descriptive; not enforced
+    def channel_permissions(self, agent: AgentId) -> tuple[list[str], list[str]] | None: return None
+    def default_channel(self, agent: AgentId) -> str | None: return "main"
 ```
+
+Topology channel protocol: `bind_roles` calls `reset_agents` once at bind with the run's full agent list and appends `channels()` to the board's channels. `channel_permissions(agent)` returning `(read, write)` is intersected with the agent's role lists (an agent without a role gets an anonymous role carrying only these limits); `None` means unrestricted, so a role, if any, applies alone. `default_channel(agent)` is where `post` without a `channel` goes; `None` means the agent must name one, and the executor answers `bad args: post needs a channel, one of [<writable channels>]`, and that agent's `post` tool schema lists `channel` as required. `channel_members` lists a channel's agents; it is descriptive only and nothing enforces it: overriding it alone changes neither delivery (`recipients`) nor read/write access (`channel_permissions`), so a topology that wants membership enforced uses it from those two, as `Tree` does. `Broadcast`, `Gossip`, `Groups`, `Star` keep the defaults; `Tree` overrides all five.
 
 `medium/board.py`:
 ```python
@@ -241,6 +272,8 @@ class SeededShuffle(Scheduler)   # shuffles live with ("schedule", round)
 ```
 The commit policy is a run option read by the runner. In M1a the scheduler is always `SeededShuffle` and is not part of the run spec.
 
+The base `Scheduler` (every live agent acts every round, in agent order) is registered as `fixed` in the `swarmlab.schedulers` entry-point group, so `Scheduler().spec()` is `{"type": "fixed", "params": {}}`; schedulers named in a spec (M6 `options.scheduler`) resolve through that group, then `module:Class`, like every other plugin.
+
 ## 12. Runner
 
 `Runner(run_dir, experiment, options)` executes `live()`, `replay()`, `resume()`, `fork(at_round, experiment=None)` exactly as specified below. `Experiment.run` and `Run` wrap it; nothing else calls it. `run.json` is written before `run_started` so a directory is always resumable or removable. `Experiment.run` works inside an already-running event loop (notebooks) by running the runner in a worker thread.
@@ -252,8 +285,10 @@ for each agent concurrently (semaphore = options.concurrency):
     view = View(r, agent, world.observe(agent), outcomes_prev[agent], board.pushable(...) if push else [], executor.schemas(agent))
     run participant.turn(view, executor) with a per-agent event buffer; executor buffers posts and actions
 append each agent's buffered events in `order`
-posts, deliveries = board.commit(r, agents, derive(seed,"topology",r), blobs); log post*, delivery*
-outcomes = world.commit(actions in `order`, each agent's in call order); log action_committed*; outcomes_prev = by agent
+posts, deliveries = board.commit(r, agents, derive(seed,"topology",r), blobs)
+outcomes = world.commit(actions in `order`, each agent's in call order)
+resolved = world.end_round(r)
+log post*, delivery*, action_committed*; if resolved is a dict: log round_resolved(data=resolved); outcomes_prev = by agent
 fold metrics on this round's logical events; log metric*
 if r % snapshot_every == 0: write snapshot (so every committed round has one on disk); log round_committed; log snapshot
 ```

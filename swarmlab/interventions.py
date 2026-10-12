@@ -94,6 +94,7 @@ _MISSING = object()
 
 
 class Intervention(Persistable, Plugin):
+    description: ClassVar[str] = ""  # one line for `swarmlab plugins` (swarmlab/registry.py)
     name: str
 
     def __init__(self, *, name: str | None = None, at_round: int | list[int] | None = None,
@@ -444,6 +445,9 @@ def _pick(ctx: InterventionContext, agents: Sequence[str] | str | int) -> list[s
 
 class InjectPost(Intervention):
     entry_point: ClassVar[str | None] = "inject_post"
+    description: ClassVar[str] = (
+        "Post a message to the board (default author: `system`, not an agent)"
+    )
 
     def __init__(self, text: str, author: str = "system", channel: str = "main",
                  fields: dict | None = None, recipients: list[str] | None = None, **trigger: Any) -> None:
@@ -458,6 +462,7 @@ class InjectPost(Intervention):
 
 class DelayDelivery(Intervention):
     entry_point: ClassVar[str | None] = "delay_delivery"
+    description: ClassVar[str] = "Delay deliveries to `agents` by `rounds` extra rounds"
 
     def __init__(self, agents: list[str] | str | int, rounds: int, duration: int | None = None,
                  **trigger: Any) -> None:
@@ -470,6 +475,7 @@ class DelayDelivery(Intervention):
 
 class Mute(Intervention):
     entry_point: ClassVar[str | None] = "mute"
+    description: ClassVar[str] = "Withhold posts by `agents` for `rounds` rounds"
 
     def __init__(self, agents: list[str] | str | int, rounds: int, **trigger: Any) -> None:
         super().__init__(**trigger)
@@ -483,6 +489,7 @@ class KillAgents(Intervention):
     """`mode="kill"` (default) or `"revive"`; `agents` a list or a count of random live agents."""
 
     entry_point: ClassVar[str | None] = "kill_agents"
+    description: ClassVar[str] = 'Remove agents from the run (`mode="revive"` brings them back)'
 
     def __init__(self, agents: list[str] | str | int, mode: str = "kill", **trigger: Any) -> None:
         super().__init__(**trigger)
@@ -499,6 +506,7 @@ class KillAgents(Intervention):
 
 class PatchPrivate(Intervention):
     entry_point: ClassVar[str | None] = "patch_private"
+    description: ClassVar[str] = "Replace part of one agent's private world data"
 
     def __init__(self, agent: str, data: dict, **trigger: Any) -> None:
         super().__init__(**trigger)
@@ -512,6 +520,9 @@ class Reconfigure(Intervention):
     """`settings` are passed as `Participant.reconfigure(**settings)` to each of `agents`."""
 
     entry_point: ClassVar[str | None] = "reconfigure"
+    description: ClassVar[str] = (
+        "Change participant settings (Participant.reconfigure) for `agents`"
+    )
 
     def __init__(self, agents: list[str] | str, settings: dict, **trigger: Any) -> None:
         super().__init__(**trigger)

@@ -4,14 +4,16 @@ What the framework ships (worlds, topologies, participants, providers, metrics, 
 
 ## Components
 
-- **Worlds**: `flaggame` (belief dynamics: hidden flag, one crop per agent, `guess` action; text or image crops, see [Flag Game modalities](flag-game.md#flag-game-modalities); optional blind agents, see [Flag Game protocols](flag-game.md#flag-game-protocols)), `coloring` (allocation: a grid to paint, with claims and a registry). New worlds subclass `World` (example 3).
-- **Topologies** (`medium: {topology: ...}`): `broadcast`, `gossip`, `groups`, `star` (members reach only the center, the center reaches everyone, `params: {center: a000}`), `tree` (coordinators over worker groups, `params: {groups: 3}`). See [Flag Game protocols](flag-game.md#flag-game-protocols).
-- **Policies**: `delay` (messages arrive k rounds late) and your own `Policy` subclasses (example 2). **Registry** with `advisory` or `enforced` claim policies for the coloring task.
-- **Participants**: scripted (`evidence_aggregator`, `enumerator`, `silent`, `row_major_painter`, `queue_painter`, `random_painter`) and `llm` (`LLMAgent`: memory window, `context_limit_tokens` with `drop_oldest`/`summarize`/`fail_turn` overflow, prompt params, `max_calls`, `extra` passthrough).
-- **Providers** (model id prefix): `anthropic`, `hf` (HF router), `openai`, `vllm` (self-hosted, normally via `job run`), `fake` (`fake:reader`, `fake:painter`: deterministic, no network).
-- **Probes**: `belief` (each agent's own model answers "which candidate?" every round, out of band, billed to `measurement_usd`).
-- **Interventions** (`interventions:` in a spec, triggered by `at_round`, `every` or a metric `when`): `inject_post`, `delay_delivery`, `mute`, `kill_agents`, `patch_private`, `reconfigure`. **Paired runs** from round 0: `Experiment.pair(...)` with unchanged-pair controls.
-- **Metrics**: `belief.consensus`, `belief.accuracy`, `belief.polarization`, `belief.entropy` (from world guesses, or from probes with `params: {source: "probe:belief"}`); `comm.read_rate`, `comm.post_rate` (share of turns with a post), `comm.posts_per_round` (posts per agent per round), `comm.posts_total` (swarm-wide posts per round), `comm.hops`; `coloring.coverage`, `coloring.duplicate_paints`, `coloring.wrong_paints`, `coloring.parallel_efficiency`; `claims.violations`, `claims.held`. `swarmlab metrics` lists them all with one-line descriptions.
+The names below are examples. Run `swarmlab plugins` for the complete list of every group with one-line descriptions (`swarmlab plugins topologies` for one group).
+
+- **Worlds**: for example `flaggame` (belief dynamics: hidden flag, one crop per agent, `guess` action; text or image crops, see [Flag Game modalities](flag-game.md#flag-game-modalities); optional blind agents, see [Flag Game protocols](flag-game.md#flag-game-protocols)) and `coloring` (allocation: a grid to paint, with claims and a registry). New worlds subclass `World` (example 3). Run `swarmlab plugins worlds` for the complete list.
+- **Topologies** (`medium: {topology: ...}`): for example `broadcast`, `gossip`, `star` (members reach only the center, the center reaches everyone, `params: {center: a000}`) and `tree` (coordinators over worker groups, `params: {groups: 3}`). See [Flag Game protocols](flag-game.md#flag-game-protocols). Run `swarmlab plugins topologies` for the complete list. A custom `Topology` subclass overrides `recipients` and may override the channel hooks `reset_agents`, `channels`, `channel_members`, `channel_permissions` and `default_channel` to add board channels, restrict who reads and writes them, and pick where a channel-less `post` goes (`None` makes the agent name a channel); see [INTERFACE §9](../INTERFACE.md#9-medium).
+- **Policies**: for example `delay` (messages arrive k rounds late), and your own `Policy` subclasses (example 2). **Registry** with claim policies such as `advisory` or `enforced` for the coloring task. Run `swarmlab plugins` for the complete list (`policies`, `claim_policies`).
+- **Participants**: scripted baselines such as `evidence_aggregator` or `row_major_painter`, and `llm` (`LLMAgent`: memory window, `context_limit_tokens` with `drop_oldest`/`summarize`/`fail_turn` overflow, prompt params, `max_calls`, `extra` passthrough). Run `swarmlab plugins participants` for the complete list.
+- **Providers** (model id prefix): `anthropic`, `hf` (HF router), `openai`, `vllm` (self-hosted, normally via `job run`), `fake` (for example `fake:reader` or `fake:painter`: deterministic, no network; `swarmlab plugins fake_scripts` lists the scripts).
+- **Probes**: for example `belief` (each agent's own model answers "which candidate?" every round, out of band, billed to `measurement_usd`). Run `swarmlab plugins probes` for the complete list.
+- **Interventions** (`interventions:` in a spec, triggered by `at_round`, `every` or a metric `when`): for example `inject_post`, `mute` or `kill_agents`. Run `swarmlab plugins interventions` for the complete list. **Paired runs** from round 0: `Experiment.pair(...)` with unchanged-pair controls.
+- **Metrics**: for example `belief.consensus` and `belief.accuracy` (from world guesses, or from probes with `params: {source: "probe:belief"}`), `comm.read_rate`, `comm.posts_per_round` (posts per agent per round) and `coloring.coverage`. Run `swarmlab plugins metrics` (or `swarmlab metrics`) for the complete list with one-line descriptions.
 - **Roles** (`roles:` plus `role:` per participant group): built-ins `worker`, `coordinator`, `reviewer`, `skeptic`, `scribe`, `manager`; each can restrict tools, channels, registry access and world actions, add prompt text, or override the model.
 - **Run control**: replay (checks metrics and score from the log), resume, fork at a round (optionally with an edited spec), budgets (soft, hard, measurement, experiment total), per-call timeout and retry.
 - **Export and publish**: Parquet tables, pi-format sessions and raw logs; private Hub dataset per experiment; static `view.html`; `fetch-published` restores a run.
@@ -60,7 +62,7 @@ exp = Experiment(..., medium=Board(topology="broadcast", policies=[OddAgentsSeeN
 
 **3. A new task with the smallest World interface** (`examples/03_new_world.py`)
 ```python
-from swarmlab import World, Outcome, text_observation, tool
+from swarmlab import World, Outcome, Requirements, text_observation, tool
 
 class Counter(World):
     def reset(self, rng, agents):
@@ -81,10 +83,23 @@ To use it from YAML, save it as `myworld.py` next to the spec and write `world: 
 ## Writing a world
 
 - Required: `reset(rng, agents)`, `observe(agent)`, `score()` and at least one `@tool` action returning an `Outcome` (example 3). A world in your own module is used from YAML as `world: {type: "mymodule:MyWorld", params: {...}}`.
+- A tool's `params` (or any one param, or its `description`) may be a function of the world instance, so the schema follows constructor config and `validate` checks the same thing:
+
+  ```python
+  @tool("choose_site", "Hold a site", {"site": lambda self: {"type": "string", "enum": self.sites}})
+  def choose_site(self, agent, site): ...
+  ```
+- Declare the run settings the world needs, and a spec that breaks them fails at construction (`validate`, `run`, `prompts`, `estimate`) instead of producing meaningless numbers. Checks that depend on the participants (what a model or custom agent can read, after roles apply) go in a `check_experiment(experiment)` override (calling `super()`): the runner calls it at run initialisation on the bound, role-applied participants, before any inference, so `validate` and `estimate` may accept a spec that it then refuses ([INTERFACE §8](../INTERFACE.md#8-world)):
+
+  ```python
+  class MyWorld(World):
+      requires = Requirements(commit="immediate", delivery="push", push_limit="n_agents", max_rounds="rounds")
+  ```
 - State in ordinary attributes is snapshotted every round (a pickle of the instance's attributes minus `params` and `_`-prefixed ones), so resume, replay and fork need no world code.
-- Optional hooks (defaults in `swarmlab/world/base.py`): `description()` (task text for prompts), `validate` and `commit` (refusals and conflict rules), `begin_round(round)`, `terminal()`, `my_status`/`collective_status`, `verify()` (evaluator-only truth for metrics, see [Analysis patterns](analysis.md#analysis-patterns)), `claim_key`, `killed_at`, and `render_state()`.
+- Optional hooks (defaults in `swarmlab/world/base.py`): `description()` (task text for prompts), `validate` and `commit` (refusals and conflict rules), `begin_round(round)`, `end_round(round)` (resolve the round after its commit; a returned dict is logged as a `round_resolved` event that metrics can fold), `terminal()`, `my_status`/`collective_status`, `verify()` (evaluator-only truth for metrics, see [Analysis patterns](analysis.md#analysis-patterns)), `claim_key`, `killed_at`, `render_state()`, and `report_sections(arms)`.
 - `Outcome.feedback` reaches the agent and the `actions` table: put there what you will analyse per decision, never correctness.
 - `render_state() -> dict | None` fills the "World state" panel of `view.html`: the builder restores a fresh world from each round's snapshot and shows what it returns. A `grid` (list of equal-length rows) is drawn as coloured cells with `palette` (cell value -> CSS colour; other 2-D lists are drawn too when `palette` is given), a list of flat dicts as a table, other values as key/value rows. `coloring` returns its current and target grids; FlagGame returns None (it has its own panel).
+- `report_sections(arms) -> list[str]` adds the world's own Markdown sections to `swarmlab report`, after the generic "Final score" table (which already lists every scalar key of each run's recorded `score()`, so most worlds need no hook). `arms` maps arm name to its finished `Run`s of this world type (`run.score`, `run.metrics`, `run.events`); it is called once per world type on a world built from that type's first reconstructed run, not reset, so use constructor config and read per-run state from the runs. With several world types in one runs dir, each type's lines get a `### World <type>` heading.
 
 ## Changing what agents are told
 

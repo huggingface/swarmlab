@@ -23,7 +23,8 @@ Decisions where the contract is silent:
   `turn_started`, `tool_called`, `inference_attempt`, `round_started`). JSON-valued fields
   (`args`, `result`, `fields`, `parsed`, `feedback`, ...) are JSON text columns.
 - **Families.** As listed in the contract, plus `other`: every event whose type no family
-  covers (`world_changed`, `budget_changed`, `overflow`, unknown types) as `type` + `payload`
+  covers (`world_changed`, `budget_changed`, `overflow`, `round_resolved`
+  (payload `{"data": ...}`), unknown types) as `type` + `payload`
   JSON, so every logged event is represented somewhere. Event types folded into a family row:
   `turn_started`/`turn_ended` -> `turns`, `tool_called`/`tool_returned` -> `tool_calls`,
   `inference_attempt`/`inference_response` -> `inference` (paired by `call_id` in log order; a

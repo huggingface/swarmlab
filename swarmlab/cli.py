@@ -111,7 +111,11 @@ Decisions where the contract is silent:
   rounds, probes, metrics) and the total cap; `--json` has the same per arm (`models`,
   `budget`, `probes`, ...) plus `total_usd`.
 - `metrics` lists every registered metric (`swarmlab.metrics` entry points) with its class's
-  `description`.
+  `description`; it is the `metrics` group of `plugins`, kept with its own note on belief sources.
+- `plugins [GROUP]` lists every plugin group (`swarmlab.registry.GROUPS`, short names such as
+  `worlds`) with each entry point's name and one-line description (`swarmlab.registry.catalog`),
+  or one group. `--json`: `{"ok", "plugins": {group: [{"name", "description", "target"}]}}`,
+  `target` being `module:Class`. An unknown GROUP is a usage error (exit 2).
 - `spec-reference` prints the spec reference (docs/guide/spec-reference.md) (every YAML key, its shape and
   default; swarmlab/spec_reference.py); `--readme docs/guide/spec-reference.md` rewrites that block in place.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
@@ -271,6 +275,15 @@ def _fail(e: BaseException, code: int, as_json: bool) -> None:
     if as_json:
         typer.echo(json.dumps({"ok": False, "error": msg, "exit_code": code}))
     raise typer.Exit(code)
+
+
+def _check_run(exp: Experiment, spec: Path, max_rounds: int | None) -> None:
+    """`Experiment.check_run` with the CLI's `--max-rounds`, its `ValueError` as a `SpecError`
+    (exit 2, like `validate`), so `estimate` and `run` refuse before estimating or starting."""
+    try:
+        exp.check_run(max_rounds)
+    except ValueError as e:
+        raise SpecError(f"{spec}: arm {exp.arm!r}: {type(e).__name__}: {e}") from e
 
 
 def _estimate(exp: Experiment, seed: int, max_rounds: int | None,
@@ -579,6 +592,7 @@ def run(
         for a, exp in exps.items():
             if max_rounds is None and "max_rounds" not in exp.options:
                 raise SpecError(f"{spec}: arm {a!r}: no max_rounds in options; pass --max-rounds")
+            _check_run(exp, spec, max_rounds)  # the world's requirements, with --max-rounds
         ests = {a: _estimate(exp, seeds[0], max_rounds) for a, exp in exps.items()}
         total_cap = float(doc["budget"].get("total_usd") or 0)
         if total_cap > 0:
@@ -841,8 +855,11 @@ def estimate(
             raise SpecError(f"{spec}: unknown arm {arm!r}; available: {sorted(doc['arms'])}")
         arms = [arm] if arm is not None else list(doc["arms"])
         seeds = [seed] if seed is not None else experiment_seeds(doc)
-        ests = {a: _estimate(_build(spec, a), seeds[0], max_rounds, calls_per_turn, prompt_growth,
-                             measured) for a in arms}
+        exps = {a: _build(spec, a) for a in arms}
+        for exp in exps.values():
+            _check_run(exp, spec, max_rounds)  # the world's requirements, with --max-rounds
+        ests = {a: _estimate(exp, seeds[0], max_rounds, calls_per_turn, prompt_growth, measured)
+                for a, exp in exps.items()}
         note = _measured_text(measured) if measured else None
         if seed is not None and len(arms) == 1:  # the single-run form: one estimate dict
             est = ests[arms[0]]
@@ -1424,7 +1441,38 @@ def metrics_cmd(as_json: JsonOpt = False) -> None:
         lines = [f"{n:<{width}}  {d}" for n, d in rows]
         lines.append('belief.* metrics read world guesses by default; add params {source: '
                      '"probe:belief"} to read the belief probe (metric name gets "@probe:belief").')
+        lines.append("See also `swarmlab plugins` for every plugin group.")
         return {"text": "\n".join(lines)}
+
+    _execute(go, as_json)
+
+
+@app.command("plugins")
+def plugins_cmd(
+    group: Annotated[str | None, typer.Argument(
+        help="One group (worlds, topologies, policies, participants, metrics, claim_policies, "
+             "schedulers, probes, interventions, fake_scripts); default: all.")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """List every plugin (entry points) by group, with a one-line description."""
+    from .registry import GROUPS, catalog
+
+    def go() -> dict[str, Any]:
+        short = [g.removeprefix("swarmlab.") for g in GROUPS]
+        if group is not None and group.removeprefix("swarmlab.") not in short:
+            raise SpecError(f"unknown plugin group {group!r}; groups: {', '.join(short)}")
+        names = short if group is None else [group.removeprefix("swarmlab.")]
+        rows = {g: catalog(g) for g in names}
+        if as_json:
+            return {"ok": True, "plugins": {
+                g: [{"name": n, "description": d, "target": t} for n, d, t in r]
+                for g, r in rows.items()}}
+        blocks = []
+        for g, r in rows.items():
+            width = max((len(n) for n, _, _ in r), default=0)
+            body = [f"  {n:<{width}}  {d}" for n, d, _ in r] or ["  (none installed)"]
+            blocks.append("\n".join([f"{g} (swarmlab.{g})", *body]))
+        return {"text": "\n\n".join(blocks)}
 
     _execute(go, as_json)
 

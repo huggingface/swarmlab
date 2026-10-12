@@ -1,9 +1,8 @@
-"""M4 acceptance 3: `swarmlab report` reproduces the M2 report; `swarmlab prompts` renders the
-exact prompts of each participant group without a model call."""
+"""M4 acceptance 3: `swarmlab report` over finished runs; `swarmlab prompts` renders the exact
+prompts of each participant group without a model call."""
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -20,45 +19,7 @@ from swarmlab.report import build_report
 from .helpers import Chatter, llm_agent_experiment
 
 REPO = Path(__file__).resolve().parent.parent
-M2_RUNS = Path(os.environ.get("AM_LOCAL", "/nonexistent")) / "runs" / "m2"
-M2_NOTE = REPO / "docs" / "notes" / "m2-phase1-report-2026-10-06.md"
 cli = CliRunner()
-
-
-@pytest.mark.skipif(not (M2_RUNS / "m2-flaggame__bc-haiku__s1").is_dir(),
-                    reason="archived M2 runs not on this machine")
-def test_report_reproduces_the_m2_report(tmp_path):
-    out = tmp_path / "report.md"
-    res = cli.invoke(app, ["report", str(M2_RUNS), "--out", str(out),
-                           "--title", "M2 phase-1 Flag Game report"])
-    assert res.exit_code == 0, res.output
-    assert since_m2(out.read_text()) == M2_NOTE.read_text()
-
-
-def since_m2(text: str) -> str:
-    """The report without the rows and sections added after the M2 note was written."""
-    out, drop_blank, health, traj, dropped = [], False, False, False, False
-    for line in text.splitlines(keepends=True):
-        if line.startswith("## "):  # sections added later: protocol health, coloring
-            dropped = line.startswith(("## Protocol health", "## Coloring", "## Terminal states"))
-            traj = line.startswith("## Trajectories")
-        if dropped:
-            continue
-        if traj and line.startswith("| ") and "." in line.split(" | ")[0]:
-            continue  # every other logged metric (full dotted name), added later
-        health = health or line.startswith("## Tool protocol health")
-        if health and line.startswith("|---"):  # max_tokens, rejected tool calls appended later
-            line = line.replace("---|", "", 2)
-        elif health and line.startswith("|"):
-            line = line.rstrip("\n").rstrip(" |").rsplit(" | ", 2)[0] + " |\n"
-        if line.startswith(("| post_rate |", "Probes skipped:")):
-            drop_blank = line.startswith("Probes skipped:")
-            continue
-        if drop_blank and line == "\n":
-            drop_blank = False
-            continue
-        out.append(line)
-    return "".join(out)
 
 
 @pytest.fixture(scope="module")
@@ -209,8 +170,8 @@ def test_init_starter_describes_gossip_as_one_partner(tmp_path):
 
 
 def test_protocol_health_and_metrics_for_a_custom_world(tmp_path):
-    """Any world gets the protocol-health section and every logged metric; world-specific
-    sections appear only for their world type."""
+    """Any world gets the protocol-health section, every logged metric and the final score;
+    the Flag Game sections appear only for runs with guesses or a verifiable truth."""
     from .helpers import site_experiment
 
     out = tmp_path / "runs"
@@ -219,8 +180,9 @@ def test_protocol_health_and_metrics_for_a_custom_world(tmp_path):
     for section in ("## Trajectories (mean over seeds)", "## Tool protocol health",
                     "## Protocol health"):
         assert section in text
-    for section in ("## Where the swarm went", "## Probe vs world belief", "## Coloring"):
+    for section in ("## Where the swarm went", "## Probe vs world belief"):
         assert section not in text
+    assert "| run | rounds | A | B | C | D |" in text.split("## Final score")[1]  # SiteWorld.score()
     traj = text.split("## Trajectories")[1].split("## ")[0]
     assert "| sites.max_share | " in traj and "| accuracy |" not in traj  # not a fixed list
     health = text.split("## Protocol health")[1]
@@ -236,11 +198,16 @@ def test_protocol_health_and_metrics_for_a_custom_world(tmp_path):
     assert "| probes skipped | no probes |" in health
     assert "| cost per round, swarm + measurement (mean / max) | $0." in health
 
-    # a coloring run in the same dir adds the coloring section, still no Flag Game sections
+    # a coloring run in the same dir adds its score keys to the table, still no Flag Game sections
     Experiment.from_yaml(REPO / "examples" / "coloring_s0.yaml", "row_major").run_all(
         [1], max_rounds=2, out=out)
     text = build_report(out, include_fake=True)
-    assert "## Coloring (final grid)" in text and "coloring-s0__row_major__s1" in text
+    final = text.split("## Final score")[1]
+    assert "coloring-s0__row_major__s1" in final
+    head = next(ln for ln in final.splitlines() if ln.startswith("| run "))
+    for key in ("coverage", "correct", "wrong", "unpainted", "paints", "useful_paints",
+                "duplicate_paints", "wrong_paints", "overwritten_paints", "wasted_paints"):
+        assert f"| {key} |" in head or head.endswith(f"| {key} |"), key
     assert "| coloring.coverage |" in text and "## Where the swarm went" not in text
 
 

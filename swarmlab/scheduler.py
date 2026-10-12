@@ -8,6 +8,11 @@ Decisions where the contract is silent:
 
 - The base class returns `live` unchanged (agent order), so a subclass that wants a fixed order
   needs no code. `SeededShuffle` copies `live` and shuffles it with the passed rng.
+- The base class is registered as `fixed` (entry point in `swarmlab.schedulers`): every live agent
+  acts every round, in agent order a000, a001, ...; `Scheduler().spec()` is
+  `{"type": "fixed", "params": {}}`. A run.json holding the older `swarmlab.scheduler:Scheduler`
+  still resolves through `module:Class`. Subclasses keep their own name or `module:Class`
+  (`entry_point` counts only where it is defined, swarmlab/base.py).
 - The scheduler is not part of `RunSpec` in M1a; the runner always uses `SeededShuffle`. It is
   still snapshotted under the key `"scheduler"` so stateful schedulers can be added later.
 
@@ -19,7 +24,9 @@ gives the speaker's single listener. Selection (decisions where the contract is 
 
 - `RunOptions.scheduler` (a plugin spec, `None` = `SeededShuffle`) picks the scheduler; it is left
   out of the serialised options while `None`, so earlier spec hashes are unchanged.
-  `build_scheduler(spec)` resolves it (entry point, then `module:Class`).
+  `build_scheduler(spec)` resolves it through `registry.build(spec, "swarmlab.schedulers")` (entry
+  point, then `module:Class`); there is no separate name table. An unknown name raises the
+  registry's `ValueError`; a class that is not a `Scheduler` raises `TypeError`.
 - `listeners` is checked, not used: the runner refuses a `gossip` topology whose `k` differs from
   `listeners` (any other topology is allowed and decides the recipients itself).
 - `turns_per_round(n)` says how many turns a round runs for `n` live agents (`n` by default, 1
@@ -33,9 +40,15 @@ from typing import Any, ClassVar
 
 from .base import Persistable, Plugin
 from .ids import AgentId
+from .registry import build
 
 
 class Scheduler(Persistable, Plugin):
+    """Every live agent acts every round, in agent order (entry point `fixed`)."""
+
+    entry_point: ClassVar[str | None] = "fixed"
+    description: ClassVar[str] = "Every live agent acts every round, in agent order a000, a001, ..."
+
     def turns_per_round(self, n: int) -> int:
         """Turns a round runs with `n` live agents (used by `swarmlab estimate`)."""
         return n
@@ -46,6 +59,9 @@ class Scheduler(Persistable, Plugin):
 
 class SeededShuffle(Scheduler):
     entry_point: ClassVar[str | None] = "seeded_shuffle"
+    description: ClassVar[str] = (
+        "Every live agent acts each round, in a seeded random order (default)"
+    )
 
     def order(self, round: int, live: list[AgentId], rng: random.Random) -> list[AgentId]:
         out = list(live)
@@ -57,6 +73,9 @@ class OneSpeaker(Scheduler):
     """One uniformly drawn live agent acts per round (the Flag Game paper's pairwise step)."""
 
     entry_point: ClassVar[str | None] = "one_speaker"
+    description: ClassVar[str] = (
+        "One uniformly drawn live agent acts per round (the Flag Game paper's pairwise step)"
+    )
 
     def __init__(self, listeners: int = 1) -> None:
         if not isinstance(listeners, int) or isinstance(listeners, bool) or listeners < 1:
@@ -70,26 +89,17 @@ class OneSpeaker(Scheduler):
         return min(1, n)
 
 
-SCHEDULERS: dict[str, type[Scheduler]] = {"seeded_shuffle": SeededShuffle, "one_speaker": OneSpeaker}
-
-
 def build_scheduler(spec: Any = None) -> Scheduler:
-    """A scheduler from `RunOptions.scheduler` (`None` -> `SeededShuffle`, a name, a
-    `{type, params}` mapping or a `PluginSpec`)."""
+    """A scheduler from `RunOptions.scheduler`: `None` -> `SeededShuffle`, a `Scheduler` instance
+    as is, else a name, a `{type, params}` mapping or a `PluginSpec`, built by
+    `registry.build(spec, "swarmlab.schedulers")` (entry point, then `module:Class`)."""
     if spec is None:
         return SeededShuffle()
     if isinstance(spec, Scheduler):
         return spec
     if isinstance(spec, str):
         spec = {"type": spec, "params": {}}
-    elif not isinstance(spec, dict):
-        spec = {"type": spec.type, "params": dict(spec.params)}
-    cls = SCHEDULERS.get(spec["type"])
-    if cls is None:
-        from .registry import resolve
-
-        cls = resolve(spec["type"], "swarmlab.schedulers")
-    sched = cls(**dict(spec.get("params") or {}))
+    sched = build(spec, "swarmlab.schedulers")
     if not isinstance(sched, Scheduler):
-        raise TypeError(f"{spec!r} does not build a Scheduler")
+        raise TypeError(f"scheduler {spec!r} builds a {type(sched).__qualname__}, not a Scheduler")
     return sched
