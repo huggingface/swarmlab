@@ -105,7 +105,13 @@ current count and whether the site scored in the round just resolved, plus that 
 points.
 
 Snapshots carry game state only (assignment, trial key, round, positions, the choices of this
-round, resolved rounds); constructor config is kept on restore, as in ColoringGrid.
+round, resolved rounds); constructor config is kept on restore, as in ColoringGrid. So a fork or
+resume under an edited spec of the same world type keeps the new `rounds`, `show_history` and
+`permute` (`permute` only matters at reset, so it has no effect after a restore; `rounds` must
+still equal `max_rounds`). The site set cannot change: `restore` raises `ValueError` when the
+restored assignment's sites differ from the configured `n_sites` labels, before any schema is
+advertised or action accepted. Changed `probabilities` over the same labels are not detected and
+have no effect: the hidden assignment comes from the snapshot.
 
 Fake script
 -----------
@@ -326,6 +332,17 @@ class HiddenSites(World):
 
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = (
         "params", "probabilities", "n_sites", "rounds", "show_history", "permute", "sites")
+
+    def restore(self, blob: bytes) -> None:
+        """Restore game state, then refuse a site set that differs from the configured one."""
+        super().restore(blob)
+        restored = list(self.assignment)
+        if set(restored) != set(self.sites) or len(restored) != self.n_sites:
+            raise ValueError(
+                f"hidden_sites: the snapshot has sites {', '.join(restored) or 'none'} but this "
+                f"world is configured with sites {', '.join(self.sites)}; n_sites/probabilities "
+                "(the site set) cannot change across a fork or resume (rounds, show_history and "
+                "permute can)")
 
     # ---- lifecycle ---------------------------------------------------------------------------
     def reset(self, rng: random.Random, agents: list[AgentId]) -> None:

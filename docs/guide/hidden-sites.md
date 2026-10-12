@@ -44,6 +44,10 @@ Agent `a`'s attempt at site `k` in round `r` succeeds iff `derive(trial_key, "tr
 
 Round r is resolved by the world's `end_round` hook, right after the round's last commit, from the positions then in force. The resolution (`W`, `R`, the site counts and each attempt's outcome) is logged as a `round_resolved` event, after the round's `action_committed` events; agents never see it.
 
+## Forks and resumes
+
+The world's snapshot carries only game state (the hidden assignment, trial key, positions, this round's choices and the resolved rounds); constructor params come from the spec the fork or resume runs under. A fork into the same world type may change `rounds` (with `max_rounds` to match), `show_history` and `permute` (which only acts at reset, so it changes nothing after the fork round). It may not change the site set: restoring a snapshot whose sites differ from the configured `n_sites` labels raises `ValueError` before any turn. Different `probabilities` over the same number of sites are not detected and have no effect, since the hidden assignment comes from the snapshot.
+
 ## Metrics
 
 All four fold the `round_resolved` events, so `swarmlab replay` reproduces them; the denominator is the number of agents holding a site.

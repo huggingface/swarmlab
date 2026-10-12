@@ -22,6 +22,7 @@ from swarmlab.world.hidden_sites import (
     ALREADY_CHOSE,
     DEFAULT_PROBABILITIES,
     POINTS_PENDING,
+    POSITION_PREFIX,
     ActualCum,
     ActualPoints,
     ExpectedCum,
@@ -574,3 +575,58 @@ def test_report_section_shows_references(tmp_path):
                             f"{ref['all_at_best']['W']:.3f} | {ref['random']['W']:.3f} | "
                             f"{ref['optimum']['W']:.3f} |")
 
+
+# ---- fork and resume under an edited world --------------------------------------------------
+
+def _fork_parent(tmp_path, rounds=4):
+    exp = api_experiment(rounds=rounds, commit="immediate")
+    return exp, exp.run(seed=2, max_rounds=rounds, out=tmp_path / "p")
+
+
+def _edited(exp, world):
+    return Experiment(name=exp.name, world=world, participants=list(exp.participants),
+                      metrics=METRIC_NAMES, options={"commit": "immediate"})
+
+
+def test_fork_into_a_different_site_set_is_rejected_at_restore(tmp_path):
+    exp, parent = _fork_parent(tmp_path)
+    three = HiddenSites(probabilities=[0.5, 0.3, 0.2], n_sites=3, rounds=4)
+    with pytest.raises(ValueError, match=r"sites A, B, C, D, E, F, G, H but this world is "
+                       r"configured with sites A, B, C; n_sites/probabilities \(the site set\) "
+                       r"cannot change across a fork or resume"):
+        parent.fork(1, experiment=_edited(exp, three)).run(out=tmp_path / "f")
+    child = next((tmp_path / "f").iterdir())
+    log = child / "events.jsonl"
+    events = [json.loads(line) for line in log.read_text().splitlines()]
+    assert all(e["round"] <= 1 for e in events)              # nothing ran after the fork round
+    assert not any(e["type"] == "run_started" and e.get("parent_run") for e in events)
+    # the restore check itself, without a runner
+    w = make(seed=1)
+    small = HiddenSites(probabilities=[0.5, 0.3, 0.2], n_sites=3)
+    with pytest.raises(ValueError, match="cannot change across a fork or resume"):
+        small.restore(w.snapshot())
+
+
+@pytest.mark.parametrize("edit", [{"rounds": 6}, {"rounds": 6, "show_history": False}])
+def test_fork_with_changed_rounds_or_history_continues(tmp_path, edit):
+    exp, parent = _fork_parent(tmp_path)
+    child = parent.fork(1, experiment=_edited(exp, HiddenSites(**edit))).run(
+        out=tmp_path / "f", max_rounds=6)
+    assert child.meta["status"] == "ended" and child.meta["restored"]["world"] is True
+    assert len(child.score["W_by_round"]) == 6
+    assert child.score["assignment"] == parent.score["assignment"]
+    from swarmlab.blobs import BlobStore
+    from swarmlab.providers.base import text_of
+
+    blobs = BlobStore(child.dir / "blobs")
+    shown = []                                     # the latest observation of each live request
+    for e in child.events_all:
+        if e.type == "inference_attempt" and e.round > 1:
+            req = ChatRequest.model_validate_json(blobs.get(e.request_hash))
+            shown.append(next(text_of(m.content) for m in reversed(req.messages)
+                              if m.role == "user" and POSITION_PREFIX in text_of(m.content)))
+    assert shown
+    for text in shown:
+        obs = parse_observation(text)
+        assert obs["rounds"] == 6 and obs["round"] > 1, text
+        assert ("history" in obs) == edit.get("show_history", True)
