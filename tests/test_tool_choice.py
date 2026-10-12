@@ -100,6 +100,38 @@ def test_tool_choice_in_extra_too_is_a_conflict():
     # without the field, extra still passes through unchanged
     raw = {"type": "function", "function": {"name": "guess"}}
     assert build_body(req(model="hf:m", tools=[GUESS], extra={"tool_choice": raw}))["tool_choice"] == raw
+    nested = {"extra_body": {"tool_choice": raw}}
+    assert build_body(req(model="hf:m", tools=[GUESS], extra=nested))["tool_choice"] == raw
+    assert build_kwargs(req(tools=[GUESS], extra=nested))["extra_body"] == {"tool_choice": raw}
+
+
+def test_tool_choice_in_nested_extra_body_is_a_conflict():
+    weaken = {"extra_body": {"tool_choice": "auto"}}
+    with pytest.raises(ValueError, match="also in extra"):
+        req(model="hf:m", tools=[GUESS], tool_choice=FORCE, extra=weaken)
+    # set after construction: every adapter catches it before anything is sent
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=completion({"content": "hi"}))
+
+    r = req(model="hf:m", tools=[GUESS], tool_choice=FORCE)
+    r.extra = weaken
+    with pytest.raises(ValueError, match="also in extra"):
+        asyncio.run(compat(handler).complete(r))
+    assert sent == []
+    a = req(tools=[GUESS], tool_choice=FORCE)
+    a.extra = {"extra_body": {"tool_choice": {"type": "auto"}}}
+    stub = stub_provider([anthropic_message()])
+    with pytest.raises(ValueError, match="also in extra"):
+        asyncio.run(stub.complete(a))
+    assert stub._client.messages.kwargs == []
+    # other extra_body fields still go along with a forced choice
+    ok = req(model="hf:m", tools=[GUESS], tool_choice=FORCE, extra={"extra_body": {"top_k": 20}})
+    body = build_body(ok)
+    assert body["top_k"] == 20
+    assert body["tool_choice"] == {"type": "function", "function": {"name": "guess"}}
 
 
 # ---- fake provider ---------------------------------------------------------------------------------

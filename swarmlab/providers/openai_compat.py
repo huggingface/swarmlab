@@ -27,7 +27,7 @@ Mapping:
   from `ToolSchema.normalized()`) and `tool_choice: "auto"` when `tool_protocol == "native"` and
   tools are present; `tool_choice: {"type": "function", "function": {"name": <name>}}` instead
   when `ChatRequest.tool_choice` names a tool (checked by `base.check_tool_choice`: the tool must
-  be offered, the protocol native, and `extra` must not carry its own `tool_choice`).
+  be offered, the protocol native, and `extra` must not carry its own `tool_choice`, top level or in `extra_body`).
 - `max_tokens`, `temperature`, `top_p`, `seed` when given; `thinking_budget` is ignored; `extra`
   is merged into the body last, as top-level body fields. This is the provider passthrough:
   Qwen3 on DeepInfra/vLLM/SGLang turns thinking off with

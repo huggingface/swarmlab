@@ -57,7 +57,8 @@ Decisions where the contract is silent:
   every adapter applies before sending (and `ChatRequest` applies at construction): the named tool
   must be among `request.tools`, `tool_protocol` must be `native` (under `json` no native tools
   are sent, so the choice cannot be honoured; it is an error, never dropped or downgraded to
-  auto), and `extra` must not also carry a `tool_choice` key. Each adapter owns the wire format
+  auto), and `extra` must not also carry a `tool_choice` key (top level or in its nested
+  `extra_body` dict). Each adapter owns the wire format
   (Anthropic `{"type": "tool", "name"}`, OpenAI-compatible `{"type": "function", "function":
   {"name"}}`), so a provider-specific `tool_choice` in `extra` is no longer the way to force a
   tool (it still passes through unchanged when `tool_choice` is None). `tool_choice` is in
@@ -155,8 +156,11 @@ class ChatRequest(BaseModel):
 def check_tool_choice(request: ChatRequest) -> str | None:
     """The forced tool's name, or None; raises `ValueError` when it cannot be honoured.
 
-    Adapters call this before sending (a request changed after construction, e.g. by attribute
-    assignment, is not re-validated by pydantic)."""
+    `extra` must not carry its own `tool_choice`, at the top level or inside the nested
+    `extra_body` dict (the OpenAI-compatible adapter flattens it into the body last, and the
+    Anthropic SDK merges an `extra_body` kwarg into the JSON body), since either would override
+    the forced choice. Adapters call this before sending (a request changed after construction,
+    e.g. by attribute assignment, is not re-validated by pydantic)."""
     choice = request.tool_choice
     if choice is None:
         return None
@@ -167,7 +171,8 @@ def check_tool_choice(request: ChatRequest) -> str | None:
     if choice.name not in names:
         raise ValueError(f"tool_choice names {choice.name!r}, which is not among the request's "
                          f"tools {names}")
-    if "tool_choice" in request.extra:
+    nested = request.extra.get("extra_body")
+    if "tool_choice" in request.extra or (isinstance(nested, dict) and "tool_choice" in nested):
         raise ValueError("tool_choice is set on the request and also in extra; drop the extra one "
                          "(the adapter owns the provider's tool_choice format)")
     return choice.name
