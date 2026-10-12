@@ -87,6 +87,17 @@ def test_base_scheduler_is_described():
     assert registry.describe(Scheduler)
 
 
+def test_describe_does_not_inherit():
+    class Quiet(Scheduler):
+        pass
+
+    class Documented(Scheduler):
+        """Own docstring wins over the parent's description."""
+
+    assert registry.describe(Quiet) == ""
+    assert registry.describe(Documented) == "Own docstring wins over the parent's description"
+
+
 def test_catalog_short_group_name_and_metrics_alias():
     assert registry.catalog("topologies") == registry.catalog("swarmlab.topologies")
     assert metrics_catalog() == [(n, d) for n, d, _ in registry.catalog("metrics")]

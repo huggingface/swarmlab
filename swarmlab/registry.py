@@ -24,12 +24,13 @@ no hand-kept name-to-class dict).
 
 `catalog(group)` lists a group for `swarmlab plugins` (and `swarmlab metrics`): every entry point
 as `(name, description, target)`, sorted by name, where `target` is the entry point's
-`module:Class` and `description` comes from `describe`: the plugin's `description` class
-attribute when it is a non-empty string, else the first line of the object's own docstring
-(trailing period stripped), else `""`. Every plugin base class defines `description` as `""`, so a
-subclass that sets neither is listed without a description; the docstring is also what describes
-worlds (whose `description()` is the agent-facing task text, a method, not a string) and fake
-scripts (functions). A plugin that fails to load is listed with `(cannot load: ...)`. `group`
+`module:Class` and `description` comes from `describe`: a non-empty string `description`
+defined on the class itself (not inherited, as `Plugin.type_name` honours `entry_point`), else the
+first line of the class's own docstring (trailing period stripped), else `""`. Nothing is
+inherited, so a subclass that sets neither is listed without a description rather than with its
+parent's. The docstring is also what describes worlds (whose `description()` is the agent-facing
+task text, a method, not a string) and fake scripts (functions, whose `description` and
+`__doc__` are read directly). A plugin that fails to load is listed with `(cannot load: ...)`. `group`
 is the full name (`swarmlab.worlds`) or the short one (`worlds`); `GROUPS` are the groups
 `swarmlab plugins` lists.
 
@@ -140,10 +141,13 @@ def full_group(group: str) -> str:
 
 def describe(obj: Any) -> str:
     """One-line description of a plugin class or function (see the module docstring)."""
-    desc = getattr(obj, "description", None)
+    own = vars(obj) if isinstance(obj, type) else {
+        "description": getattr(obj, "description", None), "__doc__": getattr(obj, "__doc__", None)}
+    desc = own.get("description")
     if isinstance(desc, str) and desc.strip():
         return desc.strip()
-    doc = (getattr(obj, "__doc__", None) or "").strip()
+    doc = own.get("__doc__")
+    doc = doc.strip() if isinstance(doc, str) else ""
     return doc.splitlines()[0].strip().removesuffix(".") if doc else ""
 
 
