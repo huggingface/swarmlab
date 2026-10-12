@@ -46,6 +46,8 @@ class Run:
 
 YAML is the serialised `Experiment` plus arms: `Experiment.from_yaml(path, arm)` and the CLI build the same object and call `run`.
 
+Plugin listing (additive): every plugin base class (`Topology`, `Policy`, `Participant`, `Scheduler`, `Probe`, `Intervention`, `ClaimPolicy`; `Metric` already had it) has `description: ClassVar[str] = ""`, one line saying what the plugin does; every built-in entry point sets it (tested). `World` cannot, because `World.description()` is the agent-facing task text, so a world's line is the first line of its class docstring; a fake script (a function) likewise uses its docstring's first line. Entry points are the only name registry: there is no hand-kept name-to-class dict (`TOPOLOGIES`, `POLICIES`, `CLAIM_POLICIES` are gone), and nested medium plugins resolve like every other plugin (entry point, then `module:Class`). `swarmlab.registry.catalog(group) -> list[(name, description, "module:Class")]` lists one group (`swarmlab.worlds` or `worlds`); `swarmlab.metrics.base.catalog()` is its metrics view. `swarmlab plugins [GROUP] [--json]` prints every group in `swarmlab.registry.GROUPS` (worlds, topologies, policies, participants, metrics, claim_policies, schedulers, probes, interventions, fake_scripts); `--json` is `{"ok": true, "plugins": {group: [{"name", "description", "target"}]}}`. A plugin that fails to load is listed with `(cannot load: ...)` as its description.
+
 ## 1. Package layout
 
 ```

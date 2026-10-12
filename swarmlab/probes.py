@@ -153,6 +153,7 @@ def parse_json_object(text: str) -> dict | None:
 class Probe(Plugin):
     """Base class. Subclasses set `name`/`template` and implement `parse`."""
 
+    description: ClassVar[str] = ""  # one line for `swarmlab plugins` (swarmlab/registry.py)
     name: str = "probe"
     every: int = 1
     template: str = ""
@@ -175,6 +176,7 @@ class BeliefProbe(Probe):
     """Ask for the agent's current belief; ok requires a string `candidate`."""
 
     entry_point: ClassVar[str | None] = "belief"
+    description: ClassVar[str] = "Ask each agent for its current belief (a candidate name)"
 
     def __init__(self, every: int = 1, coder_model: str | None = None, name: str = "belief",
                  question: str = BELIEF_QUESTION) -> None:

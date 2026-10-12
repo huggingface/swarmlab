@@ -13,7 +13,7 @@ so a topology that wants membership to matter must use it from those two (as `Tr
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from ..base import Persistable, Plugin
 from ..ids import AgentId
@@ -23,12 +23,16 @@ if TYPE_CHECKING:
 
 
 class Policy(Persistable, Plugin):
+    description: ClassVar[str] = ""  # one line for `swarmlab plugins` (swarmlab/registry.py)
+
     def apply(self, reader: AgentId, post: Post, round: int) -> tuple[int, str] | None:
         """Return (eligible_round, content) or None to withhold. Default: next round, unchanged."""
         return round + 1, post.text
 
 
 class Topology(Persistable, Plugin):
+    description: ClassVar[str] = ""  # one line for `swarmlab plugins` (swarmlab/registry.py)
+
     def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
         """Default: broadcast to everyone but the author."""
         return [a for a in agents if a != post.agent]

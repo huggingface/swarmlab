@@ -403,6 +403,8 @@ def _check_blind(blind: list[str] | int | None) -> list[str] | int:
 
 
 class FlagGame(World):
+    """Find the hidden flag among named candidates; each agent sees one crop of it."""
+
     entry_point: ClassVar[str | None] = "flaggame"
     name: str = "flaggame"
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", *_CONFIG)

@@ -7,7 +7,7 @@ The [project README](../README.md) is the overview. These pages are the referenc
 | page | read it when you want to |
 |---|---|
 | [Getting started](guide/getting-started.md) | install, run the free starter, understand skipped and repeated run dirs, install the experimenter skill |
-| [Building experiments](guide/building-experiments.md) | see every built-in world, topology, participant, provider, probe, intervention, metric and role; use the Python API; write a new world; change agents' prompts |
+| [Building experiments](guide/building-experiments.md) | see example worlds, topologies, participants, providers, probes, interventions, metrics and roles (`swarmlab plugins` lists every component); use the Python API; write a new world; change agents' prompts |
 | [The Flag Game](guide/flag-game.md) | run image or text crops, the broadcast / gossip / manager protocols, or the paper replication |
 | [Real models and budgets](guide/real-models.md) | pick a model id, set keys, read prices, tune timeouts, preflight, set reasoning controls, size `soft_usd` / `hard_usd` / `total_usd` |
 | [Spec reference](guide/spec-reference.md) | look up any YAML key, its shape and default (generated from the pydantic models) |

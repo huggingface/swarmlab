@@ -425,6 +425,7 @@ def _result_payload(res: Any) -> dict:
 
 class LLMAgent(Participant):
     entry_point: ClassVar[str | None] = "llm"
+    description: ClassVar[str] = "An LLM agent: calls a model with the view and tools each turn"
 
     def __init__(
         self,

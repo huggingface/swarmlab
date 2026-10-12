@@ -107,7 +107,11 @@ Decisions where the contract is silent:
   rounds, probes, metrics) and the total cap; `--json` has the same per arm (`models`,
   `budget`, `probes`, ...) plus `total_usd`.
 - `metrics` lists every registered metric (`swarmlab.metrics` entry points) with its class's
-  `description`.
+  `description`; it is the `metrics` group of `plugins`, kept with its own note on belief sources.
+- `plugins [GROUP]` lists every plugin group (`swarmlab.registry.GROUPS`, short names such as
+  `worlds`) with each entry point's name and one-line description (`swarmlab.registry.catalog`),
+  or one group. `--json`: `{"ok", "plugins": {group: [{"name", "description", "target"}]}}`,
+  `target` being `module:Class`. An unknown GROUP is a usage error (exit 2).
 - `spec-reference` prints the spec reference (docs/guide/spec-reference.md) (every YAML key, its shape and
   default; swarmlab/spec_reference.py); `--readme docs/guide/spec-reference.md` rewrites that block in place.
 - `models`, `doctor`, `init` are documented in their own modules (`providers/catalog.py`,
@@ -1407,7 +1411,38 @@ def metrics_cmd(as_json: JsonOpt = False) -> None:
         lines = [f"{n:<{width}}  {d}" for n, d in rows]
         lines.append('belief.* metrics read world guesses by default; add params {source: '
                      '"probe:belief"} to read the belief probe (metric name gets "@probe:belief").')
+        lines.append("See also `swarmlab plugins` for every plugin group.")
         return {"text": "\n".join(lines)}
+
+    _execute(go, as_json)
+
+
+@app.command("plugins")
+def plugins_cmd(
+    group: Annotated[str | None, typer.Argument(
+        help="One group (worlds, topologies, policies, participants, metrics, claim_policies, "
+             "schedulers, probes, interventions, fake_scripts); default: all.")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """List every plugin (entry points) by group, with a one-line description."""
+    from .registry import GROUPS, catalog
+
+    def go() -> dict[str, Any]:
+        short = [g.removeprefix("swarmlab.") for g in GROUPS]
+        if group is not None and group.removeprefix("swarmlab.") not in short:
+            raise SpecError(f"unknown plugin group {group!r}; groups: {', '.join(short)}")
+        names = short if group is None else [group.removeprefix("swarmlab.")]
+        rows = {g: catalog(g) for g in names}
+        if as_json:
+            return {"ok": True, "plugins": {
+                g: [{"name": n, "description": d, "target": t} for n, d, t in r]
+                for g, r in rows.items()}}
+        blocks = []
+        for g, r in rows.items():
+            width = max((len(n) for n, _, _ in r), default=0)
+            body = [f"  {n:<{width}}  {d}" for n, d, _ in r] or ["  (none installed)"]
+            blocks.append("\n".join([f"{g} (swarmlab.{g})", *body]))
+        return {"text": "\n\n".join(blocks)}
 
     _execute(go, as_json)
 

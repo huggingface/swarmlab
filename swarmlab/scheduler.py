@@ -59,6 +59,9 @@ class Scheduler(Persistable, Plugin):
 
 class SeededShuffle(Scheduler):
     entry_point: ClassVar[str | None] = "seeded_shuffle"
+    description: ClassVar[str] = (
+        "Every live agent acts each round, in a seeded random order (default)"
+    )
 
     def order(self, round: int, live: list[AgentId], rng: random.Random) -> list[AgentId]:
         out = list(live)
@@ -70,6 +73,9 @@ class OneSpeaker(Scheduler):
     """One uniformly drawn live agent acts per round (the Flag Game paper's pairwise step)."""
 
     entry_point: ClassVar[str | None] = "one_speaker"
+    description: ClassVar[str] = (
+        "One uniformly drawn live agent acts per round (the Flag Game paper's pairwise step)"
+    )
 
     def __init__(self, listeners: int = 1) -> None:
         if not isinstance(listeners, int) or isinstance(listeners, bool) or listeners < 1:

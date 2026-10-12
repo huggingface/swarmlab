@@ -2,7 +2,8 @@
 
 Additions after M1a:
 
-- `description` (class attribute): one line shown by `swarmlab metrics` (`catalog()`).
+- `description` (class attribute): one line shown by `swarmlab metrics` (`catalog()`) and
+  `swarmlab plugins` (`swarmlab.registry.catalog`).
 - `METRICS_REV` and `Metric.use_rev(rev)`: the revision of metric semantics a run was recorded
   with. New runs record `metrics_rev: METRICS_REV` in `run.json`; a run without it is revision 1
   and the runner calls `use_rev(1)` on every metric when it replays, resumes or reports on such a
@@ -21,6 +22,7 @@ from importlib.metadata import entry_points
 from typing import Any, ClassVar
 
 from ..base import Persistable, Plugin
+from ..registry import catalog as group_catalog
 
 METRICS_REV = 2
 
@@ -79,14 +81,7 @@ class Metric(Persistable, Plugin):
 
 def catalog() -> list[tuple[str, str]]:
     """(entry-point name, description) of every registered metric, sorted by name."""
-    out = []
-    for ep in entry_points(group="swarmlab.metrics"):
-        try:
-            desc = getattr(ep.load(), "description", "") or ""
-        except Exception as e:  # noqa: BLE001 - a broken plugin is listed, not fatal
-            desc = f"(cannot load: {type(e).__name__}: {e})"
-        out.append((ep.name, desc))
-    return sorted(out)
+    return [(name, desc) for name, desc, _ in group_catalog("swarmlab.metrics")]
 
 
 def get(name: str, **params: Any) -> Metric:

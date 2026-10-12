@@ -152,6 +152,10 @@ def _response(request: ChatRequest, rng: random.Random, calls: list[tuple[str, d
 
 
 def flaggame_reader(request: ChatRequest, rng: random.Random) -> ChatResponse:
+    """FakeProvider script for FlagGame: post the crop, read the board, guess the best candidate.
+
+    The full behaviour is in the module docstring (built-in `flaggame_reader`).
+    """
     tools = {t.name for t in request.tools}
     msgs = request.messages
     # json-protocol tool results come back as user messages starting with "[tool results]"
