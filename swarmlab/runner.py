@@ -146,7 +146,7 @@ nested spec matches); the world is restored when its `type` equals the parent's 
 keeps its own constructor config across restore, so e.g. a changed `guess_limit` applies to the
 continuation; a world whose snapshot carries config would revert it); a participant is restored
 only when its spec equals the parent's spec for that agent (the parent's params read through
-`registry.flat_params`, so run.json files with the older nested `**kwargs` form still match), else
+`registry.normalize`, so run.json files with the older nested `**kwargs` form still match), else
 it starts fresh (bound, no memory); a metric is restored when its spec is in the parent's metric
 list, else it starts fresh at the fork round. The number of participants must not change.
 
@@ -239,7 +239,7 @@ from .metrics.base import METRICS_REV, Metric
 from .metrics.base import get as get_metric
 from .probes import CODER_SYSTEM, Probe, build_probe, probe_messages
 from .providers.base import ChatMessage, ChatRequest, ProviderError
-from .registry import flat_params, resolve
+from .registry import normalize
 from .rng import derive
 from .roles import agent_roles, bind_roles
 from .scheduler import build_scheduler
@@ -304,19 +304,6 @@ def build_metric(m: str | Metric) -> Metric:
 
 def metric_spec(m: Metric) -> PluginSpec:
     return PluginSpec(**m.spec())
-
-
-def flat_participants(spec: RunSpec) -> RunSpec:
-    """`spec` with each participant's params as `Plugin.spec()` writes them now (`flat_params`)."""
-    parts = []
-    for p in spec.participants:
-        try:
-            cls = resolve(p.type, "swarmlab.participants")
-        except (ImportError, AttributeError, ValueError):
-            parts.append(p)
-            continue
-        parts.append(p.model_copy(update={"params": flat_params(cls, p.params)}))
-    return spec.model_copy(update={"participants": parts})
 
 
 def agent_stream(seed: int, agent: str, repeat: int = 0) -> random.Random:
@@ -899,7 +886,9 @@ class Runner:
         meta = self._read_meta()
         if meta is None:
             raise ValueError(f"{self.dir} is not a run directory")
-        parent_spec = flat_participants(RunSpec.model_validate(meta["spec"]))
+        parent_spec = RunSpec.model_validate(meta["spec"])
+        parent_spec = parent_spec.model_copy(update={"participants": [
+            PluginSpec(**normalize(p, "swarmlab.participants")) for p in parent_spec.participants]})
         parent_id = meta["run_id"]
         if at_round == 0:
             return self._fork_at_zero(parent_spec, parent_id, experiment, out, max_rounds)

@@ -14,7 +14,8 @@ from swarmlab import (
 )
 from swarmlab.base import _plain
 from swarmlab.ids import ActionId, AgentId
-from swarmlab.registry import build
+from swarmlab.registry import build, normalize
+from swarmlab.spec import PluginSpec
 
 
 class Counter(World):
@@ -147,6 +148,23 @@ def test_build_accepts_nested_var_keyword_form():
     g = build(old, "swarmlab.participants")
     assert (g.a, g.d) == (5, 1)
     assert g.spec() == Forwarder(d=1, a=5, c="y").spec()
+
+
+def test_normalize_flattens_nested_var_keyword_form():
+    old = {"type": "tests.test_base:Forwarder", "params": {"d": 1, "extra": {"a": 5, "c": "y"}}}
+    flat = Forwarder(d=1, a=5, c="y").spec()
+    assert normalize(old, "swarmlab.participants") == flat
+    assert normalize(PluginSpec(**old), "swarmlab.participants") == flat
+    assert normalize(flat, "swarmlab.participants") == flat
+
+
+def test_normalize_keeps_params_of_an_unresolvable_type():
+    spec = {"type": "no_such_plugin", "params": {"kwargs": {"a": 1}}}
+    assert normalize(spec, "swarmlab.participants") == spec
+    assert normalize({"type": "no_such_plugin"}, "swarmlab.participants") == {
+        "type": "no_such_plugin", "params": {}}
+    with pytest.raises(ValueError):
+        build(spec, "swarmlab.participants")
 
 
 def test_spec_without_init_is_empty_params():

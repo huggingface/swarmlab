@@ -68,6 +68,7 @@ llm = "swarmlab.participants.llm:LLMAgent"
 "claims.held" = "swarmlab.metrics.coloring:ClaimsHeld"
 
 [project.entry-points."swarmlab.schedulers"]
+fixed = "swarmlab.scheduler:Scheduler"
 seeded_shuffle = "swarmlab.scheduler:SeededShuffle"
 one_speaker = "swarmlab.scheduler:OneSpeaker"
 

@@ -15,6 +15,8 @@ Scope: run the paper's three protocols as specified in `docs/flag-game-paper-set
 
 `OneSpeaker(listeners: int = 1)` scheduler (`scheduler.py`, entry point `one_speaker`): each round exactly one live agent acts (seeded from `("schedule", round)`), i.e. a round is one of the paper's asynchronous steps. Used with `commit: immediate` and `topology: gossip(k=1)`, whose partner draw for that round gives the single listener. `options.max_rounds = kappa * N` is written by the spec author; the spec gains `options.rounds_per_agent: int | None` as sugar (`max_rounds = rounds_per_agent * N` when set). Probes under this scheduler run every `probes_every` rounds (existing `every`); the spec sets `every: N`.
 
+`options.scheduler` resolves through the `swarmlab.schedulers` entry-point group (then `module:Class`), the same path as every other plugin: built-ins are `seeded_shuffle` (the default when unset), `one_speaker`, and `fixed` (the base `Scheduler`, every live agent in agent order).
+
 ## 3. Memory: last H received messages
 
 `LLMAgent(memory="received", memory_messages: int = 8)`: the context is the system prompt, the current observation (crop re-shown every call, as in the paper), and the last `memory_messages` delivered board items (oldest to newest) as a single user-visible block, plus the agent's own previous guesses as a short list. No tool-call history is kept across turns. Works with push delivery (`delivery: push`, `push_limit: memory_messages`) so the agent need not call `read_board`; pull still works. `probe_context()` returns the same construction.
