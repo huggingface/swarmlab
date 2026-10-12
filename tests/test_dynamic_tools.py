@@ -105,3 +105,68 @@ def test_experiment_run_and_prompts_show_the_instance_enum(tmp_path):
     assert {t.name: t for t in view.tools}["pick"].parameters["properties"]["x"]["enum"] == [0, 1, 2, 3, 4, 5]
     (row,) = render_prompts(exp)
     assert '"enum": [0, 1, 2, 3, 4, 5]' in row["system"]
+
+
+class Extended(Picker):
+    """Overrides the public hook to add a required `why` argument to `pick`."""
+
+    def tool_schema(self, name):
+        s = super().tool_schema(name)
+        if name != "pick":
+            return s
+        params = dict(s.parameters)
+        params["properties"] = {**params["properties"], "why": {"type": "string"}}
+        params["required"] = [*params["required"], "why"]
+        return s.model_copy(update={"parameters": params})
+
+
+def test_tool_schema_override_is_advertised_and_validated():
+    w = Extended(3)
+    w.reset(random.Random(0), [A])
+    (pick,) = [s for s in w.tool_schemas() if s.name == "pick"]
+    assert pick.parameters["required"] == ["x", "why"]
+    ack = w.validate(A, Action(name="pick", args={"x": 0}))
+    assert not ack.ok and "missing=['why']" in ack.error
+    assert w.validate(A, Action(name="pick", args={"x": 0, "why": "because"})).ok
+
+
+def test_validate_enforces_the_resolved_enum():
+    w = make(2)
+    assert w.validate(A, Action(name="pick", args={"x": 0})).ok
+    assert w.validate(A, Action(name="pick", args={"x": 1})).ok
+    ack = w.validate(A, Action(name="pick", args={"x": 999}))
+    assert not ack.ok and ack.error == "bad args: x must be one of [0, 1]"
+    assert not w.validate(A, Action(name="pick", args={"x": 2})).ok  # just past the boundary
+
+
+class PickOutOfRange(Participant):
+    """Calls `pick` with a value outside the enum, then a valid one."""
+
+    async def turn(self, view, tools):
+        await tools.call("pick", {"x": 999})
+        await tools.call("pick", {"x": 0})
+
+
+def test_out_of_enum_call_is_refused_and_never_committed(tmp_path):
+    run = Experiment(name="pick", world=Picker(n=2), participants=[PickOutOfRange()]).run(
+        seed=0, max_rounds=1, out=tmp_path)
+    assert run.score["picks"] == [0]
+    committed = [e for e in run.events if e["type"] == "action_committed"]
+    assert len(committed) == 1
+    rets = [e for e in run.events if e["type"] == "tool_returned"]
+    assert rets[0]["result"]["ok"] is False
+    assert rets[0]["result"]["error"] == "bad args: x must be one of [0, 1]"
+
+
+def test_schema_callbacks_are_called_with_the_instance_and_stable():
+    seen = []
+
+    class Spy(Picker):
+        @tool("spy", "Spy", {"y": lambda self: seen.append(self) or {"type": "integer", "enum": [self.n]}})
+        def spy(self, agent, y) -> Outcome:
+            return Outcome(accepted=True)
+
+    w = Spy(3)
+    w.reset(random.Random(0), [A])
+    assert w.tool_schema("spy") == w.tool_schema("spy")
+    assert seen and all(s is w for s in seen)
