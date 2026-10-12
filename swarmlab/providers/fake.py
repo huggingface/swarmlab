@@ -39,7 +39,8 @@ calls include the named tool gets the first such call moved to the front; a resp
 gets a call to it prepended, whose args are the response text when that text is a JSON object (the
 text is then cleared: the answer moves into the call, which is what a JSON-answering script such as
 `cascade_herder` means) and `{}` otherwise. Its id is `fake_<8 hex>` from
-`derive(<request hash>, "fake_tool_choice")`, so the script's own rng draws are unchanged.
+`derive(<request hash>, "fake_tool_choice")`, so the script's own rng draws are unchanged. A
+refused response (`finish_reason == "refusal"`) is left as it is: a refusal is not a tool call.
 
 Tool-call ids are `fake_<8 hex from the rng>`. Under `tool_protocol == "json"` the calls are
 returned as a JSON array `[{"name", "args"}]` in `text` instead of `tool_calls`; earlier calls are
@@ -318,7 +319,7 @@ class FakeProvider(Provider):
         rng = derive(int(h[:8], 16), "fake")
         forced = check_tool_choice(request)  # before the script: an impossible choice is an error
         resp = self.script_for(request)(request, rng)
-        if forced:
+        if forced and resp.finish_reason != "refusal":
             resp = _force_tool(request, resp, int(h[:8], 16))
         usage = resp.usage
         if usage == Usage():

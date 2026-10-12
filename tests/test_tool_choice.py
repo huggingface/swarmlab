@@ -144,6 +144,17 @@ def test_fake_provider_honours_tool_choice():
     assert _fake("script_guesses", tool_choice=FORCE).tool_calls == _fake("script_guesses").tool_calls
 
 
+def script_refuses(request, rng):
+    from .helpers import _refusal
+
+    return _refusal(request)
+
+
+def test_fake_provider_leaves_a_refusal_unforced():
+    r = _fake("script_refuses", tool_choice=FORCE)
+    assert r.finish_reason == "refusal" and r.tool_calls == [] and r.refusal is not None
+
+
 def test_fake_provider_forces_a_tool_the_script_did_not_call():
     r = _fake("script_reads_then_guesses", tool_choice=ToolChoice(name="read_board"))
     assert [c.name for c in r.tool_calls] == ["read_board", "guess"]
