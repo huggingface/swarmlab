@@ -26,6 +26,7 @@ swarmlab = "swarmlab.cli:app"
 flaggame = "swarmlab.world.flaggame:FlagGame"
 coloring = "swarmlab.world.coloring:ColoringGrid"
 hidden_sites = "swarmlab.world.hidden_sites:HiddenSites"
+cascade = "swarmlab.world.cascade:CascadeWorld"
 
 [project.entry-points."swarmlab.claim_policies"]
 advisory = "swarmlab.medium.registry:Advisory"
@@ -50,6 +51,7 @@ row_major_painter = "swarmlab.participants.scripted:RowMajorPainter"
 queue_painter = "swarmlab.participants.scripted:QueuePainter"
 random_painter = "swarmlab.participants.scripted:RandomPainter"
 llm = "swarmlab.participants.llm:LLMAgent"
+cascade_worker = "swarmlab.participants.cascade:CascadeWorker"
 
 [project.entry-points."swarmlab.metrics"]
 "belief.accuracy" = "swarmlab.metrics.belief:Accuracy"
@@ -98,6 +100,7 @@ fake = "swarmlab.providers.fake:FakeProvider"
 flaggame_reader = "swarmlab.providers.fake:flaggame_reader"
 painter = "swarmlab.world.coloring:fake_painter"
 hidden_chooser = "swarmlab.world.hidden_sites:fake_chooser"
+cascade_herder = "swarmlab.world.cascade:fake_herder"
 
 [build-system]
 requires = ["hatchling"]
