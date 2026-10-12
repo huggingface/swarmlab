@@ -1,0 +1,47 @@
+# Rooms: Flag Game with communication restricted to named rooms (Rooms topology).
+# 9 LLM agents (a000..a008) in three rooms of three. `isolated` keeps the rooms disjoint;
+# `bridged` adds a002 to blue and a005 to green, so a red -> blue -> green chain exists only
+# through those two shared members. A post reaches only the room it is posted on; a member of
+# several rooms must name the room (`post` without a channel is rejected for it).
+#
+#   swarmlab validate examples/rooms_flaggame.yaml
+#   swarmlab prompts examples/rooms_flaggame.yaml --arm bridged    # see a002's channel enum
+#   swarmlab run examples/rooms_flaggame.yaml --yes                # both arms, every seed
+#
+# Runs on the deterministic fake provider (`fake:reader`: no network, no spend). For a real
+# model, replace `model: "fake:reader"` (the &llm anchor below) with e.g.
+# "anthropic:claude-haiku-4-5" (needs ANTHROPIC_API_KEY), run `swarmlab estimate` and set a
+# real `budget` first. The scripted fake posts its crop once, in its first room, and never
+# relays, so under it the bridges barely matter; comparing the arms needs a real model.
+name: rooms-flaggame
+seeds: [1, 2]
+budget: {soft_usd: 0, hard_usd: 1.0, measurement_usd: 0}   # fake pricing (1, 5, 0.1) per M tokens
+options:
+  max_rounds: 6
+arms:
+  isolated:
+    world: {type: flaggame, params: {n_candidates: 8, rival_edits: 1}}
+    participants:
+      - {type: llm, count: 9, params: &llm {model: "fake:reader", max_tokens: 256, max_calls: 4}}
+    medium:
+      topology:
+        type: rooms
+        params:
+          rooms:
+            red: [a000, a001, a002]
+            blue: [a003, a004, a005]
+            green: [a006, a007, a008]
+    metrics: [belief.consensus, belief.accuracy, comm.read_rate, comm.posts_per_round]
+  bridged:
+    world: {type: flaggame, params: {n_candidates: 8, rival_edits: 1}}
+    participants:
+      - {type: llm, count: 9, params: *llm}
+    medium:
+      topology:
+        type: rooms
+        params:
+          rooms:
+            red: [a000, a001, a002]
+            blue: [a002, a003, a004, a005]
+            green: [a005, a006, a007, a008]
+    metrics: [belief.consensus, belief.accuracy, comm.read_rate, comm.posts_per_round]

@@ -3,7 +3,7 @@
 Every topology carries the channel protocol of the `Topology` base class (`reset_agents`,
 `channels`, `channel_members`, `channel_permissions`, `default_channel`). `Broadcast`, `Gossip`,
 `Groups` and `Star` keep its defaults (no extra channels, no restrictions, posts default to
-`main`); `Tree` overrides all five.
+`main`); `Tree` and `Rooms` override all five.
 
 Decisions where the contract is silent:
 
@@ -45,6 +45,21 @@ Decisions where the contract is silent:
   The layout is a cache, never snapshotted (the topology is a pure function of params and the
   agent list). Tree's `channel_permissions(agent)` returns `(read, write)` channel lists (the
   base default is None, unrestricted), intersected with the agent's role by `bind_roles`.
+- `Rooms(rooms={name: [agents]})`: named rooms with fixed membership. Each room is a board
+  channel (added by `bind_roles`, like Tree's); an agent may be in several rooms or in none.
+  `channel_permissions(agent)` = the rooms it is in, for both read and write, so with or without
+  a role an agent can only read and post in its rooms (a role can narrow this further, never
+  widen it), and an agent in no room has no board tools. `recipients(post)` = the live members of
+  the post's room minus the author, so a member of two rooms reaches only the room it posts on:
+  information crosses rooms only when a shared member repeats it. `default_channel(agent)` is the
+  agent's room when it is in exactly one, else None, and the executor rejects `post` without a
+  channel from an agent in several rooms (`bad args` naming its rooms) rather than picking one.
+  A post on a channel that is not a room goes to the author's default room, or to nobody. Room
+  names are any non-empty strings; each room lists at least one agent, each agent at most once;
+  `reset_agents` rejects members that are not agents of the run. Room names are exposed in
+  alphabetical order (`channels()`, `channel_permissions()`, hence the board's channel list and
+  the `post` enum), so equivalent mappings behave identically and a reconstructed run keeps its
+  channel order. Pure function of params; no snapshot.
 """
 from __future__ import annotations
 
@@ -252,3 +267,58 @@ class Tree(Topology):
             return []
         members = set(self.channel_members(channel))
         return [a for a in agents if a != post.agent and a in members]
+
+
+class Rooms(Topology):
+    """Named rooms with fixed membership; an agent may be in several rooms or in none.
+
+    Room names are exposed in alphabetical order whatever the order of the `rooms` mapping, so
+    equivalent mappings behave identically (spec hashing sorts keys) and a run reconstructed from
+    run.json keeps its channel order.
+    """
+
+    entry_point: ClassVar[str | None] = "rooms"
+    description: ClassVar[str] = "Named rooms with fixed membership; an agent may be in several rooms or none"
+    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "rooms")
+
+    def __init__(self, rooms: dict[str, list[AgentId]]) -> None:
+        if not isinstance(rooms, dict) or not rooms:
+            raise TypeError(f"Rooms rooms must be a non-empty mapping of room -> agents, got {rooms!r}")
+        for name in rooms:
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"room names must be non-empty strings, got {name!r}")
+        self.rooms: dict[str, list[AgentId]] = {}  # canonical: sorted by room name
+        for name, members in sorted(rooms.items()):
+            if isinstance(members, str) or not isinstance(members, (list, tuple)) or not members:
+                raise ValueError(f"room {name!r} must list at least one agent, got {members!r}")
+            if len(set(members)) != len(members):
+                raise ValueError(f"room {name!r} lists an agent twice")
+            self.rooms[name] = [AgentId(a) for a in members]
+
+    def reset_agents(self, agents: list[AgentId]) -> None:
+        """Check that every member is one of the run's agents."""
+        unknown = sorted({a for m in self.rooms.values() for a in m} - set(agents))
+        if unknown:
+            raise ValueError(f"Rooms members {unknown} are not agents of this run")
+
+    def channels(self) -> list[str]:
+        return list(self.rooms)
+
+    def channel_members(self, channel: str) -> list[AgentId]:
+        return list(self.rooms.get(channel, []))
+
+    def channel_permissions(self, agent: AgentId) -> tuple[list[str], list[str]]:
+        chans = [c for c, members in self.rooms.items() if agent in members]
+        return list(chans), list(chans)
+
+    def default_channel(self, agent: AgentId) -> str | None:
+        chans = self.channel_permissions(agent)[1]
+        return chans[0] if len(chans) == 1 else None
+
+    def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
+        channel = post.channel if post.channel in self.rooms else self.default_channel(post.agent)
+        if channel is None:
+            return []
+        members = set(self.rooms[channel])
+        return [a for a in agents if a != post.agent and a in members]
+
