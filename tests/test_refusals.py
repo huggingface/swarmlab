@@ -46,7 +46,7 @@ def refusing(script: str, n: int = 2, **agent_kw):
 # ---- provider layer ----------------------------------------------------------------------------------
 def test_attempt_is_in_the_hash_only_when_set():
     r = req()
-    legacy = {k: v for k, v in r.model_dump(mode="json").items() if k != "attempt"}
+    legacy = {k: v for k, v in r.model_dump(mode="json").items() if k not in ("attempt", "tool_choice")}
     assert request_bytes(r) == canonical_json(legacy).encode()  # pre-`attempt` hashes hold
     again = r.model_copy(update={"attempt": 1})
     assert request_hash(again) != request_hash(r)

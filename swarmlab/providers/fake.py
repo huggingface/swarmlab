@@ -33,6 +33,15 @@ last `user` message that is not a json-protocol `[tool results]` message):
 Built-in `country_reporter` (M6): a JSON-only answerer for Flag Game paper dry runs (name-only
 candidates, image crops it cannot see); see its docstring.
 
+Tool choice: when `request.tool_choice` names a tool (scripts can read it), the provider makes
+the script's response honour it, as a real model forced to call that tool would: a response whose
+calls include the named tool gets the first such call moved to the front; a response without it
+gets a call to it prepended, whose args are the response text when that text is a JSON object (the
+text is then cleared: the answer moves into the call, which is what a JSON-answering script such as
+`cascade_herder` means) and `{}` otherwise. Its id is `fake_<8 hex>` from
+`derive(<request hash>, "fake_tool_choice")`, so the script's own rng draws are unchanged. A
+refused response (`finish_reason == "refusal"`) is left as it is: a refusal is not a tool call.
+
 Tool-call ids are `fake_<8 hex from the rng>`. Under `tool_protocol == "json"` the calls are
 returned as a JSON array `[{"name", "args"}]` in `text` instead of `tool_calls`; earlier calls are
 recognised in either form.
@@ -58,6 +67,7 @@ from .base import (
     PricingRow,
     Provider,
     Usage,
+    check_tool_choice,
     model_id,
     request_hash,
     text_of,
@@ -266,6 +276,30 @@ def resolve_script(name: str) -> Script:
                      "entry points in swarmlab.fake_scripts, or module:function)")
 
 
+def _force_tool(request: ChatRequest, resp: ChatResponse, seed: int) -> ChatResponse:
+    """`resp` with `request.tool_choice`'s tool called first (module doc, Tool choice)."""
+    name = request.tool_choice.name  # type: ignore[union-attr]
+    calls = list(resp.tool_calls)
+    hit = next((i for i, c in enumerate(calls) if c.name == name), None)
+    if hit == 0:
+        return resp
+    text = resp.text
+    if hit is not None:
+        calls.insert(0, calls.pop(hit))
+    else:
+        try:
+            args = json.loads(text) if text else {}
+        except ValueError:
+            args = None
+        if isinstance(args, dict) and text:
+            text = ""
+        else:
+            args = {}
+        call_id = f"fake_{derive(seed, 'fake_tool_choice').getrandbits(32):08x}"
+        calls.insert(0, ToolCall(call_id=call_id, name=name, args=args))
+    return resp.model_copy(update={"text": text, "tool_calls": calls, "finish_reason": "tool_use"})
+
+
 class FakeProvider(Provider):
     entry_point: ClassVar[str | None] = "fake"
     name = "fake"
@@ -283,7 +317,10 @@ class FakeProvider(Provider):
         self.calls += 1
         h = request_hash(request)
         rng = derive(int(h[:8], 16), "fake")
+        forced = check_tool_choice(request)  # before the script: an impossible choice is an error
         resp = self.script_for(request)(request, rng)
+        if forced and resp.finish_reason != "refusal":
+            resp = _force_tool(request, resp, int(h[:8], 16))
         usage = resp.usage
         if usage == Usage():
             body = resp.text + "".join(json.dumps(tc.args) + tc.name for tc in resp.tool_calls)

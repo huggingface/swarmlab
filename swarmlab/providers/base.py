@@ -51,6 +51,18 @@ Decisions where the contract is silent:
   that produced it sends verbatim in place of text + tool calls. `ChatMessage` leaves
   `provider_content` out of its JSON when None, so a request without reasoning hashes exactly
   as before.
+- Tool choice (additive, docs/INTERFACE-M1b.md §1 amendment): `ChatRequest.tool_choice =
+  ToolChoice(name=...)` says the model must call that tool (a named, required choice; None, the
+  default, leaves the choice to the model, `auto`). `check_tool_choice(request)` is the one rule
+  every adapter applies before sending (and `ChatRequest` applies at construction): the named tool
+  must be among `request.tools`, `tool_protocol` must be `native` (under `json` no native tools
+  are sent, so the choice cannot be honoured; it is an error, never dropped or downgraded to
+  auto), and `extra` must not also carry a `tool_choice` key (top level or in its nested
+  `extra_body` dict). Each adapter owns the wire format
+  (Anthropic `{"type": "tool", "name"}`, OpenAI-compatible `{"type": "function", "function":
+  {"name"}}`), so a provider-specific `tool_choice` in `extra` is no longer the way to force a
+  tool (it still passes through unchanged when `tool_choice` is None). `tool_choice` is in
+  `request_bytes`/`request_hash` only when set, so every earlier hash is unchanged.
 """
 from __future__ import annotations
 
@@ -63,7 +75,7 @@ import random
 import struct
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, model_serializer
+from pydantic import BaseModel, model_serializer, model_validator
 
 from ..base import Plugin
 from ..spec import canonical_json
@@ -114,6 +126,13 @@ class ChatMessage(BaseModel):
         return data
 
 
+class ToolChoice(BaseModel):
+    """A named, required tool choice: the model must call the tool `name` (one of the request's
+    `tools`). Adapters translate it to their provider's format (`check_tool_choice`)."""
+
+    name: str
+
+
 class ChatRequest(BaseModel):
     model: str  # "<provider>:<model id>"
     messages: list[ChatMessage]
@@ -126,6 +145,37 @@ class ChatRequest(BaseModel):
     thinking_budget: int | None = None
     extra: dict = {}
     attempt: int = 0  # re-send number after refusals: in the request hash when > 0, never sent
+    tool_choice: ToolChoice | None = None  # force this tool; in the request hash only when set
+
+    @model_validator(mode="after")
+    def _check_tool_choice(self) -> ChatRequest:
+        check_tool_choice(self)
+        return self
+
+
+def check_tool_choice(request: ChatRequest) -> str | None:
+    """The forced tool's name, or None; raises `ValueError` when it cannot be honoured.
+
+    `extra` must not carry its own `tool_choice`, at the top level or inside the nested
+    `extra_body` dict (the OpenAI-compatible adapter flattens it into the body last, and the
+    Anthropic SDK merges an `extra_body` kwarg into the JSON body), since either would override
+    the forced choice. Adapters call this before sending (a request changed after construction,
+    e.g. by attribute assignment, is not re-validated by pydantic)."""
+    choice = request.tool_choice
+    if choice is None:
+        return None
+    if request.tool_protocol != "native":
+        raise ValueError(f"tool_choice requires tool_protocol native (got {request.tool_protocol!r}:"
+                         f" no native tools are sent, so {choice.name!r} cannot be forced)")
+    names = [t.name for t in request.tools]
+    if choice.name not in names:
+        raise ValueError(f"tool_choice names {choice.name!r}, which is not among the request's "
+                         f"tools {names}")
+    nested = request.extra.get("extra_body")
+    if "tool_choice" in request.extra or (isinstance(nested, dict) and "tool_choice" in nested):
+        raise ValueError("tool_choice is set on the request and also in extra; drop the extra one "
+                         "(the adapter owns the provider's tool_choice format)")
+    return choice.name
 
 
 class Refusal(BaseModel):
@@ -170,6 +220,8 @@ def request_bytes(request: ChatRequest) -> bytes:
     data = request.model_dump(mode="json")
     if not data.get("attempt"):  # attempt 0 is left out, so pre-`attempt` hashes still hold
         data.pop("attempt", None)
+    if data.get("tool_choice", 0) is None:  # unset tool_choice is left out too
+        data.pop("tool_choice")
     return canonical_json(data).encode()
 
 
