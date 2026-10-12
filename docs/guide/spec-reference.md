@@ -32,7 +32,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
     - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
     - `arms.NAME.options.concurrency`: `int` (default `32`): concurrent turns
     - `arms.NAME.options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
-    - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
+    - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent in a random order), `fixed` (every live agent in agent order a000, a001, ...) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
     - `arms.NAME.options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
     - `arms.NAME.options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
       - `arms.NAME.options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
@@ -66,7 +66,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
   - `options.concurrency`: `int` (default `32`): concurrent turns
   - `options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
-  - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
+  - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round: `seeded_shuffle` (default, every live agent in a random order), `fixed` (every live agent in agent order a000, a001, ...) or `one_speaker` (one random live agent per round; pair with `gossip` k=1 and `commit: immediate` for the Flag Game paper's pairwise protocol)
   - `options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
   - `options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
     - `options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`

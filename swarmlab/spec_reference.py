@@ -121,7 +121,8 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
         "snapshot_every": "write a snapshot every N rounds",
         "concurrency": "concurrent turns",
         "repeat": "paired-run repeat index (0: a plain run)",
-        "scheduler": "turn order per round: `seeded_shuffle` (default, every live agent) or "
+        "scheduler": "turn order per round: `seeded_shuffle` (default, every live agent in a "
+                     "random order), `fixed` (every live agent in agent order a000, a001, ...) or "
                      "`one_speaker` (one random live agent per round; pair with `gossip` k=1 and "
                      "`commit: immediate` for the Flag Game paper's pairwise protocol)",
         "rounds_per_agent": "sugar: `max_rounds = rounds_per_agent x number of agents`",

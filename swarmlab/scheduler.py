@@ -8,6 +8,11 @@ Decisions where the contract is silent:
 
 - The base class returns `live` unchanged (agent order), so a subclass that wants a fixed order
   needs no code. `SeededShuffle` copies `live` and shuffles it with the passed rng.
+- The base class is registered as `fixed` (entry point in `swarmlab.schedulers`): every live agent
+  acts every round, in agent order a000, a001, ...; `Scheduler().spec()` is
+  `{"type": "fixed", "params": {}}`. A run.json holding the older `swarmlab.scheduler:Scheduler`
+  still resolves through `module:Class`. Subclasses keep their own name or `module:Class`
+  (`entry_point` counts only where it is defined, swarmlab/base.py).
 - The scheduler is not part of `RunSpec` in M1a; the runner always uses `SeededShuffle`. It is
   still snapshotted under the key `"scheduler"` so stateful schedulers can be added later.
 
@@ -36,6 +41,10 @@ from .ids import AgentId
 
 
 class Scheduler(Persistable, Plugin):
+    """Every live agent acts every round, in agent order (entry point `fixed`)."""
+
+    entry_point: ClassVar[str | None] = "fixed"
+
     def turns_per_round(self, n: int) -> int:
         """Turns a round runs with `n` live agents (used by `swarmlab estimate`)."""
         return n
@@ -70,7 +79,9 @@ class OneSpeaker(Scheduler):
         return min(1, n)
 
 
-SCHEDULERS: dict[str, type[Scheduler]] = {"seeded_shuffle": SeededShuffle, "one_speaker": OneSpeaker}
+SCHEDULERS: dict[str, type[Scheduler]] = {
+    "fixed": Scheduler, "seeded_shuffle": SeededShuffle, "one_speaker": OneSpeaker,
+}
 
 
 def build_scheduler(spec: Any = None) -> Scheduler:

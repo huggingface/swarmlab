@@ -1,6 +1,7 @@
 from swarmlab.ids import agent_id
+from swarmlab.registry import build, resolve
 from swarmlab.rng import derive
-from swarmlab.scheduler import Scheduler, SeededShuffle
+from swarmlab.scheduler import Scheduler, SeededShuffle, build_scheduler
 
 AGENTS = [agent_id(i) for i in range(10)]
 
@@ -31,3 +32,23 @@ def test_scheduler_snapshot_roundtrip():
     t = SeededShuffle()
     t.restore(s.snapshot())
     assert t.order(1, AGENTS, derive(1, "schedule", 1)) == s.order(1, AGENTS, derive(1, "schedule", 1))
+
+
+class Reversed(Scheduler):
+    def order(self, round, live, rng):
+        return list(reversed(live))
+
+
+def test_base_scheduler_is_registered_as_fixed():
+    assert Scheduler().spec() == {"type": "fixed", "params": {}}
+    assert resolve("fixed", "swarmlab.schedulers") is Scheduler
+    assert type(build({"type": "fixed"}, "swarmlab.schedulers")) is Scheduler
+    assert type(build_scheduler({"type": "fixed", "params": {}})) is Scheduler
+    assert type(build_scheduler("fixed")) is Scheduler
+    # the form written before the base class had a name still resolves (module:Class)
+    assert type(build_scheduler("swarmlab.scheduler:Scheduler")) is Scheduler
+
+
+def test_fixed_name_is_not_inherited():
+    assert SeededShuffle().spec()["type"] == "seeded_shuffle"
+    assert Reversed().spec() == {"type": "tests.test_scheduler:Reversed", "params": {}}
