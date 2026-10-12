@@ -56,8 +56,10 @@ Decisions where the contract is silent:
   channel from an agent in several rooms (`bad args` naming its rooms) rather than picking one.
   A post on a channel that is not a room goes to the author's default room, or to nobody. Room
   names are any non-empty strings; each room lists at least one agent, each agent at most once;
-  `reset_agents` rejects members that are not agents of the run. Pure function of params; no
-  snapshot.
+  `reset_agents` rejects members that are not agents of the run. Room names are exposed in
+  alphabetical order (`channels()`, `channel_permissions()`, hence the board's channel list and
+  the `post` enum), so equivalent mappings behave identically and a reconstructed run keeps its
+  channel order. Pure function of params; no snapshot.
 """
 from __future__ import annotations
 
@@ -268,7 +270,12 @@ class Tree(Topology):
 
 
 class Rooms(Topology):
-    """Named rooms with fixed membership; an agent may be in several rooms or in none."""
+    """Named rooms with fixed membership; an agent may be in several rooms or in none.
+
+    Room names are exposed in alphabetical order whatever the order of the `rooms` mapping, so
+    equivalent mappings behave identically (spec hashing sorts keys) and a run reconstructed from
+    run.json keeps its channel order.
+    """
 
     entry_point: ClassVar[str | None] = "rooms"
     description: ClassVar[str] = "Named rooms with fixed membership; an agent may be in several rooms or none"
@@ -277,10 +284,11 @@ class Rooms(Topology):
     def __init__(self, rooms: dict[str, list[AgentId]]) -> None:
         if not isinstance(rooms, dict) or not rooms:
             raise TypeError(f"Rooms rooms must be a non-empty mapping of room -> agents, got {rooms!r}")
-        self.rooms: dict[str, list[AgentId]] = {}
-        for name, members in rooms.items():
+        for name in rooms:
             if not isinstance(name, str) or not name:
                 raise ValueError(f"room names must be non-empty strings, got {name!r}")
+        self.rooms: dict[str, list[AgentId]] = {}  # canonical: sorted by room name
+        for name, members in sorted(rooms.items()):
             if isinstance(members, str) or not isinstance(members, (list, tuple)) or not members:
                 raise ValueError(f"room {name!r} must list at least one agent, got {members!r}")
             if len(set(members)) != len(members):

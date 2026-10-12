@@ -1,12 +1,15 @@
 """The Rooms topology: named rooms with fixed, possibly overlapping membership."""
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from swarmlab import Board, Experiment, Participant, Run, TurnUsage
 from swarmlab.ids import agent_id
 from swarmlab.medium.board import Post
 from swarmlab.medium.topology import Rooms
+from swarmlab.participants import LLMAgent
 from swarmlab.registry import resolve
 from swarmlab.rng import derive
 from swarmlab.roles import Role, assign, bind_roles
@@ -33,11 +36,11 @@ def rooms(spec: dict | None = None) -> Rooms:
 
 def test_channels_members_and_permissions():
     r = rooms()
-    assert r.channels() == ["red", "blue", "green"]
+    assert r.channels() == ["blue", "green", "red"]  # alphabetical, not mapping order
     assert r.channel_members("blue") == ["a001", "a002", "a003"]
     assert r.channel_members("main") == []
     assert r.channel_permissions("a000") == (["red"], ["red"])
-    assert r.channel_permissions("a001") == (["red", "blue"], ["red", "blue"])
+    assert r.channel_permissions("a001") == (["blue", "red"], ["blue", "red"])
     assert r.channel_permissions("a005") == ([], [])
 
 
@@ -88,18 +91,18 @@ def test_spec_is_snapshot_free_and_rebuilds():
 async def test_executor_offers_each_agent_its_rooms(tmp_path):
     board = Board(topology=Rooms(rooms=ROOMS))
     roles = bind_roles(board, {a: None for a in AGENTS}, [])
-    assert board.channels == ["main", "red", "blue", "green"]
+    assert board.channels == ["main", "blue", "green", "red"]
     ex = executor(tmp_path, roles, board=board)
 
     def enums(agent: str) -> dict[str, list[str]]:
         return {s.name: s.parameters["properties"]["channel"]["enum"]
                 for s in ex.schemas(agent) if s.name in ("post", "read_board")}
 
-    assert enums("a001") == {"read_board": ["red", "blue"], "post": ["red", "blue"]}
+    assert enums("a001") == {"read_board": ["blue", "red"], "post": ["blue", "red"]}
     assert enums("a000") == {"read_board": ["red"], "post": ["red"]}
     assert enums("a005") == {}
     res = await ex.call("a001", "post", {"text": "x"})
-    assert res.error == "bad args: post needs a channel, one of ['red', 'blue']"
+    assert res.error == "bad args: post needs a channel, one of ['blue', 'red']"
     assert (await ex.call("a001", "post", {"channel": "main", "text": "x"})).error == "not_allowed"
     assert (await ex.call("a000", "post", {"text": "x"})).ok
 
@@ -200,3 +203,62 @@ arms:
     doc = load_experiment_yaml(out)
     assert doc["arms"]["rooms"]["medium"]["topology"] == {"type": "rooms", "params": {"rooms": ROOMS}}
     assert Experiment.from_yaml(out, "rooms").spec_hash(0, 1) == exp.spec_hash(0, 1)
+
+
+# ---- canonical room order --------------------------------------------------------------------
+# a000 bridges two rooms; the mapping lists them out of alphabetical order
+BRIDGE = {"red": ["a000", "a001"], "blue": ["a000", "a002"]}
+BRIDGE_REVERSED = {"blue": ["a000", "a002"], "red": ["a000", "a001"]}
+
+
+def bridge_experiment(spec: dict) -> Experiment:
+    return Experiment(name="bridge", world=FlagGame(),
+                      participants=[LLMAgent(model="fake:reader") for _ in range(3)],
+                      medium=Board(topology=Rooms(rooms=spec)), metrics=["comm.posts_per_round"])
+
+
+def post_enums(exp: Experiment, tmp_path) -> tuple[list[str], dict[str, list[str]]]:
+    """The board's channels and each agent's `post` channel enum, built as the runner builds them."""
+    agents = [agent_id(i) for i in range(len(exp.participants))]
+    board = copy.deepcopy(exp.medium)
+    roles = bind_roles(board, {a: None for a in agents}, [])
+    ex = executor(tmp_path, roles, board=board)
+    enums = {a: s.parameters["properties"]["channel"]["enum"]
+             for a in agents for s in ex.schemas(a) if s.name == "post"}
+    return list(board.channels), enums
+
+
+def request_hashes(run: Run, rounds: set[int] | None = None) -> list[str]:
+    return [e.request_hash for e in run.events_all if e.type == "inference_attempt"
+            and (rounds is None or e.round in rounds)]
+
+
+def test_room_order_is_canonical():
+    assert Rooms(rooms=BRIDGE).channels() == Rooms(rooms=BRIDGE_REVERSED).channels() == ["blue", "red"]
+    assert Rooms(rooms=BRIDGE).channel_permissions("a000") == (["blue", "red"], ["blue", "red"])
+
+
+def test_equivalent_room_mappings_behave_identically(tmp_path):
+    a, b = bridge_experiment(BRIDGE), bridge_experiment(BRIDGE_REVERSED)
+    assert a.spec_hash(1, 2) == b.spec_hash(1, 2)
+    ra = a.run(seed=1, max_rounds=2, out=tmp_path / "a")
+    rb = b.run(seed=1, max_rounds=2, out=tmp_path / "b")
+    posts = [(p["agent"], p["channel"]) for p in ra.events if p["type"] == "post"]
+    assert ("a000", "blue") in posts  # the bridge posts to enum[0], the alphabetically first room
+    assert [(p["agent"], p["channel"]) for p in rb.events if p["type"] == "post"] == posts
+    assert logical(ra, exclude=("seq", "ts", "run")) == logical(rb, exclude=("seq", "ts", "run"))
+
+
+def test_reconstructed_run_keeps_channel_order_and_requests(tmp_path):
+    live = bridge_experiment(BRIDGE)
+    run = live.run(seed=1, max_rounds=2, out=tmp_path / "a")
+    loaded = Run.load(run.dir)
+    assert post_enums(loaded.experiment, tmp_path) == post_enums(live, tmp_path)
+    assert post_enums(live, tmp_path) == (["main", "blue", "red"],
+                                          {"a000": ["blue", "red"], "a001": ["red"], "a002": ["blue"]})
+    # re-running the reconstructed experiment issues byte-identical requests
+    again = loaded.experiment.run(seed=1, max_rounds=2, out=tmp_path / "b")
+    assert request_hashes(run) and request_hashes(again) == request_hashes(run)
+    # a fork of the reconstructed run continues with the same channel order, hence the same requests
+    child = loaded.fork(1).run(out=tmp_path / "f")
+    assert request_hashes(run, {2}) and request_hashes(child, {2}) == request_hashes(run, {2})
