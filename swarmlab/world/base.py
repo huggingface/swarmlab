@@ -3,6 +3,10 @@
 Required: reset, observe, score, and at least one @tool-decorated action. Everything else has a
 working default. Nothing agent-visible may reveal correctness; score() and verify() are
 evaluator-only and called by the runner alone.
+
+`swarmlab plugins` shows the first line of a world class's docstring: `World` cannot carry the
+`description` class attribute other plugin bases have, because `description()` is the
+agent-facing task text (M1b). Give every world class a one-line docstring summary.
 """
 from __future__ import annotations
 

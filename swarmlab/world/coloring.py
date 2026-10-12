@@ -144,6 +144,8 @@ def needed_cells(target: list[str], current: list[str]) -> list[tuple[int, int, 
 
 
 class ColoringGrid(World):
+    """Shared grid: agents paint cells until the grid equals a target everyone can see."""
+
     entry_point: ClassVar[str | None] = "coloring"
     name = "coloring"
 
@@ -384,10 +386,12 @@ class ColoringGrid(World):
 # ---- fake LLM script (entry point `painter` in swarmlab.fake_scripts; model "fake:painter") -----
 
 def fake_painter(request: Any, rng: random.Random) -> Any:
-    """A FakeProvider script for ColoringGrid: once per turn, paint a random cell that differs
-    from the target (from the latest observation in the conversation) with its target colour,
-    then `end_turn`. A probe (no tools) gets the text `{"coverage": <share of matching cells>}`.
-    The rng is a function of the request, so agents with identical prompts pick the same cell."""
+    """FakeProvider script for ColoringGrid: paint one random wrong cell per turn.
+
+    Once per turn, paint a random cell that differs from the target (from the latest observation
+    in the conversation) with its target colour, then `end_turn`. A probe (no tools) gets the
+    text `{"coverage": <share of matching cells>}`. The rng is a function of the request, so
+    agents with identical prompts pick the same cell."""
     import json
 
     from ..providers.base import text_of

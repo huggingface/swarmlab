@@ -18,7 +18,18 @@ and `normalize(spec)` is not in general equal to the built plugin's `Plugin.spec
 for equality or hashing beyond the fork's comparison of a stored spec with the same spec
 re-stated.
 Groups used by `Experiment.from_spec`: `swarmlab.worlds`, `swarmlab.participants`,
-`swarmlab.metrics`; the board resolves `swarmlab.topologies` and `swarmlab.policies` itself.
+`swarmlab.metrics`; the board resolves `swarmlab.topologies`, `swarmlab.policies` and
+`swarmlab.claim_policies` through `build` too (entry points are the only name registry; there is
+no hand-kept name-to-class dict).
+
+`catalog(group)` lists a group for `swarmlab plugins` (and `swarmlab metrics`): every entry point
+as `(name, description, target)`, sorted by name, where `target` is the entry point's
+`module:Class` and `description` comes from `describe`: the plugin's `description` class
+attribute when it is a string (every plugin base class defines it as `""`), else the first line
+of its docstring (worlds, whose `description()` is the agent-facing task text, and fake scripts,
+which are functions). A plugin that fails to load is listed with `(cannot load: ...)`. `group`
+is the full name (`swarmlab.worlds`) or the short one (`worlds`); `GROUPS` are the groups
+`swarmlab plugins` lists.
 
 `add_import_dir(path)` puts a directory at the front of `sys.path` (moving it there if it is
 already on it), so `module:Class` plugins in files next to an experiment YAML import without
@@ -44,6 +55,9 @@ GROUPS = (
     "swarmlab.metrics",
     "swarmlab.claim_policies",
     "swarmlab.schedulers",
+    "swarmlab.probes",
+    "swarmlab.interventions",
+    "swarmlab.fake_scripts",
 )
 
 
@@ -115,3 +129,29 @@ def flat_params(cls: Any, params: Mapping[str, Any]) -> dict[str, Any]:
     if var_kw is not None and isinstance(out.get(var_kw), dict):
         out.update(out.pop(var_kw))
     return out
+
+
+def full_group(group: str) -> str:
+    """`worlds` -> `swarmlab.worlds`; a full name is returned unchanged."""
+    return group if "." in group else f"swarmlab.{group}"
+
+
+def describe(obj: Any) -> str:
+    """One-line description of a plugin class or function (see the module docstring)."""
+    desc = getattr(obj, "description", None)
+    if isinstance(desc, str):
+        return desc.strip()
+    doc = (obj.__doc__ or "").strip()
+    return doc.splitlines()[0].strip().removesuffix(".") if doc else ""
+
+
+def catalog(group: str) -> list[tuple[str, str, str]]:
+    """(entry-point name, description, `module:Class`) of every plugin in `group`, by name."""
+    out = []
+    for ep in entry_points(group=full_group(group)):
+        try:
+            desc = describe(ep.load())
+        except Exception as e:  # noqa: BLE001 - a broken plugin is listed, not fatal
+            desc = f"(cannot load: {type(e).__name__}: {e})"
+        out.append((ep.name, desc, ep.value))
+    return sorted(out)
