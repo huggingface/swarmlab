@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 from swarmlab import Experiment, Run
 from swarmlab.cli import app
 from swarmlab.jobs import launch as jl
+from swarmlab.jobs import profiles as jp
 from swarmlab.jobs import remote
 from swarmlab.spec import SpecError, git_identity
 
@@ -76,9 +77,13 @@ def test_command_is_deterministic_and_complete(tmp_path):
     assert env["SWARMLAB_RUNS"] == "bc:1 bc:2"
     assert env["SWARMLAB_GIT_COMMIT"] == COMMIT and env["SWARMLAB_GIT_DIRTY"] == "0"
     assert env["VLLM_MODEL"] == MODEL and env["VLLM_GPU_MEMORY_UTILIZATION"] == "0.9"
-    for flag in ("--reasoning-parser qwen3", "--enable-auto-tool-choice",
+    # Qwen/Qwen3.5-9B has a built-in profile (no reasoning parser: runs are non-thinking)
+    assert env["VLLM_FLAGS"] == jp.PROFILES[MODEL].flags and env["VLLM_PROFILE"] == MODEL
+    for flag in ("--language-model-only", "--enable-auto-tool-choice",
                  "--tool-call-parser qwen3_coder"):
         assert flag in env["VLLM_FLAGS"]
+    assert env["VLLM_FLAGS_SOURCE"] == "profile"
+    assert json.loads(env["VLLM_PROBE_EXTRA"]) == {"chat_template_kwargs": {"enable_thinking": False}}
     assert env["VLLM_WAIT_S"] == "1200" and env["VLLM_MAX_MODEL_LEN"] == "262144"
     assert "N" not in env  # HF Jobs rejects an env var named N
     image, entry = cmd[-4], cmd[-1]
@@ -136,7 +141,7 @@ def test_bootstrap_script_has_expected_pieces():
     s = jl.bootstrap_script()
     for piece in ('"$STAGE_DIR"/swarmlab-*.whl', 'uv pip install -q --python "$VENV/bin/python" "$WHEEL"',
                   'uv pip install --system -q "vllm==$VLLM_VERSION"',
-                  '"$VLLM_BIN" serve "$VLLM_MODEL"', '--gpu-memory-utilization',
+                  'serve "$VLLM_MODEL"', '"$VLLM_BIN" "${SERVE_ARGS[@]}"', '--gpu-memory-utilization',
                   '--max-model-len', '"$BASE/health"', '"$BASE/v1/models"', 'VLLM_WAIT_S',
                   'while sleep "$SYNC_EVERY"; do sync_runs; done',
                   'buckets sync "$OUT" "$SWARMLAB_RUNS_REMOTE"',
@@ -189,7 +194,12 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self._send({"data": [{"id": MODEL}]} if self.path == "/v1/models" else {})
     def do_POST(self):
-        self.rfile.read(int(self.headers["content-length"]))
+        body = self.rfile.read(int(self.headers["content-length"]))
+        with open(os.path.join(os.environ["STUB_DIR"], "probe_body.json"), "wb") as f:
+            f.write(body)
+        if os.environ.get("FAKE_NO_TOOLS"):
+            self._send({"choices": [{"finish_reason": "stop", "message": {"content": "B"}}]})
+            return
         self._send({"choices": [{"finish_reason": "tool_calls", "message": {"content": None,
                     "tool_calls": [{"id": "c1", "type": "function", "function": {
                         "name": "guess", "arguments": "{\"candidate\": \"B\"}"}}]}}],
@@ -205,7 +215,7 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _run_bootstrap(tmp_path, runs):
+def _run_bootstrap(tmp_path, runs, **extra_env):
     """Run bootstrap.sh for real with stub uv/hf/vllm on PATH and a scripted spec."""
     stub = tmp_path / "stubs"
     stub.mkdir()
@@ -234,6 +244,7 @@ def _run_bootstrap(tmp_path, runs):
         "VLLM_FLAGS": "--reasoning-parser qwen3", "VLLM_WAIT_S": "60",
         "VLLM_PORT": str(_free_port()), "JOB_ID": "a" * 24, "TMPDIR": str(tmp_path),
         "SWARMLAB_JOB_ROOT": str(tmp_path / "root"), "SWARMLAB_JOB_TMP": str(tmp_path / "jt"),
+        **extra_env,
     }
     proc = subprocess.run(["bash", str(REPO / "swarmlab" / "jobs" / "bootstrap.sh")], env=env,
                           capture_output=True, text=True, timeout=180, cwd=tmp_path, check=False)
@@ -364,6 +375,163 @@ def test_cli_job_run_launch_calls_submit(tmp_path, monkeypatch):
     monkeypatch.setattr(jl, "checkout_identity", lambda: (COMMIT, True))
     dirty = cli.invoke(app, ["job", "run", str(vllm_spec(tmp_path)), "--model", MODEL, "--launch"])
     assert dirty.exit_code == 2 and "uncommitted" in dirty.stderr
+
+
+# ---- serve flags and profiles -------------------------------------------------------------------
+SIX = ("Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-9B", "ibm-granite/granite-4.1-3b",
+       "Qwen/Qwen3-4B-Instruct-2507", "ibm-granite/granite-4.2-8b", "LiquidAI/LFM2.5-2.6B")
+SAMPLING = ("--temperature", "--top-p", "--top-k", "--override-generation-config",
+            "--generation-config", "temperature", "top_p", "max_tokens")
+
+
+def test_profiles_cover_the_six_models():
+    assert set(SIX) <= set(jp.PROFILES)
+    parsers = {m: jp.PROFILES[m].flags.split("--tool-call-parser ")[1].split()[0] for m in SIX}
+    assert parsers == {"Qwen/Qwen3.5-2B": "qwen3_coder", "Qwen/Qwen3.5-9B": "qwen3_coder",
+                       "ibm-granite/granite-4.1-3b": "hermes",
+                       "Qwen/Qwen3-4B-Instruct-2507": "hermes",
+                       "ibm-granite/granite-4.2-8b": "qwen3_coder",
+                       "LiquidAI/LFM2.5-2.6B": "lfm2"}
+    for m in SIX:
+        p = jp.PROFILES[m]
+        assert "--enable-auto-tool-choice" in p.flags and "--dtype bfloat16" in p.flags
+        assert ("--language-model-only" in p.flags) == m.startswith("Qwen/Qwen3.5-"), m
+        assert not any(x in p.flags for x in SAMPLING), m  # sampling belongs in the spec
+        assert not any(x in json.dumps(p.probe_extra) for x in SAMPLING), m
+        assert p.validated_vllm == "0.27.1"
+        jp.check_flags(p.flags)  # never repeats a launcher flag
+    assert "--reasoning-parser minimax_m2" in jp.PROFILES["LiquidAI/LFM2.5-2.6B"].flags
+    assert all("--reasoning-parser" not in jp.PROFILES[m].flags for m in SIX[:5])
+    thinking_off = {m for m in SIX if jp.PROFILES[m].probe_extra == jp.NO_THINKING}
+    assert thinking_off == {"Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-9B", "ibm-granite/granite-4.2-8b"}
+
+
+def test_flag_precedence_explicit_then_profile_then_default():
+    granite = "ibm-granite/granite-4.1-3b"
+    r = jp.resolve_flags(granite)
+    assert (r.flags, r.source, r.profile) == (jp.PROFILES[granite].flags, "profile", granite)
+    assert r.probe_extra == {}
+    r = jp.resolve_flags(granite, vllm_flags="--dtype half --tool-call-parser hermes")
+    assert (r.flags, r.source, r.profile) == ("--dtype half --tool-call-parser hermes",
+                                              "--vllm-flags", granite)
+    r = jp.resolve_flags("some-org/unknown-model")
+    assert (r.flags, r.source, r.profile) == (jp.DEFAULT_VLLM_FLAGS, "default", None)
+    assert r.probe_extra == jp.DEFAULT_PROBE_EXTRA
+    assert jl.DEFAULT_VLLM_FLAGS == jp.DEFAULT_VLLM_FLAGS  # unchanged for unknown models
+    assert "--reasoning-parser qwen3" in jp.DEFAULT_VLLM_FLAGS
+    r = jp.resolve_flags(granite, profile="none")
+    assert (r.flags, r.source, r.profile) == (jp.DEFAULT_VLLM_FLAGS, "default", None)
+    r = jp.resolve_flags("my/finetune", profile="Qwen/Qwen3.5-2B")
+    assert r.source == "profile" and r.profile == "Qwen/Qwen3.5-2B"
+    assert jp.resolve_flags("qwen/qwen3.5-9b").profile == "Qwen/Qwen3.5-9B"
+    r = jp.resolve_flags(MODEL, append="--reasoning-parser qwen3")
+    assert r.flags == jp.PROFILES[MODEL].flags + " --reasoning-parser qwen3"
+    r = jp.resolve_flags(MODEL, vllm_flags="--enforce-eager", append="--seed 1")
+    assert r.flags == "--enforce-eager --seed 1"
+    q = jp.resolve_flags("x/y", vllm_flags="""--override-generation-config '{"a": 1}'""")
+    assert q.flags == """--override-generation-config '{"a": 1}'"""
+    with pytest.raises(SpecError, match="no such profile"):
+        jp.resolve_flags(MODEL, profile="nope/nope")
+    for bad in ("--port 9000", "--max-model-len=4096", "--max_model_len 4096", "--host 0.0.0.0",
+                "--served-model-name x", "--gpu-memory-utilization 0.5", "--revision abc"):
+        with pytest.raises(SpecError, match="launcher always passes"):
+            jp.resolve_flags(MODEL, vllm_flags=bad)
+    with pytest.raises(SpecError, match="launcher always passes"):
+        jp.resolve_flags(MODEL, append="--port 1")
+    with pytest.raises(SpecError, match="cannot parse"):
+        jp.resolve_flags(MODEL, vllm_flags="--x 'unterminated")
+
+
+def test_plan_records_effective_flags(tmp_path):
+    granite = "ibm-granite/granite-4.1-3b"
+    spec = vllm_spec(tmp_path, model=f"vllm:{granite}")
+    p = plan(spec, model=granite, vllm_version="0.27.1", max_model_len=32768)
+    assert p.vllm_flags == jp.PROFILES[granite].flags and p.vllm_profile == granite
+    assert p.vllm_flags_source == "profile" and p.probe_extra == {}
+    assert not any("validated on" in n or "max-model-len" in n for n in p.notes)
+    d = jl.stage(p, tmp_path / "st", build=None)
+    doc = json.loads((d / "plan.json").read_text())
+    assert doc["vllm_flags"] == p.vllm_flags and doc["vllm_flags_source"] == "profile"
+    assert doc["vllm_profile"] == granite and doc["probe_extra"] == {}
+    assert doc["vllm_serve_command"] == (
+        f"vllm serve {granite} --served-model-name {granite} --host 127.0.0.1 --port 8000 "
+        f"--max-model-len 32768 --gpu-memory-utilization 0.9 {p.vllm_flags}")
+    env = p.env()
+    assert env["VLLM_FLAGS"] == p.vllm_flags and env["VLLM_PROFILE"] == granite
+    assert env["VLLM_PROBE_EXTRA"] == "{}"
+    # explicit flags win and are recorded as such; default vLLM / max len get notes
+    p2 = plan(spec, model=granite, vllm_flags="--dtype bfloat16 --enable-auto-tool-choice "
+              "--tool-call-parser granite4")
+    assert p2.vllm_flags_source == "--vllm-flags" and "granite4" in p2.vllm_flags
+    assert any("validated on vLLM 0.27.1" in n for n in p2.notes)
+    assert any("--max-model-len 262144" in n for n in p2.notes)
+    assert any("replaces the" in n for n in p2.notes)
+    p3 = plan(spec, model=granite, vllm_flags="--dtype bfloat16")
+    assert any("tool calls will not be parsed" in n for n in p3.notes)
+    # unknown model: the old default, no profile notes
+    other = "acme/model-7b"
+    p4 = plan(vllm_spec(tmp_path, model=f"vllm:{other}"), model=other)
+    assert p4.vllm_flags == jl.DEFAULT_VLLM_FLAGS and p4.vllm_profile is None
+    assert p4.vllm_flags_source == "default" and p4.env()["VLLM_PROFILE"] == "none"
+    assert not any("validated on" in n for n in p4.notes)
+
+
+def test_cli_dry_run_prints_flags_and_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(jl, "submit", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    lfm = "LiquidAI/LFM2.5-2.6B"
+    spec = vllm_spec(tmp_path, model=f"vllm:{lfm}")
+    res = cli.invoke(app, ["job", "run", str(spec), "--model", lfm, "--flavor", "a10g-small",
+                           "--vllm-version", "0.27.1", "--max-model-len", "32768"],
+                     catch_exceptions=False)
+    assert res.exit_code == 0, res.output
+    out = res.output
+    assert f"vllm 0.27.1: profile {lfm}, flags from profile" in out
+    assert f"  flags: {jp.PROFILES[lfm].flags}" in out
+    assert "launcher adds: --served-model-name LiquidAI/LFM2.5-2.6B --host 127.0.0.1" in out
+    assert "--max-model-len 32768" in out and "probe extra: {}" in out
+    assert "--tool-call-parser lfm2 --reasoning-parser minimax_m2" in out  # in the hf command too
+    res = cli.invoke(app, ["job", "run", str(spec), "--model", lfm, "--json",
+                           "--vllm-flags", ("--dtype bfloat16 --enable-auto-tool-choice "
+                                            "--tool-call-parser lfm2"),
+                           "--vllm-flags-append", "--enforce-eager"])
+    assert res.exit_code == 0, res.output
+    planned = json.loads(res.stdout)["plan"]
+    assert planned["vllm_flags"] == ("--dtype bfloat16 --enable-auto-tool-choice "
+                                     "--tool-call-parser lfm2 --enforce-eager")
+    assert planned["vllm_flags_source"] == "--vllm-flags" and planned["vllm_profile"] == lfm
+    res = cli.invoke(app, ["job", "run", str(spec), "--model", lfm, "--profile", "none"])
+    assert res.exit_code == 0 and "profile none, flags from default" in res.output
+    bad = cli.invoke(app, ["job", "run", str(spec), "--model", lfm, "--vllm-flags", "--port 9"])
+    assert bad.exit_code == 2 and "launcher always passes" in bad.stderr
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_bootstrap_probe_extra_flags_and_warning(tmp_path):
+    flags = """--enable-auto-tool-choice --override-generation-config '{"x": 1}'"""
+    proc, bucket, calls = _run_bootstrap(
+        tmp_path, "scripted:1", VLLM_FLAGS=flags, VLLM_FLAGS_SOURCE="--vllm-flags",
+        VLLM_PROFILE="ibm-granite/granite-4.1-3b", VLLM_PROBE_EXTRA="{}", FAKE_NO_TOOLS="1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr  # a probe without a tool call warns
+    assert "SWARMLAB_PROBE_WARNING: no parsed tool call" in proc.stdout
+    body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
+    assert "chat_template_kwargs" not in body and body["tools"][0]["function"]["name"] == "guess"
+    assert '--override-generation-config {"x": 1}' in calls  # the quoted JSON stays one argument
+    manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
+    assert manifest["probe"]["outcome"] == "no_tool_call"
+    assert manifest["vllm"]["flags_source"] == "--vllm-flags"
+    assert manifest["vllm"]["profile"] == "ibm-granite/granite-4.1-3b"
+    assert manifest["vllm"]["command"].startswith(f"vllm serve {MODEL} --served-model-name")
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_bootstrap_default_probe_records_ok(tmp_path):
+    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "SWARMLAB_PROBE_WARNING" not in proc.stdout
+    body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}  # no VLLM_PROBE_EXTRA
+    manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
+    assert manifest["probe"]["outcome"] == "ok" and manifest["probe"]["tool_calls"] == 1
 
 
 # ---- fetch, status ------------------------------------------------------------------------------

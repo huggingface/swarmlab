@@ -1149,6 +1149,15 @@ def job_run(
     image: Annotated[str | None, typer.Option("--image", help="Docker image (default: uv python3.12).")] = None,
     vllm_version: Annotated[str | None, typer.Option("--vllm-version", help="vLLM pip version.")] = None,
     max_model_len: Annotated[int | None, typer.Option("--max-model-len", help="vLLM --max-model-len.")] = None,
+    vllm_flags: Annotated[str | None, typer.Option(
+        "--vllm-flags", help="vLLM serve flags, replacing the profile/default ones (the launcher "
+        "always adds --served-model-name --host --port --max-model-len --gpu-memory-utilization).")] = None,
+    vllm_flags_append: Annotated[str | None, typer.Option(
+        "--vllm-flags-append", help="Extra vLLM serve flags added after the profile/default/"
+        "--vllm-flags ones, e.g. '--reasoning-parser qwen3'.")] = None,
+    profile: Annotated[str, typer.Option(
+        "--profile", help="Serve profile: auto (built-in table entry for --model, else the Qwen "
+        "default), none (the Qwen default), or a model id from the table.")] = "auto",
     revision: Annotated[str | None, typer.Option("--revision", help="Model revision to pin.")] = None,
     per_round: Annotated[float | None, typer.Option(
         "--per-round", help="Seconds per round for the estimate (default 30 + 2*N).")] = None,
@@ -1173,7 +1182,8 @@ def job_run(
             if val is not None:
                 kw[key] = val
         plan = jl.plan_job(spec, model=model, flavor=flavor, arms=arm or None,
-                           seeds=_seed_list(seeds), bucket=bucket, **kw)
+                           seeds=_seed_list(seeds), bucket=bucket, vllm_flags=vllm_flags,
+                           vllm_flags_append=vllm_flags_append, profile=profile, **kw)
         data: dict[str, Any] = {"ok": True, "plan": plan.as_dict(), "launched": False}
         text = jl.describe(plan)
         if stage_dir is not None:
