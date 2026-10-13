@@ -30,7 +30,8 @@ Crossed-zone metrics (the world's zones, groups and targets come from `verify()`
   followed by the zone's targets (as of the post's round) in row-major order: the first `n` colour
   tokens after the id (n = zone cells: 10), where a colour token is a full colour name or a single
   palette letter (any case), or a run of 3+ palette letters read letter by letter
-  (`swarmlab.world.coloring.parse_report`); punctuation and other words are skipped. A read is a
+  (`swarmlab.world.coloring.parse_report`); punctuation, other words and letters touching a
+  digit (G1) are skipped. A read is a
   `read` event of a painting-group agent whose delivery ids include a delivery of such a post.
 - `coloring.zone_paint_refusals`: cumulative paints refused with `zone_paint_refused`, at call
   time (a `tool_returned` whose error starts with it) or at commit (`action_committed` feedback);

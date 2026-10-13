@@ -257,9 +257,10 @@ def format_report(zone_id: str, letters: Sequence[str]) -> str:
 def _colour_tokens(text: str) -> list[str]:
     """Colour letters in `text`, in order: full colour names and single letters r/g/b/y/...
     (any case), plus runs of 3+ palette letters such as `rgbyr` (a target row copied from the
-    observation) read letter by letter. Everything else is ignored, punctuation included."""
+    observation) read letter by letter. A token is a run of letters not touching a digit, so group
+    and zone names (G1, Z0) are never colours. Everything else is ignored, punctuation included."""
     out: list[str] = []
-    for tok in re.findall(r"[a-z]+", text.lower()):
+    for tok in re.findall(r"(?<![a-z0-9])[a-z]+(?![a-z0-9])", text.lower()):
         if tok in NAME_TO_LETTER:
             out.append(NAME_TO_LETTER[tok])
         elif len(tok) == 1 and tok in COLOURS:
