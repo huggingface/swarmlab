@@ -30,6 +30,13 @@ Image: `ghcr.io/astral-sh/uv:python3.12-bookworm` + `uv pip install --system vll
 combination that served Qwen/Qwen3.5-9B with the qwen3 reasoning parser and the qwen3_coder
 tool parser in the textworld study (a100-large, server up in ~5 min including the install).
 
+Serve flags: `swarmlab/jobs/profiles.py`. `plan_job(vllm_flags=None, profile="auto")` uses
+explicit flags if given, else the built-in profile for `--model`, else `DEFAULT_VLLM_FLAGS` (the
+Qwen3.5 flags above); `vllm_flags_append` is added to the winner. The plan records the effective
+flags, where they came from (`vllm_flags_source`), the profile and the readiness probe's request
+extra (`probe_extra`, sent as `VLLM_PROBE_EXTRA`), and `describe` prints them with the flags the
+launcher always adds (`LAUNCHER_FLAGS`).
+
 Wall-time estimate: `setup_s` (default 600: install + weights download + vLLM start) plus, per
 run, `rounds * per_round_s(N)` with `per_round_s(N) = 30 + 2 * N` seconds (a guess: the
 router-served Qwen phase-1 runs took ~1 min per round at N=16; a local server should not be
@@ -57,12 +64,11 @@ from typing import Any
 import yaml
 
 from ..spec import SpecError, experiment_seeds, git_identity, load_experiment_yaml
+from .profiles import DEFAULT_VLLM_FLAGS, LAUNCHER_FLAGS, resolve_flags  # noqa: F401 (re-export)
 
 DEFAULT_BUCKET = "hf://buckets/cmpatino/swarmlab-runs"
 DEFAULT_IMAGE = "ghcr.io/astral-sh/uv:python3.12-bookworm"
 DEFAULT_VLLM_VERSION = "0.30.0"
-DEFAULT_VLLM_FLAGS = ("--dtype bfloat16 --language-model-only --reasoning-parser qwen3 "
-                      "--enable-auto-tool-choice --tool-call-parser qwen3_coder")
 DEFAULT_MAX_MODEL_LEN = 262144
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 DEFAULT_PORT = 8000
@@ -194,6 +200,9 @@ class JobPlan:
     job_spec_yaml: str
     orig_spec_yaml: str
     notes: list[str] = field(default_factory=list)
+    vllm_flags_source: str = "default"
+    vllm_profile: str | None = None
+    probe_extra: dict[str, Any] = field(default_factory=dict)
 
     @property
     def stage_remote(self) -> str:
@@ -228,6 +237,10 @@ class JobPlan:
             "VLLM_MAX_MODEL_LEN": str(self.max_model_len),
             "VLLM_GPU_MEMORY_UTILIZATION": f"{self.gpu_memory_utilization:g}",
             "VLLM_FLAGS": self.vllm_flags,
+            "VLLM_FLAGS_SOURCE": self.vllm_flags_source,
+            "VLLM_PROFILE": self.vllm_profile or "none",
+            "VLLM_PROBE_EXTRA": json.dumps(self.probe_extra, separators=(",", ":"),
+                                           sort_keys=True),
             "VLLM_WAIT_S": "1200",
             "HF_HOME": "/tmp/hf",
         }
@@ -242,7 +255,8 @@ class JobPlan:
         d["runs"] = [f"{a}:{s}" for a, s in self.runs]
         d.update(stage_remote=self.stage_remote, runs_remote=self.runs_remote,
                  job_spec_sha256=self.job_spec_sha256, rate_usd_per_hour=self.rate_usd_per_hour,
-                 timeout=fmt_duration(self.timeout_s), hf_command=hf_command(self))
+                 timeout=fmt_duration(self.timeout_s), hf_command=hf_command(self),
+                 vllm_serve_command=serve_command(self))
         return d
 
 
@@ -257,7 +271,9 @@ def plan_job(
     bucket: str = DEFAULT_BUCKET,
     image: str = DEFAULT_IMAGE,
     vllm_version: str = DEFAULT_VLLM_VERSION,
-    vllm_flags: str = DEFAULT_VLLM_FLAGS,
+    vllm_flags: str | None = None,
+    profile: str | None = "auto",
+    vllm_flags_append: str | None = None,
     max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION,
     revision: str | None = None,
@@ -283,7 +299,22 @@ def plan_job(
         raise SpecError(f"--bucket must look like hf://buckets/<namespace>/<name>, got {bucket!r}")
     bucket = bucket.rstrip("/")
 
+    resolved = resolve_flags(model, vllm_flags=vllm_flags, profile=profile,
+                             append=vllm_flags_append)
     notes = []
+    if resolved.validated_vllm and resolved.validated_vllm != vllm_version:
+        notes.append(f"profile {resolved.profile} was validated on vLLM {resolved.validated_vllm}; "
+                     f"this job installs {vllm_version} (pass --vllm-version "
+                     f"{resolved.validated_vllm} to reproduce the validated setup)")
+    if resolved.profile and max_model_len == DEFAULT_MAX_MODEL_LEN:
+        notes.append(f"--max-model-len {max_model_len} is the Qwen3.5 default; small GPUs and "
+                     "models with a shorter context need a lower one (e.g. --max-model-len 32768)")
+    if resolved.source == "--vllm-flags" and resolved.profile:
+        notes.append(f"--vllm-flags replaces the {resolved.profile} profile's flags; the "
+                     "readiness probe still uses the profile's request extra")
+    if "--tool-call-parser" not in resolved.flags or "--enable-auto-tool-choice" not in resolved.flags:
+        notes.append("the serve flags lack --enable-auto-tool-choice/--tool-call-parser: tool calls "
+                     "will not be parsed and agent turns will be prose")
     if "vllm" in doc.get("providers", {}):
         notes.append("the spec's own providers.vllm is replaced by the in-job server override")
     job_doc = job_spec_doc(doc, model, port=port, concurrency=concurrency,
@@ -317,10 +348,11 @@ def plan_job(
         spec_path=str(spec), name=doc["name"], tag=tag, model=model, flavor=flavor, image=image,
         bucket=bucket, commit=commit, dirty=dirty, runs=runs, timeout_s=timeout_s,
         estimate_s=total, estimate_detail={"setup_s": setup_s, "arms": per_arm},
-        vllm_version=vllm_version, vllm_flags=vllm_flags, max_model_len=max_model_len,
+        vllm_version=vllm_version, vllm_flags=resolved.flags, max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization, revision=revision,
         sync_every_s=sync_every_s, job_spec_yaml=job_yaml, orig_spec_yaml=spec.read_text(),
-        notes=notes,
+        notes=notes, vllm_flags_source=resolved.source, vllm_profile=resolved.profile,
+        probe_extra=resolved.probe_extra,
     )
 
 
@@ -360,6 +392,23 @@ def job_entry(plan: JobPlan) -> str:
             f"exec bash {STAGE_LOCAL}/bootstrap.sh")
 
 
+def launcher_flags(plan: JobPlan, port: int = DEFAULT_PORT) -> list[str]:
+    """The flags bootstrap.sh always passes to `vllm serve` (never part of `vllm_flags`)."""
+    out = ["--served-model-name", plan.model, "--host", "127.0.0.1", "--port", str(port),
+           "--max-model-len", str(plan.max_model_len),
+           "--gpu-memory-utilization", f"{plan.gpu_memory_utilization:g}"]
+    if plan.revision:
+        out = ["--revision", plan.revision, *out]
+    assert {f for f in out if f.startswith("--")} <= set(LAUNCHER_FLAGS)
+    return out
+
+
+def serve_command(plan: JobPlan) -> str:
+    """The `vllm serve` line the job will run (for the printout and plan.json)."""
+    return shlex.join(["vllm", "serve", plan.model, *launcher_flags(plan),
+                       *shlex.split(plan.vllm_flags)])
+
+
 def hf_command(plan: JobPlan, hf: str = "hf") -> list[str]:
     cmd = [hf, "jobs", "run", "--detach", "--flavor", plan.flavor,
            "--timeout", fmt_duration(plan.timeout_s), "--secrets", "HF_TOKEN",
@@ -377,7 +426,12 @@ def describe(plan: JobPlan) -> str:
     lines = ["hf jobs command:", "  " + shlex.join(hf_command(plan)), "",
              f"tag {plan.tag}  commit {plan.commit[:12]}{' (dirty)' if plan.dirty else ''}",
              f"stage {plan.stage_remote}/   runs -> {plan.runs_remote}/",
-             f"runs ({len(plan.runs)}): " + ", ".join(f"{a}:s{s}" for a, s in plan.runs)]
+             f"runs ({len(plan.runs)}): " + ", ".join(f"{a}:s{s}" for a, s in plan.runs),
+             (f"vllm {plan.vllm_version}: profile {plan.vllm_profile or 'none'}, "
+              f"flags from {plan.vllm_flags_source}"),
+             f"  flags: {plan.vllm_flags}",
+             f"  launcher adds: {shlex.join(launcher_flags(plan))}",
+             f"  probe extra: {json.dumps(plan.probe_extra, sort_keys=True)}"]
     for a, d in plan.estimate_detail["arms"].items():
         lines.append(f"  {a}: N={d['agents']} x {d['rounds']} rounds x ~{d['per_round_s']:g} s/round"
                      f" = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
