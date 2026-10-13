@@ -514,8 +514,9 @@ class ColoringGrid(World):
     def description(self) -> str:
         n = self.paints_per_round
         k = self._zone_cells_n()
-        names = [COLOUR_NAMES[c] for c in self.colours]
-        example = " ".join(["Z0", *(names[i % len(names)] for i in range(k))])
+        # a placeholder, not a colour sequence: small models copied a concrete example
+        # ("Z0 red green blue ...") verbatim as if it were the zone's real targets
+        template = f"<zone id> <colour 1> <colour 2> ... <colour {k}>"
         if self.oracle:
             visibility = (
                 "Each zone's target colours are shown to two groups, one that only sees them and the "
@@ -543,9 +544,10 @@ class ColoringGrid(World):
             "The agents are split into three groups, G0, G1 and G2, and the grid holds three "
             f"zones, Z0, Z1 and Z2, of {self.zone_w} x {self.zone_h} cells. " + visibility + " "
             f"Recommended format for a post about a zone: the zone id followed by its {k} target "
-            "colours in row-major order (the top row left to right, then the next row), for "
-            f"example \"{example}\"; other wording works too. Board posts are delivered when the "
-            "round ends, so a post can be read with read_board from the next round on."
+            "colours in row-major order (the top row left to right, then the next row), written "
+            f"as \"{template}\" with the colour names; other wording works too. Board posts are "
+            "delivered when the round ends, so a post can be read with read_board from the next "
+            "round on."
         )
 
     def _duties(self, agent: AgentId) -> str:
