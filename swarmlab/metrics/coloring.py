@@ -294,8 +294,8 @@ class _PerAgentCount(Metric):
 
     def outputs(self) -> list[tuple[str, float | None, int, str | None]]:
         total, n = self.value()
-        return [(self.name, total, n, None)] + [
-            (f"{self.name}.{a}", float(self.counts.get(a, 0)), 1, None) for a in self.agents]
+        out: list[tuple[str, float | None, int, str | None]] = [(self.name, total, n, None)]
+        return out + [(f"{self.name}.{a}", float(self.counts.get(a, 0)), 1, None) for a in self.agents]
 
 
 class PostsByAgent(_PerAgentCount):
@@ -329,11 +329,12 @@ def relay_summary(run: Any) -> dict:
     truth = world.verify()
     relay, posts, reads = RelayStatus(), PostsByAgent(), ReadsByAgent()
     relay.set_truth(truth)
-    for m in (posts, reads):
+    folds: list[Metric] = [relay, posts, reads]
+    for m in folds:
         m.set_agents(list(agents))
     for ev in run.events_all:
         if ev.type in ("round_started", "action_committed", "post", "delivery", "read"):
-            for m in (relay, posts, reads):
+            for m in folds:
                 m.update(ev)
     status = relay.statuses()
     return {"board": truth.get("board"), "status": status,

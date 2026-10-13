@@ -630,6 +630,7 @@ class ColoringGrid(World):
         err = self._cell_error(x, y, action.args.get("color"))
         if err:
             return Ack(ok=False, error=f"{err[0]}: {err[1]}")
+        assert isinstance(x, int) and isinstance(y, int)  # `_cell_error` checked them
         refusal = self._zone_refusal(agent, x, y)
         if refusal:
             return Ack(ok=False, error=f"zone_paint_refused: {refusal}")
