@@ -165,8 +165,15 @@ def vllm_provider(model: str, port: int = DEFAULT_PORT, concurrency: int = DEFAU
         "timeout_s": float(timeout_s), "self_hosted": True}}
 
 
-def job_spec_doc(doc: dict, model: str, **provider_kw: Any) -> dict:
+def job_spec_doc(doc: dict, model: str, arms: Sequence[str] | None = None,
+                 **provider_kw: Any) -> dict:
+    """The spec the job runs: the in-job vllm provider, and only the chosen `arms` (when given).
+
+    Arms the job does not run are dropped: they may call other models, which the job does not
+    serve or price, and the job validates every arm of its spec before it starts."""
     out = copy.deepcopy(doc)
+    if arms is not None:
+        out["arms"] = {a: out["arms"][a] for a in out["arms"] if a in set(arms)}
     out["providers"] = {**out.get("providers", {}), "vllm": vllm_provider(model, **provider_kw)}
     return out
 
@@ -317,7 +324,7 @@ def plan_job(
                      "will not be parsed and agent turns will be prose")
     if "vllm" in doc.get("providers", {}):
         notes.append("the spec's own providers.vllm is replaced by the in-job server override")
-    job_doc = job_spec_doc(doc, model, port=port, concurrency=concurrency,
+    job_doc = job_spec_doc(doc, model, arms=chosen, port=port, concurrency=concurrency,
                            timeout_s=request_timeout_s)
     job_yaml = dump_yaml(job_doc)
     _check_job_spec(job_yaml, chosen)
