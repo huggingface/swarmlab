@@ -153,56 +153,57 @@ class Enumerator(Participant):
         return TurnUsage(calls=len(results) + 1)
 
 
-# ---- ColoringGrid painters (M3b; swarmlab/world/coloring.py) -----------------------------------
+# ---- ColoringGrid painters (M3b, crossed zones; swarmlab/world/coloring.py) --------------------
 #
 # Each paints at most `paints` cells per turn, chosen from its own observation of the target and
-# the current grid (round-start state), then calls `end_turn`.
+# the current grid (round-start state), then calls `end_turn`. Every painter skips cells it may not
+# paint (zones of another painting group) and cells whose target it cannot see ("?"), so the first
+# three never paint a zone whose targets are hidden from them: they never read or post.
 #
-# - `RowMajorPainter`: the first cells, in row-major order, whose colour differs from the target.
-#   Every such agent picks the same cells: the duplicate-work baseline.
-# - `QueuePainter(ttl_rounds=1)`: the work-queue baseline. Picks cells that differ from the target
-#   at random (its rng) among those whose registry entry shows no live claim by another agent
-#   (`registry_get` at round start; at most `max_checks` reads per turn), then
-#   `registry_acquire("cell:x,y", ttl_rounds)` and paints them in the same turn. Registry writes
-#   commit before world actions, so under `enforced` the paint of an agent that lost the acquire
-#   race is rejected; under `advisory` it goes through and counts as a claim violation. With
-#   zones on it claims `zone:..` keys as the world reports them via `claim_key`; it computes the
-#   key with the same formula from the observation's `Zones:` line.
-# - `RandomPainter`: random cells (any) with random palette colours: the noise baseline.
+# - `RowMajorPainter`: the first such cells, in row-major order, whose colour differs from the
+#   target. Every such agent picks the same cells: the duplicate-work baseline.
+# - `QueuePainter(ttl_rounds=1)`: the work-queue baseline. Picks such cells at random (its rng)
+#   among those whose registry entry shows no live claim by another agent (`registry_get` at round
+#   start; at most `max_checks` reads per turn), then `registry_acquire("cell:x,y", ttl_rounds)`
+#   (the world's `claim_key`) and paints them in the same turn. Registry writes commit before world
+#   actions, so under `enforced` the paint of an agent that lost the acquire race is rejected;
+#   under `advisory` it goes through and counts as a claim violation.
+# - `RandomPainter`: random paintable cells with random palette colours: the noise baseline.
+# - `RelayPainter(paints=10, post=True)`: the crossed-zones relay baseline. Every turn it calls
+#   `read_board(limit=200)` and keeps, for the zone its group paints, the first report it can
+#   parse (`parse_report`: the zone id and the zone's cell count of colours); once (its first
+#   turn) it posts the targets of the zone its group sees in the recommended format
+#   (`Z0 red green ...`) when `post` is true. It then paints, up to `paints` cells: first the
+#   cells of its paintable zone that differ from the parsed report (split among its group's
+#   members by cell index), then the open cells it is responsible for (open cells in row-major
+#   order, cell k belongs to agent k mod n in agent order). `post: false` is the never-posting
+#   control: nobody learns a hidden zone, so the zones stay unpainted.
 
 
-def _coloring_obs(view: View) -> tuple[list[str], list[str], list[str], tuple[int, int] | None]:
+def _coloring_obs(view: View) -> tuple[list[str], list[str], list[str]]:
     from ..world.coloring import parse_observation as parse_coloring
 
-    text = _observation_text(view)
-    target, current, colours = parse_coloring(text)
-    zones = None
-    m = re.search(r"^Zones: (\d+) x (\d+)", text, re.MULTILINE)
-    if m:
-        zones = (int(m.group(1)), int(m.group(2)))
-    return target, current, colours, zones
+    return parse_coloring(_observation_text(view))
 
 
-def _cell_key(x: int, y: int, h: int, w: int, zones: tuple[int, int] | None) -> str:
-    if zones is None:
-        return f"cell:{x},{y}"
-    zy, zx = zones
-    return f"zone:{x * zx // w},{y * zy // h}"
+def _paintable(view: View) -> list[tuple[int, int, str]]:
+    from ..world.coloring import paintable_needed_cells
+
+    return paintable_needed_cells(_observation_text(view))
 
 
 class RowMajorPainter(Participant):
     entry_point: ClassVar[str | None] = "row_major_painter"
-    description: ClassVar[str] = "ColoringGrid: paints the first `paints` wrong cells, row by row"
+    description: ClassVar[str] = (
+        "ColoringGrid: paints the first `paints` wrong cells it may paint, row by row"
+    )
 
     def __init__(self, paints: int = 1) -> None:
         self.paints = paints
 
     async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
-        from ..world.coloring import needed_cells
-
-        target, current, _, _ = _coloring_obs(view)
         calls = 0
-        for x, y, c in needed_cells(target, current)[: self.paints]:
+        for x, y, c in _paintable(view)[: self.paints]:
             await tools.call("paint", {"x": x, "y": y, "color": c})
             calls += 1
         await tools.call("end_turn", {})
@@ -221,11 +222,7 @@ class QueuePainter(Participant):
         self.max_checks = max_checks
 
     async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
-        from ..world.coloring import needed_cells
-
-        target, current, _, zones = _coloring_obs(view)
-        h, w = len(target), len(target[0]) if target else 0
-        need = needed_cells(target, current)
+        need = _paintable(view)
         self.rng.shuffle(need)
         calls = 0
         checks = 0
@@ -233,7 +230,7 @@ class QueuePainter(Participant):
         for x, y, c in need:
             if done >= self.paints:
                 break
-            key = _cell_key(x, y, h, w, zones)
+            key = f"cell:{x},{y}"
             if checks < self.max_checks:
                 checks += 1
                 calls += 1
@@ -251,18 +248,95 @@ class QueuePainter(Participant):
 
 class RandomPainter(Participant):
     entry_point: ClassVar[str | None] = "random_painter"
-    description: ClassVar[str] = "ColoringGrid: paints `paints` random cells with random colours"
+    description: ClassVar[str] = (
+        "ColoringGrid: paints `paints` random paintable cells with random colours"
+    )
 
     def __init__(self, paints: int = 1) -> None:
         self.paints = paints
 
     async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
-        target, _, colours, _ = _coloring_obs(view)
+        from ..world.coloring import parse_zones, zone_at
+
+        text = _observation_text(view)
+        target, _, colours = _coloring_obs(view)
+        info = parse_zones(text)
+        cells = [(x, y) for y in range(len(target)) for x in range(len(target[y]))
+                 if (z := zone_at(info["zones"], x, y)) is None or z["painter_group"] == info["group"]]
         calls = 0
-        if target and colours:
+        if cells and colours:
             for _ in range(self.paints):
-                x, y = self.rng.randrange(len(target[0])), self.rng.randrange(len(target))
+                x, y = self.rng.choice(cells)
                 await tools.call("paint", {"x": x, "y": y, "color": self.rng.choice(colours)})
                 calls += 1
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=calls + 1)
+
+
+class RelayPainter(Participant):
+    entry_point: ClassVar[str | None] = "relay_painter"
+    description: ClassVar[str] = (
+        "ColoringGrid: posts its zone's targets, reads its painting zone's, paints its share"
+    )
+
+    def __init__(self, paints: int = 10, post: bool = True) -> None:
+        self.paints = paints
+        self.post = post
+
+    def bind(self, agent: Any, rng: Any) -> None:
+        super().bind(agent, rng)
+        self.known: dict[str, list[str]] = {}
+        self.posted = False
+
+    async def turn(self, view: View, tools: AgentTools) -> TurnUsage:
+        from ..world.coloring import format_report, needed_cells, parse_report, parse_zones, zone_at
+
+        text = _observation_text(view)
+        target, current, _ = _coloring_obs(view)
+        info = parse_zones(text)
+        g = info["group"]
+        everyone = sorted(a for members in info["groups"].values() for a in members)
+        mates = sorted(info["groups"].get(g, []))
+        zones = info["zones"]
+        mine = [z for z in zones if z["painter_group"] == g]
+        calls = 1
+        res = await tools.call("read_board", {"limit": 200})
+        for item in res.result.get("items", []) if res.ok else []:
+            for z in mine:
+                n = z["width"] * z["height"]
+                if z["zone_id"] not in self.known:
+                    reports = parse_report(item.get("content", ""), z["zone_id"], n)
+                    if reports:
+                        self.known[z["zone_id"]] = reports[0]
+        if self.post and not self.posted:
+            for z in zones:
+                if g in z["viewers"] and z["painter_group"] != g:
+                    cols = [target[y][x] for y in range(z["y"], z["y"] + z["height"])
+                            for x in range(z["x"], z["x"] + z["width"])]
+                    if "?" not in cols:
+                        await tools.call("post", {"channel": "main",
+                                                  "text": format_report(z["zone_id"], cols)})
+                        calls += 1
+            self.posted = True
+        todo: list[tuple[int, int, str]] = []
+        for z in mine:
+            want = self.known.get(z["zone_id"])
+            if want is None:
+                continue
+            cells = [(x, y) for y in range(z["y"], z["y"] + z["height"])
+                     for x in range(z["x"], z["x"] + z["width"])]
+            for k, ((x, y), c) in enumerate(zip(cells, want, strict=True)):
+                if mates and mates[k % len(mates)] == self.agent and current[y][x] != c:
+                    todo.append((x, y, c))
+        open_need = {(x, y): c for x, y, c in needed_cells(target, current)
+                     if zone_at(zones, x, y) is None}
+        open_cells = [(x, y) for y in range(len(target)) for x in range(len(target[y]))
+                      if zone_at(zones, x, y) is None]
+        for k, (x, y) in enumerate(open_cells):
+            if everyone and everyone[k % len(everyone)] == self.agent and (x, y) in open_need:
+                todo.append((x, y, open_need[(x, y)]))
+        for x, y, c in todo[: self.paints]:
+            await tools.call("paint", {"x": x, "y": y, "color": c})
+            calls += 1
         await tools.call("end_turn", {})
         return TurnUsage(calls=calls + 1)

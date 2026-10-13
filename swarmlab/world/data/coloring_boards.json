@@ -1,0 +1,92 @@
+[
+  {
+    "board": "00", "width": 15, "height": 8,
+    "targets": [
+      ["yellow", "blue", "yellow", "yellow", "yellow", "green", "red", "green", "blue", "yellow", "yellow", "yellow", "green", "green", "green"],
+      ["red", "red", "yellow", "green", "red", "green", "green", "yellow", "yellow", "green", "green", "green", "green", "blue", "yellow"],
+      ["blue", "blue", "blue", "blue", "red", "red", "green", "red", "red", "yellow", "green", "red", "red", "yellow", "blue"],
+      ["blue", "green", "yellow", "yellow", "yellow", "green", "blue", "red", "yellow", "green", "blue", "blue", "green", "yellow", "yellow"],
+      ["red", "yellow", "red", "blue", "green", "blue", "red", "green", "yellow", "red", "green", "red", "blue", "blue", "yellow"],
+      ["yellow", "blue", "red", "blue", "green", "yellow", "red", "green", "blue", "yellow", "blue", "red", "red", "yellow", "green"],
+      ["red", "green", "yellow", "blue", "blue", "red", "yellow", "green", "blue", "red", "blue", "blue", "red", "yellow", "blue"],
+      ["red", "blue", "yellow", "red", "red", "blue", "red", "red", "blue", "blue", "red", "green", "yellow", "blue", "red"]
+    ],
+    "zones": [
+      {"zone_id": "Z0", "type": "A", "x": 5, "y": 4, "width": 5, "height": 2, "viewer_group": 0, "painter_group": 1},
+      {"zone_id": "Z1", "type": "B", "x": 0, "y": 1, "width": 5, "height": 2, "viewer_group": 1, "painter_group": 2},
+      {"zone_id": "Z2", "type": "C", "x": 5, "y": 6, "width": 5, "height": 2, "viewer_group": 2, "painter_group": 0}
+    ]
+  },
+  {
+    "board": "01", "width": 15, "height": 8,
+    "targets": [
+      ["green", "red", "yellow", "green", "yellow", "green", "yellow", "green", "green", "green", "green", "blue", "red", "yellow", "blue"],
+      ["red", "green", "yellow", "blue", "red", "yellow", "blue", "red", "yellow", "blue", "yellow", "blue", "red", "green", "green"],
+      ["green", "blue", "green", "green", "blue", "red", "blue", "red", "red", "blue", "blue", "red", "blue", "green", "yellow"],
+      ["yellow", "yellow", "green", "yellow", "green", "red", "blue", "yellow", "green", "yellow", "red", "blue", "red", "green", "green"],
+      ["red", "yellow", "blue", "blue", "yellow", "red", "red", "blue", "yellow", "green", "green", "red", "green", "red", "red"],
+      ["green", "green", "yellow", "blue", "yellow", "green", "yellow", "yellow", "red", "green", "red", "red", "green", "green", "yellow"],
+      ["yellow", "yellow", "blue", "blue", "yellow", "red", "green", "yellow", "blue", "blue", "yellow", "yellow", "red", "blue", "blue"],
+      ["green", "red", "yellow", "blue", "red", "red", "blue", "red", "green", "red", "green", "yellow", "red", "blue", "red"]
+    ],
+    "zones": [
+      {"zone_id": "Z0", "type": "A", "x": 2, "y": 0, "width": 5, "height": 2, "viewer_group": 0, "painter_group": 1},
+      {"zone_id": "Z1", "type": "B", "x": 8, "y": 1, "width": 5, "height": 2, "viewer_group": 1, "painter_group": 2},
+      {"zone_id": "Z2", "type": "C", "x": 8, "y": 6, "width": 5, "height": 2, "viewer_group": 2, "painter_group": 0}
+    ]
+  },
+  {
+    "board": "02", "width": 15, "height": 8,
+    "targets": [
+      ["red", "red", "yellow", "red", "green", "red", "blue", "green", "yellow", "red", "yellow", "red", "yellow", "yellow", "blue"],
+      ["green", "green", "red", "green", "green", "red", "red", "red", "green", "yellow", "yellow", "red", "green", "blue", "green"],
+      ["green", "green", "yellow", "green", "green", "red", "red", "blue", "red", "green", "blue", "green", "blue", "red", "red"],
+      ["red", "green", "yellow", "blue", "blue", "red", "yellow", "red", "red", "red", "red", "green", "red", "green", "blue"],
+      ["green", "green", "red", "yellow", "red", "blue", "yellow", "red", "red", "red", "blue", "blue", "blue", "red", "red"],
+      ["blue", "yellow", "blue", "yellow", "green", "yellow", "red", "blue", "yellow", "blue", "red", "yellow", "red", "yellow", "red"],
+      ["green", "red", "green", "yellow", "red", "blue", "green", "green", "blue", "red", "yellow", "yellow", "blue", "blue", "green"],
+      ["green", "blue", "red", "blue", "yellow", "blue", "red", "red", "blue", "blue", "green", "red", "yellow", "yellow", "blue"]
+    ],
+    "zones": [
+      {"zone_id": "Z0", "type": "A", "x": 7, "y": 1, "width": 5, "height": 2, "viewer_group": 0, "painter_group": 1},
+      {"zone_id": "Z1", "type": "B", "x": 0, "y": 4, "width": 5, "height": 2, "viewer_group": 1, "painter_group": 2},
+      {"zone_id": "Z2", "type": "C", "x": 6, "y": 4, "width": 5, "height": 2, "viewer_group": 2, "painter_group": 0}
+    ]
+  },
+  {
+    "board": "03", "width": 15, "height": 8,
+    "targets": [
+      ["yellow", "green", "green", "blue", "blue", "yellow", "blue", "yellow", "yellow", "blue", "yellow", "blue", "blue", "red", "yellow"],
+      ["green", "yellow", "red", "blue", "blue", "yellow", "blue", "green", "green", "green", "yellow", "yellow", "yellow", "yellow", "green"],
+      ["red", "yellow", "green", "blue", "yellow", "blue", "yellow", "yellow", "blue", "yellow", "green", "yellow", "yellow", "red", "yellow"],
+      ["blue", "blue", "blue", "blue", "red", "green", "yellow", "red", "red", "blue", "yellow", "yellow", "red", "red", "blue"],
+      ["blue", "red", "blue", "green", "yellow", "yellow", "yellow", "red", "green", "blue", "green", "green", "yellow", "green", "blue"],
+      ["green", "blue", "green", "yellow", "yellow", "blue", "red", "green", "yellow", "green", "red", "green", "red", "yellow", "green"],
+      ["blue", "yellow", "yellow", "green", "yellow", "blue", "green", "red", "yellow", "blue", "green", "red", "green", "yellow", "red"],
+      ["yellow", "yellow", "green", "yellow", "yellow", "red", "red", "blue", "blue", "yellow", "blue", "blue", "green", "red", "red"]
+    ],
+    "zones": [
+      {"zone_id": "Z0", "type": "A", "x": 8, "y": 3, "width": 5, "height": 2, "viewer_group": 0, "painter_group": 1},
+      {"zone_id": "Z1", "type": "B", "x": 8, "y": 1, "width": 5, "height": 2, "viewer_group": 1, "painter_group": 2},
+      {"zone_id": "Z2", "type": "C", "x": 2, "y": 0, "width": 5, "height": 2, "viewer_group": 2, "painter_group": 0}
+    ]
+  },
+  {
+    "board": "04", "width": 15, "height": 8,
+    "targets": [
+      ["green", "blue", "green", "blue", "red", "green", "blue", "green", "blue", "yellow", "yellow", "green", "green", "green", "green"],
+      ["yellow", "blue", "green", "red", "yellow", "red", "red", "green", "yellow", "green", "green", "yellow", "green", "green", "blue"],
+      ["red", "blue", "yellow", "yellow", "red", "blue", "green", "yellow", "blue", "blue", "yellow", "green", "red", "green", "yellow"],
+      ["yellow", "red", "red", "yellow", "blue", "yellow", "green", "green", "blue", "green", "blue", "green", "green", "red", "yellow"],
+      ["green", "red", "yellow", "blue", "red", "red", "green", "red", "red", "red", "red", "green", "red", "yellow", "blue"],
+      ["red", "blue", "red", "green", "yellow", "yellow", "red", "blue", "red", "red", "red", "blue", "red", "red", "blue"],
+      ["blue", "blue", "green", "yellow", "green", "blue", "green", "green", "red", "yellow", "red", "green", "yellow", "red", "green"],
+      ["green", "green", "red", "green", "blue", "red", "yellow", "red", "yellow", "red", "red", "green", "yellow", "red", "yellow"]
+    ],
+    "zones": [
+      {"zone_id": "Z0", "type": "A", "x": 5, "y": 1, "width": 5, "height": 2, "viewer_group": 0, "painter_group": 1},
+      {"zone_id": "Z1", "type": "B", "x": 2, "y": 6, "width": 5, "height": 2, "viewer_group": 1, "painter_group": 2},
+      {"zone_id": "Z2", "type": "C", "x": 5, "y": 4, "width": 5, "height": 2, "viewer_group": 2, "painter_group": 0}
+    ]
+  }
+]
