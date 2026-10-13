@@ -111,6 +111,23 @@ def test_job_spec_injects_self_hosted_vllm_provider(tmp_path):
     assert p.orig_spec_yaml == (tmp_path / "spec.yaml").read_text()
 
 
+def test_job_spec_keeps_only_the_chosen_arms(tmp_path):
+    """A spec with one arm per model: each job stages and validates only the arms it runs, so
+    the other arms' models (not served, not priced in the job) cannot fail its validation."""
+    other = yaml.safe_load(vllm_spec(tmp_path, model="vllm:ibm-granite/granite-4.1-3b").read_text())
+    spec = vllm_spec(tmp_path, extra_arm={"granite": other["arms"]["bc"]})
+    p = plan(spec, arms=["bc"])
+    doc = yaml.safe_load(p.job_spec_yaml)
+    assert list(doc["arms"]) == ["bc"]
+    staged = tmp_path / "job.yaml"
+    staged.write_text(p.job_spec_yaml)
+    Experiment.from_yaml(staged, "bc")
+    g = plan(spec, model="ibm-granite/granite-4.1-3b", arms=["granite"])
+    assert list(yaml.safe_load(g.job_spec_yaml)["arms"]) == ["granite"]
+    # the original spec is still shipped whole
+    assert "granite" in yaml.safe_load(p.orig_spec_yaml)["arms"]
+
+
 def test_validation_of_vllm_model_ids(tmp_path):
     with pytest.raises(SpecError, match="--model is"):
         plan(vllm_spec(tmp_path), model="Qwen/Qwen3.5-27B")
