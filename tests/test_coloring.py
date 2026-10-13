@@ -205,10 +205,12 @@ def test_description_states_rules_format_and_board_timing():
                    "three groups, G0, G1 and G2", "Z0, Z1 and Z2, of 5 x 2 cells",
                    "Cells outside the zones are open: anyone may paint them",
                    "a paint inside a zone by an agent outside its painting group is refused",
-                   '"Z0 red green blue yellow red green blue yellow red green"',
+                   '"<zone id> <colour 1> <colour 2> ... <colour 10>"',
                    "row-major order", "delivered when the round ends",
                    "read with read_board from the next round on"):
         assert phrase in d, phrase
+    # no concrete colour sequence that a model could copy as if it were a zone's targets
+    assert "red green blue" not in d
     assert "at most 1 cell per round" in ColoringGrid(paints_per_round=1).description()
     assert w.description_for(C).startswith(d) and "You are a002, in group G2." in w.description_for(C)
     assert ColoringGrid().description_for(A) == ColoringGrid().description()  # before reset
