@@ -123,8 +123,8 @@ def test_claim_policies():
 
 
 def _world():
-    w = ColoringGrid(height=2, width=2)
-    w.reset(derive(0, "world"), [A, B])
+    w = ColoringGrid(board="01")  # cells (0, 0) and (1, 1) are open on board 01
+    w.reset(derive(0, "world"), [A, B, C])
     w.begin_round(1)
     return w
 
@@ -164,7 +164,7 @@ def _executor(tmp_path, commit="round_end", registry=None, policy=None):
     board = Board(registry=True)
     board.commit_mode = commit
     ex = RoundExecutor(run="r", round=1, world=w, board=board, blobs=BlobStore(tmp_path / "b"),
-                       agents=[A, B], commit=commit, registry=registry or Registry(),
+                       agents=[A, B, C], commit=commit, registry=registry or Registry(),
                        claim_policy=policy or Advisory())
     return w, ex
 
@@ -325,7 +325,7 @@ def test_spec_hash_unchanged_without_registry(tmp_path):
                           "medium": MediumSpec(**spec.medium.model_dump(), registry=False,
                                                claim_policy="advisory")})
     assert spec_hash(explicit) == spec_hash(spec)  # the defaults never reach the hash
-    on = Experiment(name="x", world=ColoringGrid(), participants=[Grabber()],
+    on = Experiment(name="x", world=ColoringGrid(), participants=[Grabber()] * 3,
                     medium=Board(registry=True, claim_policy="enforced"))
     ospec = on.to_spec(seed=1, max_rounds=2)
     assert ospec.medium.registry is True and ospec.medium.claim_policy == PluginSpec(type="enforced")
@@ -333,5 +333,5 @@ def test_spec_hash_unchanged_without_registry(tmp_path):
     assert back.medium.registry and isinstance(back.medium.claim_policy, Enforced)
     assert spec_hash(back.to_spec(seed=1, max_rounds=2)) == spec_hash(ospec)
     assert spec_hash(ospec) != spec_hash(
-        Experiment(name="x", world=ColoringGrid(), participants=[Grabber()],
+        Experiment(name="x", world=ColoringGrid(), participants=[Grabber()] * 3,
                    medium=Board(registry=True)).to_spec(seed=1, max_rounds=2))
