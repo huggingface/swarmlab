@@ -22,7 +22,8 @@ hash, so it separates cache entries and belongs to the arm's spec.
 **text_tool_fallback** (native protocol only, default False because it is an experimental
 condition): when a response has no native tool calls but its text spells out calls to offered
 tools, they are parsed (`parse_text_tool_calls`: Hermes/Qwen `<tool_call>{...}</tool_call>`
-blocks, then `name(key="value", ...)` call syntax, then a JSON call list as in the json
+blocks, with the arguments nested under "arguments"/"args"/"parameters" or flattened next to
+"name", then `name(key="value", ...)` call syntax, then a JSON call list as in the json
 protocol) and executed like json-protocol calls (results come back as a `[tool results]` user
 message, since there are no provider tool-call ids). Each trigger is logged (logger
 `swarmlab.participants.llm`) and noted in the turn.
@@ -373,7 +374,14 @@ def parse_tool_json(text: str) -> list[tuple[str, dict]] | None:
     for i, item in enumerate(value):
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
             raise ToolJsonError(f"element {i} is not an object with a string \"name\"")
-        args = next((item[k] for k in ("args", "arguments", "parameters", "input") if k in item), {})
+        arg_keys = [k for k in ("args", "arguments", "parameters", "input") if k in item]
+        if arg_keys:
+            args = item[arg_keys[0]]
+        else:
+            # flattened form, e.g. Qwen3-4B-Instruct-2507 under vLLM's hermes parser writes
+            # `<tool_call>{"name": "paint", "x": 1, "y": 0, "color": "b"}</tool_call>`: the
+            # arguments sit next to "name" (the server drops such a call; this keeps it)
+            args = {k: v for k, v in item.items() if k not in ("name", "id", "type")}
         if isinstance(args, str):
             try:
                 args = json.loads(args) if args.strip() else {}
