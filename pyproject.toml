@@ -27,6 +27,7 @@ flaggame = "swarmlab.world.flaggame:FlagGame"
 coloring = "swarmlab.world.coloring:ColoringGrid"
 hidden_sites = "swarmlab.world.hidden_sites:HiddenSites"
 cascade = "swarmlab.world.cascade:CascadeWorld"
+minesweeper = "swarmlab.world.minesweeper:Minesweeper"
 
 [project.entry-points."swarmlab.claim_policies"]
 advisory = "swarmlab.medium.registry:Advisory"
@@ -74,6 +75,11 @@ cascade_worker = "swarmlab.participants.cascade:CascadeWorker"
 "hidden.expected_cum" = "swarmlab.world.hidden_sites:ExpectedCum"
 "hidden.actual_points" = "swarmlab.world.hidden_sites:ActualPoints"
 "hidden.actual_cum" = "swarmlab.world.hidden_sites:ActualCum"
+"minesweeper.cleared" = "swarmlab.world.minesweeper:Cleared"
+"minesweeper.collisions" = "swarmlab.world.minesweeper:Collisions"
+"minesweeper.productive_rate" = "swarmlab.world.minesweeper:ProductiveRate"
+"minesweeper.allocation_efficiency" = "swarmlab.world.minesweeper:AllocationEfficiency"
+"minesweeper.mine_hits" = "swarmlab.world.minesweeper:MineHits"
 
 [project.entry-points."swarmlab.schedulers"]
 fixed = "swarmlab.scheduler:Scheduler"
@@ -101,6 +107,8 @@ flaggame_reader = "swarmlab.providers.fake:flaggame_reader"
 painter = "swarmlab.world.coloring:fake_painter"
 hidden_chooser = "swarmlab.world.hidden_sites:fake_chooser"
 cascade_herder = "swarmlab.world.cascade:fake_herder"
+minesweeper_random = "swarmlab.world.minesweeper:fake_random"
+minesweeper_allocator = "swarmlab.world.minesweeper:fake_allocator"
 
 [build-system]
 requires = ["hatchling"]
