@@ -13,8 +13,10 @@
 #   VLLM_FLAGS is shell-quoted (shlex) and split with Python's shlex, so a quoted JSON value works;
 #   the script itself always adds --served-model-name --host --port --max-model-len
 #   --gpu-memory-utilization (and --revision), which VLLM_FLAGS must not repeat.
-#   VLLM_FLAGS_SOURCE / VLLM_PROFILE (recorded in job.json)  VLLM_PROBE_EXTRA (JSON merged into
-#   the readiness probe's request; default: chat_template_kwargs.enable_thinking=false)
+#   VLLM_FLAGS_SOURCE / VLLM_PROFILE (recorded in job.json)
+#   VLLM_PROBE_EXTRA (JSON object merged into the readiness probe's request; `{}` sends none; unset
+#   or empty: chat_template_kwargs.enable_thinking=false) and VLLM_PROBE_EXTRA_SOURCE (where the
+#   launcher took it from: --probe-extra | profile | default | none); both recorded in job.json
 #   VLLM_REVISION (optional)  VLLM_WAIT_S (default 1200: /health + /v1/models must answer by then)
 #
 # Layout: vLLM in the image's system Python (`uv pip install --system`, as in the textworld
@@ -47,6 +49,11 @@ export SWARMLAB_OFFLINE=1   # never fetch the router catalog inside the job
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 STATUS=starting RC=0 VLLM_PID="" SYNC_PID="" RUN_PID="" READY_S="" FAILED_RUNS="" DONE_RUNS=""
 VLLM_CMDLINE=""
+if [ -z "${VLLM_PROBE_EXTRA:-}" ]; then   # launched by hand: the launcher's default
+  VLLM_PROBE_EXTRA='{"chat_template_kwargs":{"enable_thinking":false}}'
+  VLLM_PROBE_EXTRA_SOURCE="${VLLM_PROBE_EXTRA_SOURCE:-default}"
+fi
+export VLLM_PROBE_EXTRA VLLM_PROBE_EXTRA_SOURCE="${VLLM_PROBE_EXTRA_SOURCE:-}"
 HF="hf"
 mkdir -p "$OUT" "$WORK" "$JT/joblogs"
 
@@ -63,6 +70,10 @@ try:
     probe = json.load(open(e("PROBE_FILE")))
 except (OSError, ValueError):
     probe = None
+try:
+    probe_extra = json.loads(e("VLLM_PROBE_EXTRA") or "")
+except ValueError:
+    probe_extra = e("VLLM_PROBE_EXTRA")   # unparsable: recorded as given (the probe fails on it)
 doc = {
     "tag": e("SWARMLAB_TAG"), "job_id": e("JOB_ID"), "flavor": e("SWARMLAB_FLAVOR"),
     "accelerator": e("ACCELERATOR"), "image": e("SWARMLAB_IMAGE"),
@@ -78,6 +89,8 @@ doc = {
              "gpu_memory_utilization": e("VLLM_GPU_MEMORY_UTILIZATION"),
              "flags": e("VLLM_FLAGS"), "flags_source": e("VLLM_FLAGS_SOURCE") or None,
              "profile": e("VLLM_PROFILE") or None, "command": e("VLLM_CMDLINE") or None,
+             "probe_extra": probe_extra,
+             "probe_extra_source": e("VLLM_PROBE_EXTRA_SOURCE") or None,
              "ready_s": e("READY_S") or None},
     "probe": probe,
 }
@@ -165,20 +178,26 @@ READY_S=$(( $(date +%s) - WAIT_T0 ))
 log "vLLM ready in ${READY_S}s: $(grep -E 'KV cache|Maximum concurrency' "$JT/vllm.log" | tail -2 | tr '\n' ' ')"
 
 # one real tool-calling completion: proves the parsers before any run starts. The request extra
-# (VLLM_PROBE_EXTRA, from the serve profile) carries model-specific fields such as
-# chat_template_kwargs.enable_thinking=false; vLLM drops template kwargs a template does not use.
+# (VLLM_PROBE_EXTRA: --probe-extra, else the serve profile's, else the default) carries
+# model-specific fields such as chat_template_kwargs.enable_thinking=false; vLLM drops template
+# kwargs a template does not use.
 VLLM_PORT="$VLLM_PORT" VLLM_MODEL="$VLLM_MODEL" PROBE_FILE="$JT/probe.json" python3 - <<'PY' \
   || fail 13 "endpoint probe failed (see PROBE ERROR above)"
 import json, os, time, urllib.error, urllib.request
-extra_text = os.environ.get("VLLM_PROBE_EXTRA")
-extra = json.loads(extra_text) if extra_text else {"chat_template_kwargs": {"enable_thinking": False}}
+try:
+    extra = json.loads(os.environ["VLLM_PROBE_EXTRA"])
+except ValueError as e:
+    extra = "not JSON: %s" % e
+if not isinstance(extra, dict):
+    print("PROBE ERROR: VLLM_PROBE_EXTRA must be a JSON object, got %r" % os.environ["VLLM_PROBE_EXTRA"][:200])
+    raise SystemExit(1)
 body = {"model": os.environ["VLLM_MODEL"], "max_tokens": 1024,
         "messages": [{"role": "user", "content": "Guess candidate B with the tool."}],
         "tools": [{"type": "function", "function": {"name": "guess", "description": "Guess the flag.",
                    "parameters": {"type": "object", "properties": {"candidate": {"type": "string"}},
                                   "required": ["candidate"]}}}],
         "tool_choice": "auto", **extra}
-out = {"outcome": "error", "extra": extra}
+out = {"outcome": "error", "extra": extra, "extra_source": os.environ.get("VLLM_PROBE_EXTRA_SOURCE") or None}
 def save():
     with open(os.environ["PROBE_FILE"], "w") as f:
         json.dump(out, f)

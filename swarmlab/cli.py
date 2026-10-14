@@ -1157,7 +1157,12 @@ def job_run(
         "--vllm-flags ones, e.g. '--reasoning-parser qwen3'.")] = None,
     profile: Annotated[str, typer.Option(
         "--profile", help="Serve profile: auto (built-in table entry for --model, else the Qwen "
-        "default), none (the Qwen default), or a model id from the table.")] = "auto",
+        "default), none (the Qwen default flags, no probe extra), or a model id from the "
+        "table.")] = "auto",
+    probe_extra: Annotated[str | None, typer.Option(
+        "--probe-extra", help="JSON object merged into the readiness probe's request, replacing "
+        "the profile/default one, e.g. '{\"chat_template_kwargs\": {\"enable_thinking\": "
+        "false}}'; '{}' sends none.")] = None,
     revision: Annotated[str | None, typer.Option("--revision", help="Model revision to pin.")] = None,
     per_round: Annotated[float | None, typer.Option(
         "--per-round", help="Seconds per round for the estimate (default 30 + 2*N).")] = None,
@@ -1173,9 +1178,12 @@ def job_run(
 ) -> None:
     """Print (and with --launch submit) an HF Job: vLLM serving MODEL + `swarmlab run` per arm x seed."""
     from .jobs import launch as jl
+    from .jobs import profiles as jp
 
     def go() -> dict[str, Any]:
         kw: dict[str, Any] = {}
+        if probe_extra is not None:
+            kw["probe_extra"] = jp.parse_probe_extra(probe_extra)
         for key, val in (("image", image), ("vllm_version", vllm_version),
                          ("max_model_len", max_model_len), ("revision", revision),
                          ("per_round_s", per_round), ("timeout", timeout)):

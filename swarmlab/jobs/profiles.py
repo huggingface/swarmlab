@@ -12,6 +12,15 @@ auto` looks up `--model`; `--profile <model id>` forces one; `--profile none` sk
 then `DEFAULT_VLLM_FLAGS` (the Qwen3.5 textworld flags), so a model not in the table is served
 exactly as before. `--vllm-flags-append` is added to whichever of the three won.
 
+The readiness probe's request extra resolves separately (it describes the model's chat template,
+not the server): an explicit `--probe-extra '<JSON object>'` wins (`'{}'` is a real override: the
+probe sends no extra fields), then the selected profile's `probe_extra` (even when `--vllm-flags`
+replaced the profile's flags), then `DEFAULT_PROBE_EXTRA`, but only when the flags are the Qwen
+default too (`--profile auto` with a model not in the table and no `--vllm-flags`). Otherwise
+(`--profile none`, or `--vllm-flags` for a model not in the table) the launcher knows nothing about
+the template and the probe sends no extra. `ResolvedFlags.probe_extra_source` records which case
+applied: `--probe-extra`, `profile`, `default` or `none`.
+
 The launcher always adds `--served-model-name <model> --host 127.0.0.1 --port <port>
 --max-model-len <n> --gpu-memory-utilization <f>` (and `--revision` when given) itself; flag
 strings must not repeat them (`check_flags` rejects that), since the job spec's provider URL and
@@ -31,6 +40,8 @@ cache at 32k: 2.66 GiB free, 5 GiB needed), so it runs on l40sx1 or a100-large.
 """
 from __future__ import annotations
 
+import copy
+import json
 import shlex
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,13 +50,16 @@ from ..spec import SpecError
 
 DEFAULT_VLLM_FLAGS = ("--dtype bfloat16 --language-model-only --reasoning-parser qwen3 "
                       "--enable-auto-tool-choice --tool-call-parser qwen3_coder")
-# the request extra the readiness probe sends when no profile applies (unchanged behaviour)
+# the readiness probe's request extra for a model not in the table served with the Qwen
+# default flags (`--profile auto`, no `--vllm-flags`, no `--probe-extra`)
 DEFAULT_PROBE_EXTRA: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
 NO_THINKING: dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
 # flags `bootstrap.sh` passes itself; a flag string repeating one is rejected
 LAUNCHER_FLAGS = ("--served-model-name", "--host", "--port", "--max-model-len",
                   "--gpu-memory-utilization", "--revision")
-PROFILE_CHOICES_HELP = "auto (look up --model), none (the Qwen default), or a model id in the table"
+PROFILE_CHOICES_HELP = ('auto (look up --model), none (the Qwen default flags, no probe extra), '
+                        'or a model id in the table')
+PROBE_EXTRA_SOURCES = ("--probe-extra", "profile", "default", "none")
 
 
 @dataclass(frozen=True)
@@ -138,6 +152,24 @@ def check_flags(flags: str, what: str = "--vllm-flags") -> list[str]:
     return tokens
 
 
+def parse_probe_extra(text: str, what: str = "--probe-extra") -> dict[str, Any]:
+    """Parse a probe request extra given as JSON text; it must be a JSON object."""
+    try:
+        value = json.loads(text)
+    except ValueError as e:
+        raise SpecError(f"{what}: not valid JSON ({e}): {text!r}; pass a JSON object, e.g. "
+                        """'{"chat_template_kwargs": {"enable_thinking": false}}' or '{}'""") from e
+    return check_probe_extra(value, what)
+
+
+def check_probe_extra(value: Any, what: str = "--probe-extra") -> dict[str, Any]:
+    """A probe request extra must be a JSON object (its keys are merged into the request body)."""
+    if not isinstance(value, dict):
+        raise SpecError(f"{what} must be a JSON object (merged into the probe's request body), "
+                        f"got {type(value).__name__}: {json.dumps(value)[:200]}")
+    return copy.deepcopy(value)
+
+
 @dataclass(frozen=True)
 class ResolvedFlags:
     flags: str
@@ -146,14 +178,20 @@ class ResolvedFlags:
     probe_extra: dict[str, Any]
     validated_vllm: str | None
     min_gpu_gb: int | None = None   # the profile's `min_gpu_gb`, when one was selected
+    probe_extra_source: str = "default"   # "--probe-extra" | "profile" | "default" | "none"
 
 
 def resolve_flags(model: str, *, vllm_flags: str | None = None, profile: str | None = "auto",
-                  append: str | None = None) -> ResolvedFlags:
+                  append: str | None = None,
+                  probe_extra: dict[str, Any] | None = None) -> ResolvedFlags:
     """Explicit flags > profile > default; `append` goes after whichever won.
 
-    The probe extra follows the selected profile even when `vllm_flags` replaces its flags (it
-    describes the model's chat template, not the server); without a profile it is the default.
+    The probe extra resolves on its own: explicit `probe_extra` (`{}` included: the probe then
+    sends no extra fields) > the selected profile's `probe_extra` (even when `vllm_flags` replaces
+    the profile's flags: it describes the model's chat template, not the server) >
+    `DEFAULT_PROBE_EXTRA`, only when the flags came from the Qwen default as well (`source ==
+    "default"` under `profile="auto"`). With `profile="none"`, or `vllm_flags` for a model not in
+    the table, it is `{}` (source `none`). A non-object `probe_extra` raises `SpecError`.
     """
     prof = select_profile(model, profile)
     if vllm_flags is not None:
@@ -165,8 +203,18 @@ def resolve_flags(model: str, *, vllm_flags: str | None = None, profile: str | N
     if append:
         flags = f"{flags} {append}".strip()
     flags = shlex.join(check_flags(flags))
+    no_profile = (profile or "auto").strip().lower() == "none"
+    extra: dict[str, Any]
+    if probe_extra is not None:
+        extra, extra_source = check_probe_extra(probe_extra), "--probe-extra"
+    elif prof is not None:
+        extra, extra_source = copy.deepcopy(prof.probe_extra), "profile"
+    elif source == "default" and not no_profile:
+        extra, extra_source = copy.deepcopy(DEFAULT_PROBE_EXTRA), "default"
+    else:
+        extra, extra_source = {}, "none"
     return ResolvedFlags(
         flags=flags, source=source, profile=prof.model if prof else None,
-        probe_extra=dict(prof.probe_extra) if prof else dict(DEFAULT_PROBE_EXTRA),
+        probe_extra=extra, probe_extra_source=extra_source,
         validated_vllm=prof.validated_vllm if prof else None,
         min_gpu_gb=prof.min_gpu_gb if prof else None)

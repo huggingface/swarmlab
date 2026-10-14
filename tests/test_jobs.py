@@ -464,6 +464,7 @@ def test_flag_precedence_explicit_then_profile_then_default():
     assert "--reasoning-parser qwen3" in jp.DEFAULT_VLLM_FLAGS
     r = jp.resolve_flags(granite, profile="none")
     assert (r.flags, r.source, r.profile) == (jp.DEFAULT_VLLM_FLAGS, "default", None)
+    assert (r.probe_extra, r.probe_extra_source) == ({}, "none")
     r = jp.resolve_flags("my/finetune", profile="Qwen/Qwen3.5-2B")
     assert r.source == "profile" and r.profile == "Qwen/Qwen3.5-2B"
     assert jp.resolve_flags("qwen/qwen3.5-9b").profile == "Qwen/Qwen3.5-9B"
@@ -531,7 +532,7 @@ def test_cli_dry_run_prints_flags_and_profile(tmp_path, monkeypatch):
     assert f"vllm 0.27.1: profile {lfm}, flags from profile" in out
     assert f"  flags: {jp.PROFILES[lfm].flags}" in out
     assert "launcher adds: --served-model-name LiquidAI/LFM2.5-2.6B --host 127.0.0.1" in out
-    assert "--max-model-len 32768" in out and "probe extra: {}" in out
+    assert "--max-model-len 32768" in out and "probe extra: {} (from profile)" in out
     assert "--tool-call-parser lfm2 --reasoning-parser minimax_m2" in out  # in the hf command too
     res = cli.invoke(app, ["job", "run", str(spec), "--model", lfm, "--json",
                            "--vllm-flags", ("--dtype bfloat16 --enable-auto-tool-choice "
@@ -544,6 +545,7 @@ def test_cli_dry_run_prints_flags_and_profile(tmp_path, monkeypatch):
     assert planned["vllm_flags_source"] == "--vllm-flags" and planned["vllm_profile"] == lfm
     res = cli.invoke(app, ["job", "run", str(spec), "--model", lfm, "--profile", "none"])
     assert res.exit_code == 0 and "profile none, flags from default" in res.output
+    assert "probe extra: {} (from none)" in res.output
     bad = cli.invoke(app, ["job", "run", str(spec), "--model", lfm, "--vllm-flags", "--port 9"])
     assert bad.exit_code == 2 and "launcher always passes" in bad.stderr
 
@@ -575,6 +577,129 @@ def test_bootstrap_default_probe_records_ok(tmp_path):
     assert body["chat_template_kwargs"] == {"enable_thinking": False}  # no VLLM_PROBE_EXTRA
     manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
     assert manifest["probe"]["outcome"] == "ok" and manifest["probe"]["tool_calls"] == 1
+    assert manifest["vllm"]["probe_extra"] == jp.DEFAULT_PROBE_EXTRA
+    assert manifest["vllm"]["probe_extra_source"] == "default"
+
+
+def test_probe_extra_precedence():
+    """--probe-extra > the profile's > DEFAULT_PROBE_EXTRA (only with the default flags under
+    --profile auto) > nothing."""
+    granite42, mine = "ibm-granite/granite-4.2-8b", {"chat_template_kwargs": {"thinking": "off"}}
+    r = jp.resolve_flags(granite42)   # profile
+    assert (r.probe_extra, r.probe_extra_source) == (jp.NO_THINKING, "profile")
+    r = jp.resolve_flags(granite42, vllm_flags="--dtype half")   # still the profile's
+    assert (r.probe_extra, r.probe_extra_source) == (jp.NO_THINKING, "profile")
+    r = jp.resolve_flags(granite42, probe_extra=mine)   # explicit beats profile
+    assert (r.probe_extra, r.probe_extra_source) == (mine, "--probe-extra")
+    assert r.source == "profile" and r.profile == granite42   # flags untouched
+    r = jp.resolve_flags(granite42, probe_extra={})   # {} is a real override
+    assert (r.probe_extra, r.probe_extra_source) == ({}, "--probe-extra")
+    r = jp.resolve_flags("acme/model-7b")   # unknown model, default flags: the default extra
+    assert (r.probe_extra, r.probe_extra_source) == (jp.DEFAULT_PROBE_EXTRA, "default")
+    r = jp.resolve_flags("acme/model-7b", probe_extra=mine)   # explicit beats default
+    assert (r.probe_extra, r.probe_extra_source) == (mine, "--probe-extra")
+    r = jp.resolve_flags("acme/model-7b", vllm_flags="--dtype half")   # nothing known
+    assert (r.probe_extra, r.probe_extra_source) == ({}, "none")
+    for m in (granite42, "acme/model-7b", MODEL):
+        r = jp.resolve_flags(m, profile="none")   # no profile: no template knowledge
+        assert (r.probe_extra, r.probe_extra_source) == ({}, "none"), m
+        r = jp.resolve_flags(m, profile="none", probe_extra=mine)
+        assert (r.probe_extra, r.probe_extra_source) == (mine, "--probe-extra"), m
+    r = jp.resolve_flags("acme/model-7b", profile="Qwen/Qwen3.5-2B")   # a forced profile's
+    assert (r.probe_extra, r.probe_extra_source) == (jp.NO_THINKING, "profile")
+    # resolution returns copies: mutating one never edits the table
+    jp.resolve_flags(granite42).probe_extra["chat_template_kwargs"]["x"] = 1
+    assert jp.PROFILES[granite42].probe_extra == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_probe_extra_must_be_a_json_object(tmp_path):
+    assert jp.parse_probe_extra('{"top_k": 1}') == {"top_k": 1}
+    assert jp.parse_probe_extra("{}") == {}
+    for bad in ("[1]", "nope", '"text"', "1", "null", ""):
+        with pytest.raises(SpecError, match="--probe-extra"):
+            jp.parse_probe_extra(bad)
+    with pytest.raises(SpecError, match="must be a JSON object"):
+        jp.resolve_flags(MODEL, probe_extra=[1])  # type: ignore[arg-type]
+    spec = vllm_spec(tmp_path)
+    for bad in ("[1]", "nope"):
+        res = cli.invoke(app, ["job", "run", str(spec), "--model", MODEL, "--probe-extra", bad])
+        assert res.exit_code == 2, res.output
+        assert "--probe-extra" in res.stderr and "JSON object" in res.stderr
+
+
+ARBITRARY_FLAGS = ("--dtype float16 --enforce-eager --enable-auto-tool-choice "
+                   "--tool-call-parser pythonic --chat-template /models/t.jinja")
+CUSTOM_EXTRA = {"chat_template_kwargs": {"thinking": "off"}, "top_k": 1}
+
+
+def test_unlisted_model_with_custom_flags_and_probe_extra(tmp_path, monkeypatch):
+    other = "acme/model-7b"
+    spec = vllm_spec(tmp_path, model=f"vllm:{other}")
+    p = plan(spec, model=other, vllm_flags=ARBITRARY_FLAGS, probe_extra=CUSTOM_EXTRA)
+    assert p.vllm_flags == ARBITRARY_FLAGS and p.vllm_flags_source == "--vllm-flags"
+    assert p.vllm_profile is None
+    assert p.probe_extra == CUSTOM_EXTRA and p.probe_extra_source == "--probe-extra"
+    env = p.env()
+    assert json.loads(env["VLLM_PROBE_EXTRA"]) == CUSTOM_EXTRA
+    assert env["VLLM_PROBE_EXTRA_SOURCE"] == "--probe-extra" and env["VLLM_FLAGS"] == ARBITRARY_FLAGS
+    doc = json.loads((jl.stage(p, tmp_path / "st", build=None) / "plan.json").read_text())
+    assert doc["probe_extra"] == CUSTOM_EXTRA and doc["probe_extra_source"] == "--probe-extra"
+    assert ('probe extra: {"chat_template_kwargs": {"thinking": "off"}, "top_k": 1} '
+            "(from --probe-extra)") in jl.describe(p)
+    # the same through the CLI
+    monkeypatch.setattr(jl, "submit", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    res = cli.invoke(app, ["job", "run", str(spec), "--model", other, "--json",
+                           "--vllm-flags", ARBITRARY_FLAGS,
+                           "--probe-extra", json.dumps(CUSTOM_EXTRA)])
+    assert res.exit_code == 0, res.output
+    planned = json.loads(res.stdout)["plan"]
+    assert planned["probe_extra"] == CUSTOM_EXTRA
+    assert planned["probe_extra_source"] == "--probe-extra"
+    # without --probe-extra an unlisted model with its own flags gets no extra
+    q = plan(spec, model=other, vllm_flags=ARBITRARY_FLAGS)
+    assert (q.probe_extra, q.probe_extra_source) == ({}, "none")
+    assert "probe extra: {} (from none)" in jl.describe(q)
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_bootstrap_sends_custom_probe_extra(tmp_path):
+    other = "acme/model-7b"
+    p = plan(vllm_spec(tmp_path, model=f"vllm:{other}"), model=other, vllm_flags=ARBITRARY_FLAGS,
+             probe_extra=CUSTOM_EXTRA)
+    env = p.env()
+    proc, bucket, _ = _run_bootstrap(
+        tmp_path, "scripted:1", VLLM_MODEL=other, VLLM_FLAGS=env["VLLM_FLAGS"],
+        VLLM_PROBE_EXTRA=env["VLLM_PROBE_EXTRA"],
+        VLLM_PROBE_EXTRA_SOURCE=env["VLLM_PROBE_EXTRA_SOURCE"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
+    assert body["chat_template_kwargs"] == {"thinking": "off"} and body["top_k"] == 1
+    assert body["model"] == other and body["tools"][0]["function"]["name"] == "guess"
+    manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
+    assert manifest["vllm"]["probe_extra"] == CUSTOM_EXTRA
+    assert manifest["vllm"]["probe_extra_source"] == "--probe-extra"
+    assert manifest["probe"]["extra"] == CUSTOM_EXTRA
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_empty_probe_extra_overrides_the_profile(tmp_path):
+    granite42 = "ibm-granite/granite-4.2-8b"
+    p = plan(vllm_spec(tmp_path, model=f"vllm:{granite42}"), model=granite42, probe_extra={})
+    assert p.vllm_flags_source == "profile" and p.vllm_profile == granite42
+    assert (p.probe_extra, p.probe_extra_source) == ({}, "--probe-extra")
+    env = p.env()
+    assert env["VLLM_PROBE_EXTRA"] == "{}"
+    proc, bucket, _ = _run_bootstrap(
+        tmp_path, "scripted:1", VLLM_MODEL=granite42, VLLM_FLAGS=env["VLLM_FLAGS"],
+        VLLM_PROBE_EXTRA=env["VLLM_PROBE_EXTRA"],
+        VLLM_PROBE_EXTRA_SOURCE=env["VLLM_PROBE_EXTRA_SOURCE"])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
+    assert "chat_template_kwargs" not in body
+    assert set(body) == {"model", "max_tokens", "messages", "tools", "tool_choice"}
+    manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
+    assert manifest["vllm"]["probe_extra"] == {}
+    assert manifest["vllm"]["probe_extra_source"] == "--probe-extra"
 
 
 # ---- fetch, status ------------------------------------------------------------------------------

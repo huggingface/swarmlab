@@ -32,10 +32,14 @@ tool parser in the textworld study (a100-large, server up in ~5 min including th
 
 Serve flags: `swarmlab/jobs/profiles.py`. `plan_job(vllm_flags=None, profile="auto")` uses
 explicit flags if given, else the built-in profile for `--model`, else `DEFAULT_VLLM_FLAGS` (the
-Qwen3.5 flags above); `vllm_flags_append` is added to the winner. The plan records the effective
-flags, where they came from (`vllm_flags_source`), the profile and the readiness probe's request
-extra (`probe_extra`, sent as `VLLM_PROBE_EXTRA`), and `describe` prints them with the flags the
-launcher always adds (`LAUNCHER_FLAGS`).
+Qwen3.5 flags above); `vllm_flags_append` is added to the winner. The readiness probe's request
+extra resolves separately: `plan_job(probe_extra={...})` (`--probe-extra`; `{}` sends none) >
+the profile's > `DEFAULT_PROBE_EXTRA` only with the default flags under `--profile auto`, else `{}`
+(`profiles.resolve_flags` has the details). The plan records the effective flags, where they came
+from (`vllm_flags_source`), the profile, the probe extra and where it came from (`probe_extra`,
+`probe_extra_source`: `--probe-extra | profile | default | none`, sent as `VLLM_PROBE_EXTRA` /
+`VLLM_PROBE_EXTRA_SOURCE` and recorded in the job's job.json), and `describe` prints them with the
+flags the launcher always adds (`LAUNCHER_FLAGS`).
 
 Wall-time estimate: `setup_s` (default 600: install + weights download + vLLM start) plus, per
 run, `rounds * per_round_s(N)` with `per_round_s(N) = 30 + 2 * N` seconds (a guess: the
@@ -218,6 +222,7 @@ class JobPlan:
     vllm_flags_source: str = "default"
     vllm_profile: str | None = None
     probe_extra: dict[str, Any] = field(default_factory=dict)
+    probe_extra_source: str = "default"   # "--probe-extra" | "profile" | "default" | "none"
 
     @property
     def stage_remote(self) -> str:
@@ -256,6 +261,7 @@ class JobPlan:
             "VLLM_PROFILE": self.vllm_profile or "none",
             "VLLM_PROBE_EXTRA": json.dumps(self.probe_extra, separators=(",", ":"),
                                            sort_keys=True),
+            "VLLM_PROBE_EXTRA_SOURCE": self.probe_extra_source,
             "VLLM_WAIT_S": "1200",
             "HF_HOME": "/tmp/hf",
         }
@@ -289,6 +295,7 @@ def plan_job(
     vllm_flags: str | None = None,
     profile: str | None = "auto",
     vllm_flags_append: str | None = None,
+    probe_extra: dict[str, Any] | None = None,
     max_model_len: int = DEFAULT_MAX_MODEL_LEN,
     gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION,
     revision: str | None = None,
@@ -315,7 +322,7 @@ def plan_job(
     bucket = bucket.rstrip("/")
 
     resolved = resolve_flags(model, vllm_flags=vllm_flags, profile=profile,
-                             append=vllm_flags_append)
+                             append=vllm_flags_append, probe_extra=probe_extra)
     notes = []
     if resolved.validated_vllm and resolved.validated_vllm != vllm_version:
         notes.append(f"profile {resolved.profile} was validated on vLLM {resolved.validated_vllm}; "
@@ -326,7 +333,9 @@ def plan_job(
                      "models with a shorter context need a lower one (e.g. --max-model-len 32768)")
     if resolved.source == "--vllm-flags" and resolved.profile:
         notes.append(f"--vllm-flags replaces the {resolved.profile} profile's flags; the "
-                     "readiness probe still uses the profile's request extra")
+                     + ("readiness probe still uses the profile's request extra"
+                        if resolved.probe_extra_source == "profile"
+                        else "readiness probe uses the --probe-extra request extra"))
     gpu_gb = FLAVOR_GPU_GB.get(flavor)
     if resolved.min_gpu_gb and gpu_gb is not None and gpu_gb < resolved.min_gpu_gb:
         fits = sorted((f for f, gb in FLAVOR_GPU_GB.items() if gb >= resolved.min_gpu_gb),
@@ -375,7 +384,7 @@ def plan_job(
         gpu_memory_utilization=gpu_memory_utilization, revision=revision,
         sync_every_s=sync_every_s, job_spec_yaml=job_yaml, orig_spec_yaml=spec.read_text(),
         notes=notes, vllm_flags_source=resolved.source, vllm_profile=resolved.profile,
-        probe_extra=resolved.probe_extra,
+        probe_extra=resolved.probe_extra, probe_extra_source=resolved.probe_extra_source,
     )
 
 
@@ -454,7 +463,8 @@ def describe(plan: JobPlan) -> str:
               f"flags from {plan.vllm_flags_source}"),
              f"  flags: {plan.vllm_flags}",
              f"  launcher adds: {shlex.join(launcher_flags(plan))}",
-             f"  probe extra: {json.dumps(plan.probe_extra, sort_keys=True)}"]
+             (f"  probe extra: {json.dumps(plan.probe_extra, sort_keys=True)} "
+              f"(from {plan.probe_extra_source})")]
     for a, d in plan.estimate_detail["arms"].items():
         lines.append(f"  {a}: N={d['agents']} x {d['rounds']} rounds x ~{d['per_round_s']:g} s/round"
                      f" = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
