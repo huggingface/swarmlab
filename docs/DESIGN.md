@@ -142,7 +142,7 @@ status tools: my_status, collective_status   # read-only, each toggleable per ar
 ```
 Agent-visible feedback is strictly separated from evaluator-side scoring. Private information is first-class. `calibrate` estimates solo success so experiments sit in the 20 to 60 percent headroom band.
 
-- **ColoringGrid** (shared): cells, colors, optional crossed zones, target changes, worker failures. Validation configuration: 16 agents, plain grid, full visibility, S0 board-only.
+- **ColoringGrid** (shared): cells, colors, crossed zones (always on: `zones` zones whose targets one of `groups` agent groups sees and a different group alone may paint, so targets must be relayed over the board; `oracle` shows them to the painters too), target changes, worker failures. Every board generated from the seed (the board id is a content hash). Validation configuration: 16 agents, 8x8, oracle zones (full visibility for the painters), S0 board-only.
 - **FlagGame** (per_agent): hidden flag, one random crop per agent with configurable overlap, `guess(candidate)` as a world action that returns an acknowledgement only. The latest committed guess counts; a per-agent guess limit is a parameter (unlimited by default); the game ends on a fixed round count, never on a correct guess. Flags synthetic by default, real as a parameter. Crops text-rendered by default, images as a parameter. Candidates: closed set by default (truth, a rival favoured by some crops, distractors; default 8), open text as a parameter.
 
 ### 5. Medium
@@ -214,7 +214,7 @@ Abbreviations: **tests** = the unit and acceptance tests in `tests/`; **M2** = F
 | 2 Runner, scheduler, executor | `runner.py`, `scheduler.py`, `executor.py` | acceptance 1-3 (determinism, recovery, fork); N=256 | phase-commit default; `commit: immediate` supported but impractical on slow providers |
 | 3 Event log, snapshots, recovery | `events.py`, `blobs.py`, `snapshot.py`, `export.py`, `publish.py` | tests (events, recovery, export, publish); N=256 (197-260 MB run dirs replay and export) | Parquet export has 13 table families plus pi-format sessions |
 | 4 World: FlagGame | `world/flaggame.py` | tests; M2; N=256 | text variant only; the image variant is not built |
-| 4 World: ColoringGrid | `world/coloring.py` | tests (coloring); S0 example with scripted and fake-LLM painters | not run with real models; viewer has no grid panel |
+| 4 World: ColoringGrid | `world/coloring.py` | tests (coloring); S0 and crossed-zones examples with scripted and fake-LLM painters | crossed zones are the core of the world (G groups, M zones, boards generated from the seed, relay-status metric); the viewer panel draws grids and the zone table |
 | 5 Medium: board, topologies, policies | `medium/board.py`, `medium/topology.py` | tests; M2; N=256 | broadcast, gossip, groups, tree; delay policy; custom `Policy` classes |
 | 5 Medium: registry, claim policies | `medium/registry.py`, `registry.py` | tests (registry, coloring); S0 example | advisory and enforced claims |
 | 6 Participants: scripted | `participants/scripted.py` | tests; M2 baseline | evidence aggregator, enumerator, silent, painters |

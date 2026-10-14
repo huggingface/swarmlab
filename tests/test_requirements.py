@@ -29,6 +29,14 @@ class RoundsWorld(FlagGame):
         self.rounds = rounds
 
 
+class GroupsWorld(FlagGame):
+    requires: ClassVar[Requirements] = Requirements(n_agents=("groups", "most"))
+
+    def __init__(self, groups: int = 3, most: int | None = None) -> None:
+        super().__init__()
+        self.groups, self.most = groups, most
+
+
 class FixedOrderWorld(FlagGame):
     requires: ClassVar[Requirements] = Requirements(scheduler="swarmlab.scheduler:Scheduler")
 
@@ -86,6 +94,16 @@ def test_a_matching_experiment_is_accepted_and_runs(tmp_path):
 def test_run_time_overrides_are_checked_at_run_start(tmp_path):
     with pytest.raises(ValueError, match="requires commit=immediate, got round_end"):
         push_ok().run(seed=1, max_rounds=2, commit="round_end", out=tmp_path)
+
+
+def test_n_agents_bounds_name_world_attributes():
+    with pytest.raises(ValueError, match=r"^world GroupsWorld requires n_agents>=4 \(world.groups\), got 3$"):
+        exp(GroupsWorld(groups=4), 3)
+    exp(GroupsWorld(groups=4), 4)
+    with pytest.raises(ValueError, match=r"requires n_agents in \[2 \(world.groups\), 5 \(world.most\)\], "
+                                         r"got 6"):
+        exp(GroupsWorld(groups=2, most=5), 6)
+    exp(GroupsWorld(groups=2, most=5), 5)
 
 
 def test_max_rounds_names_a_world_attribute(tmp_path):
