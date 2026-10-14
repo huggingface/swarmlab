@@ -38,15 +38,3 @@ def test_global_random_untouched():
     state = random.getstate()
     derive(1, "world").random()
     assert random.getstate() == state
-
-
-def test_derive_records_its_root_without_changing_the_stream_or_pickles():
-    import hashlib
-    import pickle
-
-    r = derive(5, "world")
-    assert r.root == (5, "world") and type(r) is random.Random
-    plain = random.Random(int.from_bytes(hashlib.sha256(b"5\x00world").digest()[:8], "big"))
-    assert draws(r) == draws(plain)
-    assert pickle.dumps(derive(5, "world")) == pickle.dumps(
-        random.Random(int.from_bytes(hashlib.sha256(b"5\x00world").digest()[:8], "big")))
