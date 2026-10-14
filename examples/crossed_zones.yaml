@@ -1,0 +1,55 @@
+# Crossed zones (swarmlab/world/coloring.py, docs/guide/building-experiments.md#crossed-zones):
+# three agents share a 15 x 8 coloring board. Each of its three 5 x 2 zones has targets shown only
+# to one agent group and may be painted only by another group, so the targets must be relayed over
+# the message board (Z0: G0 -> G1, Z1: G1 -> G2, Z2: G2 -> G0; agent i is in group i mod 3).
+# Every board (target and zone placement) is generated from the run seed; the score's `board` is a
+# hash of it. The world params `groups` (G, default 3), `zones` (M, default G) and `zone_size`
+# (maximum [w, h], default [5, 2]) generalize this: zone z is seen by group z mod G and painted by
+# group (z + 1) mod G, and the run needs at least G agents.
+#   swarmlab validate examples/crossed_zones.yaml
+#   swarmlab run examples/crossed_zones.yaml --out runs/crossed --yes     # free: scripted arm
+#   swarmlab report runs/crossed
+#
+# The `zones` arm runs three scripted `relay_painter`s (post the zone they see once, read the
+# board, paint their zone once a report arrives and their share of the open cells; each turn stays
+# within `calls_per_turn`, default 20, the run's call cap): each board completes in 4 rounds.
+# `relay_painter` with `post: false` is the never-posting control; the world param `oracle: true`
+# is the control in which every zone's painters also see its targets (with it, `post: false`
+# painters complete the board from their own observation).
+#
+# For an LLM arm, swap the participants for a model, e.g. a self-hosted vLLM server (`swarmlab job
+# run` adds this provider block itself when it runs the spec in an HF Job):
+#
+#   providers:
+#     vllm: {type: openai_compat, params: {name: vllm, base_url: "http://127.0.0.1:8000/v1",
+#            pricing: {"Qwen/Qwen3.8-27B": [0, 0, 0]}, self_hosted: true}}
+#   ...
+#   arms:
+#     llm:
+#       world: {type: coloring, params: {paints_per_round: 10}}
+#       participants:
+#         - type: llm
+#           count: 3
+#           params:
+#             model: "vllm:Qwen/Qwen3.8-27B"
+#             max_tokens: 2048
+#             max_calls: 20        # up to 10 paints, read_board, post, end_turn per turn
+#             memory: window
+#             window_rounds: 6
+#       metrics: *metrics
+#       budget: {hard_usd: 1.0}
+name: crossed-zones
+seeds: [1, 2, 3, 4, 5]
+budget: {soft_usd: 0, hard_usd: 0}
+options:
+  max_rounds: 20
+  commit: round_end          # the world requires it: posts are readable from the next round on
+arms:
+  zones:
+    world: {type: coloring, params: {paints_per_round: 10}}
+    participants:
+      - {type: relay_painter, count: 3}
+    medium: {topology: broadcast}
+    metrics: &metrics [coloring.coverage, coloring.wrong_paints, coloring.relay_status,
+                       coloring.zone_paint_refusals, coloring.posts_by_agent,
+                       coloring.reads_by_agent, comm.read_rate, comm.posts_per_round]

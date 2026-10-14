@@ -115,6 +115,8 @@ def test_parse_tool_json_is_tolerant():
         == [("guess", {"candidate": "A"})]
     assert parse_tool_json('ok: [{"name": "post", "parameters": {"text": "x"}}, {"name": "end_turn"}]') \
         == [("post", {"text": "x"}), ("end_turn", {})]
+    assert parse_tool_json('{"name": "paint", "x": 1, "y": 0, "color": "b", "id": "c1"}') \
+        == [("paint", {"x": 1, "y": 0, "color": "b"})]  # flattened: other keys are the args
     assert parse_tool_json("[]") == []
     for bad in ("[{oops", '[{"args": {}}]', '[{"name": "x", "args": [1]}]', "[1, 2]"):
         with pytest.raises(ToolJsonError):

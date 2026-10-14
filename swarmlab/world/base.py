@@ -37,8 +37,9 @@ Requirements. Two checks, at two points, with a deliberate boundary between them
   command that builds the experiment: `validate`, `run`, `prompts`, `estimate`) and again by
   `Experiment.estimate`/`run` and the CLI `estimate`/`run` with their overrides
   (`Experiment.check_run`, swarmlab/experiment.py). It reads only options, medium and participant
-  count, never a participant: an unset `commit` or `scheduler` counts as its default (`round_end`,
-  `SeededShuffle`); `max_rounds` (no default) is checked only when the options carry it (or
+  count (plus the world attributes a `max_rounds` or `n_agents` bound names, which are
+  constructor config), never a participant: an unset `commit` or `scheduler` counts as its
+  default (`round_end`, `SeededShuffle`); `max_rounds` (no default) is checked only when the options carry it (or
   `rounds_per_agent`), since `run(max_rounds=...)` may give it later.
 - Runtime initialisation establishes participant-dependent compatibility.
   `check_experiment(experiment)` is the runtime hook: the runner calls it in `Runner._init_fresh`
@@ -179,7 +180,8 @@ class Requirements(BaseModel):
       resolves (`registry.resolve(name, "swarmlab.schedulers")`) to the class of the experiment's
       scheduler (an unset `scheduler` option is `SeededShuffle`).
     - `max_rounds`: an int, or the name of a world attribute `max_rounds` must equal (`"rounds"`).
-    - `n_agents`: `(min, max)`, either bound `None` for open.
+    - `n_agents`: `(min, max)`, either bound `None` for open; a bound may also be the name of a
+      world attribute holding it (`("n_groups", None)`: at least `world.n_groups` agents).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -189,7 +191,7 @@ class Requirements(BaseModel):
     push_limit: int | Literal["n_agents"] | None = None
     scheduler: str | None = None
     max_rounds: int | str | None = None
-    n_agents: tuple[int | None, int | None] | None = None
+    n_agents: tuple[int | str | None, int | str | None] | None = None
 
     def check(self, world: Any, experiment: Any) -> None:
         """Raise `ValueError` listing every requirement `experiment` violates (None if all hold)."""
@@ -229,14 +231,23 @@ class Requirements(BaseModel):
             if options["max_rounds"] != want_r:
                 bad.append((f"max_rounds={want_r}{label}", options["max_rounds"]))
         if self.n_agents is not None:
-            lo, hi = self.n_agents
+            (lo, lo_s), (hi, hi_s) = (self._bound(world, b) for b in self.n_agents)
             if (lo is not None and n < lo) or (hi is not None and n > hi):
-                want_n = (f"n_agents in [{lo}, {hi}]" if lo is not None and hi is not None
-                          else f"n_agents>={lo}" if lo is not None else f"n_agents<={hi}")
+                want_n = (f"n_agents in [{lo_s}, {hi_s}]" if lo is not None and hi is not None
+                          else f"n_agents>={lo_s}" if lo is not None else f"n_agents<={hi_s}")
                 bad.append((want_n, n))
         if bad:
             name = type(world).__name__
             raise ValueError("; ".join(f"world {name} requires {w}, got {g}" for w, g in bad))
+
+    @staticmethod
+    def _bound(world: Any, bound: int | str | None) -> tuple[int | None, str]:
+        """(value, label) of an `n_agents` bound: a str names a world attribute (label `3
+        (world.n_groups)`)."""
+        if isinstance(bound, str):
+            value = getattr(world, bound)
+            return value, f"{value} (world.{bound})"
+        return bound, str(bound)
 
 
 class World(Persistable, Plugin):
