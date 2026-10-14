@@ -1,0 +1,59 @@
+# Minesweeper (swarmlab/world/minesweeper.py, docs/guide/minesweeper.md): 4 agents share one board
+# and win as a team when every safe cell is revealed. The board sets the difficulty: 9x9 with 10
+# mines (beginner, below), 16x16 with 40 (intermediate) or 16 rows x 30 columns with 99 (expert).
+# Same seed -> same minefield and safe opening in every arm.
+#   swarmlab validate examples/minesweeper.yaml
+#   swarmlab run examples/minesweeper.yaml --yes        # both arms x every seed (free)
+#
+# `on_mine: continue` keeps a game going after a mine (the cell shows *), so every run can be
+# cleared and score.cleared_round is defined; score.first_mine_round is still the round the game
+# would be lost under the standard rule (`on_mine: end`, the world's default).
+#
+# The world's task text says nothing about how rounds work (commit mode, scheduler and topology
+# are the experiment's choice), so this spec, which commits at round end and pushes posts to
+# everyone, says it in `system_prompt_append`.
+#
+# Both arms run free scripted models: `random` reveals a random provably safe cell per agent (no
+# coordination), `allocator` gives agent k the k-th provably safe cell and posts its pick. For an
+# LLM arm, swap the participant params, e.g.
+#
+#   participants:
+#     - type: llm
+#       count: 4
+#       params:
+#         model: "hf:Qwen/Qwen3.8-27B:deepinfra"
+#         max_tokens: 8192          # thinking on: ~5k completion tokens per call
+#         max_calls: 3
+#         memory: window
+#         window_rounds: 3
+#         system_prompt_append: *rounds
+#   budget: {soft_usd: 0, hard_usd: 11.0}
+#
+# and set `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 240}}}`: thinking
+# calls run up to ~75 s. The guide's Cost section has measured numbers.
+name: minesweeper
+seeds: [0, 1, 2]
+budget: {soft_usd: 0, hard_usd: 0}
+options: {max_rounds: 60, commit: round_end}
+
+x-world: &world {type: minesweeper, params: {height: 9, width: 9, mines: 10, on_mine: continue}}
+x-medium: &medium {topology: broadcast, delivery: push, push_consume: true, push_limit: 20}
+x-metrics: &metrics [minesweeper.cleared, minesweeper.collisions, minesweeper.productive_rate,
+                     minesweeper.allocation_efficiency, minesweeper.mine_hits, comm.posts_per_round]
+x-rounds: &rounds "All agents act at the same time each round, and actions are applied together at the end of the round, so if two agents reveal the same cell in one round the second reveal is wasted. A message you post is delivered to every agent at the start of the next round."
+
+arms:
+  random:
+    world: *world
+    medium: *medium
+    participants:
+      - {type: llm, count: 4, params: {model: "fake:minesweeper_random", max_tokens: 256,
+                                       system_prompt_append: *rounds}}
+    metrics: *metrics
+  allocator:
+    world: *world
+    medium: *medium
+    participants:
+      - {type: llm, count: 4, params: {model: "fake:minesweeper_allocator", max_tokens: 256,
+                                       system_prompt_append: *rounds}}
+    metrics: *metrics
