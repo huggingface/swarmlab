@@ -52,20 +52,24 @@ Actions and commit
 ------------------
 - `reveal(x, y)`: opens the cell; a 0 flood-fills its neighbours. Feedback (agent-visible):
   `{"result": "opened", "x", "y", "value", "cells_opened"}`, `{"result": "exploded", "x", "y"}`,
-  `{"result": "already_revealed", "x", "y", "same_round"}` (`same_round`: the cell was opened
-  earlier in this same round, by another reveal or its flood), or an error: `flagged` (unflag it
-  first), `out_of_bounds`, `reveals_per_round`, `game_over` (a mine already ended the game
-  earlier in the same commit batch).
+  `{"result": "already_revealed", "x", "y", "collision"}` (see below), or an error: `flagged`
+  (unflag it first), `out_of_bounds`, `reveals_per_round`, `game_over` (the game is already won
+  or lost, possibly earlier in the same commit batch; no action is accepted after that).
 - `flag(x, y)` / `unflag(x, y)`: mark or unmark a hidden cell. Flags are shared board state (every
   agent sees them, anyone may remove one), never checked against the minefield: feedback is
   `flagged` / `unflagged` or the error `not_hidden` / `not_flagged`, never whether a flag is right.
 - `validate(agent, action, pending)` refuses at call time an out-of-bounds cell and a reveal (or,
   with `free_flags: False`, any action) beyond `reveals_per_round` given the agent's buffered
   `pending` actions; the commit enforces the same limit in commit order.
-- Under `commit: round_end` actions apply at the end of the round in the seeded commit order, so
-  agents choose without seeing each other's choices of the round and a cell revealed twice is a
-  collision (`same_round: true`). Under `commit: immediate` each turn sees the earlier turns'
-  results, and a repeat reveal is a stale one.
+- A repeat reveal of an open cell is a **collision** (`collision: true`) when another agent's
+  reveal opened it (directly or by its flood) after this agent last observed the board, and
+  **stale** otherwise (the cell was visible to the agent, was in the opening, or the agent's own
+  earlier reveal opened it). The runner observes at the start of every turn, and `observe`
+  records how many reveals the agent has seen, so the rule needs no knowledge of the commit mode:
+  under `commit: round_end` actions apply together at the end of the round in the seeded commit
+  order, nobody sees the round's reveals while choosing, and a cell revealed twice in a round is
+  a collision; under `commit: immediate` each turn sees the earlier turns' results, so repeating
+  one is stale. Unit code that calls the actions without `observe` is judged as round_end.
 - `claim_key(agent, action) -> "cell:<x>,<y>"`, so the registry and claim policies apply.
 
 The world has no requirements (`requires` is empty): any commit mode, scheduler, topology and
@@ -82,8 +86,10 @@ start of the round (`round_safe`, `round_mines`). Then, per round:
 
 - `ideal_reveals`: what a perfectly coordinated team could open without guessing,
   `min(n_agents * reveals_per_round, |round_safe|)`, or 1 (one forced guess) when nothing is
-  provably safe. Under `commit: immediate` later turns see more than the round-start board, so
-  this and the classification below are judged against the round-start board, a lower bound.
+  provably safe; 0 in a round that starts with the game already over (the runner always plays
+  round 1, even when the opening cleared the board). Under `commit: immediate` later turns see
+  more than the round-start board, so this and the classification below are judged against the
+  round-start board, a lower bound.
 - each reveal that opened a cell is `certain` (it was in `round_safe`) or a `guess`;
 - each mine hit is `provable` (the cell was in `round_mines`: a reasoning error), `unforced`
   (provably safe cells were available) or `forced` (nothing was provably safe).
@@ -273,7 +279,12 @@ class Minesweeper(World):
         self.minefield: list[list[bool]] = []
         self.numbers: list[list[int]] = []
         self.board: list[list[str]] = []          # what agents see
-        self.opened_round: list[list[int]] = []   # round each cell was opened (-1: not yet; 0: opening)
+        self.seq = 0                              # reveals committed so far that changed the board
+        self.opened_seq: list[list[int]] = []     # seq of the reveal that opened a cell (-1: hidden; 0: opening)
+        self.opened_by: list[list[str | None]] = []   # agent whose reveal opened it (None: the opening)
+        self.seen_seq: dict[str, int] = {}        # seq when each agent last observed the board, this round
+        self.round_start_seq = 0
+        self.round_live = False                   # the game was still on at the start of the round
         self.round = 0
         self.lost = False
         self.cleared_round: int | None = None
@@ -316,7 +327,10 @@ class Minesweeper(World):
         self.numbers = [[sum(self.minefield[ny][nx] for nx, ny in self._nbrs(x, y))
                          for x in range(self.width)] for y in range(self.height)]
         self.board = [[HIDDEN] * self.width for _ in range(self.height)]
-        self.opened_round = [[-1] * self.width for _ in range(self.height)]
+        self.seq = 0
+        self.opened_seq = [[-1] * self.width for _ in range(self.height)]
+        self.opened_by = [[None] * self.width for _ in range(self.height)]
+        self.seen_seq, self.round_start_seq, self.round_live = {}, 0, False
         self.round, self.lost = 0, False
         self.cleared_round = self.first_mine_round = None
         self.round_safe, self.round_mines, self.round_used = [], [], {}
@@ -328,15 +342,16 @@ class Minesweeper(World):
         if self.safe_opening:
             start = next(((x, y) for x, y in order if not self.minefield[y][x] and self.numbers[y][x] == 0),
                          None) or next((x, y) for x, y in order if not self.minefield[y][x])
-            self.initial_opened = self._open(*start)
+            self.initial_opened = self._open(*start, None)
             if self.won():
                 self.cleared_round = 0
 
     def begin_round(self, round: int) -> None:
         self.round = round
-        self.round_used = {}
+        self.round_used, self.seen_seq, self.round_start_seq = {}, {}, self.seq
         self.tally = dict.fromkeys(_TALLY_KEYS, 0)
-        if self.terminal():
+        self.round_live = not self.terminal()
+        if not self.round_live:
             self.round_safe, self.round_mines = [], []
             return
         safe, mines = deduce(self.board)
@@ -346,7 +361,7 @@ class Minesweeper(World):
     def end_round(self, round: int) -> dict:
         """Tally round `round` against the round-start board (logged as round_resolved)."""
         n = len(self.agents)
-        ideal = min(n * self.reveals_per_round, len(self.round_safe)) or 1
+        ideal = (min(n * self.reveals_per_round, len(self.round_safe)) or 1) if self.round_live else 0
         self.stats["ideal_reveals"] += ideal
         opened = self.safe_cells() - self._safe_left()
         return {"round": round, "n_agents": n, "provably_safe": len(self.round_safe),
@@ -361,8 +376,9 @@ class Minesweeper(World):
     def _nbrs(self, x: int, y: int) -> list[tuple[int, int]]:
         return neighbours(x, y, self.width, self.height)
 
-    def _open(self, x: int, y: int) -> int:
-        """Open a safe cell, flood-filling from 0s; returns the number of cells opened."""
+    def _open(self, x: int, y: int, by: str | None) -> int:
+        """Open a safe cell, flood-filling from 0s, as reveal `self.seq` by agent `by` (None: the
+        opening); returns the number of cells opened."""
         stack, opened = [(x, y)], 0
         while stack:
             cx, cy = stack.pop()
@@ -370,7 +386,7 @@ class Minesweeper(World):
                 continue
             n = self.numbers[cy][cx]
             self.board[cy][cx] = EMPTY if n == 0 else str(n)
-            self.opened_round[cy][cx] = self.round
+            self.opened_seq[cy][cx], self.opened_by[cy][cx] = self.seq, by
             opened += 1
             if n == 0:
                 stack.extend(self._nbrs(cx, cy))
@@ -428,6 +444,10 @@ class Minesweeper(World):
         )
 
     def observe(self, agent: AgentId) -> Observation:
+        # The runner observes at the start of every turn (after the earlier turns' commits under
+        # `commit: immediate`), so this records what the agent has seen; it only classifies repeat
+        # reveals (collision vs stale) and never changes what any agent is shown.
+        self.seen_seq[agent] = self.seq
         label_w = len(str(self.height - 1))
         pad = " " * (label_w + 1)
         lines = [(f"{BOARD_HEADER}{self.width} columns x {self.height} rows; x = column "
@@ -464,8 +484,9 @@ class Minesweeper(World):
         err = self._cell_error(x, y)
         if err:
             return self._refuse("out_of_bounds", err.split(": ", 1)[1])
-        if self.lost:
-            return self._refuse("game_over", "a mine was revealed; the game is lost", x=x, y=y)
+        if self.terminal():          # also later in the commit batch that ended the game
+            why = "the game is lost: a mine was revealed" if self.lost else "the game is won"
+            return self._refuse("game_over", why, x=x, y=y)
         return None
 
     def _count(self, agent: AgentId, name: str, x: int, y: int) -> Outcome | None:
@@ -489,14 +510,19 @@ class Minesweeper(World):
         self.tally["reveals"] += 1
         self.stats["reveals"] += 1
         if cell != HIDDEN:
-            same = self.opened_round[y][x] == self.round
-            self.tally["collisions" if same else "stale"] += 1
-            self.stats["collisions" if same else "stale_reveals"] += 1
+            # A collision: another agent's reveal opened the cell after this agent last saw the
+            # board (the same round under round_end). Stale: it was already visible to this agent,
+            # or its own earlier reveal opened it.
+            seen = self.seen_seq.get(agent, self.round_start_seq)
+            collision = self.opened_by[y][x] not in (None, agent) and self.opened_seq[y][x] > seen
+            self.tally["collisions" if collision else "stale"] += 1
+            self.stats["collisions" if collision else "stale_reveals"] += 1
             return Outcome(accepted=True, feedback={"result": "already_revealed", "x": x, "y": y,
-                                                    "same_round": same})
+                                                    "collision": collision})
+        self.seq += 1
         if self.minefield[y][x]:
             self.board[y][x] = EXPLODED
-            self.opened_round[y][x] = self.round
+            self.opened_seq[y][x], self.opened_by[y][x] = self.seq, agent
             kind = ("provable" if (x, y) in self.round_mines else
                     "unforced" if self.round_safe else "forced")
             for key in ("mine_hits", f"{kind}_mine_hits"):
@@ -507,7 +533,7 @@ class Minesweeper(World):
             self.lost = self.lost or self.on_mine == "end"
             return Outcome(accepted=True, feedback={"result": "exploded", "x": x, "y": y})
         kind = "certain" if (x, y) in self.round_safe else "guess"
-        opened = self._open(x, y)
+        opened = self._open(x, y, agent)
         for key, stat in (("productive", "productive_reveals"),
                           ("certain" if kind == "certain" else "guesses", f"{kind}_reveals")):
             self.tally[key] += 1

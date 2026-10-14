@@ -219,18 +219,89 @@ def test_reveal_limit_at_validate_and_commit():
     assert strict.flag("a000", x=bx, y=by).feedback["error"] == "reveals_per_round"
 
 
-def test_collision_in_the_same_round_and_stale_reveal_later():
-    w = make(seed=1)
+def test_collision_vs_stale_follows_what_the_agent_had_seen():
+    w = make(seed=1, reveals_per_round=2)
+    for a in AGENTS:
+        w.observe(a)                                         # every turn observes first
     x, y = cells(w, False)[0]
     assert w.reveal("a000", x=x, y=y).feedback["result"] == "opened"
-    again = w.reveal("a001", x=x, y=y)
+    again = w.reveal("a001", x=x, y=y)                       # chosen from the same board: collision
     assert again.accepted and again.feedback == {"result": "already_revealed", "x": x, "y": y,
-                                                 "same_round": True}
+                                                 "collision": True}
+    assert w.reveal("a000", x=x, y=y).feedback["collision"] is False    # its own reveal: stale
+    w.observe("a002")                                        # a later turn that saw the result
+    assert w.reveal("a002", x=x, y=y).feedback["collision"] is False
     data = next_round(w)
-    assert data["collisions"] == 1 and data["stale"] == 0
-    assert w.reveal("a002", x=x, y=y).feedback["same_round"] is False
-    assert w.end_round(2)["stale"] == 1
+    assert (data["collisions"], data["stale"]) == (1, 2)
+    w.observe("a003")
+    assert w.reveal("a003", x=x, y=y).feedback["collision"] is False   # opened in an earlier round
+    ox, oy = next((x, y) for x, y in ((x, y) for y in range(9) for x in range(9))
+                  if w.opened_by[y][x] is None and w.board[y][x] != HIDDEN)
+    assert w.reveal("a001", x=ox, y=oy).feedback["collision"] is False  # the opening
+    assert w.end_round(2)["stale"] == 2
     assert w.claim_key("a000", Action(name="reveal", args={"x": 3, "y": 4})) == "cell:3,4"
+
+
+def test_no_action_is_accepted_after_a_win_in_the_same_batch():
+    w = Minesweeper(height=1, width=2, mines=1, safe_opening=False)
+    w.reset(derive(1, "world"), ["a000", "a001"])
+    w.begin_round(1)
+    assert w.minefield == [[True, False]]
+    assert w.reveal("a000", x=1, y=0).feedback["result"] == "opened"
+    assert w.won() and w.terminal()
+    late = w.reveal("a001", x=0, y=0)                        # a mine later in the same batch
+    assert not late.accepted and late.feedback == {"error": "game_over", "x": 0, "y": 0,
+                                                   "detail": "the game is won"}
+    assert not w.flag("a001", x=0, y=0).accepted
+    sc = w.score()
+    assert (sc["won"], sc["lost"], sc["cleared_round"], sc["first_mine_round"], sc["mine_hits"]) == \
+        (1, 0, 1, None, 0)
+    lost = make(seed=1)
+    lost.reveal("a000", *cells(lost, True)[0])
+    assert lost.reveal("a001", *cells(lost, False)[0]).feedback["detail"] == \
+        "the game is lost: a mine was revealed"
+
+
+def test_board_cleared_by_the_opening_records_no_play(tmp_path):
+    exp = Experiment(name="ms-opened", world=Minesweeper(height=1, width=2, mines=1),
+                     participants=[LLMAgent(model="fake:minesweeper_random", max_tokens=256)] * 2,
+                     metrics=METRIC_NAMES)
+    run = exp.run(seed=1, max_rounds=2, out=tmp_path)
+    sc = run.score
+    assert run.meta["end_reason"] == "terminal" and run.meta["last_round"] == 1   # round 1 still runs
+    assert (sc["won"], sc["lost"], sc["cleared_round"], sc["first_mine_round"]) == (1, 0, 0, None)
+    assert (sc["reveals"], sc["mine_hits"], sc["ideal_reveals"], sc["allocation_efficiency"]) == \
+        (0, 0, 0, None)
+    resolved = [e for e in run.events if e["type"] == "round_resolved"]
+    assert [e["data"]["ideal_reveals"] for e in resolved] == [0]
+    assert Run.load(run.dir).replay()["score"] == sc
+
+
+def reveal_origin(request, rng):
+    """fake:tests.test_minesweeper:reveal_origin: reveal (0, 0) once per turn, then end_turn."""
+    from swarmlab.providers.fake import _response
+
+    acted = request.messages[-1].role != "user"
+    return _response(request, rng, [] if acted else [("reveal", {"x": 0, "y": 0}), ("end_turn", {})])
+
+
+@pytest.mark.parametrize("commit,collisions,stale", [("round_end", 1, 0), ("immediate", 0, 1)])
+def test_repeat_reveal_is_a_collision_only_when_chosen_blind(tmp_path, commit, collisions, stale):
+    exp = Experiment(name=f"ms-{commit}", world=Minesweeper(safe_opening=False, on_mine="continue"),
+                     participants=[LLMAgent(model="fake:tests.test_minesweeper:reveal_origin",
+                                            max_tokens=64)] * 2,
+                     metrics=METRIC_NAMES, options={"commit": commit})
+    run = exp.run(seed=1, max_rounds=1, out=tmp_path)
+    acts = [e for e in run.events if e["type"] == "action_committed"]
+    assert [e["action"]["args"] for e in acts] == [{"x": 0, "y": 0}] * 2
+    assert acts[1]["feedback"]["result"] == "already_revealed"
+    assert acts[1]["feedback"]["collision"] is (commit == "round_end")
+    sc = run.score
+    assert (sc["collisions"], sc["stale_reveals"]) == (collisions, stale)
+    assert run.metrics["minesweeper.collisions"][-1][1:] == (float(collisions), 2)
+    resolved = next(e for e in run.events if e["type"] == "round_resolved")["data"]
+    assert (resolved["collisions"], resolved["stale"]) == (collisions, stale)
+    assert Run.load(run.dir).replay()["score"] == sc
 
 
 # ---- deduction and accounting -----------------------------------------------------------------

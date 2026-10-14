@@ -10,7 +10,9 @@ Same seed, same minefield and opening in every arm, so arms are compared game by
 
 The world has no requirements: any commit mode, scheduler, topology and agent count is a legitimate variation, so its task text (`description()`) says nothing about turns, their order, when actions apply or who reads a post. It states the agents (count and ids), the board, the rules above and the win condition. Tell agents how your experiment's rounds work with `system_prompt_append` (see [Changing what agents are told](building-experiments.md#changing-what-agents-are-told)); `examples/minesweeper.yaml` does this for `commit: round_end` with posts pushed to everyone. Add any goal beyond winning (for example "in as few rounds as possible") the same way.
 
-Under `commit: round_end` every agent chooses from the same board and actions apply together in the seeded commit order, so a cell revealed by two agents in one round is a **collision** (`same_round: true` in the second reveal's feedback). Under `commit: immediate` each turn sees the earlier turns' results and a repeat reveal is a stale one.
+A repeat reveal of an open cell is a **collision** when another agent's reveal opened it after this agent last saw the board (`collision: true` in the feedback), and **stale** otherwise: the cell was visible to the agent, was part of the opening, or the agent's own earlier reveal opened it. The world records what each agent has seen when the runner observes at the start of its turn, so this follows the commit mode by itself: under `commit: round_end` every agent chooses from the same board and actions apply together in the seeded commit order, so a cell revealed by two agents in one round is a collision; under `commit: immediate` each turn sees the earlier turns' results, so repeating one is stale.
+
+Once the game is won or lost no action is accepted (`game_over`), including later actions of the commit batch that ended it, so a game is never both won and lost.
 
 ## Parameters
 
@@ -56,13 +58,13 @@ The observation is one text part, identical for every agent:
 
     Mines: 15  Flags: 0  Exploded: 0  Hidden: 64
 
-`parse_observation` inverts it. Feedback reports what happened (`opened` with `value` and `cells_opened`, `exploded`, `already_revealed` with `same_round`, `flagged`, `unflagged`, or an error: `flagged`, `not_hidden`, `not_flagged`, `out_of_bounds`, `reveals_per_round`, `game_over`). Agents never see the minefield, whether a flag is right, the provable cells or any accounting below. There are no status tools: the board is public.
+`parse_observation` inverts it. Feedback reports what happened (`opened` with `value` and `cells_opened`, `exploded`, `already_revealed` with `collision`, `flagged`, `unflagged`, or an error: `flagged`, `not_hidden`, `not_flagged`, `out_of_bounds`, `reveals_per_round`, `game_over`). Agents never see the minefield, whether a flag is right, the provable cells or any accounting below. There are no status tools: the board is public.
 
 ## Provable cells and accounting
 
 At the start of every round the world runs `deduce` on the visible board: iterated single-clue rules plus the pairwise subset rule (the 1-2-1 pattern), ignoring flags. It is sound but not complete (exact inference can prove more), so it gives a lower bound on what was knowable. From it, per round:
 
-- `ideal_reveals`: what a perfectly coordinated team could open without guessing, `min(agents x reveals_per_round, provably safe cells)`, or 1 (a forced guess) when nothing is provably safe;
+- `ideal_reveals`: what a perfectly coordinated team could open without guessing, `min(agents x reveals_per_round, provably safe cells)`, or 1 (a forced guess) when nothing is provably safe, or 0 in a round that starts with the game already over (the runner always plays round 1, even when the opening cleared a tiny board);
 - each reveal that opened a cell is **certain** (provably safe at round start) or a **guess**;
 - each mine hit is **provable** (the board proved it was a mine: a reasoning error), **unforced** (provably safe cells were available) or **forced** (nothing was provably safe).
 
