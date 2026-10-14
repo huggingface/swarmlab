@@ -170,14 +170,17 @@ class Enumerator(Participant):
 #   under `advisory` it goes through and counts as a claim violation.
 # - `RandomPainter`: random paintable cells with random palette colours: the noise baseline.
 # - `RelayPainter(paints=10, post=True)`: the crossed-zones relay baseline. Every turn it calls
-#   `read_board(limit=200)` and keeps, for the zone its group paints, the first report it can
+#   `read_board(limit=200)` and keeps, for each zone its group paints, the first report it can
 #   parse (`parse_report`: the zone id and the zone's cell count of colours); once (its first
-#   turn) it posts the targets of the zone its group sees in the recommended format
-#   (`Z0 red green ...`) when `post` is true. It then paints, up to `paints` cells: first the
-#   cells of its paintable zone that differ from the parsed report (split among its group's
-#   members by cell index), then the open cells it is responsible for (open cells in row-major
-#   order, cell k belongs to agent k mod n in agent order). `post: false` is the never-posting
-#   control: nobody learns a hidden zone, so the zones stay unpainted.
+#   turn) it posts the targets of each zone its group sees and does not paint, one post per zone,
+#   in the recommended format (`Z0 red green ...`) when `post` is true. It then paints, up to
+#   `paints` cells: first the cells of its paintable zones (in zone order) that differ from the
+#   parsed reports (each zone's cells split among its group's members by cell index), then the
+#   open cells it is responsible for (open cells in row-major order, cell k belongs to agent
+#   k mod n in agent order). Any number of groups and zones works: with `groups: 2` a group sees
+#   one zone and paints the other; with more zones than groups it sees and paints several.
+#   `post: false` is the never-posting control: nobody learns a hidden zone, so the zones stay
+#   unpainted.
 
 
 def _coloring_obs(view: View) -> tuple[list[str], list[str], list[str]]:

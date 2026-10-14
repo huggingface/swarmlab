@@ -1,7 +1,8 @@
 """ColoringGrid with crossed zones, painters, coloring, relay and claim metrics (M3b)."""
 from __future__ import annotations
 
-import random
+import inspect
+import re
 from pathlib import Path
 
 import pytest
@@ -27,37 +28,50 @@ from swarmlab.rng import derive
 from swarmlab.viewer.build import build
 from swarmlab.world.base import Action
 from swarmlab.world.coloring import (
-    BOARD_IDS,
     ColoringGrid,
-    fixed_boards,
+    board_hash,
     format_report,
     generate_zones,
+    join_names,
     needed_cells,
     paintable_needed_cells,
     parse_observation,
     parse_report,
     parse_zones,
+    zone_at,
     zone_size,
 )
 
 from .helpers import logical
 
-A, B, C = agent_id(0), agent_id(1), agent_id(2)
+A, B, C, D = agent_id(0), agent_id(1), agent_id(2), agent_id(3)
 REPO = Path(__file__).resolve().parent.parent
 GRID_METRICS = ["coloring.coverage", "coloring.duplicate_paints", "coloring.wrong_paints",
                 "coloring.parallel_efficiency"]
 CLAIM_METRICS = ["claims.violations", "claims.held"]
 ZONE_METRICS = ["coloring.relay_status", "coloring.zone_paint_refusals",
                 "coloring.posts_by_agent", "coloring.reads_by_agent"]
-# board 00: Z0 (A) x 5-9, y 4-5, G0 -> G1; Z1 (B) x 0-4, y 1-2, G1 -> G2; Z2 (C) x 5-9, y 6-7, G2 -> G0
-# row 0 is entirely open
+# `world()` is the default board of seed 0 (8 x 15, three 5 x 2 zones, Z0 G0 -> G1, Z1 G1 -> G2,
+# Z2 G2 -> G0); zone cells always come from `w.crossed`. Its row 0 is entirely open (asserted in
+# `world()`): the paint tests below use row 0 cells, as do the runs of seed 0 on the default board.
 
 
 def world(**kw):
-    w = ColoringGrid(**{"board": "00", **kw})
+    w = ColoringGrid(**kw)
     w.reset(derive(0, "world"), [A, B, C])
     w.begin_round(1)
+    if (w.height, w.width, w.n_zones) == (8, 15, 3):
+        assert all(zone_at(w.crossed, x, 0) is None for x in range(w.width))  # row 0 is open
     return w
+
+
+def zone(w, zid):
+    return next(z for z in w.crossed if z["zone_id"] == zid)
+
+
+def span(z):
+    """The coordinates of a zone line: `x=5..9, y=4..5`."""
+    return f"x={z['x']}..{z['x'] + z['width'] - 1}, y={z['y']}..{z['y'] + z['height'] - 1}"
 
 
 def text(w, agent=A):
@@ -75,75 +89,148 @@ def zone_cells(z):
 
 # ---- boards and zones -------------------------------------------------------------------------------
 
-def test_fixed_boards_are_the_shipped_data_and_follow_the_cycle():
-    boards = fixed_boards()
-    assert tuple(sorted(boards)) == BOARD_IDS
-    b0 = boards["00"]
-    assert b0["targets"][0] == "ybyyygrgbyyyggg" and len(b0["targets"]) == 8
-    for b in boards.values():
-        assert [(z["zone_id"], z["type"], z["viewer_group"], z["painter_group"]) for z in b["zones"]] == [
-            ("Z0", "A", 0, 1), ("Z1", "B", 1, 2), ("Z2", "C", 2, 0)]
-        assert all((z["width"], z["height"]) == (5, 2) for z in b["zones"])
-        assert set("".join(b["targets"])) <= set("rgby")
-
-
-def test_board_auto_maps_seed_to_board_and_falls_back_to_the_stream():
-    for seed, bid in [(1, "00"), (2, "01"), (3, "02"), (4, "03"), (5, "04"), (6, "00"), (0, "04")]:
-        w = ColoringGrid()
+def test_board_id_is_a_content_hash_of_the_generated_board():
+    ids = []
+    for seed in (1, 2, 3):
+        w, again = ColoringGrid(), ColoringGrid()
         w.reset(derive(seed, "world"), [A, B, C])
-        assert w.board_id == bid and w.score()["board"] == bid
-        assert ["".join(r) for r in w.target] == fixed_boards()[bid]["targets"]
-    w = ColoringGrid()
-    w.reset(random.Random(7), [A, B, C])  # no `root`: drawn from the stream, deterministically
-    other = ColoringGrid()
-    other.reset(random.Random(7), [A, B, C])
-    assert w.board_id == other.board_id in BOARD_IDS
-    fixed = ColoringGrid(board="03")
-    fixed.reset(derive(1, "world"), [A, B, C])
-    assert fixed.board_id == "03"
-    assert derive(4, "world").root == (4, "world")
+        again.reset(derive(seed, "world"), [A, B, C])
+        assert re.fullmatch(r"[0-9a-f]{10}", w.board_id)
+        assert again.board_id == w.board_id and again.target == w.target and again.crossed == w.crossed
+        assert w.score()["board"] == w.verify()["board"] == w.render_state()["board"] == w.board_id
+        assert w.board_id == board_hash(w.target, w.crossed)
+        ids.append(w.board_id)
+    assert len(set(ids)) == 3
+    w = world()
+    zones = [dict(z) for z in w.crossed]
+    zones[0]["x"] += 1 if zones[0]["x"] == 0 else -1
+    assert board_hash(w.target, zones) != w.board_id  # the zones are part of the hash
+    two = ColoringGrid(groups=2, zones=3)
+    two.reset(derive(0, "world"), [A, B, C])
+    assert two.target == w.target and two.board_id != w.board_id  # so are their groups
 
 
-def test_board_param_errors():
-    with pytest.raises(ValueError, match="board must be"):
-        ColoringGrid(board="07")
-    with pytest.raises(ValueError, match="needs height=8, width=15, palette=4"):
-        ColoringGrid(height=8, width=8, board="01")
-    with pytest.raises(ValueError, match="needs height=8, width=15, palette=4"):
-        ColoringGrid(palette=5, board="00")
+def test_param_errors():
+    with pytest.raises(ValueError, match="groups must be >= 2"):
+        ColoringGrid(groups=1)
+    with pytest.raises(ValueError, match="zones must be >= 1"):
+        ColoringGrid(zones=0)
+    with pytest.raises(ValueError, match="zone_size must be"):
+        ColoringGrid(zone_size=[5])
+    with pytest.raises(ValueError, match="zone_size must be"):
+        ColoringGrid(zone_size=[0, 2])
     with pytest.raises(ValueError, match="unknown status tools"):
         ColoringGrid(status_tools=["nope"])
     with pytest.raises(ValueError, match="cannot hold 3 zones"):
         ColoringGrid(height=1, width=2)
+    with pytest.raises(ValueError, match="cannot hold 5 zones"):
+        ColoringGrid(height=2, width=2, zones=5)
     with pytest.raises(ValueError, match="at least 3 agents"):
         ColoringGrid().reset(derive(1, "world"), [A, B])
+    with pytest.raises(ValueError, match="at least 4 agents"):
+        ColoringGrid(groups=4).reset(derive(1, "world"), [A, B, C])
+    assert "board" not in inspect.signature(ColoringGrid).parameters
 
 
-@pytest.mark.parametrize("hw,size", [((8, 8), (5, 2)), ((3, 4), (4, 1)), ((2, 2), (1, 1)),
-                                     ((2, 6), (2, 2)), ((8, 15), (5, 2)), ((20, 20), (5, 2))])
-def test_generated_zones_fit_and_follow_the_cycle(hw, size):
+@pytest.mark.parametrize("hw,n_zones,groups,max_size,size", [
+    ((8, 8), 3, 3, (5, 2), (5, 2)), ((3, 4), 3, 3, (5, 2), (4, 1)), ((2, 2), 3, 3, (5, 2), (1, 1)),
+    ((2, 6), 3, 3, (5, 2), (2, 2)), ((8, 15), 3, 3, (5, 2), (5, 2)), ((20, 20), 3, 3, (5, 2), (5, 2)),
+    ((8, 15), 2, 2, (5, 2), (5, 2)), ((8, 15), 6, 3, (5, 2), (5, 2)), ((8, 15), 4, 4, (5, 2), (5, 2)),
+    ((4, 6), 6, 3, (5, 2), (2, 2)), ((2, 2), 4, 2, (5, 2), (1, 1)), ((9, 9), 3, 3, (3, 3), (3, 3)),
+    ((8, 15), 3, 3, (3, 3), (3, 3)), ((5, 5), 4, 4, (3, 3), (2, 2)), ((2, 15), 3, 3, (5, 2), (5, 2)),
+])
+def test_generated_zones_fit_shrink_and_follow_the_cycle(hw, n_zones, groups, max_size, size):
     h, w_ = hw
-    assert zone_size(h, w_) == size
+    assert zone_size(h, w_, n_zones, *max_size) == size
     for seed in range(20):
-        zones = generate_zones(derive(seed, "world"), h, w_)
+        zones = generate_zones(derive(seed, "world"), h, w_, n_zones, groups, size)
         cells = [c for z in zones for c in zone_cells(z)]
-        assert len(cells) == len(set(cells)) == 3 * size[0] * size[1]
+        assert len(cells) == len(set(cells)) == n_zones * size[0] * size[1]
         assert all(0 <= x < w_ and 0 <= y < h for x, y in cells)
-        assert [(z["zone_id"], z["type"], z["viewer_group"], z["painter_group"]) for z in zones] == [
-            ("Z0", "A", 0, 1), ("Z1", "B", 1, 2), ("Z2", "C", 2, 0)]
+        assert [(z["zone_id"], z["viewer_group"], z["painter_group"]) for z in zones] == [
+            (f"Z{i}", i % groups, (i + 1) % groups) for i in range(n_zones)]
+        assert all(set(z) == {"zone_id", "x", "y", "width", "height", "viewer_group",
+                              "painter_group"} for z in zones)
 
 
 def test_random_board_keeps_the_old_target_draws_and_is_deterministic():
-    w = ColoringGrid(height=3, width=4)
+    for kw, (h, w_) in [({"height": 3, "width": 4}, (3, 4)), ({}, (8, 15)), ({"groups": 4}, (8, 15))]:
+        w = ColoringGrid(**kw)
+        w.reset(derive(0, "world"), [A, B, C, D])
+        rng = derive(0, "world")
+        assert w.target == [[rng.choice("rgby") for _ in range(w_)] for _ in range(h)]  # drawn first
+        again = ColoringGrid(**kw)
+        again.reset(derive(0, "world"), [A, B, C, D])
+        assert again.target == w.target and again.crossed == w.crossed
+        assert again.board_id == w.board_id
+
+
+@pytest.mark.parametrize("kw,n", [({}, 3), ({}, 5), ({"groups": 2}, 2), ({"groups": 2}, 3),
+                                  ({"groups": 4, "zones": 4}, 4), ({"groups": 4, "zones": 4}, 6),
+                                  ({"groups": 3, "zones": 6}, 3), ({"groups": 3, "zones": 1}, 3),
+                                  ({"groups": 2, "zones": 5, "height": 4, "width": 6}, 2),
+                                  ({"zone_size": [3, 3]}, 3)])
+def test_every_cell_is_paintable_and_viewers_differ_from_painters(kw, n):
+    agents = [agent_id(i) for i in range(n)]
+    for seed in range(5):
+        w = ColoringGrid(**kw)
+        w.reset(derive(seed, "world"), agents)
+        groups = w.verify()["groups"]
+        assert sorted(groups) == agents and len(w.crossed) == w.n_zones
+        for z in w.crossed:
+            assert z["viewer_group"] != z["painter_group"]
+            assert any(g == z["painter_group"] for g in groups.values())
+            assert any(g == z["viewer_group"] for g in groups.values())
+        for y in range(w.height):
+            for x in range(w.width):
+                assert any(w.validate(a, Action(name="paint", args={"x": x, "y": y, "color": "r"})).ok
+                           for a in agents), (kw, n, seed, x, y)
+
+
+def test_two_groups_see_one_zone_and_paint_the_other():
+    w = ColoringGrid(groups=2)
     w.reset(derive(0, "world"), [A, B, C])
-    rng = derive(0, "world")
-    assert w.target == [[rng.choice("rgby") for _ in range(4)] for _ in range(3)]  # drawn first
-    again = ColoringGrid(height=3, width=4)
-    again.reset(derive(0, "world"), [A, B, C])
-    assert again.target == w.target and again.crossed == w.crossed and w.board_id == "random"
-    rnd = ColoringGrid(board="random")  # the fixed-board size, generated anyway
-    rnd.reset(derive(1, "world"), [A, B, C])
-    assert rnd.board_id == "random" and ["".join(r) for r in rnd.target] != fixed_boards()["00"]["targets"]
+    w.begin_round(1)
+    assert [(z["zone_id"], z["viewer_group"], z["painter_group"]) for z in w.crossed] == [
+        ("Z0", 0, 1), ("Z1", 1, 0)]
+    assert w.groups == {A: 0, B: 1, C: 0}
+    t = text(w, A)
+    assert "Groups: G0 = a000, a002; G1 = a001" in t
+    assert ("You are a000, in group G0. Your group sees the targets of Z0 and must report them on "
+            "the message board for G1, which paints Z0. Only your group may paint Z1; its targets "
+            "are shown to G1, so you must get them from the board.") in t
+    assert "split into 2 groups, G0 and G1, and the grid holds 2 zones, Z0 and Z1, of" in w.description()
+
+
+def test_more_zones_than_groups_and_one_zone():
+    w = ColoringGrid(groups=3, zones=6)
+    w.reset(derive(0, "world"), [A, B, C])
+    w.begin_round(1)
+    assert [z["zone_id"] for z in w.crossed] == [f"Z{i}" for i in range(6)]
+    t = text(w, A)
+    assert t.count("Your group sees the targets of") == 2 and t.count("Only your group may paint") == 2
+    assert "sees the targets of Z0 " in t and "sees the targets of Z3 " in t
+    assert "may paint Z2;" in t and "may paint Z5;" in t
+    assert "the grid holds 6 zones, Z0, Z1, Z2, Z3, Z4 and Z5, of 5 x 2 cells" in w.description()
+    one = ColoringGrid(zones=1)
+    one.reset(derive(0, "world"), [A, B, C])
+    assert "the grid holds 1 zone, Z0, of 5 x 2 cells" in one.description()
+    assert one.description_for(C) == one.description() + " You are a002, in group G2."  # no duties
+    assert join_names(["A"]) == "A" and join_names(["A", "B"]) == "A and B"
+    assert join_names(["A", "B", "C"]) == "A, B and C"
+
+
+def test_zone_size_param_sets_the_zones_and_the_report_length():
+    w = ColoringGrid(zone_size=[3, 3])
+    w.reset(derive(0, "world"), [A, B, C])
+    assert all((z["width"], z["height"]) == (3, 3) for z in w.crossed)
+    d = w.description()
+    assert "of 3 x 3 cells" in d and '"<zone id> <colour 1> <colour 2> ... <colour 9>"' in d
+    assert "Zones (3 columns x 3 rows each;" in text(w, A)
+    small = ColoringGrid(height=4, width=6, zones=6)  # 5 x 2 zones do not fit six times: 2 x 2
+    small.reset(derive(0, "world"), [A, B, C])
+    assert (small.zone_w, small.zone_h) == (2, 2) and "of 2 x 2 cells" in small.description()
+    assert small.score()["open_correct"] == 0  # the zones cover the whole grid: no open cells
 
 
 # ---- observation --------------------------------------------------------------------------------------
@@ -158,11 +245,12 @@ def test_observation_masks_the_zones_a_group_cannot_see():
             shown = [target[y][x] for x, y in zone_cells(z)]
             want = [w.target[y][x] for x, y in zone_cells(z)]
             assert shown == (want if zid == seen else ["?"] * 10), (agent, zid)
-        open_rows = [target[0], w.target[0]]
-        assert open_rows[0] == "".join(open_rows[1])
+        open_ = [(x, y) for y in range(8) for x in range(15) if zone_at(w.crossed, x, y) is None]
+        assert len(open_) == 90 and all(target[y][x] == w.target[y][x] for x, y in open_)
         assert w.observe(agent).private == {"group": int(agent[1:]) % 3}
     t = text(w, A)
-    assert "Z0 type A at x=5..9, y=4..5: targets visible to G0, painted by G1" in t
+    assert f"Z0 at {span(zones['Z0'])}: targets visible to G0, painted by G1" in t
+    assert f"Z2 at {span(zones['Z2'])}: targets visible to G2, painted by G0" in t
     assert "Groups: G0 = a000; G1 = a001; G2 = a002" in t
     assert ("You are a000, in group G0. Your group sees the targets of Z0 and must report them on "
             "the message board for G1, which paints Z0. Only your group may paint Z2; its targets "
@@ -171,6 +259,8 @@ def test_observation_masks_the_zones_a_group_cannot_see():
     assert info["agent"] == "a000" and info["group"] == 0 and info["groups"][1] == ["a001"]
     assert [(z["zone_id"], z["viewers"], z["painter_group"]) for z in info["zones"]] == [
         ("Z0", [0], 1), ("Z1", [1], 2), ("Z2", [2], 0)]
+    assert [{k: z[k] for k in ("x", "y", "width", "height")} for z in info["zones"]] == [
+        {k: z[k] for k in ("x", "y", "width", "height")} for z in w.crossed]
     assert len(needed_cells(*parse_observation(t)[:2])) == 120 - 20  # hidden cells skipped
     assert len(paintable_needed_cells(t)) == 90  # open only: Z0 is not ours, Z2 is hidden
 
@@ -192,7 +282,7 @@ def test_oracle_shows_a_zone_to_its_painters_too():
     assert [target[y][x] for x, y in zone_cells(z0)] == [w.target[y][x] for x, y in zone_cells(z0)]
     assert [target[y][x] for x, y in zone_cells(z2)] == ["?"] * 10  # still hidden
     t = text(w, B)
-    assert "Z0 type A at x=5..9, y=4..5: targets visible to G0 and G1 (its painters), painted by G1" in t
+    assert f"Z0 at {span(z0)}: targets visible to G0 and G1 (its painters), painted by G1" in t
     assert parse_zones(t)["zones"][0]["viewers"] == [0, 1]
     assert len(paintable_needed_cells(t)) == 100
     assert "shown to two groups" in w.description() and "have to reach" not in w.description()
@@ -202,7 +292,8 @@ def test_description_states_rules_format_and_board_timing():
     w = world()
     d = w.description()
     for phrase in ("at most 10 cells per round", "refused", "already has its target colour wastes",
-                   "three groups, G0, G1 and G2", "Z0, Z1 and Z2, of 5 x 2 cells",
+                   ("split into 3 groups, G0, G1 and G2, and the grid holds 3 zones, Z0, Z1 and Z2, "
+                    "of 5 x 2 cells."),
                    "Cells outside the zones are open: anyone may paint them",
                    "a paint inside a zone by an agent outside its painting group is refused",
                    '"<zone id> <colour 1> <colour 2> ... <colour 10>"',
@@ -229,7 +320,8 @@ def test_validate_bounds_and_colour():
 
 def test_zone_paint_refused_at_call_time_names_only_the_painter_group():
     w = world()
-    for x, y, color in [(5, 4, "r"), (9, 5, "g")]:  # Z0 cells, painted by G1
+    z0 = zone_cells(zone(w, "Z0"))
+    for (x, y), color in [(z0[0], "r"), (z0[-1], "g")]:  # Z0 cells, painted by G1
         for agent in (A, C):
             ack = w.validate(agent, Action(name="paint", args={"x": x, "y": y, "color": color}))
             assert not ack.ok
@@ -238,21 +330,24 @@ def test_zone_paint_refused_at_call_time_names_only_the_painter_group():
             for word in ("red", "green", "blue", "yellow", "correct", "wrong", "target"):
                 assert word not in ack.error
         assert w.validate(B, Action(name="paint", args={"x": x, "y": y, "color": color})).ok
-    assert w.validate(A, Action(name="paint", args={"x": 5, "y": 6, "color": "r"})).ok  # Z2 is G0's
-    assert w.validate(C, Action(name="paint", args={"x": 0, "y": 1, "color": "r"})).ok  # Z1 is G2's
+    (x2, y2), (x1, y1), (x0, y0) = zone_cells(zone(w, "Z2"))[0], zone_cells(zone(w, "Z1"))[0], z0[0]
+    assert w.validate(A, Action(name="paint", args={"x": x2, "y": y2, "color": "r"})).ok  # Z2: G0's
+    assert w.validate(C, Action(name="paint", args={"x": x1, "y": y1, "color": "r"})).ok  # Z1: G2's
     assert w.validate(A, Action(name="paint", args={"x": 0, "y": 0, "color": "r"})).ok  # open
     full = [Action(name="paint", args={"x": i, "y": 0, "color": "r"}) for i in range(10)]
-    assert w.validate(B, Action(name="paint", args={"x": 5, "y": 4, "color": "r"}),
+    assert w.validate(B, Action(name="paint", args={"x": x0, "y": y0, "color": "r"}),
                       pending=full).error.startswith("paints_per_round")
 
 
 def test_zone_paint_refused_again_at_commit_without_using_the_limit():
     w = world(paints_per_round=1)
-    outs = w.commit([paint(A, 5, 4, w.target[4][5]), paint(A, 0, 0, w.target[0][0], 1)])
+    x, y = zone_cells(zone(w, "Z0"))[0]
+    outs = w.commit([paint(A, x, y, w.target[y][x]), paint(A, 0, 0, w.target[0][0], 1)])
     assert outs[0].accepted is False and outs[0].feedback == {
-        "error": "zone_paint_refused", "detail": "cell (5, 4) is in zone Z0, which only group G1 may paint"}
+        "error": "zone_paint_refused",
+        "detail": f"cell ({x}, {y}) is in zone Z0, which only group G1 may paint"}
     assert outs[1].accepted and outs[1].feedback == {"result": "painted"}
-    assert w.grid[4][5] == "." and w.score()["zone_paint_refusals"] == 1
+    assert w.grid[y][x] == "." and w.score()["zone_paint_refusals"] == 1
     assert w.score()["paints"] == 1
 
 
@@ -277,9 +372,10 @@ def test_conflict_rule_last_writer_wins_and_accounting():
 
 def test_commit_feedback_says_why():
     w = world(paints_per_round=1)
+    x, y = zone_cells(zone(w, "Z0"))[0]
     outs = w.commit([paint(A, 15, 0, "r"), paint(A, 0, 0, "z", 1), paint(B, 0, 0, w.target[0][0]),
                      paint(B, 1, 0, w.target[0][1], 1), paint(C, 0, 0, w.target[0][0]),
-                     paint(C, 5, 4, "r", 1)])
+                     paint(C, x, y, "r", 1)])
     assert [o.feedback.get("error") or o.feedback.get("result") for o in outs] == [
         "out_of_bounds", "bad_color", "overwritten", "paints_per_round", "painted",
         "zone_paint_refused"]
@@ -304,7 +400,7 @@ def test_score_keys_and_zone_counts():
     assert (s["zones_completed"], s["crossed_correct"], s["open_correct"], s["correct"]) == (1, 11, 1, 12)
     assert ColoringGrid().score()["zones_completed"] == 0  # before reset
     v = w.verify()
-    assert v["board"] == "00" and v["groups"] == {A: 0, B: 1, C: 2} and len(v["crossed_zones"]) == 3
+    assert v["board"] == w.board_id and v["groups"] == {A: 0, B: 1, C: 2} and len(v["crossed_zones"]) == 3
     assert v["oracle"] is False and "zones" not in v
 
 
@@ -350,14 +446,18 @@ def test_snapshot_keeps_state_not_config():
     other = ColoringGrid(paints_per_round=2, oracle=True)
     other.restore(w.snapshot())
     assert other.grid == w.grid and other.score() == w.score() and other.paints_per_round == 2
-    assert other.crossed == w.crossed and other.groups == w.groups and other.board_id == "00"
-    assert other.oracle is True and other.board == "auto"
+    assert other.crossed == w.crossed and other.groups == w.groups and other.board_id == w.board_id
+    assert other.oracle is True and other.n_groups == 3
     assert text(other, A) != text(w, A)  # oracle (config) now unmasks Z2 for G0
 
 
-def test_requirements_round_end_and_three_agents():
-    with pytest.raises(ValueError, match="n_agents>=3"):
+def test_requirements_round_end_and_one_agent_per_group():
+    with pytest.raises(ValueError, match=r"requires n_agents>=3 \(world.n_groups\), got 2"):
         Experiment(name="x", world=ColoringGrid(), participants=[RelayPainter()] * 2)
+    with pytest.raises(ValueError, match=r"requires n_agents>=4 \(world.n_groups\), got 3"):
+        Experiment(name="x", world=ColoringGrid(groups=4), participants=[RelayPainter()] * 3)
+    Experiment(name="x", world=ColoringGrid(groups=2), participants=[RelayPainter()] * 2)
+    Experiment(name="x", world=ColoringGrid(groups=4, zones=4), participants=[RelayPainter()] * 4)
     with pytest.raises(ValueError, match="commit=round_end"):
         Experiment(name="x", world=ColoringGrid(), participants=[RelayPainter()] * 3,
                    options={"commit": "immediate"})
@@ -368,15 +468,35 @@ def test_requirements_round_end_and_three_agents():
 
 def test_parse_report_is_loose():
     want = list("rgbyrgbyrg")
-    assert parse_report(format_report("Z0", want), "Z0") == [want]
-    assert parse_report("z0: R, G, B, Y, R; G B Y R G!", "Z0") == [want]
+    assert parse_report(format_report("Z0", want), "Z0", 10) == [want]
+    assert parse_report("z0: R, G, B, Y, R; G B Y R G!", "Z0", 10) == [want]
     assert parse_report("Zone Z0 targets -> Red green BLUE yellow red green blue yellow red green "
-                        "blue blue", "Z0") == [want]  # only the first ten count
-    assert parse_report("Z0 rows: rgbyr / gbyrg", "Z0") == [want]  # rows copied from the grid
-    assert parse_report("Z0 painted by G1: r g b y r g b y r g", "Z0") == [want]  # 'by', G1 skipped
-    assert parse_report("Z0 red green blue", "Z0") == []  # too few
-    assert parse_report("Z10 r g b y r g b y r g", "Z1") == []  # not the zone id
-    assert parse_report("Z1 r r r r r r r r r r and Z0 r g b y r g b y r g", "Z0") == [want]
+                        "blue blue", "Z0", 10) == [want]  # only the first ten count
+    assert parse_report("Z0 rows: rgbyr / gbyrg", "Z0", 10) == [want]  # rows copied from the grid
+    assert parse_report("Z0 painted by G1: r g b y r g b y r g", "Z0", 10) == [want]  # 'by', G1 skipped
+    assert parse_report("Z0 red green blue", "Z0", 10) == []  # too few
+    assert parse_report("Z0 red green blue", "Z0", 3) == [list("rgb")]  # a 3-cell zone
+    assert parse_report("Z10 r g b y r g b y r g", "Z1", 10) == []  # not the zone id
+    assert parse_report("Z10 r g b y r g b y r g", "Z10", 10) == [want]
+    assert parse_report("Z1 r r r r r r r r r r and Z0 r g b y r g b y r g", "Z0", 10) == [want]
+
+
+def test_parse_zones_reads_the_zone_lines():
+    lines = [
+        "Target grid (2 rows x 3 columns; x = column 0-2, y = row 0-1; \"?\" = hidden from you):",
+        "r??", "g??", "", "Groups: G0 = a000, a002; G1 = a001",
+        "Zones (2 columns x 2 rows each; cells outside the zones are open: anyone may paint them):",
+        "Z0 at x=1..2, y=0..1: targets visible to G0, painted by G1",
+        "Z10 at x=0..0, y=0..0: targets visible to G1 and G0 (its painters), painted by G0",
+        "Z1 type A at x=0..0, y=0..0: targets visible to G1, painted by G0",  # the old format
+        "You are a002, in group G0. Only your group may paint Z1."]
+    info = parse_zones("\n".join(lines))
+    assert info["zones"] == [
+        {"zone_id": "Z0", "x": 1, "y": 0, "width": 2, "height": 2, "viewers": [0], "painter_group": 1},
+        {"zone_id": "Z10", "x": 0, "y": 0, "width": 1, "height": 1, "viewers": [1, 0],
+         "painter_group": 0}]
+    assert info["groups"] == {0: ["a000", "a002"], 1: ["a001"]}
+    assert (info["agent"], info["group"]) == ("a002", 0)
 
 
 def relay_world():
@@ -447,13 +567,14 @@ def relay_exp(name="relay", post_=True, n=3, metrics=None, **world_kw):
                       metrics=metrics if metrics is not None else ["coloring.coverage", *ZONE_METRICS])
 
 
-@pytest.mark.parametrize("seed,bid", list(zip(range(1, 6), BOARD_IDS, strict=True)))
-def test_relay_painters_complete_every_board(tmp_path, seed, bid):
+@pytest.mark.parametrize("seed", range(1, 6))
+def test_relay_painters_complete_every_board(tmp_path, seed):
     run = relay_exp().run(seed=seed, max_rounds=20, out=tmp_path)
     s = run.score
-    assert run.end_reason == "terminal" and s["board"] == bid and s["coverage"] == 1.0
-    assert run.meta["last_round"] <= 20
-    assert (s["zones_completed"], s["crossed_correct"], s["open_correct"]) == (3, 30, 90)
+    assert run.end_reason == "terminal" and re.fullmatch(r"[0-9a-f]{10}", s["board"])
+    assert s["coverage"] == 1.0 and run.meta["last_round"] <= 20
+    crossed = 3 * 5 * 2
+    assert (s["zones_completed"], s["crossed_correct"], s["open_correct"]) == (3, crossed, 120 - crossed)
     assert s["zone_paint_refusals"] == 0 and s["wrong_paints"] == 0
     last = {n: run.metrics[n][-1][1] for n in run.metrics}
     assert last["coloring.relay_status"] == 3.0
@@ -495,9 +616,30 @@ def test_relay_painters_with_six_agents_split_work(tmp_path):
     assert run.score["zones_completed"] == 3
 
 
-def test_relay_painters_on_a_generated_board(tmp_path):
+def test_relay_painters_on_a_small_board(tmp_path):
     run = relay_exp("gen", height=8, width=8).run(seed=3, max_rounds=20, out=tmp_path)
-    assert run.end_reason == "terminal" and run.score["board"] == "random"
+    assert run.end_reason == "terminal" and re.fullmatch(r"[0-9a-f]{10}", run.score["board"])
+    Run.load(run.dir)
+
+
+@pytest.mark.parametrize("world_kw,n", [({"groups": 2}, 2), ({"groups": 2}, 5),
+                                        ({"groups": 4, "zones": 4}, 4),
+                                        ({"groups": 4, "zones": 4}, 6),
+                                        ({"groups": 3, "zones": 6}, 3),
+                                        ({"groups": 2, "zones": 3, "zone_size": [3, 3]}, 3)])
+def test_relay_painters_complete_other_group_and_zone_counts(tmp_path, world_kw, n):
+    run = relay_exp("gm", n=n, **world_kw).run(seed=1, max_rounds=20, out=tmp_path)
+    s = run.score
+    w = ColoringGrid(**world_kw)
+    zones, (zw, zh) = w.n_zones, (w.zone_w, w.zone_h)
+    assert run.end_reason == "terminal" and s["coverage"] == 1.0
+    assert (s["zones_completed"], s["crossed_correct"]) == (zones, zones * zw * zh)
+    assert s["open_correct"] == 120 - zones * zw * zh
+    assert s["zone_paint_refusals"] == 0 and s["wrong_paints"] == 0
+    last = {name: run.metrics[name][-1][1] for name in run.metrics}
+    assert last["coloring.relay_status"] == float(zones)
+    assert [k for k in last if k.startswith("coloring.relay_status.")] == [
+        f"coloring.relay_status.Z{i}" for i in range(zones)]
     Run.load(run.dir)
 
 
@@ -527,9 +669,9 @@ def values(run, name):
 
 
 def test_row_major_painters_duplicate_work(tmp_path):
-    exp = Experiment(name="rm", world=ColoringGrid(board="00", paints_per_round=1),
+    exp = Experiment(name="rm", world=ColoringGrid(paints_per_round=1),
                      participants=[RowMajorPainter()] * 15, metrics=GRID_METRICS)
-    run = exp.run(seed=0, max_rounds=5, out=tmp_path)  # row 0 is open: everyone paints its next cell
+    run = exp.run(seed=0, max_rounds=5, out=tmp_path)  # seed 0: row 0 is open, everyone paints its next cell
     assert run.score["correct"] == 5 and run.score["duplicate_paints"] == 70
     assert values(run, "coloring.coverage") == [k / 120 for k in range(1, 6)]
     assert values(run, "coloring.parallel_efficiency") == [1 / 15] * 5
@@ -657,7 +799,8 @@ def test_viewer_builds_for_a_coloring_run(tmp_path):
 def test_render_state_lists_the_zones():
     w = world()
     st = w.render_state()
-    assert st["board"] == "00" and [z["zone"] for z in st["zones"]] == ["Z0", "Z1", "Z2"]
+    assert st["board"] == w.board_id and [z["zone"] for z in st["zones"]] == ["Z0", "Z1", "Z2"]
+    assert "type" not in st["zones"][0]
     assert st["zones"][0]["seen_by"] == "G0" and st["zones"][0]["painted_by"] == "G1"
     assert len(st["grid"]) == 8 and len(st["target"][0]) == 15
 
@@ -685,7 +828,7 @@ def test_example_specs_load_and_run_scripted_arms(tmp_path):
     zones = Experiment.arms_from_yaml(REPO / "examples" / "crossed_zones.yaml")
     assert set(zones) == {"zones"}
     run = zones["zones"].run(seed=3, out=tmp_path)
-    assert run.score["board"] == "02" and run.end_reason == "terminal"
+    assert re.fullmatch(r"[0-9a-f]{10}", run.score["board"]) and run.end_reason == "terminal"
 
 
 def test_report_shows_zone_scores_and_relay_table(tmp_path):
@@ -694,15 +837,20 @@ def test_report_shows_zone_scores_and_relay_table(tmp_path):
     out = tmp_path / "runs"
     Experiment.from_yaml(REPO / "examples" / "crossed_zones.yaml", "zones").run_all(
         [1, 2], out=out)
-    relay_exp("crossed-zones-silent", post_=False).run_all([1], max_rounds=3, out=out)
+    relay_exp("crossed-zones-silent", post_=False, n=4, groups=4, zones=4).run_all(
+        [1], max_rounds=3, out=out)
     text_ = build_report(out, include_fake=True)
     final = text_.split("## Final score")[1]
     head = next(ln for ln in final.splitlines() if ln.startswith("| run "))
     for key in ("board", "zones_completed", "crossed_correct", "open_correct", "zone_paint_refusals"):
         assert f"| {key} |" in head or head.endswith(f"| {key} |"), key
     assert "## Crossed zones (relay status at the end of each run)" in text_
-    assert "| zones | crossed-zones__zones__s1 | 00 | complete | complete | complete | 3 | 1 / 1 / 1 |" in text_
-    assert "viewer_never_posted | viewer_never_posted | viewer_never_posted | 0 | 0 / 0 / 0 |" in text_
+    # one column per zone id over the runs: the 3-zone runs show n/a under Z3
+    assert "| arm | run | board | Z0 | Z1 | Z2 | Z3 | zones done |" in text_
+    assert re.search(r"\| zones \| crossed-zones__zones__s1 \| [0-9a-f]{10} \| complete \| complete \| "
+                     r"complete \| n/a \| 3 \| 1 / 1 / 1 \|", text_)
+    assert ("viewer_never_posted | viewer_never_posted | viewer_never_posted | viewer_never_posted "
+            "| 0 | 0 / 0 / 0 / 0 |") in text_
     assert "| coloring.relay_status.Z0 |" in text_
 
 
@@ -721,7 +869,7 @@ def coloring_executor(tmp_path, commit="round_end", **kw):
 
 
 def cell(w, i):
-    y, x = divmod(i, w.width)  # i < 15: row 0, all open on board 00
+    y, x = divmod(i, w.width)  # i < 15: row 0, all open on seed 0's board (`world()`)
     return {"x": x, "y": y, "color": w.target[y][x]}
 
 
@@ -740,8 +888,9 @@ async def test_round_end_refuses_a_paint_beyond_the_limit_at_call_time(tmp_path)
     bad = await ex.call(C, "paint", {"x": 99, "y": 0, "color": "r"})
     assert bad.error.startswith("out_of_bounds: ")
     assert (await ex.call(C, "paint", {"x": 0, "y": 0, "color": "z"})).error.startswith("bad_color: ")
-    zone = await ex.call(C, "paint", {"x": 5, "y": 4, "color": "r"})
-    assert zone.error.startswith("zone_paint_refused: ") and not ex.buffered_actions(C)
+    x, y = zone_cells(zone(w, "Z0"))[0]
+    refused = await ex.call(C, "paint", {"x": x, "y": y, "color": "r"})
+    assert refused.error.startswith("zone_paint_refused: ") and not ex.buffered_actions(C)
 
 
 async def test_round_end_limit_counts_pending_paints_up_to_paints_per_round(tmp_path):
@@ -786,7 +935,7 @@ async def test_executor_passes_pending_only_to_worlds_that_accept_it(tmp_path):
         def my_status(self, agent):
             return super().my_status(agent)
 
-    w = OldStyle(board="00", paints_per_round=1, status_tools=["my_status"])
+    w = OldStyle(paints_per_round=1, status_tools=["my_status"])
     w.reset(derive(0, "world"), [A, B, C])
     w.begin_round(1)
     ex = RoundExecutor(run="r", round=1, world=w, board=Board(), blobs=BlobStore(tmp_path / "b"),
@@ -821,8 +970,7 @@ def test_cap_note_marks_spinning_turns_and_report_counts_rejected_calls(tmp_path
     from swarmlab.report import build_report
 
     out = tmp_path / "runs"
-    exp = Experiment(name="cap", world=ColoringGrid(board="00", paints_per_round=1,
-                                                    status_tools=["my_status"]),
+    exp = Experiment(name="cap", world=ColoringGrid(paints_per_round=1, status_tools=["my_status"]),
                      participants=[Spinner(), Busy(), Idle()], metrics=GRID_METRICS)
     run = exp.run(seed=0, max_rounds=2, out=out, max_calls_per_turn=5)
     ended = {e["agent"]: e for e in run.events if e["type"] == "turn_ended" and e["round"] == 1}

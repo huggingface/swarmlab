@@ -18,7 +18,7 @@ from swarmlab.medium.registry import (
 from swarmlab.rng import derive
 from swarmlab.spec import MediumSpec, PluginSpec, RunSpec, spec_hash
 from swarmlab.world.base import Action
-from swarmlab.world.coloring import ColoringGrid
+from swarmlab.world.coloring import ColoringGrid, zone_at
 
 from .helpers import flag_experiment, logical
 
@@ -123,9 +123,10 @@ def test_claim_policies():
 
 
 def _world():
-    w = ColoringGrid(board="01")  # cells (0, 0) and (1, 1) are open on board 01
+    w = ColoringGrid()  # the default board of seed 0: cells (0, 0) and (1, 1) are open
     w.reset(derive(0, "world"), [A, B, C])
     w.begin_round(1)
+    assert zone_at(w.crossed, 0, 0) is None and zone_at(w.crossed, 1, 1) is None
     return w
 
 

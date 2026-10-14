@@ -1,42 +1,51 @@
 """ColoringGrid with crossed zones (DESIGN.md component 4; M3b, crossed zones).
 
 A shared world: agents paint cells with `paint(x, y, color)` until the current grid equals a
-target grid. The grid holds three **crossed zones**: each zone's target colours are shown to one
-group of agents and the zone may be painted only by a different group, so the targets have to be
-relayed over the message board. Cells outside the zones ("open" cells) are visible to and
-paintable by everyone. There is no switch to turn the zones off: a coloring grid without them
-never restricts visibility or painting and so cannot test communication. `oracle: true` is the
-control condition in which a zone's painting group also sees its targets.
+target grid. The agents are split into `groups` groups and the grid holds `zones` **crossed
+zones**: each zone's target colours are shown to one group of agents and the zone may be painted
+only by a different group, so the targets have to be relayed over the message board. Cells
+outside the zones ("open" cells) are visible to and paintable by everyone. There is no switch to
+turn the zones off: a coloring grid without them never restricts visibility or painting and so
+cannot test communication. `oracle: true` is the control condition in which a zone's painting
+group also sees its targets.
 
 Grid, colours, boards
 ---------------------
-`height` rows by `width` columns; `x` is the column (0 .. width-1), `y` the row (0 .. height-1).
-Colours are the first `palette` letters of `COLOURS` ("rgbykwopcmnt", as in FlagGame), so
-`2 <= palette <= 12`; an unpainted cell is ".". The defaults (8 x 15, palette 4: r g b y) select
-the five fixed boards in `swarmlab/world/data/coloring_boards.json` (ids "00".."04", the boards of
-the first crossed-zone experiments; colour names map to letters red=r, green=g, blue=b, yellow=y).
+`height` rows by `width` columns (default 8 x 15); `x` is the column (0 .. width-1), `y` the row
+(0 .. height-1). Colours are the first `palette` letters of `COLOURS` ("rgbykwopcmnt", as in
+FlagGame), so `2 <= palette <= 12` (default 4: r g b y); an unpainted cell is ".".
 
-- `board: "auto"` (default): on an 8 x 15 grid with palette 4, fixed board `(seed - 1) % 5` of
-  the run seed (seeds 1..5 -> boards 00..04). The world sees the run seed through the rng it is
-  reset with: `swarmlab.rng.derive(seed, "world")` records `root = (seed, "world")` on the stream,
-  and `reset` reads it. A stream without `root` (a plain `random.Random`) picks the board with
-  `rng.randrange(5)`. On any other size or palette, "auto" generates the board (as "random").
-- `board: "00".."04"`: that fixed board (needs 8 x 15 and palette 4, else `ValueError`).
-- `board: "random"`: the target is drawn cell by cell in row-major order from the world rng (as the
-  coloring world always did), then the zones are placed from the same stream: three
-  non-overlapping `zone_width x zone_height` rectangles fully inside the grid (rejection
-  sampling, then a shuffled aligned lattice when the grid is tight). The zone size is 5 x 2, or on
-  grids too small for three of those the largest `w x h` with `w <= 5`, `h <= 2` such that three
-  fit on an aligned lattice (`(width // w) * (height // h) >= 3`); a grid of fewer than 3 cells is
-  a `ValueError`.
+Every board is generated from the run seed, through the world rng `reset` gets
+(`swarmlab.rng.derive(seed, "world")`): first the target, cell by cell in row-major order
+(`rng.choice` of the palette, as the coloring world always did), then the zones from the same
+stream (`generate_zones`): `zones` non-overlapping `w x h` rectangles fully inside the grid,
+placed by rejection sampling (200 attempts of up to 50 draws per zone), then, when the grid is
+too tight for that, on a shuffled aligned lattice. `zone_size: [w, h]` (default `[5, 2]`) is the
+maximum zone size: zones are that size, or on grids too small for `zones` of those the largest
+`w x h` within it (by area, then width) such that `zones` fit on an aligned lattice
+(`(width // w) * (height // h) >= zones`, `zone_size()`); a grid of fewer cells than zones is a
+`ValueError` at construction. The same seed and config give the same board.
+
+The board id (`board` in `score()`, `verify()`, `render_state()` and the report's "Crossed zones"
+table) is a content hash, so runs stay comparable across code versions: the first 10 hex
+characters of the sha256 of the initial target rows joined by "\\n", a "\\n", and the JSON list of
+`[zone_id, x, y, width, height, viewer_group, painter_group]` per zone (`board_hash`).
 
 Zones and groups
 ----------------
-Agent i (reset's agent order a000, a001, ...) is in group `G(i % 3)`; at least 3 agents are
-required (`requires.n_agents`; `reset` also raises), groups differ in size by at most one. Zones
-are `Z0` (type A: targets shown to G0, painted by G1), `Z1` (type B: G1 -> G2) and `Z2` (type C:
-G2 -> G0); the fixed boards encode the same cycle (checked at load). Each group therefore sees one
-zone's targets and is the only group allowed to paint another zone.
+`groups: G` (default 3, at least 2) and `zones: M` (default G, at least 1). Agent i (reset's agent
+order a000, a001, ...) is in group `G(i % G)`, so groups differ in size by at most one. Zone z
+(ids `Z0` .. `Z{M-1}`) has its targets shown to group `z % G` and may be painted only by group
+`(z + 1) % G` (the fixed cycle): with G = M = 3, Z0 G0 -> G1, Z1 G1 -> G2, Z2 G2 -> G0; with G = 2,
+Z0 G0 -> G1 and Z1 G1 -> G0, so each group sees one zone and paints the other; with M > G a group
+sees and paints several zones; with M < G some groups neither see nor paint a zone. Invariants:
+
+- every zone's painting group is non-empty, which holds when there are at least G agents: the
+  world requires them (`requires.n_agents = ("n_groups", None)`, checked at `Experiment`
+  construction against `world.n_groups`; `reset` also raises `ValueError`);
+- every zone's viewing group differs from its painting group, which holds for G >= 2.
+
+Open cells may be zero (zones may cover the whole grid).
 
 Observation format (exact; `parse_observation` and `parse_zones` invert it)
 ----------------------------------------------------------------------------
@@ -53,15 +62,21 @@ One text part:
     Colours: r g b y
     Colour names: r = red, g = green, b = blue, y = yellow
     <blank>
-    Groups: G0 = a000; G1 = a001; G2 = a002
+    Groups: G0 = a000; G1 = a001; G2 = a002          (all G groups)
     Zones (5 columns x 2 rows each; cells outside the zones are open: anyone may paint them):
-    Z0 type A at x=5..9, y=4..5: targets visible to G0, painted by G1
-    Z1 type B at x=0..4, y=1..2: targets visible to G1, painted by G2
-    Z2 type C at x=5..9, y=6..7: targets visible to G2, painted by G0
-    You are a000, in group G0. <your duties: the zone you see and report, the zone you paint>
+    Z0 at x=5..9, y=4..5: targets visible to G0, painted by G1
+    Z1 at x=0..4, y=1..2: targets visible to G1, painted by G2
+    Z2 at x=5..9, y=6..7: targets visible to G2, painted by G0
+    You are a000, in group G0. <your duties: per zone you see and report, per zone you paint>
 
-With `oracle: true` the zone lines read `targets visible to G0 and G1 (its painters)` and the
-painting group's target rows show the zone. `observation.private` is `{"group": <0..2>}`.
+With `oracle: true` the zone lines read `targets visible to G0 and G1 (its painters), painted by
+G1` and the painting group's target rows show the zone. `observation.private` is
+`{"group": <0..G-1>}`.
+
+The task text (`description()`) names the actual numbers and names ("The agents are split into 3
+groups, G0, G1 and G2, and the grid holds 3 zones, Z0, Z1 and Z2, of 5 x 2 cells.") and gives
+the recommended relay format only as a placeholder template, `"<zone id> <colour 1> <colour 2>
+... <colour k>"` (k = cells per zone), never as a concrete colour sequence a model could copy.
 
 Actions and commit
 ------------------
@@ -91,7 +106,8 @@ Actions and commit
   claim check).
 
 Run settings (`requires`): `commit: round_end` (the task text says posts are delivered when the
-round ends, readable from the next round on) and at least 3 agents.
+round ends, readable from the next round on) and at least `groups` agents (`n_agents >=
+world.n_groups`).
 
 Dynamics
 --------
@@ -114,15 +130,16 @@ Evaluator side
 `terminal()` is true when coverage is 1.0 and no target change is scheduled after the current
 round. `score()` -> coverage, correct (matching cells), wrong (painted, not matching), unpainted,
 paints, useful_paints, duplicate_paints, wrong_paints, overwritten_paints, wasted_paints, plus
-board (board id or "random"), zones_completed (zones whose cells all match, 0..3),
-crossed_correct (matching zone cells, of 3 x zone size: 30 on the fixed boards), open_correct
-(matching open cells: 90) and zone_paint_refusals (commit-time zone refusals; call-time refusals
-never reach the world, `validate` has no side effects, so they are counted by the metric
-`coloring.zone_paint_refusals` from the log). Per-zone relay diagnostics need the board's post,
-delivery and read events, which the world never sees: they are the metric `coloring.relay_status`
-(swarmlab/metrics/coloring.py) and this world's `report_sections` table.
+board (the board hash), zones_completed (zones whose cells all match, 0..M), crossed_correct
+(matching zone cells, of M x w x h), open_correct (matching open cells, of the rest) and
+zone_paint_refusals (commit-time zone refusals; call-time refusals never reach the world,
+`validate` has no side effects, so they are counted by the metric `coloring.zone_paint_refusals`
+from the log). Per-zone relay diagnostics need the board's post, delivery and read events, which
+the world never sees: they are the metric `coloring.relay_status` (swarmlab/metrics/coloring.py)
+and this world's `report_sections` table.
 `verify()` -> target (as of now), initial_target, target_changes, colours, height, width,
-paints_per_round, board, crossed_zones (list of zone dicts), groups (agent -> group), oracle.
+paints_per_round, board, crossed_zones (list of zone dicts: zone_id, x, y, width, height,
+viewer_group, painter_group), groups (agent -> group), oracle.
 
 `render_state()` (the replay page's world panel) -> `grid` (current), `target`, `palette`, the
 zones as a table, coverage, cells_matching, cells, round and paint counts.
@@ -132,12 +149,11 @@ constructor config is kept on restore, as in FlagGame.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import re
 from collections.abc import Sequence
-from functools import cache
-from importlib.resources import files
 from typing import Any, ClassVar
 
 from ..ids import ActionId, AgentId
@@ -156,41 +172,21 @@ HIDDEN = "?"
 TARGET_HEADER = "Target grid"
 CURRENT_HEADER = 'Current grid ("." = unpainted):'
 COLOURS_PREFIX = "Colours:"
-N_GROUPS = 3
-ZONE_IDS = ("Z0", "Z1", "Z2")
-ZONE_TYPES = ("A", "B", "C")
-ZONE_W, ZONE_H = 5, 2
-FIXED_SIZE = (8, 15)  # (height, width) of the fixed boards
-FIXED_PALETTE = 4
-BOARD_IDS = ("00", "01", "02", "03", "04")
 RELAY_STATUSES = ("complete", "viewer_never_posted", "viewer_posted_wrong_or_unparsed",
                   "painter_never_read_correct_report", "painter_read_but_painted_wrong")
 
 
-def zone_cycle(i: int) -> tuple[int, int]:
-    """(viewer group, painter group) of zone i: A G0->G1, B G1->G2, C G2->G0."""
-    return i % N_GROUPS, (i + 1) % N_GROUPS
+def join_names(names: Sequence[str]) -> str:
+    """"A", "A and B", "A, B and C"."""
+    names = list(names)
+    if len(names) <= 1:
+        return "".join(names)
+    return ", ".join(names[:-1]) + " and " + names[-1]
 
 
-@cache
-def fixed_boards() -> dict[str, dict]:
-    """The fixed boards by id: `{"targets": [row strings of letters], "zones": [zone dicts]}`."""
-    raw = json.loads(files("swarmlab.world").joinpath("data/coloring_boards.json").read_text())
-    out: dict[str, dict] = {}
-    for b in raw:
-        if (b["height"], b["width"]) != FIXED_SIZE or len(b["targets"]) != b["height"]:
-            raise ValueError(f"board {b['board']}: not {FIXED_SIZE[1]} x {FIXED_SIZE[0]}")
-        rows = ["".join(NAME_TO_LETTER[c] for c in row) for row in b["targets"]]
-        zones = [dict(z) for z in b["zones"]]
-        for i, z in enumerate(zones):
-            if (z["zone_id"], z["type"], (z["viewer_group"], z["painter_group"])) != (
-                    ZONE_IDS[i], ZONE_TYPES[i], zone_cycle(i)):
-                raise ValueError(f"board {b['board']}: zone {i} breaks the A/B/C cycle: {z}")
-        _check_zones(zones, b["height"], b["width"])
-        out[b["board"]] = {"targets": rows, "zones": zones}
-    if tuple(sorted(out)) != BOARD_IDS:
-        raise ValueError(f"fixed boards must be {BOARD_IDS}, got {sorted(out)}")
-    return out
+def zone_cycle(i: int, groups: int) -> tuple[int, int]:
+    """(viewer group, painter group) of zone i: `i % groups` -> `(i + 1) % groups`."""
+    return i % groups, (i + 1) % groups
 
 
 def _cells(z: dict) -> list[tuple[int, int]]:
@@ -199,39 +195,37 @@ def _cells(z: dict) -> list[tuple[int, int]]:
             for x in range(z["x"], z["x"] + z["width"])]
 
 
-def _check_zones(zones: list[dict], height: int, width: int) -> None:
-    seen: set[tuple[int, int]] = set()
-    for z in zones:
-        cells = _cells(z)
-        if any(not (0 <= x < width and 0 <= y < height) for x, y in cells) or seen & set(cells):
-            raise ValueError(f"zone {z['zone_id']} is outside the grid or overlaps another")
-        seen |= set(cells)
-
-
-def zone_size(height: int, width: int) -> tuple[int, int]:
-    """(zone width, zone height) for a grid: 5 x 2, or the largest w x h (w <= 5, h <= 2) of which
-    three fit on an aligned lattice; ValueError for a grid of fewer than 3 cells."""
-    sizes = sorted(((w, h) for w in range(ZONE_W, 0, -1) for h in range(ZONE_H, 0, -1)),
+def zone_size(height: int, width: int, n_zones: int, max_w: int, max_h: int) -> tuple[int, int]:
+    """(zone width, zone height) for a grid: the largest w x h (w <= max_w, h <= max_h; by area,
+    then width) of which `n_zones` fit on an aligned lattice; ValueError when even 1 x 1 zones do
+    not fit (fewer cells than zones)."""
+    sizes = sorted(((w, h) for w in range(max_w, 0, -1) for h in range(max_h, 0, -1)),
                    key=lambda s: (-s[0] * s[1], -s[0]))
     for w, h in sizes:
-        if (width // w) * (height // h) >= N_GROUPS:
+        if (width // w) * (height // h) >= n_zones:
             return w, h
-    raise ValueError(f"a {width} x {height} grid cannot hold {N_GROUPS} zones (needs >= 3 cells)")
+    raise ValueError(f"a {width} x {height} grid cannot hold {n_zones} zones "
+                     f"(needs >= {n_zones} cells)")
 
 
-def generate_zones(rng: random.Random, height: int, width: int) -> list[dict]:
-    """Three non-overlapping zones placed from `rng` (see the module docstring)."""
-    zw, zh = zone_size(height, width)
+_fit_zone_size = zone_size  # ColoringGrid's `zone_size` param shadows the function in __init__
+
+
+def generate_zones(rng: random.Random, height: int, width: int, n_zones: int, groups: int,
+                   size: tuple[int, int]) -> list[dict]:
+    """`n_zones` non-overlapping `size` (w, h) zones placed from `rng`, on the `groups` cycle (see
+    the module docstring). `size` must fit (`zone_size`)."""
+    zw, zh = size
 
     def zone(i: int, x: int, y: int) -> dict:
-        v, p = zone_cycle(i)
-        return {"zone_id": ZONE_IDS[i], "type": ZONE_TYPES[i], "x": x, "y": y, "width": zw,
-                "height": zh, "viewer_group": v, "painter_group": p}
+        v, p = zone_cycle(i, groups)
+        return {"zone_id": f"Z{i}", "x": x, "y": y, "width": zw, "height": zh,
+                "viewer_group": v, "painter_group": p}
 
     for _ in range(200):
         placed: list[dict] = []
         used: set[tuple[int, int]] = set()
-        for i in range(N_GROUPS):
+        for i in range(n_zones):
             for _ in range(50):
                 z = zone(i, rng.randrange(width - zw + 1), rng.randrange(height - zh + 1))
                 if not used & set(_cells(z)):
@@ -240,11 +234,19 @@ def generate_zones(rng: random.Random, height: int, width: int) -> list[dict]:
                     break
             else:
                 break
-        if len(placed) == N_GROUPS:
+        if len(placed) == n_zones:
             return placed
     slots = [(i * zw, j * zh) for j in range(height // zh) for i in range(width // zw)]
     rng.shuffle(slots)
-    return [zone(i, x, y) for i, (x, y) in enumerate(slots[:N_GROUPS])]
+    return [zone(i, x, y) for i, (x, y) in enumerate(slots[:n_zones])]
+
+
+def board_hash(target: Sequence[Sequence[str]], zones: Sequence[dict]) -> str:
+    """The board id: 10 hex chars of the sha256 of the target rows and the zones (module docstring)."""
+    rects = [[z["zone_id"], z["x"], z["y"], z["width"], z["height"], z["viewer_group"],
+              z["painter_group"]] for z in zones]
+    text = "\n".join("".join(r) for r in target) + "\n" + json.dumps(rects)
+    return hashlib.sha256(text.encode()).hexdigest()[:10]
 
 
 # ---- relay reports (the recommended board format, parsed loosely) ----------------------------------
@@ -270,9 +272,10 @@ def _colour_tokens(text: str) -> list[str]:
     return out
 
 
-def parse_report(text: str, zone_id: str, n: int = ZONE_W * ZONE_H) -> list[list[str]]:
+def parse_report(text: str, zone_id: str, n: int) -> list[list[str]]:
     """Every reading of `text` as a report on `zone_id`: for each occurrence of the zone id (as a
-    token, any case), the first `n` colour tokens after it (`_colour_tokens`), when there are `n`.
+    token, any case), the first `n` (the zone's cell count) colour tokens after it
+    (`_colour_tokens`), when there are `n`.
     A report is correct when one of the readings equals the zone's targets in row-major order."""
     low = text.lower()
     out: list[list[str]] = []
@@ -311,13 +314,13 @@ def parse_observation(text: str) -> tuple[list[str], list[str], list[str]]:
     return target, current, colours
 
 
-_ZONE_RE = re.compile(r"^(Z\d+) type (\w) at x=(\d+)\.\.(\d+), y=(\d+)\.\.(\d+): targets visible "
+_ZONE_RE = re.compile(r"^(Z\d+) at x=(\d+)\.\.(\d+), y=(\d+)\.\.(\d+): targets visible "
                       r"to G(\d+)(?: and G(\d+) \(its painters\))?, painted by G(\d+)$")
 
 
 def parse_zones(text: str) -> dict:
-    """The zone and group lines of the last observation in `text`: `{"zones": [{"zone_id", "type",
-    "x", "y", "width", "height", "viewers": [groups], "painter_group"}], "groups": {group: [agents]},
+    """The zone and group lines of the last observation in `text`: `{"zones": [{"zone_id", "x",
+    "y", "width", "height", "viewers": [groups], "painter_group"}], "groups": {group: [agents]},
     "agent": own id or None, "group": own group or None}`."""
     idx = text.rfind(TARGET_HEADER)
     part = text[idx:] if idx >= 0 else text
@@ -328,11 +331,11 @@ def parse_zones(text: str) -> dict:
         line = raw.strip()
         m = _ZONE_RE.match(line)
         if m:
-            x0, x1, y0, y1 = (int(m.group(k)) for k in (3, 4, 5, 6))
-            viewers = [int(m.group(7))] + ([int(m.group(8))] if m.group(8) else [])
-            zones.append({"zone_id": m.group(1), "type": m.group(2), "x": x0, "y": y0,
-                          "width": x1 - x0 + 1, "height": y1 - y0 + 1, "viewers": viewers,
-                          "painter_group": int(m.group(9))})
+            x0, x1, y0, y1 = (int(m.group(k)) for k in (2, 3, 4, 5))
+            viewers = [int(m.group(6))] + ([int(m.group(7))] if m.group(7) else [])
+            zones.append({"zone_id": m.group(1), "x": x0, "y": y0, "width": x1 - x0 + 1,
+                          "height": y1 - y0 + 1, "viewers": viewers,
+                          "painter_group": int(m.group(8))})
         elif line.startswith("Groups:"):
             for chunk in line[len("Groups:"):].split(";"):
                 name, _, members = chunk.partition("=")
@@ -375,13 +378,15 @@ def paintable_needed_cells(text: str) -> list[tuple[int, int, str]]:
 
 
 class ColoringGrid(World):
-    """Shared grid with three crossed zones: targets seen by one group, painted by another."""
+    """Shared grid with crossed zones: each zone's targets seen by one group, painted by another."""
 
     entry_point: ClassVar[str | None] = "coloring"
     name = "coloring"
-    requires: ClassVar[Requirements] = Requirements(commit="round_end", n_agents=(N_GROUPS, None))
+    requires: ClassVar[Requirements] = Requirements(commit="round_end", n_agents=("n_groups", None))
 
-    def __init__(self, height: int = 8, width: int = 15, palette: int = 4, board: str = "auto",
+    def __init__(self, height: int = 8, width: int = 15, palette: int = 4,
+                 groups: int = 3, zones: int | None = None,
+                 zone_size: list[int] | tuple[int, int] = (5, 2),
                  oracle: bool = False,
                  target_changes: list | tuple = (),
                  worker_failures: list | tuple = (),
@@ -393,21 +398,23 @@ class ColoringGrid(World):
             raise ValueError(f"palette must be in 2..{len(COLOURS)}, got {palette}")
         if paints_per_round < 1:
             raise ValueError("paints_per_round must be >= 1")
-        board = str(board)
-        if board not in ("auto", "random", *BOARD_IDS):
-            raise ValueError(f"board must be 'auto', 'random' or one of {list(BOARD_IDS)}, got {board!r}")
-        fixed_ok = (height, width) == FIXED_SIZE and palette == FIXED_PALETTE
-        if board in BOARD_IDS and not fixed_ok:
-            raise ValueError(f"fixed board {board} needs height={FIXED_SIZE[0]}, width={FIXED_SIZE[1]}, "
-                             f"palette={FIXED_PALETTE}")
+        if groups < 2:
+            raise ValueError(f"groups must be >= 2 (a zone's viewers and painters differ), got {groups}")
+        zones = groups if zones is None else zones
+        if zones < 1:
+            raise ValueError(f"zones must be >= 1, got {zones}")
+        size = list(zone_size)
+        if len(size) != 2 or any(not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in size):
+            raise ValueError(f"zone_size must be [width, height] of integers >= 1, got {zone_size!r}")
         bad_status = set(status_tools) - {"my_status", "collective_status"}
         if bad_status:
             raise ValueError(f"unknown status tools {sorted(bad_status)}")
         self.height, self.width = height, width
         self.colours = list(COLOURS[:palette])
-        self.board = board
+        self.n_groups, self.n_zones = groups, zones
+        self.zone_max = (size[0], size[1])
         self.oracle = bool(oracle)
-        self.zone_w, self.zone_h = (ZONE_W, ZONE_H) if fixed_ok else zone_size(height, width)
+        self.zone_w, self.zone_h = _fit_zone_size(height, width, zones, size[0], size[1])
         self.target_changes = [(int(r), [(int(x), int(y), str(c)) for x, y, c in cells])
                                for r, cells in target_changes]
         for r, cells in self.target_changes:
@@ -434,40 +441,22 @@ class ColoringGrid(World):
         self.round_paints: dict[str, int] = {}
 
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = (
-        "params", "height", "width", "colours", "board", "oracle", "zone_w", "zone_h",
-        "target_changes", "worker_failures", "paints_per_round", "status_tools",
+        "params", "height", "width", "colours", "n_groups", "n_zones", "zone_max", "oracle",
+        "zone_w", "zone_h", "target_changes", "worker_failures", "paints_per_round", "status_tools",
     )
 
     # ---- lifecycle ---------------------------------------------------------------------------
-    def _uses_fixed(self) -> bool:
-        if self.board in BOARD_IDS:
-            return True
-        return (self.board == "auto" and (self.height, self.width) == FIXED_SIZE
-                and len(self.colours) == FIXED_PALETTE)
-
     def reset(self, rng: random.Random, agents: list[AgentId]) -> None:
-        if len(agents) < N_GROUPS:
-            raise ValueError(f"ColoringGrid needs at least {N_GROUPS} agents (one per group), "
+        if len(agents) < self.n_groups:
+            raise ValueError(f"ColoringGrid needs at least {self.n_groups} agents (one per group), "
                              f"got {len(agents)}")
         self.agents = list(agents)
-        self.groups = {str(a): i % N_GROUPS for i, a in enumerate(self.agents)}
-        if self._uses_fixed():
-            if self.board in BOARD_IDS:
-                bid = self.board
-            else:
-                root = getattr(rng, "root", None)
-                seed = root[0] if isinstance(root, tuple) and root else None
-                idx = (seed - 1) % len(BOARD_IDS) if isinstance(seed, int) else rng.randrange(len(BOARD_IDS))
-                bid = BOARD_IDS[idx]
-            fb = fixed_boards()[bid]
-            self.board_id = bid
-            self.target = [list(r) for r in fb["targets"]]
-            self.crossed = [dict(z) for z in fb["zones"]]
-        else:
-            self.board_id = "random"
-            self.target = [[rng.choice(self.colours) for _ in range(self.width)]
-                           for _ in range(self.height)]
-            self.crossed = generate_zones(rng, self.height, self.width)
+        self.groups = {str(a): i % self.n_groups for i, a in enumerate(self.agents)}
+        self.target = [[rng.choice(self.colours) for _ in range(self.width)]
+                       for _ in range(self.height)]
+        self.crossed = generate_zones(rng, self.height, self.width, self.n_zones, self.n_groups,
+                                      (self.zone_w, self.zone_h))
+        self.board_id = board_hash(self.target, self.crossed)
         self.initial_target = [list(r) for r in self.target]
         self.grid = [[UNPAINTED] * self.width for _ in range(self.height)]
         self.painter = [[None] * self.width for _ in range(self.height)]
@@ -517,6 +506,8 @@ class ColoringGrid(World):
         # a placeholder, not a colour sequence: small models copied a concrete example
         # ("Z0 red green blue ...") verbatim as if it were the zone's real targets
         template = f"<zone id> <colour 1> <colour 2> ... <colour {k}>"
+        groups = join_names([f"G{g}" for g in range(self.n_groups)])
+        zones = join_names([f"Z{z}" for z in range(self.n_zones)])
         if self.oracle:
             visibility = (
                 "Each zone's target colours are shown to two groups, one that only sees them and the "
@@ -541,8 +532,9 @@ class ColoringGrid(World):
             "and a paint beyond the limit is refused. Painting a cell that already has its target "
             "colour wastes your paint. When several agents paint the same cell in one round, the "
             "last one applied wins. The task is done when the current grid equals the target. "
-            "The agents are split into three groups, G0, G1 and G2, and the grid holds three "
-            f"zones, Z0, Z1 and Z2, of {self.zone_w} x {self.zone_h} cells. " + visibility + " "
+            f"The agents are split into {self.n_groups} groups, {groups}, and the grid holds "
+            f"{self.n_zones} zone{'s' if self.n_zones != 1 else ''}, {zones}, of "
+            f"{self.zone_w} x {self.zone_h} cells. " + visibility + " "
             f"Recommended format for a post about a zone: the zone id followed by its {k} target "
             "colours in row-major order (the top row left to right, then the next row), written "
             f"as \"{template}\" with the colour names; other wording works too. Board posts are "
@@ -595,13 +587,13 @@ class ColoringGrid(World):
                   "Colour names: " + ", ".join(f"{c} = {COLOUR_NAMES[c]}" for c in self.colours)]
         if self.crossed:
             lines += ["", "Groups: " + "; ".join(f"G{g} = {', '.join(self._members(g))}"
-                                                 for g in range(N_GROUPS)),
+                                                 for g in range(self.n_groups)),
                       (f"Zones ({self.zone_w} columns x {self.zone_h} rows each; cells outside "
                        "the zones are open: anyone may paint them):")]
             for z in self.crossed:
                 v, p = z["viewer_group"], z["painter_group"]
                 seen = f"G{v} and G{p} (its painters)" if self.oracle else f"G{v}"
-                lines.append(f"{z['zone_id']} type {z['type']} at x={z['x']}..{z['x'] + z['width'] - 1}, "
+                lines.append(f"{z['zone_id']} at x={z['x']}..{z['x'] + z['width'] - 1}, "
                              f"y={z['y']}..{z['y'] + z['height'] - 1}: targets visible to {seen}, "
                              f"painted by G{p}")
             duties = self._duties(agent)
@@ -768,7 +760,7 @@ class ColoringGrid(World):
         done, crossed, open_ok = self._zone_counts()
         return {"grid": [list(r) for r in self.grid], "target": [list(r) for r in self.target],
                 "palette": {**{c: PALETTE_CSS[c] for c in self.colours}, UNPAINTED: "transparent"},
-                "zones": [{"zone": z["zone_id"], "type": z["type"], "x": z["x"], "y": z["y"],
+                "zones": [{"zone": z["zone_id"], "x": z["x"], "y": z["y"],
                            "width": z["width"], "height": z["height"],
                            "seen_by": f"G{z['viewer_group']}", "painted_by": f"G{z['painter_group']}"}
                           for z in self.crossed],
@@ -780,24 +772,31 @@ class ColoringGrid(World):
 
     def report_sections(self, arms: dict[str, list[Any]]) -> list[str]:
         """A "Crossed zones" table: per run, the board, each zone's final relay status (the
-        `coloring.relay_status` fold over the run's events) and posts / read_board calls per
-        agent (in agent order)."""
+        `coloring.relay_status` fold over the run's events; one column per zone id, the union over
+        the runs in zone-index order) and posts / read_board calls per agent (in agent order)."""
         from ..metrics.coloring import relay_summary
 
-        rows = []
+        found: list[tuple[str, Any, dict | Exception]] = []
         for arm, runs in sorted(arms.items()):
             for run in runs:
                 try:
-                    s = relay_summary(run)
+                    found.append((arm, run, relay_summary(run)))
                 except Exception as e:  # noqa: BLE001 - one bad run must not hide the others
-                    rows.append([arm, run.id, f"n/a ({type(e).__name__}: {e})", "", "", "", "", "", ""])
-                    continue
-                rows.append([arm, run.id, s["board"], *(s["status"].get(z, "n/a") for z in ZONE_IDS),
-                             s["zones_completed"], " / ".join(str(v) for v in s["posts"].values()),
-                             " / ".join(str(v) for v in s["reads"].values())])
-        if not rows:
+                    found.append((arm, run, e))
+        if not found:
             return []
-        head = ["arm", "run", "board", *ZONE_IDS, "zones done", "posts per agent",
+        zone_ids = sorted({z for _, _, s in found if isinstance(s, dict) for z in s["status"]},
+                          key=lambda z: int(z[1:]))  # the union over the runs, by zone index
+        rows = []
+        for arm, run, s in found:
+            if isinstance(s, Exception):
+                rows.append([arm, run.id, f"n/a ({type(s).__name__}: {s})",
+                             *[""] * (len(zone_ids) + 3)])
+                continue
+            rows.append([arm, run.id, s["board"], *(s["status"].get(z, "n/a") for z in zone_ids),
+                         s["zones_completed"], " / ".join(str(v) for v in s["posts"].values()),
+                         " / ".join(str(v) for v in s["reads"].values())])
+        head = ["arm", "run", "board", *zone_ids, "zones done", "posts per agent",
                 "read_board calls per agent"]
         out = ["## Crossed zones (relay status at the end of each run)", "",
                "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]

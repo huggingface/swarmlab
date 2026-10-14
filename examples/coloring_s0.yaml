@@ -1,8 +1,8 @@
 # Coloring S0 (DESIGN.md M3): framework validation of the registry and claim policies on an
 # 8x8 ColoringGrid with 16 agents, board-only medium otherwise. The grid's three crossed zones are
-# generated from the seed (8x8 is not the fixed 15x8 board size); `oracle: true` shows every
-# zone's targets to its painting group too, so painters that never read the board can finish
-# (full visibility for the painters, as S0 was designed). See examples/crossed_zones.yaml for the
+# generated from the seed, like every coloring board; `oracle: true` shows every zone's targets to
+# its painting group too, so painters that never read the board can finish (full visibility for
+# the painters, as S0 was designed). See examples/crossed_zones.yaml for the
 # relay task itself.
 #   swarmlab validate examples/coloring_s0.yaml
 #   swarmlab run examples/coloring_s0.yaml --yes          # every arm x every seed below

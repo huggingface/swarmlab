@@ -18,7 +18,8 @@ Crossed-zone metrics (the world's zones, groups and targets come from `verify()`
 
 - `coloring.relay_status`: the per-zone relay diagnostics the world cannot compute itself (it
   never sees the board). Main output: the number of zones whose painting group has read a correct
-  report (denominator 3). Outputs `coloring.relay_status.Z0` / `.Z1` / `.Z2`: the zone's status
+  report (denominator the number of zones). Outputs `coloring.relay_status.Z0`, `.Z1`, ... (one
+  per zone of the truth, in order; before `set_truth` only the main output): the zone's status
   as a label (value = its index in `RELAY_STATUSES`, denominator 1), first match wins:
   `complete` (every zone cell matches its target, however that came about),
   `viewer_never_posted` (no agent of the zone's viewing group has posted anything),
@@ -28,11 +29,11 @@ Crossed-zone metrics (the world's zones, groups and targets come from `verify()`
   read a correct report and the zone is still not complete: painted wrong, or not at all).
   A correct report is a post by a viewing-group agent in which the zone id (a token, any case) is
   followed by the zone's targets (as of the post's round) in row-major order: the first `n` colour
-  tokens after the id (n = zone cells: 10), where a colour token is a full colour name or a single
-  palette letter (any case), or a run of 3+ palette letters read letter by letter
-  (`swarmlab.world.coloring.parse_report`); punctuation, other words and letters touching a
-  digit (G1) are skipped. A read is a
-  `read` event of a painting-group agent whose delivery ids include a delivery of such a post.
+  tokens after the id (n = the zone's cell count, 10 for a 5 x 2 zone), where a colour token is
+  a full colour name or a single palette letter (any case), or a run of 3+ palette letters read
+  letter by letter (`swarmlab.world.coloring.parse_report`); punctuation, other words and letters
+  touching a digit (G1) are skipped. A read is a `read` event of a painting-group agent whose
+  delivery ids include a delivery of such a post.
 - `coloring.zone_paint_refusals`: cumulative paints refused with `zone_paint_refused`, at call
   time (a `tool_returned` whose error starts with it) or at commit (`action_committed` feedback);
   denominator the `paint` calls so far.
@@ -55,7 +56,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
-from ..world.coloring import RELAY_STATUSES, ZONE_IDS, parse_report
+from ..world.coloring import RELAY_STATUSES, parse_report
 from .base import Metric
 
 
@@ -171,7 +172,7 @@ class RelayStatus(_GridFold):
         self.groups = {str(a): int(g) for a, g in truth.get("groups", {}).items()}
 
     def output_names(self) -> list[str]:
-        return [self.name] + [f"{self.name}.{z}" for z in ZONE_IDS]
+        return [self.name] + [f"{self.name}.{z['zone_id']}" for z in self.zones]
 
     def update(self, event: Any) -> None:
         super().update(event)
@@ -232,7 +233,7 @@ class RelayStatus(_GridFold):
         value, denom = self.value()
         st = self.statuses()
         out: list[tuple[str, float | None, int, str | None]] = [(self.name, value, denom, None)]
-        for zid in ZONE_IDS:
+        for zid in (z["zone_id"] for z in self.zones):
             label = st.get(zid)
             out.append((f"{self.name}.{zid}",
                         None if label is None else float(RELAY_STATUSES.index(label)),
