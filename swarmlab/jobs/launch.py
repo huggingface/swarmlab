@@ -17,6 +17,11 @@ HF Jobs have no inbound networking, so the model server and the swarmlab runner 
 - `stage(plan, dir, build_wheel=...)`: writes the stage dir locally: `spec.yaml` (job spec),
   `spec.orig.yaml` (the spec as given), `bootstrap.sh`, `plan.json` and the wheel (`uv build
   --wheel` of the checkout this package was imported from).
+- `serve_argv(plan)`: the exact `vllm serve` argv (`["vllm", "serve", model, *launcher_flags,
+  *shlex.split(vllm_flags)]`). plan.json carries it as `vllm_serve_argv` (a JSON list) next to
+  `vllm_serve_command` (its `shlex.join`), and bootstrap.sh executes that list as read from
+  plan.json (NUL-delimited, so a quoted token with spaces or newlines stays one argument), so
+  the printed command and the executed argv cannot drift.
 - `submit(plan, hf=...)`: stage into a temp dir, upload it, submit, parse the job id, upload
   `launch.json` next to it and append a row to the local ledger. Only `swarmlab job run
   --launch` calls it.
@@ -223,6 +228,7 @@ class JobPlan:
     vllm_profile: str | None = None
     probe_extra: dict[str, Any] = field(default_factory=dict)
     probe_extra_source: str = "default"   # "--probe-extra" | "profile" | "default" | "none"
+    port: int = DEFAULT_PORT   # vLLM's port; the job spec's provider URL points at it
 
     @property
     def stage_remote(self) -> str:
@@ -240,6 +246,14 @@ class JobPlan:
     def rate_usd_per_hour(self) -> float | None:
         return FLAVOR_USD_PER_HOUR.get(self.flavor)
 
+    @property
+    def vllm_serve_argv(self) -> list[str]:
+        return serve_argv(self)
+
+    @property
+    def vllm_serve_command(self) -> str:
+        return serve_command(self)
+
     def env(self) -> dict[str, str]:
         env = {
             "SWARMLAB_TAG": self.tag,
@@ -253,6 +267,7 @@ class JobPlan:
             "SWARMLAB_IMAGE": self.image,
             "SWARMLAB_SYNC_EVERY": str(self.sync_every_s),
             "VLLM_MODEL": self.model,
+            "VLLM_PORT": str(self.port),
             "VLLM_VERSION": self.vllm_version,
             "VLLM_MAX_MODEL_LEN": str(self.max_model_len),
             "VLLM_GPU_MEMORY_UTILIZATION": f"{self.gpu_memory_utilization:g}",
@@ -277,7 +292,8 @@ class JobPlan:
         d.update(stage_remote=self.stage_remote, runs_remote=self.runs_remote,
                  job_spec_sha256=self.job_spec_sha256, rate_usd_per_hour=self.rate_usd_per_hour,
                  timeout=fmt_duration(self.timeout_s), hf_command=hf_command(self),
-                 vllm_serve_command=serve_command(self))
+                 vllm_serve_argv=self.vllm_serve_argv,
+                 vllm_serve_command=self.vllm_serve_command)
         return d
 
 
@@ -385,6 +401,7 @@ def plan_job(
         sync_every_s=sync_every_s, job_spec_yaml=job_yaml, orig_spec_yaml=spec.read_text(),
         notes=notes, vllm_flags_source=resolved.source, vllm_profile=resolved.profile,
         probe_extra=resolved.probe_extra, probe_extra_source=resolved.probe_extra_source,
+        port=port,
     )
 
 
@@ -424,9 +441,9 @@ def job_entry(plan: JobPlan) -> str:
             f"exec bash {STAGE_LOCAL}/bootstrap.sh")
 
 
-def launcher_flags(plan: JobPlan, port: int = DEFAULT_PORT) -> list[str]:
-    """The flags bootstrap.sh always passes to `vllm serve` (never part of `vllm_flags`)."""
-    out = ["--served-model-name", plan.model, "--host", "127.0.0.1", "--port", str(port),
+def launcher_flags(plan: JobPlan) -> list[str]:
+    """The flags the launcher always passes to `vllm serve` (never part of `vllm_flags`)."""
+    out = ["--served-model-name", plan.model, "--host", "127.0.0.1", "--port", str(plan.port),
            "--max-model-len", str(plan.max_model_len),
            "--gpu-memory-utilization", f"{plan.gpu_memory_utilization:g}"]
     if plan.revision:
@@ -435,10 +452,15 @@ def launcher_flags(plan: JobPlan, port: int = DEFAULT_PORT) -> list[str]:
     return out
 
 
+def serve_argv(plan: JobPlan) -> list[str]:
+    """The exact `vllm serve` argv the job runs: plan.json's `vllm_serve_argv`, which bootstrap.sh
+    executes as is. The launcher flags go first, then the user flags (shell-split)."""
+    return ["vllm", "serve", plan.model, *launcher_flags(plan), *shlex.split(plan.vllm_flags)]
+
+
 def serve_command(plan: JobPlan) -> str:
-    """The `vllm serve` line the job will run (for the printout and plan.json)."""
-    return shlex.join(["vllm", "serve", plan.model, *launcher_flags(plan),
-                       *shlex.split(plan.vllm_flags)])
+    """`serve_argv` shell-quoted (for the printout, plan.json and the job's job.json)."""
+    return shlex.join(serve_argv(plan))
 
 
 def hf_command(plan: JobPlan, hf: str = "hf") -> list[str]:

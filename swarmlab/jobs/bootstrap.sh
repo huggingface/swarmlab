@@ -9,10 +9,14 @@
 #   SWARMLAB_RUNS         space-separated "arm:seed" pairs, run in this order
 #   SWARMLAB_GIT_COMMIT / SWARMLAB_GIT_DIRTY / SWARMLAB_JOB_SPEC_SHA256 / SWARMLAB_FLAVOR / SWARMLAB_IMAGE
 #   SWARMLAB_SYNC_EVERY   seconds between background syncs of $SWARMLAB_JOB_TMP/runs (default 300)
-#   VLLM_MODEL VLLM_VERSION VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_FLAGS
-#   VLLM_FLAGS is shell-quoted (shlex) and split with Python's shlex, so a quoted JSON value works;
-#   the script itself always adds --served-model-name --host --port --max-model-len
-#   --gpu-memory-utilization (and --revision), which VLLM_FLAGS must not repeat.
+#   VLLM_MODEL VLLM_PORT VLLM_VERSION VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_FLAGS
+#   The `vllm serve` argv is NOT rebuilt from these: it is read from $STAGE_DIR/plan.json
+#   (`vllm_serve_argv`, the list `swarmlab job run` printed as `vllm_serve_command`) and passed
+#   NUL-delimited, so a quoted token with spaces or newlines (a JSON value, an inline chat
+#   template) stays one argument and the executed command is the planned one. The env vars are
+#   recorded in job.json and must agree with that argv (model, port, VLLM_FLAGS as its shell-quoted
+#   tail), else exit 12. The launcher's flags (--served-model-name --host --port --max-model-len
+#   --gpu-memory-utilization, --revision) come first in the argv; VLLM_FLAGS never repeats them.
 #   VLLM_FLAGS_SOURCE / VLLM_PROFILE (recorded in job.json)
 #   VLLM_PROBE_EXTRA (JSON object merged into the readiness probe's request; `{}` sends none; unset
 #   or empty: chat_template_kwargs.enable_thinking=false) and VLLM_PROBE_EXTRA_SOURCE (where the
@@ -25,7 +29,7 @@
 # mirrored to the bucket with `hf buckets sync` after every run and every SWARMLAB_SYNC_EVERY s.
 # job.json (manifest), results.jsonl (one CLI summary per run), vllm.log and job-side logs land
 # in SWARMLAB_STAGE. Exit codes: 0 all runs ran; 1 a run failed; 10 install; 11 vLLM install;
-# 12 vLLM not ready; 13 endpoint probe failed (HTTP error); 143 SIGTERM (job timeout or cancel).
+# 12 vLLM not ready (or plan.json's argv missing / disagreeing with the env); 13 endpoint probe failed (HTTP error); 143 SIGTERM (job timeout or cancel).
 # A probe answer without a parsed tool call only warns: grep the log for SWARMLAB_PROBE_WARNING;
 # job.json "probe" records the outcome (ok | no_tool_call | error).
 set -uo pipefail
@@ -151,15 +155,38 @@ STATUS=serving
 log "uv pip install --system vllm==$VLLM_VERSION"
 uv pip install --system -q "vllm==$VLLM_VERSION" || fail 11 "vLLM install failed"
 VLLM_BIN=$(command -v vllm) || fail 11 "vllm executable not on PATH after install"
-REV_ARGS=()
-[ -n "${VLLM_REVISION:-}" ] && REV_ARGS=(--revision "$VLLM_REVISION")
-SPLIT_FLAGS='import os, shlex; [print(t) for t in shlex.split(os.environ.get("VLLM_FLAGS", ""))]'
-python3 -c "$SPLIT_FLAGS" >/dev/null || fail 12 "cannot parse VLLM_FLAGS: ${VLLM_FLAGS:-}"
-mapfile -t FLAG_ARGS < <(python3 -c "$SPLIT_FLAGS")
-SERVE_ARGS=(serve "$VLLM_MODEL" "${REV_ARGS[@]}" --served-model-name "$VLLM_MODEL"
-  --host 127.0.0.1 --port "$VLLM_PORT" --max-model-len "$VLLM_MAX_MODEL_LEN"
-  --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION" "${FLAG_ARGS[@]}")
-VLLM_CMDLINE="vllm ${SERVE_ARGS[*]}"
+# the argv the plan recorded (plan.json `vllm_serve_argv`), checked against the env, written
+# NUL-delimited for mapfile; prints its shlex.join (== plan.json `vllm_serve_command`) for the log
+VLLM_CMDLINE=$(PLAN_FILE="$STAGE_DIR/plan.json" ARGV_FILE="$JT/vllm_argv.bin" \
+  VLLM_PORT="$VLLM_PORT" python3 - <<'PY'
+import json, os, shlex, sys
+e = os.environ
+def die(msg):
+    sys.exit("SERVE ARGV ERROR: " + msg)
+try:
+    argv = json.load(open(e["PLAN_FILE"]))["vllm_serve_argv"]
+except (OSError, ValueError, KeyError, TypeError) as x:
+    die("no vllm_serve_argv in %s (%s: %s)" % (e["PLAN_FILE"], type(x).__name__, x))
+if not (isinstance(argv, list) and len(argv) >= 3 and argv[:2] == ["vllm", "serve"]
+        and all(isinstance(a, str) and "\0" not in a for a in argv)):
+    die("vllm_serve_argv must be a list of strings starting with vllm serve MODEL: %r" % (argv,))
+if argv[2] != e.get("VLLM_MODEL"):
+    die("plan.json serves %r but VLLM_MODEL is %r" % (argv[2], e.get("VLLM_MODEL")))
+port = argv[argv.index("--port") + 1] if "--port" in argv[:-1] else None
+if port != e["VLLM_PORT"]:
+    die("plan.json serves on port %r but VLLM_PORT is %r" % (port, e["VLLM_PORT"]))
+try:
+    flags = shlex.split(e.get("VLLM_FLAGS", ""))
+except ValueError as x:
+    die("cannot parse VLLM_FLAGS %r: %s" % (e.get("VLLM_FLAGS"), x))
+if flags and argv[len(argv) - len(flags):] != flags:
+    die("VLLM_FLAGS %r is not the tail of plan.json's vllm_serve_argv" % e.get("VLLM_FLAGS"))
+with open(e["ARGV_FILE"], "wb") as f:
+    f.write(b"".join(a.encode("utf-8", "surrogateescape") + b"\0" for a in argv[1:]))
+print(shlex.join(argv))
+PY
+) || fail 12 "no usable vllm serve argv in $STAGE_DIR/plan.json (see SERVE ARGV ERROR above)"
+mapfile -d '' -t SERVE_ARGS <"$JT/vllm_argv.bin"
 log "starting (profile=${VLLM_PROFILE:-none}, flags from ${VLLM_FLAGS_SOURCE:-?}): $VLLM_CMDLINE"
 "$VLLM_BIN" "${SERVE_ARGS[@]}" >"$JT/vllm.log" 2>&1 &
 VLLM_PID=$!

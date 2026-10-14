@@ -2,6 +2,7 @@
 and the bootstrap script runs against stub `uv`, `hf` and `vllm` executables."""
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -158,8 +159,8 @@ def test_bootstrap_script_has_expected_pieces():
     s = jl.bootstrap_script()
     for piece in ('"$STAGE_DIR"/swarmlab-*.whl', 'uv pip install -q --python "$VENV/bin/python" "$WHEEL"',
                   'uv pip install --system -q "vllm==$VLLM_VERSION"',
-                  'serve "$VLLM_MODEL"', '"$VLLM_BIN" "${SERVE_ARGS[@]}"', '--gpu-memory-utilization',
-                  '--max-model-len', '"$BASE/health"', '"$BASE/v1/models"', 'VLLM_WAIT_S',
+                  '"$STAGE_DIR/plan.json"', '["vllm_serve_argv"]',
+                  "mapfile -d '' -t SERVE_ARGS", '"$VLLM_BIN" "${SERVE_ARGS[@]}"', '"$BASE/health"', '"$BASE/v1/models"', 'VLLM_WAIT_S',
                   'while sleep "$SYNC_EVERY"; do sync_runs; done',
                   'buckets sync "$OUT" "$SWARMLAB_RUNS_REMOTE"',
                   '--yes --out "$OUT" --json', '"$SWARMLAB_STAGE/job.json"', 'trap'):
@@ -195,13 +196,15 @@ STUB_VLLM = r'''#!/usr/bin/env bash
 echo "vllm $*" >> "$STUB_LOG"
 port=8000; prev=""
 for a in "$@"; do [ "$prev" = "--port" ] && port="$a"; prev="$a"; done
-exec "$REAL_PYTHON" "$STUB_DIR/fake_vllm.py" "$port"
+exec "$REAL_PYTHON" "$STUB_DIR/fake_vllm.py" "$port" "$@"
 '''
 
 FAKE_VLLM = r'''
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 MODEL = os.environ["VLLM_MODEL"]
+with open(os.path.join(os.environ["STUB_DIR"], "vllm_argv.json"), "w") as f:
+    json.dump(sys.argv[2:], f)   # the exact argv `vllm` received
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _send(self, obj):
@@ -232,8 +235,13 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _run_bootstrap(tmp_path, runs, **extra_env):
-    """Run bootstrap.sh for real with stub uv/hf/vllm on PATH and a scripted spec."""
+def _run_bootstrap(tmp_path, runs, plan_kw=None, **extra_env):
+    """Run bootstrap.sh for real with stub uv/hf/vllm on PATH and a scripted spec.
+
+    The stage dir gets the plan.json of a real plan (`plan_kw` over: model MODEL, flags
+    `--reasoning-parser qwen3`, max-model-len 4096, a free port), whose `vllm_serve_argv` the
+    script executes; the VLLM_* env comes from that plan. `extra_env` overrides any variable
+    (None unsets it)."""
     stub = tmp_path / "stubs"
     stub.mkdir()
     for name, body in (("hf", STUB_HF), ("uv", STUB_UV), ("vllm", STUB_VLLM)):
@@ -243,6 +251,11 @@ def _run_bootstrap(tmp_path, runs, **extra_env):
     bucket = tmp_path / "bucket"
     stage = tmp_path / "stage"
     stage.mkdir()
+    kw = {"model": MODEL, "vllm_flags": "--reasoning-parser qwen3", "max_model_len": 4096,
+          "port": _free_port(), **(plan_kw or {})}
+    (tmp_path / "planspec").mkdir()
+    p = plan(vllm_spec(tmp_path / "planspec", model=f"vllm:{kw['model']}"), **kw)
+    (stage / "plan.json").write_text(json.dumps(p.as_dict(), indent=1, sort_keys=True))
     (stage / "swarmlab-0.0.1-py3-none-any.whl").write_text("not a real wheel")
     (stage / "spec.yaml").write_text(yaml.safe_dump({
         "name": "boot", "options": {"max_rounds": 2},
@@ -256,13 +269,13 @@ def _run_bootstrap(tmp_path, runs, **extra_env):
         "SWARMLAB_STAGE_DIR": str(stage), "SWARMLAB_TAG": "t1",
         "SWARMLAB_STAGE": "hf://buckets/ns/b/jobs/t1", "SWARMLAB_RUNS_REMOTE": "hf://buckets/ns/b/runs/t1",
         "SWARMLAB_RUNS": runs, "SWARMLAB_GIT_COMMIT": COMMIT, "SWARMLAB_GIT_DIRTY": "0",
-        "SWARMLAB_SYNC_EVERY": "1", "VLLM_MODEL": MODEL, "VLLM_VERSION": "0.30.0",
-        "VLLM_MAX_MODEL_LEN": "4096", "VLLM_GPU_MEMORY_UTILIZATION": "0.9",
-        "VLLM_FLAGS": "--reasoning-parser qwen3", "VLLM_WAIT_S": "60",
-        "VLLM_PORT": str(_free_port()), "JOB_ID": "a" * 24, "TMPDIR": str(tmp_path),
+        "SWARMLAB_SYNC_EVERY": "1", "VLLM_WAIT_S": "60",
+        "JOB_ID": "a" * 24, "TMPDIR": str(tmp_path),
         "SWARMLAB_JOB_ROOT": str(tmp_path / "root"), "SWARMLAB_JOB_TMP": str(tmp_path / "jt"),
+        **{k: v for k, v in p.env().items() if k.startswith("VLLM_") and k != "VLLM_WAIT_S"},
         **extra_env,
     }
+    env = {k: v for k, v in env.items() if v is not None}
     proc = subprocess.run(["bash", str(REPO / "swarmlab" / "jobs" / "bootstrap.sh")], env=env,
                           capture_output=True, text=True, timeout=180, cwd=tmp_path, check=False)
     return proc, bucket, (tmp_path / "stub.log").read_text()
@@ -500,6 +513,8 @@ def test_plan_records_effective_flags(tmp_path):
     assert doc["vllm_serve_command"] == (
         f"vllm serve {granite} --served-model-name {granite} --host 127.0.0.1 --port 8000 "
         f"--max-model-len 32768 --gpu-memory-utilization 0.9 {p.vllm_flags}")
+    assert doc["vllm_serve_argv"] == jl.serve_argv(p) == shlex.split(doc["vllm_serve_command"])
+    assert doc["vllm_serve_argv"][-len(p.vllm_flags.split()):] == p.vllm_flags.split()
     env = p.env()
     assert env["VLLM_FLAGS"] == p.vllm_flags and env["VLLM_PROFILE"] == granite
     assert env["VLLM_PROBE_EXTRA"] == "{}"
@@ -554,13 +569,15 @@ def test_cli_dry_run_prints_flags_and_profile(tmp_path, monkeypatch):
 def test_bootstrap_probe_extra_flags_and_warning(tmp_path):
     flags = """--enable-auto-tool-choice --override-generation-config '{"x": 1}'"""
     proc, bucket, calls = _run_bootstrap(
-        tmp_path, "scripted:1", VLLM_FLAGS=flags, VLLM_FLAGS_SOURCE="--vllm-flags",
+        tmp_path, "scripted:1", plan_kw={"vllm_flags": flags}, VLLM_FLAGS_SOURCE="--vllm-flags",
         VLLM_PROFILE="ibm-granite/granite-4.1-3b", VLLM_PROBE_EXTRA="{}", FAKE_NO_TOOLS="1")
     assert proc.returncode == 0, proc.stdout + proc.stderr  # a probe without a tool call warns
     assert "SWARMLAB_PROBE_WARNING: no parsed tool call" in proc.stdout
     body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
     assert "chat_template_kwargs" not in body and body["tools"][0]["function"]["name"] == "guess"
     assert '--override-generation-config {"x": 1}' in calls  # the quoted JSON stays one argument
+    argv = json.loads((tmp_path / "stubs" / "vllm_argv.json").read_text())
+    assert argv[-3:] == ["--enable-auto-tool-choice", "--override-generation-config", '{"x": 1}']
     manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
     assert manifest["probe"]["outcome"] == "no_tool_call"
     assert manifest["vllm"]["flags_source"] == "--vllm-flags"
@@ -570,7 +587,8 @@ def test_bootstrap_probe_extra_flags_and_warning(tmp_path):
 
 @pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
 def test_bootstrap_default_probe_records_ok(tmp_path):
-    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1")
+    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1", VLLM_PROBE_EXTRA=None,
+                                     VLLM_PROBE_EXTRA_SOURCE=None)   # launched by hand
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "SWARMLAB_PROBE_WARNING" not in proc.stdout
     body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
@@ -664,14 +682,11 @@ def test_unlisted_model_with_custom_flags_and_probe_extra(tmp_path, monkeypatch)
 @pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
 def test_bootstrap_sends_custom_probe_extra(tmp_path):
     other = "acme/model-7b"
-    p = plan(vllm_spec(tmp_path, model=f"vllm:{other}"), model=other, vllm_flags=ARBITRARY_FLAGS,
-             probe_extra=CUSTOM_EXTRA)
-    env = p.env()
-    proc, bucket, _ = _run_bootstrap(
-        tmp_path, "scripted:1", VLLM_MODEL=other, VLLM_FLAGS=env["VLLM_FLAGS"],
-        VLLM_PROBE_EXTRA=env["VLLM_PROBE_EXTRA"],
-        VLLM_PROBE_EXTRA_SOURCE=env["VLLM_PROBE_EXTRA_SOURCE"])
+    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1", plan_kw={
+        "model": other, "vllm_flags": ARBITRARY_FLAGS, "probe_extra": CUSTOM_EXTRA})
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    staged = json.loads((tmp_path / "stage" / "plan.json").read_text())
+    assert staged["probe_extra"] == CUSTOM_EXTRA and staged["probe_extra_source"] == "--probe-extra"
     body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
     assert body["chat_template_kwargs"] == {"thinking": "off"} and body["top_k"] == 1
     assert body["model"] == other and body["tools"][0]["function"]["name"] == "guess"
@@ -687,12 +702,9 @@ def test_empty_probe_extra_overrides_the_profile(tmp_path):
     p = plan(vllm_spec(tmp_path, model=f"vllm:{granite42}"), model=granite42, probe_extra={})
     assert p.vllm_flags_source == "profile" and p.vllm_profile == granite42
     assert (p.probe_extra, p.probe_extra_source) == ({}, "--probe-extra")
-    env = p.env()
-    assert env["VLLM_PROBE_EXTRA"] == "{}"
-    proc, bucket, _ = _run_bootstrap(
-        tmp_path, "scripted:1", VLLM_MODEL=granite42, VLLM_FLAGS=env["VLLM_FLAGS"],
-        VLLM_PROBE_EXTRA=env["VLLM_PROBE_EXTRA"],
-        VLLM_PROBE_EXTRA_SOURCE=env["VLLM_PROBE_EXTRA_SOURCE"])
+    assert p.env()["VLLM_PROBE_EXTRA"] == "{}"
+    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1", plan_kw={
+        "model": granite42, "vllm_flags": None, "probe_extra": {}})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     body = json.loads((tmp_path / "stubs" / "probe_body.json").read_text())
     assert "chat_template_kwargs" not in body
@@ -700,6 +712,54 @@ def test_empty_probe_extra_overrides_the_profile(tmp_path):
     manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
     assert manifest["vllm"]["probe_extra"] == {}
     assert manifest["vllm"]["probe_extra_source"] == "--probe-extra"
+
+
+def test_plan_port_reaches_provider_argv_and_env(tmp_path):
+    p = plan(vllm_spec(tmp_path), port=9123)
+    assert yaml.safe_load(p.job_spec_yaml)["providers"]["vllm"]["params"]["base_url"] == (
+        "http://127.0.0.1:9123/v1")
+    argv = jl.serve_argv(p)
+    assert argv[argv.index("--port") + 1] == "9123" and p.env()["VLLM_PORT"] == "9123"
+    assert "--port 9123" in jl.describe(p)
+
+
+MULTILINE_JSON = json.dumps({"temperature_floor": 0, "stop": ["</s>", "\n\n"],
+                             "nested": {"a": [1, 2]}}, indent=2)
+INLINE_TEMPLATE = 'Say "hi" to {{ user }}\n  and don\'t stop: it\'s a "test"'
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_bootstrap_passes_multiline_and_quoted_flags_verbatim(tmp_path):
+    """A quoted token with newlines, spaces and both quote kinds reaches vLLM as ONE argument,
+    and the executed argv is exactly the planned (printed) command."""
+    assert "\n" in MULTILINE_JSON and "\n" in INLINE_TEMPLATE
+    user = ["--override-generation-config", MULTILINE_JSON, "--chat-template", INLINE_TEMPLATE,
+            "--enforce-eager"]
+    kw = {"vllm_flags": shlex.join(user), "port": _free_port()}
+    p = plan(vllm_spec(tmp_path, model=f"vllm:{MODEL}"), max_model_len=4096, **kw)
+    planned = shlex.split(p.vllm_serve_command)
+    assert planned == p.vllm_serve_argv and planned[-5:] == user
+    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1", plan_kw=kw)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    got = json.loads((tmp_path / "stubs" / "vllm_argv.json").read_text())
+    assert got == planned[1:]   # token count and content, launcher flags first
+    assert len(got) == len(planned) - 1 and got[-5:] == user
+    staged = json.loads((tmp_path / "stage" / "plan.json").read_text())
+    assert staged["vllm_serve_argv"] == planned
+    assert staged["vllm_serve_command"] == p.vllm_serve_command == shlex.join(planned)
+    manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
+    assert manifest["vllm"]["command"] == p.vllm_serve_command
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_bootstrap_refuses_an_argv_that_disagrees_with_the_env(tmp_path):
+    proc, _, calls = _run_bootstrap(tmp_path, "scripted:1", VLLM_FLAGS="--enforce-eager")
+    assert proc.returncode == 12, proc.stdout + proc.stderr
+    assert "is not the tail of plan.json's vllm_serve_argv" in proc.stdout + proc.stderr
+    assert "vllm serve" not in calls   # vLLM never started
+    (tmp_path / "x").mkdir()
+    proc, _, _ = _run_bootstrap(tmp_path / "x", "scripted:1", VLLM_FLAGS="--x 'unterminated")
+    assert proc.returncode == 12 and "cannot parse VLLM_FLAGS" in proc.stdout + proc.stderr
 
 
 # ---- fetch, status ------------------------------------------------------------------------------
