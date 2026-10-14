@@ -30,10 +30,10 @@ Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget c
 | `Qwen/Qwen3.5-9B` | `--language-model-only --enable-auto-tool-choice --tool-call-parser qwen3_coder` | yes | a100 |
 | `ibm-granite/granite-4.1-3b` | `--enable-auto-tool-choice --tool-call-parser hermes` | no | a10g |
 | `Qwen/Qwen3-4B-Instruct-2507` | `--enable-auto-tool-choice --tool-call-parser hermes` | no | a10g |
-| `ibm-granite/granite-4.2-8b` | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` | yes | a10g |
+| `ibm-granite/granite-4.2-8b` | `--enable-auto-tool-choice --tool-call-parser qwen3_coder` | yes | a100 (needs a 48 GB card at 32k) |
 | `LiquidAI/LFM2.5-2.6B` | `--enable-auto-tool-choice --tool-call-parser lfm2 --reasoning-parser minimax_m2` | no | a10g |
 
-All six were validated under **vLLM 0.27.1**, BF16, TP=1 (`swarmlab/jobs/profiles.py` is the source of truth). `--vllm-version` still defaults to 0.30.0; pass `--vllm-version 0.27.1` to reproduce the validated setup (the printout notes the mismatch otherwise). Everything the bootstrap uses (`vllm serve`, the launcher flags above, `--language-model-only`, `/health`, `/v1/models`, the parser names) exists in both 0.27.1 and 0.30.0. Pass `--max-model-len` too: the default 262144 is the Qwen3.5 context and does not fit an A10G or the shorter-context models (the benchmark used 32768). Flavors used: `a10g-small` for the models up to 4B, `a10g-large` for granite-4.2-8b, `a100-large` for Qwen3.5-9B.
+All six were validated under **vLLM 0.27.1**, BF16, TP=1 (`swarmlab/jobs/profiles.py` is the source of truth). `--vllm-version` still defaults to 0.30.0; pass `--vllm-version 0.27.1` to reproduce the validated setup (the printout notes the mismatch otherwise). Everything the bootstrap uses (`vllm serve`, the launcher flags above, `--language-model-only`, `/health`, `/v1/models`, the parser names) exists in both 0.27.1 and 0.30.0. Pass `--max-model-len` too: the default 262144 is the Qwen3.5 context and does not fit an A10G or the shorter-context models (the benchmark used 32768). Flavors used: `a10g-small` for the models up to 4B, `a100-large` for Qwen3.5-9B and granite-4.2-8b. **granite-4.2-8b needs a 48 GB card at `--max-model-len 32768`** (`l40sx1` or `a100-large`): on `a10g-large` (24 GB) vLLM ran out of KV cache (2.66 GiB free, 5 GiB needed) and exited before it was ready. The profile records this as `min_gpu_gb`, and the plan prints a note when the chosen flavor's card is smaller.
 
 ```
 swarmlab job run spec.yaml --model ibm-granite/granite-4.1-3b --flavor a10g-small \

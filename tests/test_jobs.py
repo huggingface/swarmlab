@@ -421,6 +421,32 @@ def test_profiles_cover_the_six_models():
     assert all("--reasoning-parser" not in jp.PROFILES[m].flags for m in SIX[:5])
     thinking_off = {m for m in SIX if jp.PROFILES[m].probe_extra == jp.NO_THINKING}
     assert thinking_off == {"Qwen/Qwen3.5-2B", "Qwen/Qwen3.5-9B", "ibm-granite/granite-4.2-8b"}
+    # granite-4.2-8b is the only profile that does not fit a 24 GB card at 32k context
+    big = {m: jp.PROFILES[m].min_gpu_gb for m in SIX if jp.PROFILES[m].min_gpu_gb}
+    assert big == {"ibm-granite/granite-4.2-8b": 48}
+    assert "a100" in jp.PROFILES["ibm-granite/granite-4.2-8b"].validated
+    assert "48 GB" in jp.PROFILES["ibm-granite/granite-4.2-8b"].note
+
+
+def test_plan_notes_a_flavor_whose_card_is_too_small(tmp_path):
+    granite = "ibm-granite/granite-4.2-8b"
+    spec = vllm_spec(tmp_path, model=f"vllm:{granite}")
+    kw = {"model": granite, "vllm_version": "0.27.1", "max_model_len": 32768}
+    assert jp.resolve_flags(granite).min_gpu_gb == 48
+    small = plan(spec, flavor="a10g-large", **kw)
+    note = [n for n in small.notes if "needs a 48 GB GPU" in n]
+    assert len(note) == 1 and "a10g-large has 24 GB" in note[0]
+    assert "use l40sx1 or a100-large" in note[0]  # the two cheapest flavors that fit
+    assert "note: profile ibm-granite/granite-4.2-8b needs a 48 GB GPU" in jl.describe(small)
+    for ok in ("l40sx1", "a100-large", "h200", "some-new-flavor"):   # fits, or unknown size
+        assert not any("GB GPU" in n for n in plan(spec, flavor=ok, **kw).notes), ok
+    # the other profiles and unknown models fit the a10g: no size note
+    for m in ("ibm-granite/granite-4.1-3b", "acme/model-7b"):
+        p = plan(vllm_spec(tmp_path, model=f"vllm:{m}"), model=m, flavor="a10g-small",
+                 vllm_version="0.27.1", max_model_len=32768)
+        assert not any("GB GPU" in n for n in p.notes), m
+    # every priced flavor has a card size, so the note never silently skips one
+    assert set(jl.FLAVOR_GPU_GB) == set(jl.FLAVOR_USD_PER_HOUR)
 
 
 def test_flag_precedence_explicit_then_profile_then_default():

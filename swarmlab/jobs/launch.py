@@ -84,6 +84,14 @@ FLAVOR_USD_PER_HOUR = {
     "a10g-largex4": 5.00, "l40sx1": 1.80, "l40sx4": 8.30, "a100-large": 2.50, "a100x4": 10.00,
     "a100x8": 20.00, "h200": 5.00, "h200x2": 10.00, "rtx-pro-6000": 2.75,
 }
+# memory of ONE GPU in the flavor (GB); the profiles run TP=1, so a multi-GPU flavor does not add
+# memory for the model. Unknown flavors get no size note.
+FLAVOR_GPU_GB = {
+    "cpu-basic": 0, "cpu-upgrade": 0, "t4-small": 16, "t4-medium": 16,
+    "l4x1": 24, "l4x4": 24, "a10g-small": 24, "a10g-large": 24, "a10g-largex2": 24,
+    "a10g-largex4": 24, "l40sx1": 48, "l40sx4": 48, "a100-large": 80, "a100x4": 80,
+    "a100x8": 80, "h200": 141, "h200x2": 141, "rtx-pro-6000": 96,
+}
 JOB_ID_RE = re.compile(r"\b([0-9a-f]{24})\b")
 
 
@@ -319,6 +327,14 @@ def plan_job(
     if resolved.source == "--vllm-flags" and resolved.profile:
         notes.append(f"--vllm-flags replaces the {resolved.profile} profile's flags; the "
                      "readiness probe still uses the profile's request extra")
+    gpu_gb = FLAVOR_GPU_GB.get(flavor)
+    if resolved.min_gpu_gb and gpu_gb is not None and gpu_gb < resolved.min_gpu_gb:
+        fits = sorted((f for f, gb in FLAVOR_GPU_GB.items() if gb >= resolved.min_gpu_gb),
+                      key=lambda f: FLAVOR_USD_PER_HOUR.get(f, float("inf")))
+        notes.append(f"profile {resolved.profile} needs a {resolved.min_gpu_gb} GB GPU at "
+                     f"--max-model-len 32768 (the validated setting) and {flavor} has {gpu_gb} GB "
+                     "per card: vLLM will run out of KV cache and exit before it is ready; use "
+                     f"{' or '.join(fits[:2])} (a much shorter --max-model-len is unvalidated)")
     if "--tool-call-parser" not in resolved.flags or "--enable-auto-tool-choice" not in resolved.flags:
         notes.append("the serve flags lack --enable-auto-tool-choice/--tool-call-parser: tool calls "
                      "will not be parsed and agent turns will be prose")

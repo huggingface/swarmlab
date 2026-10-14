@@ -18,9 +18,16 @@ strings must not repeat them (`check_flags` rejects that), since the job spec's 
 the readiness check depend on them.
 
 Every profile below was validated under vLLM 0.27.1, BF16, TP=1, on an A10G (24 GB), except
-Qwen/Qwen3.5-9B (A100). The launcher's default vLLM is newer (0.30.0); `describe` notes the
-mismatch and `--vllm-version 0.27.1` reproduces the validated setup. The parser names used here
-(`qwen3`, `qwen3_coder`, `hermes`, `lfm2`, `minimax_m2`) are registered in both 0.27.1 and 0.30.0.
+Qwen/Qwen3.5-9B and ibm-granite/granite-4.2-8b (A100). The launcher's default vLLM is newer
+(0.30.0); `describe` notes the mismatch and `--vllm-version 0.27.1` reproduces the validated setup.
+The parser names used here (`qwen3`, `qwen3_coder`, `hermes`, `lfm2`, `minimax_m2`) are registered
+in both 0.27.1 and 0.30.0.
+
+A profile's `min_gpu_gb` is the GPU memory one card needs to serve the model at `--max-model-len
+32768` (the benchmark setting) with the launcher's `--gpu-memory-utilization 0.9`; `plan_job` adds
+a note when the chosen flavor's card is smaller (`launch.FLAVOR_GPU_GB`). It is only set where a
+smaller card is known to fail: granite-4.2-8b needs 48 GB (on a10g-large, 24 GB, vLLM ran out of KV
+cache at 32k: 2.66 GiB free, 5 GiB needed), so it runs on l40sx1 or a100-large.
 """
 from __future__ import annotations
 
@@ -51,6 +58,8 @@ class ServeProfile:
     validated: str = "vLLM 0.27.1, BF16, TP=1, a10g"
     validated_vllm: str = "0.27.1"
     note: str = ""
+    # GPU memory (GB) one card needs at --max-model-len 32768; None = fits the 24 GB a10g
+    min_gpu_gb: int | None = None
 
 
 PROFILES: dict[str, ServeProfile] = {p.model: p for p in (
@@ -76,7 +85,10 @@ PROFILES: dict[str, ServeProfile] = {p.model: p for p in (
     ServeProfile(
         "ibm-granite/granite-4.2-8b",
         "--dtype bfloat16 --enable-auto-tool-choice --tool-call-parser qwen3_coder",
-        NO_THINKING, note="non-thinking per request; no reasoning parser"),
+        NO_THINKING, validated="vLLM 0.27.1, BF16, TP=1, a100", min_gpu_gb=48,
+        note="non-thinking per request; no reasoning parser; needs a 48 GB card at "
+             "--max-model-len 32768 (a10g-large runs out of KV cache: 2.66 GiB free, 5 GiB "
+             "needed), so use l40sx1 or a100-large"),
     ServeProfile(
         "LiquidAI/LFM2.5-2.6B",
         "--dtype bfloat16 --enable-auto-tool-choice --tool-call-parser lfm2 "
@@ -133,6 +145,7 @@ class ResolvedFlags:
     profile: str | None   # the profile's model id when one was selected
     probe_extra: dict[str, Any]
     validated_vllm: str | None
+    min_gpu_gb: int | None = None   # the profile's `min_gpu_gb`, when one was selected
 
 
 def resolve_flags(model: str, *, vllm_flags: str | None = None, profile: str | None = "auto",
@@ -155,4 +168,5 @@ def resolve_flags(model: str, *, vllm_flags: str | None = None, profile: str | N
     return ResolvedFlags(
         flags=flags, source=source, profile=prof.model if prof else None,
         probe_extra=dict(prof.probe_extra) if prof else dict(DEFAULT_PROBE_EXTRA),
-        validated_vllm=prof.validated_vllm if prof else None)
+        validated_vllm=prof.validated_vllm if prof else None,
+        min_gpu_gb=prof.min_gpu_gb if prof else None)
