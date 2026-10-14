@@ -143,6 +143,10 @@ def test_text_tool_fallback_hermes_blocks(tmp_path):
     ('read_board(limit=5, channel="main")', [("read_board", {"limit": 5, "channel": "main"})]),
     ('<tool_call>{"name": "guess", "arguments": {"candidate": "D"}}</tool_call>', [("guess", {"candidate": "D"})]),
     ('```json\n[{"name": "guess", "args": {"candidate": "E"}}]\n```', [("guess", {"candidate": "E"})]),
+    # flattened arguments next to "name" (Qwen3-4B-Instruct-2507 under vLLM's hermes parser)
+    ('<tool_call>\n{"name": "guess", "candidate": "G"}\n</tool_call>', [("guess", {"candidate": "G"})]),
+    ('<tool_call>{"name": "read_board", "limit": 3}</tool_call>\n<tool_call>{"name": "end_turn"}</tool_call>',
+     [("read_board", {"limit": 3}), ("end_turn", {})]),
     ('<think>maybe guess(candidate="X")</think> guess(candidate="F")', [("guess", {"candidate": "F"})]),
     ("I think the answer is B.", []),
     ('post(text="hi")', []),  # not an offered tool
