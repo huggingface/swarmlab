@@ -595,6 +595,14 @@ def test_never_posting_relay_painters_leave_every_zone_unpainted(tmp_path):
         assert set(_labels(run).values()) == {"viewer_never_posted"}
 
 
+def test_never_posting_relay_painters_complete_under_the_oracle(tmp_path):
+    # the painters see their zones' targets themselves and paint them from the observation
+    run = relay_exp("oracle", post_=False, oracle=True).run(seed=1, max_rounds=20, out=tmp_path)
+    s = run.score
+    assert run.end_reason == "terminal" and s["coverage"] == 1.0 and s["zones_completed"] == 3
+    assert s["wrong_paints"] == 0 and not [e for e in run.events if e["type"] == "post"]
+
+
 def _last_world(run):
     from swarmlab.snapshot import SnapshotStore
 
@@ -652,6 +660,79 @@ def test_crossed_zone_determinism_replay_and_fork(tmp_path):
     child = a.fork(at_round=2).run()
     tail = [e for e in logical(a, strip) if e["round"] > 2]
     assert [e for e in logical(child, strip) if e["round"] > 2 and e["type"] != "run_started"] == tail
+
+
+# 40 one-cell zones on a 5 x 8 grid, two groups of one: each agent sees and reports 20 zones, more
+# than one turn's calls under the default cap of 20.
+BIG = {"groups": 2, "zones": 40, "height": 5, "width": 8, "zone_size": [1, 1]}
+
+
+def _reports(events, upto=None):
+    """(agent, zone id) of every post, in log order (each relay post names one zone)."""
+    return [(e["agent"], e["text"].split()[0]) for e in events
+            if e["type"] == "post" and (upto is None or e["round"] <= upto)]
+
+
+def test_relay_painters_spread_reports_over_turns_within_the_call_cap(tmp_path):
+    run = relay_exp("big", n=2, **BIG).run(seed=1, max_rounds=40, out=tmp_path)
+    assert run.end_reason == "terminal" and run.score["coverage"] == 1.0
+    assert run.score["zones_completed"] == 40 and run.score["wrong_paints"] == 0
+    assert not [e for e in run.events if e["type"] == "turn_ended" and e["yield_kind"] == "cap"]
+    reports = _reports(run.events)
+    assert len(reports) == len(set(reports))  # no zone reported twice by the same agent
+    w = ColoringGrid(**BIG)
+    w.reset(derive(1, "world"), [A, B])
+    for i, a in enumerate((A, B)):
+        seen = {z["zone_id"] for z in w.crossed if z["viewer_group"] == i}
+        assert {zid for who, zid in reports if who == a} == seen and len(seen) == 20
+    paint_rounds = {e["round"] for e in run.events
+                    if e["type"] == "tool_called" and e["tool"] == "paint"}
+    assert min(paint_rounds) <= 3  # painting does not wait for the whole backlog
+    Run.load(run.dir)
+
+
+def test_relay_painter_fork_mid_backlog_does_not_resend_reports(tmp_path):
+    a = relay_exp("bigfork", n=2, **BIG).run(seed=1, max_rounds=40, out=tmp_path / "a")
+    first = _reports(a.events, upto=1)
+    assert 0 < len(first) < 40  # round 1 leaves part of the backlog
+    child = a.fork(at_round=1).run()
+    later = [(e["agent"], e["text"].split()[0]) for e in child.events
+             if e["type"] == "post" and e["round"] > 1]
+    both = first + later
+    assert len(both) == len(set(both)) == 40
+    strip = ("seq", "ts", "run")
+    tail = [e for e in logical(a, strip) if e["round"] > 1]
+    assert [e for e in logical(child, strip) if e["round"] > 1 and e["type"] != "run_started"] == tail
+
+
+async def test_relay_painter_shares_a_turn_between_reports_and_paints(tmp_path):
+    from swarmlab.blobs import BlobStore
+    from swarmlab.executor import RoundExecutor
+    from swarmlab.tools import AgentTools
+    from swarmlab.view import View
+
+    w = ColoringGrid(**BIG)
+    w.reset(derive(1, "world"), [A, B])
+    w.begin_round(1)
+    board = Board()
+    board.commit_mode = "round_end"
+    ex = RoundExecutor(run="r", round=1, world=w, board=board, blobs=BlobStore(tmp_path / "blobs"),
+                       agents=[A, B], max_calls_per_turn=8,
+                       topology_rng=lambda: derive(0, "topology", 1))
+    p = RelayPainter(calls_per_turn=8)
+    p.bind(A, derive(0, "agent", A))
+    painted = [z for z in w.crossed if z["painter_group"] == 0]
+    for z in painted[1:]:  # earlier reports: one zone still unknown, so the turn reads the board
+        p.known[z["zone_id"]] = [w.target[y][x] for x, y in zone_cells(z)]
+    view = View(round=1, agent=A, observation=w.observe(A), outcomes=[], pushed=[],
+                tools=ex.schemas(A))
+    ex.begin_turn(A)
+    usage = await p.turn(view, AgentTools(ex, A))
+    called = [e.tool for e in ex.events(A) if e.type == "tool_called"]
+    assert usage.calls == len(called) <= 8 and called[0] == "read_board" and called[-1] == "end_turn"
+    assert called.count("post") >= 1 and called.count("paint") >= 1
+    assert all(e.result["ok"] for e in ex.events(A) if e.type == "tool_returned")
+    assert len(p.reported) == called.count("post")
 
 
 def coloring(name, participants, board=None, n=16, world_kw=None, metrics=None):

@@ -11,9 +11,11 @@
 #   swarmlab report runs/crossed
 #
 # The `zones` arm runs three scripted `relay_painter`s (post the zone they see once, read the
-# board, paint their zone once a report arrives and their share of the open cells): each board
-# completes in 4 rounds. `relay_painter` with `post: false` is the never-posting control; the world
-# param `oracle: true` is the control in which every zone's painters also see its targets.
+# board, paint their zone once a report arrives and their share of the open cells; each turn stays
+# within `calls_per_turn`, default 20, the run's call cap): each board completes in 4 rounds.
+# `relay_painter` with `post: false` is the never-posting control; the world param `oracle: true`
+# is the control in which every zone's painters also see its targets (with it, `post: false`
+# painters complete the board from their own observation).
 #
 # For an LLM arm, swap the participants for a model, e.g. a self-hosted vLLM server (`swarmlab job
 # run` adds this provider block itself when it runs the spec in an HF Job):
