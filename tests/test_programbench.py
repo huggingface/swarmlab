@@ -23,6 +23,8 @@ from swarmlab.participants import LLMAgent
 from swarmlab.providers.fake import resolve_script
 from swarmlab.registry import build, resolve
 from swarmlab.snapshot import SnapshotStore
+from swarmlab.viewer.build import build as build_view
+from swarmlab.viewer.build import collect
 from swarmlab.world import programbench as pb
 from swarmlab.world.base import Action
 from swarmlab.world.programbench import (
@@ -635,6 +637,9 @@ def test_fake_script_dry_run_submits_and_replays(tmp_path):
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tar:
         assert sorted(tar.getnames()) == ["compile.sh", "executable"]
     assert Run.load(run.dir).replay()["score"] == sc
+    states = collect(run.dir)["world_states"]
+    assert [e["name"] for e in states["1"]["workspace"]] == ["compile.sh", "executable"]
+    assert build_view(run.dir).exists()
 
 
 def test_fake_script_needs_a_large_enough_cap(tmp_path):
