@@ -207,8 +207,8 @@ in the `mini_swe_agent-2.4.6` wheel (RECORD sha256 `nCzDa2nFPoPLT2CwqoCXaJljc_TD
 copied verbatim into `SYSTEM_TEMPLATE` and `INSTANCE_TEMPLATE`. The repository's main branch
 (commit 04d809ceab9df28f9adaed044884180159172930, same version string) rewords both templates
 ("reference executable", "independent implementation", no "wall of shame"); the world follows the
-2.4.6 release, which the mini-swe-agent participant will render too. This world does not depend
-on mini-swe-agent: the package comes with the participant's extra in a later PR, and a test
+2.4.6 release, which the mini-swe-agent participant renders too. This world does not depend
+on mini-swe-agent: the package comes with the participant's extra (`swarmlab[minisweagent]`), and a test
 compares the copy with the installed package when it is present (it skips otherwise). The environment and agent code
 (`docker.py`, `local.py`, `default.py`, the `bash` tool schema) are identical in both.
 """
