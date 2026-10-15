@@ -99,7 +99,6 @@ from .base import (
     parse_json_args,
     text_of,
 )
-
 from .catalog import ANTHROPIC_LONG_PROMPT, ANTHROPIC_MODELS
 
 THINKING_BUDGET_MODELS = frozenset({"claude-haiku-4-5"})
