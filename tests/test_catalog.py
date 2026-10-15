@@ -44,7 +44,7 @@ def test_entries_filters(listing):
     assert rows and all(r.tools and "qwen3.5" in r.spec_id.lower() for r in rows)
     anth = catalog.entries("anthropic", listing=listing)
     assert [(r.spec_id, r.input, r.output, r.cached) for r in anth] == [
-        ("anthropic:claude-haiku-4-5", 1.0, 5.0, 0.1)]
+        ("anthropic:claude-haiku-4-5", 1.0, 5.0, 0.1), ("anthropic:claude-haiku-5-5", 0.1, 0.5, 0.01)]
     assert all(r.provider == "hf" for r in catalog.entries("hf", listing=listing))
 
 
@@ -124,3 +124,27 @@ def test_models_command(cached):
     assert res.exit_code == 0 and "anthropic:claude-haiku-4-5" in res.stdout and "5.00" in res.stdout
     res = CliRunner().invoke(app, ["models", "--provider", "nope"])
     assert res.exit_code == 2
+
+
+def test_haiku_5_5_prompt_length_tier():
+    """Haiku 5.5: 0.10 / 0.50 / 0.01 up to 100,000 prompt tokens, 0.50 / 2.50 / 0.05 for the whole
+    request above (cache reads count toward the prompt); an explicit pricing override wins."""
+    from swarmlab.providers.anthropic import AnthropicProvider
+    from swarmlab.providers.base import ChatMessage, ChatRequest, Usage
+
+    req = ChatRequest(model="anthropic:claude-haiku-5-5", max_tokens=1000,
+                      messages=[ChatMessage(role="user", content="hi")])
+    p = AnthropicProvider()
+    assert p.model_pricing("claude-haiku-5-5") == (0.10, 0.50, 0.01)
+    short = Usage(prompt_tokens=100_000, cached_prompt_tokens=50_000, completion_tokens=1000)
+    assert p.cost(req, short) == pytest.approx((50_000 * 0.10 + 50_000 * 0.01 + 1000 * 0.50) / 1e6)
+    long = Usage(prompt_tokens=100_001, cached_prompt_tokens=90_000, completion_tokens=1000)
+    assert p.cost(req, long) == pytest.approx((10_001 * 0.50 + 90_000 * 0.05 + 1000 * 2.50) / 1e6)
+    assert p.max_cost(req) == pytest.approx((p.estimate_prompt_tokens(req) * 0.10 + 1000 * 0.50) / 1e6)
+    over = req.model_copy(update={"messages": [ChatMessage(role="user", content="x" * 400_100)]})
+    assert p.max_cost(over) == pytest.approx((p.estimate_prompt_tokens(over) * 0.50 + 1000 * 2.50) / 1e6)
+    custom = AnthropicProvider(pricing={"claude-haiku-5-5": [1.0, 1.0, 1.0]})
+    assert custom.cost(req, long) == pytest.approx((10_001 + 90_000 + 1000) / 1e6)
+    old = AnthropicProvider()
+    req4 = req.model_copy(update={"model": "anthropic:claude-haiku-4-5"})
+    assert old.cost(req4, long) == pytest.approx((10_001 * 1.0 + 90_000 * 0.1 + 1000 * 5.0) / 1e6)
