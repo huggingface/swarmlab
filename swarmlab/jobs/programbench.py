@@ -216,7 +216,7 @@ def plan_grade(run_dir: Path | str, *, flavor: str | None = None,
     if n is None:
         notes.append(f"the programbench package is not installed here, so the branch count is "
                      f"unknown: timeout {fmt_duration(timeout_s)} (the cap)")
-    elif bound is not None and timeout_s < bound:
+    elif timeout is not None and bound is not None and timeout_s < bound:
         notes.append(f"timeout {fmt_duration(timeout_s)} is below the evaluator's bound "
                      f"({bound / 3600:.1f} h: {GRADE_SETUP_S // 60} min setup + {COMPILE_S} s "
                      f"compile + {n} x {BRANCH_S} s); real grading of a small task takes minutes")
