@@ -85,7 +85,7 @@ The `solo` role leaves the agent `bash` (and `end_turn`, which is always offered
 
 The world needs `commit: immediate`, because a coding agent needs each command's output before its next call, so `validate` refuses `round_end`. At run start, a one-round run must also allow at least `step_limit` tool calls in its turn (`max_calls_per_turn >= 1000`), otherwise the default 20-call cap would end the episode long before the benchmark's limit. Runs with several rounds of k calls are a legitimate variation and are not checked. There the participant enforces the step limit.
 
-The `llm` participant is swarmlab's own loop and does not reproduce the baseline's observation template or step warnings. The faithful solo participant (mini-swe-agent 2.4.6 itself) comes in a follow-up PR, and so do `swarmlab job run` without vLLM and `swarmlab programbench grade`.
+The `llm` participant is swarmlab's own loop and does not reproduce the baseline's observation template or step warnings. The faithful solo participant (mini-swe-agent 2.4.6 itself) comes in a follow-up PR. Running in a job and grading are described [below](#running-in-hf-jobs).
 
 ## Snapshots, resume and the viewer
 
@@ -93,7 +93,7 @@ Each round's world snapshot holds the run state plus a deterministic `.tar.gz` o
 
 Restoring a snapshot touches no container and no file. The viewer's "World state" panel shows the workspace's top-level entries with sizes, the step count, whether and by whom the task was submitted, and the last 10 commands with their return codes. Resume and fork extract the tar into the workspace at the start of the next round, in a fresh container under Docker. Running processes (a tmux session, a background server) do not survive a snapshot boundary. In the solo shape there is no boundary inside the episode.
 
-`score()` is cheap and runs every round: `submitted`, `steps` (bash commands), `elapsed_s` (the world's clock, which starts at the first round and does not count backend start-up), and `graded: false` until the grade step exists. Each round's `round_resolved` event records the steps and the submission.
+`score()` is cheap and runs every round: `submitted`, `steps` (bash commands), `elapsed_s` (the world's clock, which starts at the first round and does not count backend start-up), and `graded: false` until `swarmlab programbench grade` writes the score ([Grading](#grading)). Each round's `round_resolved` event records the steps and the submission.
 
 ## Dry run (free)
 
@@ -113,3 +113,54 @@ arms:
 ```
 
 The local backend writes into `workspace` and empties it when a snapshot is restored there, so point a local run at a scratch directory, never at a checkout you care about.
+
+## Running in HF Jobs
+
+HF Jobs cannot run Docker, so a ProgramBench run executes swarmlab inside the task image itself, with the `local` backend. `swarmlab job run` does this when no arm calls a `vllm:` model and `--model` is left out (API mode: no vLLM is installed or served).
+
+```
+swarmlab job run solo.yaml                 # prints the plan and the exact hf jobs command
+swarmlab job run solo.yaml --launch        # uploads the stage dir and submits
+```
+
+Use the solo YAML above with `backend: local` (the default) and an API model, e.g. `model: "anthropic:claude-haiku-5-5"`.
+
+- **Image**: the task image `programbench/<task>:task_cleanroom_v6` (`--image` overrides it). The planner refuses a world whose `backend` is not `local` (it does not rewrite the spec), arms that name different tasks (one job, one image), and more than one programbench run per job. Each run works in the image's own `/workspace`, which nothing resets between runs, so launch one job per arm and seed (`--arm`, `--seeds`).
+- **Flavor and timeout**: `cpu-upgrade` (8 vCPU, 32 GB, $0.03/h) by default; `--flavor cpu-xl` or `cpu-performance` for big builds. The timeout defaults to the world's `wall_limit_s` plus 1 h for setup, the final snapshot and the sync, which is 7 h for the official 6 h limit.
+- **Secrets**: `HF_TOKEN` (stage download and the bucket sync) and the model's key variable are passed by name, `--secrets HF_TOKEN --secrets ANTHROPIC_API_KEY`, so the hf CLI reads each value from your shell. If only `ANTHROPIC_KEY` is set, that name is passed instead (the provider reads either). The names, never the values, are recorded in `plan.json`, the launch ledger and the job's `job.json`. `--launch` refuses while one is unset. The agent's commands never see either: the world strips secret-looking variables from their environment.
+- **Bootstrap**: the image has Python 3.10, pip and curl, but no uv. The job's command installs uv into `/opt/swarmlab/uv`, fetches the stage dir, then `bootstrap.sh` (mode `api`) installs a managed Python 3.12 and `swarmlab[anthropic,programbench]` from the staged wheel. It then runs `swarmlab run` and syncs the run dir to the bucket. `/opt/swarmlab` (venv, stage, run dirs, logs) is made root-only, so the agent user cannot read it.
+- **Lockdown in the job**: the job runs as root, so at the world's first `bash` command (not at job start) the world pins `pin_hosts` in `/etc/hosts`, blackholes DNS and removes the agent's sudo, then runs every command as `agent`. The pinned hosts include the Hub and the Xet storage hosts, because the bootstrap's bucket sync keeps running after the lockdown.
+- **Hidden tests**: none are in this job. No dataset is mounted; the tests reach only the grade job below.
+
+What to expect in the job log: `mode=api tag=... job=...`, `installing uv`, `installing a managed Python 3.12`, `installing swarmlab-...whl [anthropic,programbench]`, `run arm=solo seed=0`, then little until the run ends: the run's estimate and status lines, while the agent's commands go to the run's events, not the log. Finally `finishing: status=completed rc=0; final sync ...` and `JOB_EXIT 0`. Bring the run home with `swarmlab job fetch <run_id> --tag <tag>`. `swarmlab view`, `report` and `export` then work on it, and the score says `graded: false`.
+
+## Grading
+
+```
+swarmlab programbench grade runs/<run_id>                    # prints the plan and the command
+swarmlab programbench grade runs/<run_id> --launch [--wait]  # submits; --wait polls, then writes the score
+swarmlab programbench fetch-grade runs/<run_id>              # later: download grade.json, write the score
+```
+
+`grade` writes the run's last committed snapshot workspace to `runs/<run_id>/artifacts/submission.tar.gz`. If that snapshot holds no workspace (no command ever ran), it writes an empty `artifacts/submission.untouched` marker and refuses, since there is nothing of the agent's to grade. It then plans a second job:
+
+- image: the task's clean `task_cleanroom_v6` image, which is also what the official evaluator uses;
+- flavor `cpu-upgrade` by default. pytest runs with as many workers as the job's real CPU count, read from the cgroup;
+- timeout: the evaluator's bounds (30 min setup + 900 s compile + 3600 s per active test branch), capped at 12 h. cmatrix has 14 branches, so its bound is 14.8 h and the default is 12 h. A small task actually grades in minutes. `--timeout` overrides it;
+- the hidden tests: `-v hf://datasets/programbench/ProgramBench-Tests:/root/programbench-tests:ro`, mounted only in this job and under `/root`. They contain the task's original source;
+- `--secrets HF_TOKEN` only.
+
+Inside the job, `swarmlab/jobs/grade.py` runs ProgramBench 1.2.5's own `Evaluator`, filled with the arguments its batch runner uses. Only its container class is swapped for a local one, because the job's own filesystem is the container. Every evaluator step therefore runs unchanged:
+
+- the workspace wipe, the submission extraction and the removal of gold-hash files and `./executable`;
+- the seeded git repo, and `compile.sh` with DNS blackholed under 900 s;
+- the stashed and hashed binary and the `pytest-rerunfailures` install;
+- per branch: the tests archive, `eval/run.sh` with `--reruns=2` under 3600 s, the serial retry after xdist worker crashes, and the JUnit XML parsing.
+
+The score is `programbench.submission`'s: the fraction of non-ignored tests on the active branches that pass, `resolved` at 1.0 and `near_resolved` at 0.95. The job uploads `grade.json` (the full `EvaluationResult`, the score, CPUs, image, programbench version) to its stage dir.
+
+The one deviation: the official evaluator starts a fresh container from the post-compile image for each branch. Here the branches share the job, and `/workspace` and the stashed binary are reset from the post-compile tar before each branch. Files a test leaves elsewhere (`/tmp`, `$HOME`) carry over to later branches. The submission's `compile.sh` and tests run as root, as in the official compile container, but here in the same job as the grader.
+
+Where the score lands: `fetch-grade` (or `grade --wait`) keeps `grade.json` in `runs/<run_id>/artifacts/` and rewrites `run.json`. `score` becomes the world's score plus `graded: true, score, passed, total, resolved, near_resolved, branches, compile_ok`. `score_world` keeps the runner's original value, and `grade` records the job, versions and deviation. This is the one documented exception to "the runner owns the score": replay checks the world's own score against `score_world`, so `Run.load`, `swarmlab report` (its Final score table shows the graded keys) and `export` work on a graded run. A re-grade replaces the graded keys.
+
+Scores are not cheat-filtered: the benchmark's automated cheating judge is not public. Read the transcript (`swarmlab view`, `export`) before trusting a high score.

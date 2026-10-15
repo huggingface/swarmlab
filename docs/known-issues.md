@@ -27,6 +27,14 @@ Last checked against main on 2026-10-08. Items fixed since the first version (pe
 - `plan_job(port=...)` changes the provider URL in the job spec but bootstrap.sh still serves on `VLLM_PORT` (default 8000) and the plan does not set it; only the default port works. The CLI does not expose `--port`.
 - The job wall-time estimate (30 + 2N s per round) is 3-4x pessimistic for self-hosted vLLM (measured: N=64 about 40 s/round). Pass `--per-round` or `--timeout` from a measured run.
 
+## ProgramBench in HF Jobs and grading
+
+- Not yet run for real: neither an API-mode agent job in a task image nor a grade job has been launched. The bootstrap's api and grade branches and `grade.py` are tested only against stubs, plus one end-to-end evaluation of the `programbench` package's fixture task, `testorg__calculator`, with the real `Evaluator` on a temp dir. Untested until the smoke: the uv install in the task image, the bucket sync after the lockdown through the pinned Xet CAS hosts (`cas-server-direct.xethub.hf.co`, `cas-server.xethub.hf.co`; download hosts are not pinned), the dataset mount syntax and its read speed, `/root` being untraversable for `agent`, and the evaluator's DNS blackhole as root in a job.
+- The programbench world's `docker` backend is not exercised here: there is no Docker on this Space, and jobs refuse it.
+- Grading deviation: branches share one machine, reset from the post-compile tar, instead of one fresh container each. The submission's `compile.sh` and tests run as root next to the grader, so a hostile submission could tamper with `grade.json`. Scores are not cheat-filtered.
+- The grade job's timeout is capped at 12 h, below the evaluator's worst case for tasks with many branches (cmatrix: 14.8 h). A real grade of a small task should take minutes.
+- Haiku 5.5's long-prompt tier (over 100,000 prompt tokens) is billed by `AnthropicProvider.cost`, but `estimate` and `swarmlab models` show only the base row.
+
 ## Roles, paired runs, registry, viewer
 
 - Roles: a role's `model` override is ignored by `Experiment.estimate`; a fork keeps the parent's participant settings (role overrides in an edited spec do not re-bind them); `reconfigure` interventions do not change roles. `Role` and `Tree` are not re-exported at top level (import from `swarmlab.roles` and `swarmlab.medium.topology`).
