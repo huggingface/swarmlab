@@ -101,6 +101,9 @@ Decisions where the contract is silent:
   a found run's spend is its `run.json` ledger, so spend added by `swarmlab resume` counts;
   on a refusal that run and every later one get outcome `capped`, the JSON gets
   `capped: {reason, total_usd, spent, skipped: [run ids]}` and the exit code is 1.
+- `programbench grade RUN [--launch [--wait]]` and `programbench fetch-grade RUN [--grade-json F]`
+  grade a finished ProgramBench run in a second HF Job and write the score into its run.json
+  (swarmlab/jobs/programbench.py; `grade` only prints unless `--launch`).
 - `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server, or API models
   without vLLM when `--model` is omitted and no arm calls a `vllm:` model) are documented in
   `swarmlab/jobs/` and docs/handoff/WP8.md. `job run` only prints unless `--launch`.
@@ -1274,6 +1277,111 @@ def job_fetch(
     def go() -> dict[str, Any]:
         d = remote.fetch(run_id, out, bucket, tag)
         return {**summary(Run(d)), "fetched": str(d)}
+
+    _execute(go, as_json)
+
+
+# ---- ProgramBench grading (swarmlab/jobs/programbench.py) -------------------------------------
+programbench_app = typer.Typer(
+    name="programbench", no_args_is_help=True,
+    help="Grade a finished ProgramBench run with the official evaluator in a second HF Job.")
+app.add_typer(programbench_app, name="programbench")
+
+
+def _grade_written(run_dir: Path, grade_json: Path) -> dict[str, Any]:
+    from .jobs import programbench as pbj
+
+    score = pbj.write_grade(run_dir, grade_json)
+    text = (f"graded {run_dir}: score={score['score']:.4f} ({score['passed']}/{score['total']} "
+            f"tests, {score['branches']} branches) resolved={score['resolved']} "
+            f"near_resolved={score['near_resolved']} compile_ok={score['compile_ok']}\n"
+            f"  run.json score updated; grade.json kept in {run_dir / 'artifacts'}")
+    return {"ok": True, "run_dir": str(run_dir), "score": score, "text": text}
+
+
+@programbench_app.command("grade")
+def programbench_grade(
+    run_dir: Annotated[Path, typer.Argument(help="A finished programbench run directory.")],
+    flavor: Annotated[str | None, typer.Option(
+        "--flavor", help="HF Jobs flavor of the grade job (default cpu-upgrade; pytest workers = "
+        "its real CPU count).")] = None,
+    timeout: Annotated[str | None, typer.Option(
+        "--timeout", help="Job timeout (default: the evaluator's bounds, 900 s compile + 3600 s "
+        "per active branch + setup, capped at 12h).")] = None,
+    bucket: Annotated[str, typer.Option("--bucket", help="Bucket for the stage dir.")] = (
+        "hf://buckets/cmpatino/swarmlab-runs"),
+    stage_dir: Annotated[Path | None, typer.Option(
+        "--stage-dir", help="Also write the stage files (submission, bootstrap, plan, wheel) "
+        "here.")] = None,
+    launch: Annotated[bool, typer.Option(
+        "--launch", help="Upload the stage dir and submit the grade job (otherwise only print).")] = False,
+    wait: Annotated[bool, typer.Option(
+        "--wait", help="With --launch: poll the job, then fetch grade.json and write the score "
+        "into the run.")] = False,
+    poll: Annotated[float, typer.Option("--poll", help="Seconds between status polls.")] = 30.0,
+    allow_dirty: Annotated[bool, typer.Option(
+        "--allow-dirty", help="Launch from a checkout with uncommitted changes.")] = False,
+    ledger: Annotated[Path, typer.Option("--ledger", help="Local launch ledger (JSONL).")] = Path(
+        "runs/jobs.jsonl"),
+    as_json: JsonOpt = False,
+) -> None:
+    """Write the run's submission.tar.gz and print (with --launch submit) its grade job."""
+    from .jobs import launch as jl
+    from .jobs import programbench as pbj
+
+    def go() -> dict[str, Any]:
+        kw: dict[str, Any] = {"flavor": flavor, "timeout": timeout, "bucket": bucket}
+        plan = pbj.plan_grade(run_dir, **kw)
+        data: dict[str, Any] = {"ok": True, "plan": plan.as_dict(), "launched": False}
+        text = pbj.describe_grade(plan)
+        if stage_dir is not None:
+            pbj.stage_grade(plan, stage_dir)
+            data["stage_dir"] = str(stage_dir)
+            text += f"\nstaged locally: {stage_dir}"
+        if not launch:
+            if wait:
+                raise SpecError("--wait needs --launch")
+            text += "\nnot launched (pass --launch to upload the stage dir and submit)"
+        else:
+            if plan.dirty and not allow_dirty:
+                raise SpecError("the checkout has uncommitted changes; commit first or pass "
+                                "--allow-dirty")
+            row = pbj.submit_grade(plan, hf=jl.which_hf(), ledger=ledger)
+            data.update(launched=True, job=row)
+            text += (f"\nlaunched grade job {row['job_id']}  {row['url']}\n"
+                     f"follow: swarmlab job logs {row['job_id']} --follow\n"
+                     f"fetch:  swarmlab programbench fetch-grade {run_dir}")
+            if wait:
+                def say(line: str) -> None:
+                    print(line, file=sys.stderr if as_json else sys.stdout, flush=True)
+
+                stage = pbj.wait_grade(row["job_id"], hf=jl.which_hf(), poll_s=poll, say=say)
+                data["job_stage"] = stage
+                got = _grade_written(run_dir, pbj.fetch_grade(run_dir, hf=jl.which_hf()))
+                data["score"] = got["score"]
+                text += "\n" + got["text"]
+        data["text"] = text
+        return data if as_json else {"text": text}
+
+    _execute(go, as_json)
+
+
+@programbench_app.command("fetch-grade")
+def programbench_fetch_grade(
+    run_dir: Annotated[Path, typer.Argument(help="The run directory that was graded.")],
+    grade_json: Annotated[Path | None, typer.Option(
+        "--grade-json", help="A grade.json already on disk (default: download it from the "
+        "stage dir recorded in RUN/artifacts/grade_job.json).")] = None,
+    as_json: JsonOpt = False,
+) -> None:
+    """Download the grade job's grade.json and write its score into run.json."""
+    from .jobs import launch as jl
+    from .jobs import programbench as pbj
+
+    def go() -> dict[str, Any]:
+        src = grade_json if grade_json is not None else pbj.fetch_grade(run_dir, hf=jl.which_hf())
+        data = _grade_written(run_dir, src)
+        return data if as_json else {"text": data["text"]}
 
     _execute(go, as_json)
 
