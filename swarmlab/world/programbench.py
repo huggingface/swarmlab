@@ -151,8 +151,8 @@ Decisions the contract leaves open
   are tested on temp files. With a known CPU count n the local backend sets `MAKEFLAGS=-j<n>`,
   `CARGO_BUILD_JOBS`, `OMP_NUM_THREADS` and `GOMAXPROCS` to n (the floor, at least 1).
 - Resource sentence. `description()` ends with one sentence, `This machine has 8 CPUs and 32 GB
-  of memory.`, from `cpus`/`memory_gb` (explicit, detected, or docker's 20/60); a half is kept
-  only when it is not a whole number. It is omitted when both are unknown.
+  of memory.`, from `cpus`/`memory_gb` (explicit, detected, or docker's 20/60); a value that is
+  not a whole number is shown with one decimal (`15.5 GB`). It is omitted when both are unknown.
 - Template variables. The instance template's `{{system}} {{release}} {{version}} {{machine}}`
   are `platform.uname()` of the machine running swarmlab, recorded at `reset`: what
   mini-swe-agent's environments substitute (the Docker host's kernel is the container's).
@@ -163,8 +163,10 @@ Snapshots, restore and the grade seam
 -------------------------------------
 `snapshot()` is a pickle of `{"meta": <plain state dict>, "workspace_tar": <bytes | None>}`.
 The tar is the WHOLE workspace minus `snapshot_exclude`, gzip-compressed deterministically
-(sorted names, integer mtimes, gzip header mtime 0), so an unchanged workspace gives identical
-bytes and the blob store keeps one copy. The local backend builds it in Python
+(depth-first sorted names, whole-second mtimes, symlink mtimes 0, gzip header mtime 0), so an
+unchanged workspace gives identical bytes and the blob store keeps one copy; extraction keeps the
+permission bits (setuid, setgid and sticky dropped), so a restored workspace tars to the same
+bytes. The local backend builds it in Python
 (`workspace_tar`); docker runs `tar --sort=name --format=gnu ... | gzip -n` in the container as
 root (the reference binary is execute-only). Unreadable files (a non-root local run) are skipped
 and listed in `snapshot_skipped`. `None` means the docker backend never started: the workspace
