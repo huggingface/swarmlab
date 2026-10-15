@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.40"]
+anthropic = ["anthropic>=1.11"]  # top-level cache_control kwarg (prompt caching)
 hub = ["datasets>=3", "huggingface_hub>=0.25"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 
