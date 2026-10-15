@@ -750,8 +750,10 @@ def describe(plan: JobPlan) -> str:
                          f" s/round = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
     cost = (f"~${rate * est_h:.2f} expected, ${rate * plan.timeout_s / 3600:.2f} worst case "
             f"(${rate:.2f}/h x timeout)" if rate is not None else "rate unknown for this flavor")
+    bounded = any("wall_limit_s" in d for d in plan.estimate_detail["arms"].values())
     lines.append(f"estimate: ~{plan.estimate_s / 60:.0f} min wall (incl. "
-                 f"{plan.estimate_detail['setup_s'] // 60} min setup); timeout "
+                 f"{plan.estimate_detail['setup_s'] // 60} min setup"
+                 f"{'; an upper bound: the wall limit' if bounded else ''}); timeout "
                  f"{fmt_duration(plan.timeout_s)}; flavor {plan.flavor}: {cost}")
     lines.append("model calls are self-hosted: the ledger shows $0, the cost is the job's compute"
                  if plan.mode == "vllm" else
