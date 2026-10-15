@@ -10,7 +10,7 @@ The world reproduces the official harness's environment (mini-swe-agent 2.4.6 wi
 pip install "swarmlab[programbench]"
 ```
 
-The extra pins `programbench==1.2.5` (task metadata; the grader in a later step) and `mini-swe-agent==2.4.6` (the faithful participant, in a later step). Building the world, replaying a run, the viewer and reports work without it; only the run-start task check (`check_task`) imports `programbench`.
+The extra pins `programbench==1.2.5` (task metadata now; the grader in a later step). Building the world, replaying a run, the viewer and reports work without it; only the run-start task check (`check_task`) imports `programbench`. mini-swe-agent, the faithful solo participant, comes with that participant's own extra in a later PR; the world's task text is already copied from its 2.4.6 release.
 
 ## Parameters
 

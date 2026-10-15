@@ -18,7 +18,7 @@ dependencies = [
 anthropic = ["anthropic>=0.40"]
 hub = ["datasets>=3", "huggingface_hub>=0.25"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
-programbench = ["programbench==1.2.5", "mini-swe-agent==2.4.6"]
+programbench = ["programbench==1.2.5"]
 
 [project.scripts]
 swarmlab = "swarmlab.cli:app"
