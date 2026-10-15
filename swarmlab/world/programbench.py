@@ -16,7 +16,7 @@ Constructor
 -----------
 `ProgramBench(task, backend="local", workspace="/workspace", user="agent", step_limit=1000,
 wall_limit_s=21600, command_timeout_s=180, lockdown=True,
-pin_hosts=("api.anthropic.com", "huggingface.co", "hf.co"), max_output_bytes=1_000_000,
+pin_hosts=PIN_HOSTS, max_output_bytes=1_000_000,
 cpus=None, memory_gb=None, snapshot_exclude=(), check_task=True)`
 
 - `task`: a ProgramBench instance id, `<owner>__<repo>.<short sha>` (`abishekvashok__cmatrix.5c082c6`).
@@ -42,7 +42,12 @@ cpus=None, memory_gb=None, snapshot_exclude=(), check_task=True)`
   true and `validate` refuses further commands (`wall_limit`).
 - `command_timeout_s`: the per-command timeout (180 s).
 - `lockdown`, `pin_hosts`: job-mode network and privilege lockdown (below); acts only with the
-  local backend when swarmlab runs as root.
+  local backend when swarmlab runs as root. `PIN_HOSTS` (the default): the Anthropic API, the
+  Hub (`huggingface.co`, `hf.co`) and the Xet storage hosts a bucket upload talks to
+  (`cas-server-direct.xethub.hf.co`, `cas-server.xethub.hf.co`: `hf buckets sync`, which the job
+  bootstrap runs after the lockdown, uploads file contents to the `casUrl` the Hub's
+  `xet-write-token` endpoint returns; both names were seen there). Download hosts
+  (`transfer.xethub.hf.co`, `cas-bridge.xethub.hf.co`) are not pinned.
 - `max_output_bytes`: a safety cap on one command's output (below).
 - `cpus`, `memory_gb`: the resources the task text states and the docker flags use. `None`:
   docker uses the official 20 CPUs / 60 GB; the local backend detects them from the cgroup when
@@ -244,6 +249,8 @@ from .base import Ack, Action, Outcome, Requirements, World, tool
 SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 IMAGE_ORG = "programbench"
 IMAGE_TAG = "task_cleanroom_v6"
+PIN_HOSTS = ("api.anthropic.com", "huggingface.co", "hf.co", "cas-server-direct.xethub.hf.co",
+             "cas-server.xethub.hf.co")
 EXTRA = "swarmlab[programbench]"
 BASELINE_ENV: dict[str, str] = {"PAGER": "cat", "MANPAGER": "cat", "LESS": "-R",
                                 "PIP_PROGRESS_BAR": "off", "TQDM_DISABLE": "1"}
@@ -995,7 +1002,7 @@ class ProgramBench(World):
     def __init__(self, task: str, backend: str = "local", workspace: str = "/workspace",
                  user: str | None = "agent", step_limit: int = 1000, wall_limit_s: float = 21600,
                  command_timeout_s: float = 180, lockdown: bool = True,
-                 pin_hosts: Sequence[str] = ("api.anthropic.com", "huggingface.co", "hf.co"),
+                 pin_hosts: Sequence[str] = PIN_HOSTS,
                  max_output_bytes: int | None = 1_000_000, cpus: float | None = None,
                  memory_gb: float | None = None, snapshot_exclude: Sequence[str] = (),
                  check_task: bool = True) -> None:

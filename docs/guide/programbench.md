@@ -26,7 +26,7 @@ The extra pins `programbench==1.2.5` (task metadata now; the grader in a later s
 | `wall_limit_s` | 21600 | the 6 h wall-clock limit; past it the run is terminal and `bash` is refused |
 | `command_timeout_s` | 180 | per-command timeout |
 | `lockdown` | true | job-mode network and sudo lockdown (local backend, as root only; below) |
-| `pin_hosts` | `[api.anthropic.com, huggingface.co, hf.co]` | the hosts that stay reachable under lockdown |
+| `pin_hosts` | `[api.anthropic.com, huggingface.co, hf.co, cas-server-direct.xethub.hf.co, cas-server.xethub.hf.co]` | the hosts that stay reachable under lockdown: the Anthropic API, the Hub, and the Xet storage hosts the job's bucket sync uploads to |
 | `max_output_bytes` | 1000000 | safety cap on one command's output (head and tail kept around one elision line); `null` disables it |
 | `cpus`, `memory_gb` | null | the resources the task text states; docker defaults to the official 20 CPUs and 60 GB, the local backend detects them from the cgroup under lockdown |
 | `snapshot_exclude` | `[]` | fnmatch patterns left out of the workspace snapshot (e.g. `target`); by default the whole workspace is kept, since it is the submission |
