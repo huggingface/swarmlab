@@ -1,0 +1,5 @@
+# The official solo prompt: mini-swe-agent 2.4.6's ProgramBench templates (programbench_system,
+# programbench_instance: swarmlab.world.programbench's verbatim copy, rendered with this machine's
+# uname as mini-swe-agent renders it), plus the world's one resource sentence.
+system_template: "{{ programbench_system }}"
+instance_template: "{{ programbench_instance }}{% if resource_sentence %}\n\n{{ resource_sentence }}{% endif %}"
