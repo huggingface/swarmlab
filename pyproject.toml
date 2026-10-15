@@ -56,6 +56,7 @@ queue_painter = "swarmlab.participants.scripted:QueuePainter"
 random_painter = "swarmlab.participants.scripted:RandomPainter"
 relay_painter = "swarmlab.participants.scripted:RelayPainter"
 llm = "swarmlab.participants.llm:LLMAgent"
+mini_swe_agent = "swarmlab.participants.minisweagent:MiniSweAgent"
 cascade_worker = "swarmlab.participants.cascade:CascadeWorker"
 
 [project.entry-points."swarmlab.metrics"]
@@ -125,7 +126,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["swarmlab"]
-artifacts = ["swarmlab/participants/prompts/*.j2", "swarmlab/viewer/*.html"]
+artifacts = ["swarmlab/participants/prompts/*.j2", "swarmlab/participants/prompts/minisweagent/*.yaml",
+             "swarmlab/viewer/*.html"]
 
 [tool.uv]
 # mini-swe-agent (the `minisweagent` extra) requires litellm, which pins huggingface-hub<2 and

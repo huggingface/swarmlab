@@ -1,0 +1,643 @@
+"""The mini_swe_agent participant (swarmlab/participants/minisweagent.py): mini-swe-agent 2.4.6's
+loop driven step by step against the ProgramBench world's temp-dir local backend, with fake
+model scripts defined here (`fake:tests.test_minisweagent_participant:<script>`). No Docker, no
+network, no model keys."""
+from __future__ import annotations
+
+import json
+import pickle
+import random
+import re
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+pytest.importorskip("minisweagent")
+
+from swarmlab import Experiment, Run
+from swarmlab.medium.board import Board
+from swarmlab.participants.base import Participant, TurnUsage
+from swarmlab.participants.minisweagent import (
+    EXTRA,
+    FORMAT_ERROR_TEMPLATE,
+    OBSERVATION_TEMPLATE,
+    WAIT_RESULT,
+    MiniSweAgent,
+    command_rules,
+    load_minisweagent,
+    resource_sentence_of,
+    rules_block,
+)
+from swarmlab.providers.fake import _assistant_calls, _response
+from swarmlab.registry import build, catalog, describe
+from swarmlab.roles import Role, assign
+from swarmlab.snapshot import SnapshotStore
+from swarmlab.view import View, text_observation
+from swarmlab.world import programbench as pb
+from swarmlab.world.programbench import SUBMIT_MARKER, ProgramBench, prompt_parts
+
+TASK = "abishekvashok__cmatrix.5c082c6"
+HERE = __name__
+GUIDE = Path(__file__).resolve().parents[1] / "docs" / "guide" / "programbench.md"
+SUBMIT = f"echo {SUBMIT_MARKER}"
+
+
+def fake(script: str) -> str:
+    return f"fake:{HERE}:{script}"
+
+
+# ---- fake model scripts ---------------------------------------------------------------------------
+
+def _replies(request) -> int:
+    """Model replies so far: assistant messages plus format-error messages (dropped replies)."""
+    return sum(1 for m in request.messages if m.role == "assistant"
+               or (m.role == "user" and ("Tool call error" in str(m.content)
+                                         or "output token limit" in str(m.content))))
+
+
+def _names(request) -> list[str]:
+    return [n for m in request.messages for n, _ in _assistant_calls(m)]
+
+
+SEEN: list[dict] = []
+
+
+def recording_echo(request, rng):
+    """`fake:programbench_echo`, recording the tools and message roles of each request."""
+    SEEN.append({"tools": [t.name for t in request.tools],
+                 "roles": [m.role for m in request.messages]})
+    return pb.fake_echo(request, rng)
+
+
+def forever(request, rng):
+    """A bash command every step, never a submission."""
+    return _response(request, rng, [("bash", {"command": f"echo step {_replies(request) + 1}"})])
+
+
+def submit_fifth(request, rng):
+    """Four commands, then the submission."""
+    k = _replies(request)
+    return _response(request, rng, [("bash", {"command": SUBMIT if k == 4 else f"echo {k}"})])
+
+
+def chatty(request, rng):
+    """Text only, never a tool call."""
+    return _response(request, rng, [], "Let me think about this.")
+
+
+def flaky(request, rng):
+    """Cut off, then an unknown tool, then a command, then the submission."""
+    k = _replies(request)
+    if k == 0:
+        resp = _response(request, rng, [], "I was going to")
+        return resp.model_copy(update={"finish_reason": "max_tokens"})
+    if k == 1:
+        return _response(request, rng, [("post", {"text": "hi"})])
+    return _response(request, rng, [("bash", {"command": "ls" if k == 2 else SUBMIT})])
+
+
+CLOCK = [1_000_000.0]
+
+
+def slow(request, rng):
+    """A command per step; each model call takes 1100 s of the patched clock."""
+    CLOCK[0] += 1100
+    return forever(request, rng)
+
+
+def interleaved(request, rng):
+    """A command, a board read and another command in one reply, then the submission."""
+    if _replies(request) == 0:
+        return _response(request, rng, [("bash", {"command": "echo first"}),
+                                        ("read_board", {}),
+                                        ("bash", {"command": "echo second"})])
+    return _response(request, rng, [("bash", {"command": SUBMIT})])
+
+
+def ends_then_runs(request, rng):
+    """`end_turn` and then a command in one reply; the submission next turn."""
+    if _replies(request) == 0:
+        return _response(request, rng, [("end_turn", {}), ("bash", {"command": "ls"})])
+    return _response(request, rng, [("bash", {"command": SUBMIT})])
+
+
+def three_commands(request, rng):
+    """Three commands per reply (the executor's cap cuts the first reply)."""
+    k = _replies(request)
+    if k == 0:
+        return _response(request, rng, [("bash", {"command": f"echo {c}"}) for c in "abc"])
+    return _response(request, rng, [("bash", {"command": SUBMIT})])
+
+
+def waiting_lead(request, rng):
+    """A command and `wait_for_workers`, then the submission."""
+    if "wait_for_workers" not in _names(request):
+        return _response(request, rng, [("bash", {"command": "echo plan"}),
+                                        ("wait_for_workers", {})])
+    return _response(request, rng, [("bash", {"command": SUBMIT})])
+
+
+def lead(request, rng):
+    """Assign worker-1, wait, read the board, submit once the report is there."""
+    names = _names(request)
+    if "post" not in names:
+        return _response(request, rng, [("post", {"channel": "worker-1",
+                                                  "text": "Write compile.sh."}),
+                                        ("wait_for_workers", {})])
+    reported = any(m.role == "tool" and "worker-1: done" in str(m.content)
+                   for m in request.messages)
+    if reported:
+        return _response(request, rng, [("bash", {"command": SUBMIT})])
+    if names[-1] == "read_board":
+        return _response(request, rng, [("wait_for_workers", {})])
+    return _response(request, rng, [("read_board", {})])
+
+
+def worker(request, rng):
+    """Build compile.sh, then report to the lead."""
+    if "bash" not in _names(request):
+        return _response(request, rng, [("bash", {"command": pb.FAKE_COMPILE})])
+    return _response(request, rng, [("post", {"channel": "lead", "text": "worker-1: done"})])
+
+
+class Poster(Participant):
+    """Posts `texts` on `channel` in the given rounds, then ends its turn."""
+
+    def __init__(self, texts: list[str], rounds: list[int], channel: str = "main") -> None:
+        self.texts, self.rounds, self.channel = list(texts), list(rounds), channel
+
+    async def turn(self, view, tools) -> TurnUsage:
+        if view.round in self.rounds:
+            for text in self.texts:
+                await tools.call("post", {"channel": self.channel, "text": text})
+        await tools.call("end_turn", {})
+        return TurnUsage()
+
+
+# ---- helpers ----------------------------------------------------------------------------------
+
+def world(tmp_path: Path, **kw) -> ProgramBench:
+    return ProgramBench(TASK, workspace=str(tmp_path / "ws"), user=None, lockdown=False,
+                        check_task=False, **kw)
+
+
+def solo(tmp_path: Path, model: str, *, rounds: int = 1, cap: int = 1000, world_kw=None,
+         role: str | None = None, **params) -> Run:
+    p = MiniSweAgent(model=model, **params)
+    roles = {}
+    if role:
+        assign(p, role)
+        roles = {role: Role(name=role, tools=["bash"])}
+    exp = Experiment(name="msa", world=world(tmp_path, **(world_kw or {})), participants=[p],
+                     roles=roles, options={"commit": "immediate", "max_calls_per_turn": cap})
+    return exp.run(seed=0, max_rounds=rounds, out=tmp_path / "runs")
+
+
+def state(run: Run, agent: str = "a000", round: int | None = None) -> dict:
+    store = SnapshotStore(run.dir)
+    manifest = store.latest() if round is None else store.read(round)
+    return pickle.loads(store.load(manifest)[f"participant:{agent}"])
+
+
+def roles_of(st: dict) -> list[str]:
+    return [m["role"] for m in st["messages"]]
+
+
+def tools_of(st: dict) -> list[dict]:
+    return [m for m in st["messages"] if m["role"] == "tool"]
+
+
+def turns(run: Run, agent: str = "a000") -> list[dict]:
+    return [e for e in run.events if e["type"] == "turn_ended" and e["agent"] == agent]
+
+
+def inference_rounds(run: Run, agent: str) -> list[int]:
+    return [e.round for e in run.events_all if e.type == "inference_attempt" and e.agent == agent]
+
+
+# ---- the solo episode ---------------------------------------------------------------------------
+
+def test_solo_episode_transcript_has_the_baseline_shape(tmp_path):
+    SEEN.clear()
+    run = solo(tmp_path, fake("recording_echo"), role="solo", world_kw={"cpus": 8, "memory_gb": 32})
+    assert (run.meta["end_reason"], run.score["submitted"], run.score["steps"]) == \
+        ("terminal", True, 3)
+    st = state(run)
+    assert roles_of(st) == ["system", "user", "assistant", "tool", "assistant", "tool",
+                            "assistant", "exit"]
+    system, instance = prompt_parts()
+    msgs = st["messages"]
+    assert msgs[0]["content"] == system
+    assert msgs[1]["content"] == f"{instance}\n\nThis machine has 8 CPUs and 32 GB of memory."
+    w = world(tmp_path, cpus=8, memory_gb=32)
+    w.reset(random.Random(0), ["a000"])
+    assert f"{msgs[0]['content']}\n\n{msgs[1]['content']}" == w.description()
+    call = msgs[2]["tool_calls"][0]
+    assert call["function"] == {"name": "bash", "arguments": json.dumps({"command": "ls"})}
+    assert msgs[3] == {"role": "tool", "tool_call_id": call["id"],
+                       "content": "<returncode>0</returncode>\n<output>\n</output>\n",
+                       "extra": {"raw_output": "", "returncode": 0, "exception_info": ""}}
+    assert msgs[5]["content"].startswith("<returncode>0</returncode>\n<output>\ncompile.sh\n")
+    assert msgs[2]["extra"]["actions"] == [{"command": "ls", "tool_call_id": call["id"]}]
+    assert msgs[2]["extra"]["cost"] > 0 and "timestamp" not in msgs[2]["extra"]
+    assert msgs[-1] == {"role": "exit", "content": "",
+                        "extra": {"exit_status": "Submitted", "submission": ""}}
+    assert (st["n_calls"], st["finished"]) == (3, True)
+    # what the model was sent: the role's tools, mini-swe-agent's messages without `exit`
+    assert [s["tools"] for s in SEEN] == [["bash", "end_turn"]] * 3
+    assert SEEN[1]["roles"] == ["system", "user", "assistant", "tool"]
+    (ended,) = turns(run)
+    assert ended["usage"]["notes"] == ["exit:Submitted"]
+    assert ended["usage"]["calls"] == 3 and ended["usage"]["inference_calls"] == 3
+    assert Run.load(run.dir).replay()["score"] == run.score
+
+
+def test_step_limit_warning_and_exit(tmp_path):
+    run = solo(tmp_path, fake("forever"), step_limit=22, world_kw={"step_limit": 22})
+    st = state(run)
+    assert st["n_calls"] == 22 and roles_of(st)[-1] == "exit"
+    assert st["messages"][-1]["extra"]["exit_status"] == "LimitsExceeded"
+    obs = [m["content"] for m in tools_of(st)]
+    assert len(obs) == 22
+    assert all("<IMPORTANT>" not in o for o in obs[:2])
+    assert "You are now 19 steps away from reaching your limit." in obs[2]
+    assert "You are now 0 steps away" in obs[21]
+    assert run.meta["end_reason"] == "max_rounds" and not run.score["submitted"]
+
+
+def test_wall_limit_warning_and_exit(tmp_path, monkeypatch):
+    from minisweagent.agents import default
+
+    import swarmlab.participants.minisweagent as msa_mod
+
+    clock = SimpleNamespace(time=lambda: CLOCK[0])
+    monkeypatch.setattr(default, "time", clock)
+    monkeypatch.setattr(msa_mod, "time", clock)
+    CLOCK[0] = 1_000_000.0
+    run = solo(tmp_path, fake("slow"), wall_limit_s=3600)
+    st = state(run)
+    assert st["messages"][-1]["extra"]["exit_status"] == "TimeExceeded"
+    assert st["n_calls"] == 4 and st["elapsed_s"] == 4400
+    obs = [m["content"] for m in tools_of(st)]
+    assert all("running low on time" not in o for o in obs[:2])
+    assert "You have approximately 5 minutes remaining before timeout." in obs[2]
+
+
+def test_three_format_errors_end_the_episode(tmp_path):
+    run = solo(tmp_path, fake("chatty"))
+    st = state(run)
+    assert roles_of(st) == ["system", "user", "user", "user", "user", "exit"]
+    assert st["messages"][-1]["extra"]["exit_status"] == "RepeatedFormatError"
+    error = st["messages"][2]["content"]
+    assert error.startswith("Tool call error:\n\n<error>\nNo tool calls found in the response.")
+    assert st["n_calls"] == 3 and st["cost"] > 0  # format-error replies are billed, as in run()
+    assert st["messages"][2]["extra"]["interrupt_type"] == "FormatError"
+
+
+def test_format_errors_are_the_baseline_messages_and_reset_on_a_clean_step(tmp_path):
+    run = solo(tmp_path, fake("flaky"), role="solo")
+    st = state(run)
+    assert roles_of(st) == ["system", "user", "user", "user", "assistant", "tool", "assistant",
+                            "exit"]
+    cut, unknown = st["messages"][2]["content"], st["messages"][3]["content"]
+    assert cut.startswith("Your previous response reached the output token limit "
+                          "(finish_reason=length)")
+    # post is not offered in the solo role; the baseline's parser words it this way
+    assert "<error>\nUnknown tool 'post'.Missing 'command' argument in bash tool call.\n</error>" \
+        in unknown
+    assert st["n_consecutive_format_errors"] == 0
+    assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+# ---- several rounds, snapshots, forks -------------------------------------------------------------
+
+def test_steps_per_turn_spread_the_episode_over_rounds(tmp_path):
+    run = solo(tmp_path, fake("submit_fifth"), rounds=5, cap=20, steps_per_turn=2)
+    assert run.meta["end_reason"] == "terminal" and run.meta["last_round"] == 3
+    per_turn = [e["usage"]["inference_calls"] for e in turns(run)]
+    assert per_turn == [2, 2, 1]
+    assert [e["usage"]["notes"] for e in turns(run)] == [[], [], ["exit:Submitted"]]
+    first = state(run, round=1)
+    assert (first["n_calls"], len(first["messages"]), first["finished"]) == (2, 6, False)
+    assert first["elapsed_s"] > 0
+    final = state(run)
+    assert final["n_calls"] == 5 and final["messages"][:6] == first["messages"]
+    # a fork from round 1 restores the state, rebuilds the agent and ends the same way
+    child = run.fork(1).run(out=tmp_path / "forks")
+    assert child.meta["end_reason"] == "terminal"
+    assert state(child)["messages"] == final["messages"]
+    assert Run.load(run.dir).replay()["score"] == run.score
+
+
+def test_snapshot_holds_plain_state_and_round_trips(tmp_path):
+    run = solo(tmp_path, fake("submit_fifth"), rounds=1, cap=20, steps_per_turn=2,
+               world_kw={"step_limit": 2})
+    st = state(run)
+    assert set(st) == {"model", "steps_per_turn", "step_limit", "wall_limit_s", "max_tokens",
+                       "temperature", "extra", "templates", "idle_until_assigned", "wait_tool",
+                       "lead_channel", "worker_channels", "messages", "n_calls", "cost",
+                       "n_consecutive_format_errors", "elapsed_s", "finished", "assigned",
+                       "delivered_upto", "agent", "rng"}
+    p = MiniSweAgent(model=fake("submit_fifth"))
+    p.restore(pickle.dumps(st))
+    assert p.messages == st["messages"] and p.n_calls == 2 and p.exit_status is None
+    again = pickle.loads(p.snapshot())
+    assert again["messages"] == st["messages"] and again["elapsed_s"] == st["elapsed_s"]
+
+
+def test_the_wall_clock_is_rebased_on_restore(monkeypatch):
+    import swarmlab.participants.minisweagent as msa_mod
+
+    monkeypatch.setattr(msa_mod, "time", SimpleNamespace(time=lambda: 5000.0))
+    p = MiniSweAgent(model="fake:x")
+    p.bind("a000", random.Random(0))
+    p.messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    p.n_calls, p.cost, p.elapsed_s = 7, 0.5, 1200.0
+    msa = load_minisweagent()
+    turn = msa_mod._Turn(usage=msa_mod.LLMTurnUsage(), loop=None, tools=None, offered=[])
+    agent = p._build(_view(), turn, msa)
+    assert (agent._start_time, agent.n_calls, agent.cost) == (3800.0, 7, 0.5)
+    assert agent.messages is p.messages
+
+
+# ---- deliveries ---------------------------------------------------------------------------------
+
+def _team(tmp_path, participants, *, delivery="pull", channels=("main",), rounds=2, cap=20,
+          **world_kw) -> Run:
+    exp = Experiment(name="msa-team", world=world(tmp_path, **world_kw),
+                     participants=participants,
+                     medium=Board(delivery=delivery, channels=list(channels)),
+                     options={"commit": "immediate", "max_calls_per_turn": cap,
+                              "scheduler": {"type": "fixed"}})
+    return exp.run(seed=0, max_rounds=rounds, out=tmp_path / "runs")
+
+
+def test_push_deliveries_are_one_user_message_inserted_once(tmp_path):
+    run = _team(tmp_path, [Poster(["assignment one", "assignment two"], [1]),
+                           MiniSweAgent(model=fake("forever"), steps_per_turn=1)],
+                delivery="push")
+    st = state(run, "a001")
+    assert roles_of(st) == ["system", "user", "user", "assistant", "tool", "assistant", "tool"]
+    delivered = st["messages"][2]["content"]
+    assert re.fullmatch(r"Delivered to you:\n- \S+ \(round 1\): assignment one\n"
+                        r"- \S+ \(round 1\): assignment two", delivered)
+    assert st["delivered_upto"][0] == 1
+
+
+def test_pull_board_reads_run_through_the_adapter_in_call_order(tmp_path):
+    run = _team(tmp_path, [Poster(["assignment one"], [1]),
+                           MiniSweAgent(model=fake("interleaved"), steps_per_turn=1)])
+    st = state(run, "a001")
+    assert not any(str(m.get("content", "")).startswith("Delivered") for m in st["messages"])
+    reply = st["messages"][2]
+    assert [c["function"]["name"] for c in reply["tool_calls"]] == ["bash", "read_board", "bash"]
+    first, read, second = st["messages"][3:6]
+    assert [m["tool_call_id"] for m in (first, read, second)] == \
+        [c["id"] for c in reply["tool_calls"]]
+    assert "first" in first["content"] and "second" in second["content"]
+    payload = json.loads(read["content"])
+    assert payload["ok"] and [i["content"] for i in payload["result"]["items"]] == \
+        ["assignment one"]
+    called = [e["tool"] for e in run.events if e["type"] == "tool_called" and e["agent"] == "a001"]
+    assert called[:3] == ["bash", "read_board", "bash"]
+    assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+def test_idle_worker_makes_no_model_call_until_assigned_and_after_its_report(tmp_path):
+    run = _team(tmp_path, [Poster(["build it"], [2]),
+                           MiniSweAgent(model=fake("worker"), steps_per_turn=10,
+                                        idle_until_assigned=True)],
+                channels=("main", "lead"), rounds=3)
+    assert sorted(set(inference_rounds(run, "a001"))) == [2]
+    assert len(inference_rounds(run, "a001")) == 2
+    ended = turns(run, "a001")
+    assert [e["usage"]["notes"] for e in ended] == [["idle"], [], ["idle"]]
+    assert [e["usage"].get("inference_calls", 0) for e in ended] == [0, 2, 0]
+    called = [(e["round"], e["tool"]) for e in run.events
+              if e["type"] == "tool_called" and e["agent"] == "a001"]
+    assert called == [(1, "read_board"), (2, "read_board"), (2, "bash"), (2, "post"),
+                      (3, "read_board")]
+    st = state(run, "a001")
+    assert st["assigned"] is False and st["finished"] is False
+    assert st["messages"][2]["content"].endswith(": build it")
+
+
+def test_wait_for_workers_ends_the_turn_and_posts_nothing(tmp_path):
+    run = solo(tmp_path, fake("waiting_lead"), rounds=3, cap=20, steps_per_turn=10,
+               wait_tool=True)
+    assert [e["usage"].get("inference_calls") for e in turns(run)] == [1, 1]
+    assert turns(run)[0]["yield_kind"] == "no_tool"
+    st = state(run)
+    wait = tools_of(st)[1]
+    assert wait["content"] == WAIT_RESULT
+    assert not [e for e in run.events if e["type"] == "post"]
+    assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+def test_team_shape_from_the_guide(tmp_path):
+    spec = _guide_yaml("programbench-team")
+    arm = spec["arms"]["team"]
+    arm["world"]["params"].update(workspace=str(tmp_path / "ws"), user=None, lockdown=False,
+                                  check_task=False, backend="local")
+    arm["participants"][0]["params"]["model"] = fake("lead")
+    arm["participants"][1]["params"]["model"] = fake("worker")
+    spec["options"]["max_rounds"] = 4
+    path = tmp_path / "team.yaml"
+    path.write_text(yaml.safe_dump(spec))
+    run = Experiment.from_yaml(path, "team").run(seed=0, out=tmp_path / "runs")
+    assert run.meta["end_reason"] == "terminal" and run.meta["last_round"] == 2
+    assert state(run, "a000")["messages"][-1]["extra"]["exit_status"] == "Submitted"
+    assert inference_rounds(run, "a002") == inference_rounds(run, "a003") == []
+    assert sorted(set(inference_rounds(run, "a001"))) == [1]
+    posts = [(e["agent"], e["channel"]) for e in run.events if e["type"] == "post"]
+    assert posts == [("a000", "worker-1"), ("a001", "lead")]
+    lead_msgs = state(run, "a000")["messages"]
+    assert "You lead a team of 3 workers." in lead_msgs[1]["content"]
+    assert any(m["role"] == "tool" and m["content"] == WAIT_RESULT for m in lead_msgs)
+
+
+# ---- refused calls and the executor's cap ---------------------------------------------------------
+
+def test_a_command_after_end_turn_is_refused_and_the_episode_goes_on(tmp_path):
+    run = solo(tmp_path, fake("ends_then_runs"), rounds=2, cap=20)
+    st = state(run)
+    ended, refused = tools_of(st)[:2]
+    assert json.loads(ended["content"]) == {"ok": True, "result": {}, "error": None}
+    assert refused["content"].startswith(
+        "<exception>swarmlab refused the command: turn_ended</exception>\n"
+        "<returncode>-1</returncode>")
+    assert turns(run)[0]["yield_kind"] == "end_turn"
+    assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+def test_world_wall_limit_ends_the_episode_as_time_exceeded(tmp_path):
+    run = solo(tmp_path, fake("forever"), world_kw={"wall_limit_s": 1e-9})
+    st = state(run)
+    assert st["messages"][-1] == {"role": "exit", "content": "TimeExceeded",
+                                  "extra": {"exit_status": "TimeExceeded", "submission": ""}}
+
+
+def test_another_agents_submission_ends_the_episode(tmp_path):
+    run = _team(tmp_path, [MiniSweAgent(model="fake:programbench_echo"),
+                           MiniSweAgent(model=fake("forever"))], rounds=1, cap=10,
+                step_limit=10)
+    st = state(run, "a001")
+    assert st["n_calls"] == 1
+    assert st["messages"][-1] == {"role": "exit", "content": "",
+                                  "extra": {"exit_status": "Submitted", "submission": ""}}
+
+
+def test_the_executor_cap_ends_the_turn_with_a_well_formed_history(tmp_path):
+    run = solo(tmp_path, fake("three_commands"), rounds=2, cap=2)
+    assert turns(run)[0]["yield_kind"] == "cap"
+    st = state(run, round=1)
+    reply = st["messages"][2]
+    a, b, c = st["messages"][3:6]
+    assert [m["tool_call_id"] for m in (a, b, c)] == [x["id"] for x in reply["tool_calls"]]
+    assert "<output>\na\n</output>" in a["content"] and "<output>\nb\n</output>" in b["content"]
+    assert c["content"].startswith("<exception>action was not executed</exception>")
+    assert state(run)["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+# ---- templates ------------------------------------------------------------------------------------
+
+def _view(tools=None, description=None, agent="a000") -> View:
+    from swarmlab.executor import END_TURN_SCHEMA
+    from swarmlab.tools import ToolSchema
+
+    if tools is None:
+        tools = [ToolSchema(name="bash", description="Execute a bash command", parameters={
+            "type": "object", "properties": {"command": {"type": "string"}},
+            "required": ["command"], "additionalProperties": False}), END_TURN_SCHEMA]
+    if description is None:
+        description = "x\n\nThis machine has 8 CPUs and 32 GB of memory."
+    return View(round=1, agent=agent, observation=text_observation("obs"), outcomes=[],
+                pushed=[], tools=tools, description=description)
+
+
+def _post_tool(channels: list[str]):
+    from swarmlab.tools import ToolSchema
+
+    return ToolSchema(name="post", description="Post.", parameters={
+        "type": "object", "properties": {"channel": {"type": "string", "enum": channels},
+                                         "text": {"type": "string"}},
+        "required": ["channel", "text"], "additionalProperties": False})
+
+
+def test_templates_lead_and_worker():
+    lead_p = MiniSweAgent(model="fake:x", templates="lead", wait_tool=True)
+    lead_p.bind("a000", random.Random(0))
+    view = _view(tools=[_post_tool(["worker-1", "worker-2"])])
+    system, instance = prompt_parts()
+    assert lead_p._render_system(view) == system
+    text = lead_p.turn_message(view).content
+    assert text.startswith(instance) and "You lead a team of 2 workers." in text
+    assert "`worker-1`, `worker-2`" in text and "`wait_for_workers`" in text
+    assert text.endswith("\n\nThis machine has 8 CPUs and 32 GB of memory.")
+    no_wait = MiniSweAgent(model="fake:x", templates="lead")
+    no_wait.bind("a000", random.Random(0))
+    assert "wait_for_workers" not in no_wait.turn_message(view).content
+    w = MiniSweAgent(model="fake:x", templates="worker")
+    w.bind("a001", random.Random(0))
+    wview = _view(tools=[_post_tool(["lead", "worker-1"])])
+    wsys, wtext = w._render_system(wview), w.turn_message(wview).content
+    assert rules_block(system) in wsys and "## Task context" not in wsys + wtext
+    assert "on channel `worker-1`" in wtext and "to channel `lead`" in wtext
+    assert command_rules(instance) in wtext and "- Submit your changes" not in wtext
+
+
+def test_template_helpers_and_custom_templates(tmp_path):
+    assert resource_sentence_of("a\n\nThis machine has 8 CPUs.") == "This machine has 8 CPUs."
+    assert resource_sentence_of("a\n\nsomething else") == ""
+    custom = tmp_path / "t.yaml"
+    custom.write_text(yaml.safe_dump({"system_template": "S {{ agent }} {{ step_limit }}",
+                                      "instance_template": "I {{ worker_channels }}"}))
+    p = MiniSweAgent(model="fake:x", templates=f"file:{custom}", step_limit=7)
+    p.bind("a003", random.Random(0))
+    view = _view(tools=[_post_tool(["lead", "worker-3"])])
+    assert p._render_system(view) == "S a003 7"
+    assert p.turn_message(view).content == "I ['worker-3']"
+    with pytest.raises(ValueError, match="templates must be one of"):
+        MiniSweAgent(model="fake:x", templates="nope")
+
+
+def test_templates_are_the_installed_mini_swe_agent_model_config():
+    import minisweagent
+
+    path = Path(minisweagent.__file__).parent / "config" / "benchmarks" / "programbench.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    assert cfg["model"]["observation_template"] == OBSERVATION_TEMPLATE
+    assert cfg["model"]["format_error_template"] == FORMAT_ERROR_TEMPLATE
+    assert (cfg["agent"]["step_limit"], cfg["agent"]["wall_time_limit_seconds"]) == (1000, 21600)
+
+
+# ---- spec, plugins, the extra ---------------------------------------------------------------------
+
+def test_params_hold_only_non_defaults_and_round_trip():
+    from swarmlab.spec import canonical_json
+
+    plain = MiniSweAgent(model="anthropic:claude-haiku-4-5")
+    explicit = MiniSweAgent(model="anthropic:claude-haiku-4-5", steps_per_turn=None,
+                            step_limit=1000, wall_limit_s=21600, max_tokens=8192,
+                            temperature=None, extra=None, templates="solo",
+                            idle_until_assigned=False, wait_tool=False, lead_channel="lead",
+                            worker_channels=None)
+    assert plain.params == explicit.params == {"model": "anthropic:claude-haiku-4-5"}
+    assert canonical_json(plain.spec()) == canonical_json(explicit.spec())
+    team = MiniSweAgent(model="fake:x", steps_per_turn=10, templates="worker",
+                        idle_until_assigned=True, worker_channels=["w"])
+    assert team.params == {"model": "fake:x", "steps_per_turn": 10, "templates": "worker",
+                           "idle_until_assigned": True, "worker_channels": ["w"]}
+    rebuilt = build(team.spec(), "swarmlab.participants")
+    assert isinstance(rebuilt, MiniSweAgent) and rebuilt.spec() == team.spec()
+    assert team.spec()["type"] == "mini_swe_agent"
+    assert team.calls_per_turn_cap == 10 and plain.calls_per_turn_cap == 1000
+
+
+@pytest.mark.parametrize("kw", [{"model": "nocolon"}, {"steps_per_turn": 0},
+                                {"step_limit": True}, {"wall_limit_s": 0},
+                                {"idle_until_assigned": "yes"}, {"lead_channel": ""},
+                                {"worker_channels": "w"}])
+def test_constructor_rejects_bad_params(kw):
+    with pytest.raises(ValueError):
+        MiniSweAgent(**{"model": "fake:x", **kw})
+
+
+def test_plugins_lists_it_with_a_one_line_description():
+    rows = {name: (desc, target) for name, desc, target in catalog("participants")}
+    desc, target = rows["mini_swe_agent"]
+    assert target == "swarmlab.participants.minisweagent:MiniSweAgent"
+    assert desc == describe(MiniSweAgent) and "\n" not in desc and len(desc) <= 160
+
+
+def test_missing_package_names_the_extra(monkeypatch):
+    for name in [m for m in sys.modules if m == "minisweagent" or m.startswith("minisweagent.")]:
+        monkeypatch.setitem(sys.modules, name, None)
+    with pytest.raises(ImportError, match=re.escape(EXTRA)):
+        load_minisweagent()
+
+
+def _guide_yaml(name: str) -> dict:
+    for block in re.findall(r"```yaml\n(.*?)```", GUIDE.read_text(), re.DOTALL):
+        spec = yaml.safe_load(block)
+        if spec.get("name") == name and any(
+                p.get("type") == "mini_swe_agent"
+                for arm in spec["arms"].values() for p in arm["participants"]):
+            return spec
+    raise AssertionError(f"no mini_swe_agent spec {name!r} in {GUIDE}")
+
+
+def test_guide_solo_spec_renders_the_official_prompt(tmp_path):
+    from swarmlab.prompts_cmd import render_prompts
+
+    spec = _guide_yaml("programbench-solo")
+    path = tmp_path / "solo.yaml"
+    path.write_text(yaml.safe_dump(spec))
+    (row,) = render_prompts(Experiment.from_yaml(path, "solo"))
+    system, instance = prompt_parts()
+    assert (row["type"], row["tools"]) == ("mini_swe_agent", ["bash", "end_turn"])
+    assert row["system"] == system
+    assert row["user"] == f"{instance}\n\nThis machine has 20 CPUs and 60 GB of memory."

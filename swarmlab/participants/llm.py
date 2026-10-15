@@ -324,6 +324,18 @@ def render_system_prompt(template: str | None, *, agent: str, role: str, descrip
     return out
 
 
+def render_delivered(items: list[dict]) -> str:
+    """Delivered board items as text: `Delivered to you:` and a line per item,
+    `- <post_id> (round <eligible_round>): <content>` (non-string content as JSON)."""
+    lines = ["Delivered to you:"]
+    for item in items:
+        content = item.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, sort_keys=True)
+        lines.append(f"- {item.get('post_id')} (round {item.get('eligible_round')}): {content}")
+    return "\n".join(lines)
+
+
 def json_protocol_text(tools: list[ToolSchema]) -> str:
     schemas = "\n".join(f"- {t.name}: {json.dumps(t.parameters, sort_keys=True)}" for t in tools)
     return JSON_PROTOCOL_TEXT.format(schemas=schemas)
@@ -844,13 +856,7 @@ class LLMAgent(Participant):
                 lines.append(f"- {o.get('tool')} {o.get('action_id')}: {verdict} {fb}")
             parts.append(Part(type="text", text="\n".join(lines)))
         if view.pushed:
-            lines = ["Delivered to you:"]
-            for item in view.pushed:
-                content = item.get("content")
-                if not isinstance(content, str):
-                    content = json.dumps(content, sort_keys=True)
-                lines.append(f"- {item.get('post_id')} (round {item.get('eligible_round')}): {content}")
-            parts.append(Part(type="text", text="\n".join(lines)))
+            parts.append(Part(type="text", text=render_delivered(view.pushed)))
         return ChatMessage(role="user", content=parts)
 
     def turn_message(self, view: View) -> ChatMessage:
