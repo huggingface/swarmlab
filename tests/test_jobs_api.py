@@ -247,3 +247,14 @@ def test_bootstrap_api_mode_skips_vllm(tmp_path):
     assert manifest["mode"] == "api" and manifest["vllm"] is None
     assert manifest["secrets"] == ["HF_TOKEN", "ANTHROPIC_API_KEY"]
     assert manifest["status"] == "completed" and manifest["runs_done"] == ["scripted:1"]
+
+
+def test_mini_swe_agent_participant_adds_its_extra(tmp_path):
+    pytest.importorskip("swarmlab.participants.minisweagent")  # the participant PR
+    doc = solo_doc()
+    arm = doc["arms"]["solo"]
+    arm["participants"] = [{"type": "mini_swe_agent", "count": 1, "role": "solo",
+                            "params": {"model": "anthropic:claude-haiku-4-5"}}]
+    doc["options"]["max_calls_per_turn"] = 3000
+    p = plan(write(tmp_path, doc))
+    assert p.extras == ["anthropic", "minisweagent", "programbench"]
