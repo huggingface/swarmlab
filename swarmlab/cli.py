@@ -101,7 +101,8 @@ Decisions where the contract is silent:
   a found run's spend is its `run.json` ledger, so spend added by `swarmlab resume` counts;
   on a refusal that run and every later one get outcome `capped`, the JSON gets
   `capped: {reason, total_usd, spent, skipped: [run ids]}` and the exit code is 1.
-- `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server) are documented in
+- `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server, or API models
+  without vLLM when `--model` is omitted and no arm calls a `vllm:` model) are documented in
   `swarmlab/jobs/` and docs/handoff/WP8.md. `job run` only prints unless `--launch`.
 - Working directory: `run` without `--out` refuses (exit 2) when the current directory is the
   swarmlab checkout itself (`is_swarmlab_checkout`: a pyproject.toml with `name = "swarmlab"`),
@@ -1120,7 +1121,8 @@ def init(
 # ---- HF Jobs (WP8) -----------------------------------------------------------------------------
 job_app = typer.Typer(
     name="job", no_args_is_help=True,
-    help="Run a spec in an HF Job next to a vLLM server; check, follow and fetch it.")
+    help="Run a spec in an HF Job (next to a vLLM server, or against API models); check, follow "
+         "and fetch it.")
 app.add_typer(job_app, name="job")
 
 
@@ -1135,9 +1137,13 @@ def _seed_list(text: str | None) -> list[int] | None:
 
 @job_app.command("run")
 def job_run(
-    spec: Annotated[Path, typer.Argument(help="Experiment YAML whose models are vllm:<model>.")],
-    model: Annotated[str, typer.Option("--model", help="HF model id vLLM serves, e.g. Qwen/Qwen3.5-9B.")],
-    flavor: Annotated[str, typer.Option("--flavor", help="HF Jobs hardware flavor.")] = "a100-large",
+    spec: Annotated[Path, typer.Argument(help="Experiment YAML (vllm:<model> models, or API models).")],
+    model: Annotated[str | None, typer.Option(
+        "--model", help="HF model id vLLM serves, e.g. Qwen/Qwen3.5-9B. Omit for API mode (no "
+        "vLLM: the arms call API models such as anthropic:...).")] = None,
+    flavor: Annotated[str | None, typer.Option(
+        "--flavor", help="HF Jobs hardware flavor (default: a100-large with vLLM, cpu-upgrade in "
+        "API mode).")] = None,
     arm: Annotated[list[str] | None, typer.Option(
         "--arm", help="Arm to run (repeatable; default: every arm).")] = None,
     seeds: Annotated[str | None, typer.Option(
@@ -1146,7 +1152,9 @@ def job_run(
         "--timeout", help="Job timeout, e.g. 2h (default: 1.5x the estimate).")] = None,
     bucket: Annotated[str, typer.Option("--bucket", help="Bucket for stage files and runs.")] = (
         "hf://buckets/cmpatino/swarmlab-runs"),
-    image: Annotated[str | None, typer.Option("--image", help="Docker image (default: uv python3.12).")] = None,
+    image: Annotated[str | None, typer.Option(
+        "--image", help="Docker image (default: uv python3.12; in API mode the ProgramBench task "
+        "image when the first arm's world is programbench).")] = None,
     vllm_version: Annotated[str | None, typer.Option("--vllm-version", help="vLLM pip version.")] = None,
     max_model_len: Annotated[int | None, typer.Option("--max-model-len", help="vLLM --max-model-len.")] = None,
     vllm_flags: Annotated[str | None, typer.Option(
@@ -1176,7 +1184,8 @@ def job_run(
         "runs/jobs.jsonl"),
     as_json: JsonOpt = False,
 ) -> None:
-    """Print (and with --launch submit) an HF Job: vLLM serving MODEL + `swarmlab run` per arm x seed."""
+    """Print (and with --launch submit) an HF Job: `swarmlab run` per arm x seed, next to vLLM
+    serving MODEL, or against API models (no --model, no vllm: model in the arms)."""
     from .jobs import launch as jl
     from .jobs import profiles as jp
 
@@ -1186,10 +1195,10 @@ def job_run(
             kw["probe_extra"] = jp.parse_probe_extra(probe_extra)
         for key, val in (("image", image), ("vllm_version", vllm_version),
                          ("max_model_len", max_model_len), ("revision", revision),
-                         ("per_round_s", per_round), ("timeout", timeout)):
+                         ("per_round_s", per_round), ("timeout", timeout), ("flavor", flavor)):
             if val is not None:
                 kw[key] = val
-        plan = jl.plan_job(spec, model=model, flavor=flavor, arms=arm or None,
+        plan = jl.plan_job(spec, model=model, arms=arm or None,
                            seeds=_seed_list(seeds), bucket=bucket, vllm_flags=vllm_flags,
                            vllm_flags_append=vllm_flags_append, profile=profile, **kw)
         data: dict[str, Any] = {"ok": True, "plan": plan.as_dict(), "launched": False}
