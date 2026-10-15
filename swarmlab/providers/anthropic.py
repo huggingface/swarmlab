@@ -129,6 +129,7 @@ from .base import (
     model_id,
     parse_json_args,
     text_of,
+    usage_cost,
 )
 from .catalog import ANTHROPIC_LONG_PROMPT, ANTHROPIC_MODELS
 
@@ -349,10 +350,9 @@ class AnthropicProvider(Provider):
         return (prompt * p_in + out_tokens * p_out) / 1e6
 
     def cost(self, request: ChatRequest, usage: Usage) -> float:
-        p_in, p_out, p_cached = self._row_for(model_id(request), usage.prompt_tokens)
-        cached = min(usage.cached_prompt_tokens, usage.prompt_tokens)
-        return ((usage.prompt_tokens - cached) * p_in + cached * p_cached
-                + usage.completion_tokens * p_out) / 1e6
+        # the prompt-length tier row (long prompts) with the cache-write premium (base.usage_cost)
+        return usage_cost(usage, self._row_for(model_id(request), usage.prompt_tokens),
+                          self.write_factor)
 
     def _get_client(self) -> Any:
         loop = asyncio.get_running_loop()

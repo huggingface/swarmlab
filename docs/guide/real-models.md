@@ -1,10 +1,6 @@
 # Real models and budgets
 
-<<<<<<< HEAD
-Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, self-hosting with HF Jobs (vLLM serve profiles), API models in HF Jobs, refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
-=======
-Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, prompt caching, self-hosting with HF Jobs (vLLM serve profiles), refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
->>>>>>> origin/ext/prompt-cache
+Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, prompt caching, self-hosting with HF Jobs (vLLM serve profiles), API models in HF Jobs, refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
 
 ## Switching to real models
 
