@@ -18,9 +18,29 @@ Decisions where the contract is silent:
   whose data is not a readable PNG counts 1000 (the M1b flat rate).
 - `max_cost = (est * p_in + (max_tokens + (thinking_budget or 0)) * p_out) / 1e6` (the thinking
   budget is added even where the provider ignores it: worst case).
-- `cost(request, usage) = ((prompt - cached) * p_in + cached * p_cached + completion * p_out) / 1e6`.
-  `prompt_tokens` includes cached tokens; `reasoning_tokens` is informational and assumed to be
-  part of `completion_tokens` (true for OpenAI-style usage and for Anthropic `output_tokens`).
+- `cost(request, usage) = ((prompt - cached - writes) * p_in + cached * p_cached
+  + writes * p_in * write_factor + completion * p_out) / 1e6` (`usage_cost`, the one helper every
+  provider's `cost` goes through). `prompt_tokens` includes cached reads (`cached_prompt_tokens`)
+  and cache writes (`cache_write_tokens`); `write_factor` is a provider attribute, 1.0 here (no
+  write premium: OpenAI-style caching, the fake), 1.25 / 2.0 on Anthropic for the 5-minute /
+  1-hour cache TTL. Reads are clamped to `prompt_tokens` and writes to what is left.
+  `reasoning_tokens` is informational and assumed to be part of `completion_tokens` (true for
+  OpenAI-style usage and for Anthropic `output_tokens`). `max_cost` assumes no caching at all
+  (every prompt token at the full input price, no read discount, no write premium), since the
+  estimate cannot know what the provider's cache holds. That is far above the real cost once
+  the prefix is cached (reads at 0.1x on Anthropic); the one case it is below is a call whose
+  prompt is mostly a cache write (an agent's first call), by at most the write premium on the
+  prompt part (0.25x of it for the 5-minute TTL, 1x for 1 hour), which the reserved
+  `max_tokens` of completion usually covers.
+- Prompt caching (additive, docs/INTERFACE-M1b.md §1 amendment): `Usage.cache_write_tokens`
+  (default 0) counts prompt tokens written to the provider's prompt cache, billed at
+  `p_in * write_factor`. It is set by the Anthropic adapter (`cache_creation_input_tokens`); the
+  OpenAI-compatible adapter leaves it 0. What a provider sends to enable caching is a provider
+  constructor param (Anthropic `prompt_cache`, `cache_ttl`), never a `ChatRequest` field, so
+  `request_hash` is the same with caching on or off. `cache_write_tokens` is left out of the
+  serialised `Usage` when 0 (readers treat a missing key as 0), so every usage dict in events
+  (`inference_response`, `turn_ended`), every stored response blob and every event-stream hash
+  of a run without cache writes is byte-identical to before the field existed.
 - Providers are services, not snapshot state: the runner never deep-copies or pickles them.
   `calls` counts `complete()` invocations on the instance (tests use it).
 - Timeouts and retries: `timeout_s` (default 90 s) bounds each attempt (the transport timeout
@@ -102,13 +122,21 @@ class ProviderError(RuntimeError):
 
 
 class Usage(BaseModel):
-    prompt_tokens: int = 0
+    prompt_tokens: int = 0  # all prompt tokens: uncached + cache reads + cache writes
     completion_tokens: int = 0
-    cached_prompt_tokens: int = 0
+    cached_prompt_tokens: int = 0  # cache reads (billed at the cached price)
     reasoning_tokens: int = 0
+    cache_write_tokens: int = 0  # cache writes (billed at input price * the provider's write_factor)
 
     def __add__(self, other: Usage) -> Usage:
         return Usage(**{k: getattr(self, k) + getattr(other, k) for k in Usage.model_fields})
+
+    @model_serializer(mode="wrap")
+    def _drop_zero_cache_writes(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("cache_write_tokens", 1) == 0:
+            data.pop("cache_write_tokens")  # 0 is left out: events and response blobs as before
+        return data
 
 
 class ChatMessage(BaseModel):
@@ -263,6 +291,17 @@ def _normalise_pricing(pricing: dict | None) -> dict[str, PricingRow]:
     return out
 
 
+def usage_cost(usage: Usage, row: PricingRow, write_factor: float = 1.0) -> float:
+    """USD for `usage` at pricing `row` (module doc): uncached prompt at `p_in`, cache reads at
+    `p_cached`, cache writes at `p_in * write_factor`, completion at `p_out`."""
+    p_in, p_out, p_cached = row
+    prompt = usage.prompt_tokens
+    cached = min(usage.cached_prompt_tokens, prompt)
+    writes = min(usage.cache_write_tokens, prompt - cached)
+    return ((prompt - cached - writes) * p_in + cached * p_cached + writes * p_in * write_factor
+            + usage.completion_tokens * p_out) / 1e6
+
+
 class Provider(Plugin):
     """Base class: subclasses set `name` and `pricing` and implement `complete`."""
 
@@ -272,6 +311,7 @@ class Provider(Plugin):
     timeout_s: float = DEFAULT_TIMEOUT_S
     max_retries: int = DEFAULT_MAX_RETRIES
     self_hosted: bool = False  # paid as compute time (e.g. vLLM in a GPU job), not per token
+    write_factor: float = 1.0  # cache writes cost p_in * write_factor (Anthropic: 1.25 / 2.0)
     default_pricing: ClassVar[dict[str, PricingRow]] = {}
     _backoff_s: float = 1.0
 
@@ -331,15 +371,13 @@ class Provider(Plugin):
         return math.ceil(chars / 4) + images
 
     def max_cost(self, request: ChatRequest) -> float:
+        """The gate's reservation: no caching assumed (every prompt token at `p_in`)."""
         p_in, p_out, _ = self.model_pricing(model_id(request))
         out_tokens = request.max_tokens + (request.thinking_budget or 0)
         return (self.estimate_prompt_tokens(request) * p_in + out_tokens * p_out) / 1e6
 
     def cost(self, request: ChatRequest, usage: Usage) -> float:
-        p_in, p_out, p_cached = self.model_pricing(model_id(request))
-        cached = min(usage.cached_prompt_tokens, usage.prompt_tokens)
-        return ((usage.prompt_tokens - cached) * p_in + cached * p_cached
-                + usage.completion_tokens * p_out) / 1e6
+        return usage_cost(usage, self.model_pricing(model_id(request)), self.write_factor)
 
 
 def parse_json_args(raw: Any) -> tuple[dict, bool]:
