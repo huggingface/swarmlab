@@ -19,6 +19,7 @@ anthropic = ["anthropic>=0.40"]
 hub = ["datasets>=3", "huggingface_hub>=0.25"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
 programbench = ["programbench==1.2.5"]
+minisweagent = ["mini-swe-agent==2.4.6"]
 
 [project.scripts]
 swarmlab = "swarmlab.cli:app"
@@ -125,6 +126,15 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["swarmlab"]
 artifacts = ["swarmlab/participants/prompts/*.j2", "swarmlab/viewer/*.html"]
+
+[tool.uv]
+# mini-swe-agent (the `minisweagent` extra) requires litellm, which pins huggingface-hub<2 and
+# filelock<4; locking it would downgrade both for every install. swarmlab only imports
+# mini-swe-agent's agent loop, exceptions, tool-call helpers and config (none imports litellm;
+# models go through swarmlab's providers), so litellm is left out of uv resolutions: the marker
+# is outside requires-python, so it never applies. A plain `pip install "swarmlab[minisweagent]"`
+# does not read this table and installs litellm (and its pins) in that environment only.
+override-dependencies = ["litellm; python_version < '3'"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
