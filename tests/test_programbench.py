@@ -503,7 +503,7 @@ def test_lockdown_and_detection_are_skipped_when_not_root(tmp_path, monkeypatch)
     monkeypatch.setattr(pb.os, "geteuid", lambda: 1000)
     w = make(tmp_path, lockdown=True)
     sh(w, "true")
-    assert calls == [] and w.resources["cpus"] is None and w.lockdown_record["applied"] is False
+    assert calls == [] and w.resources["cpus"] is None and w.backend_info["applied"] is False
 
 
 def test_lockdown_runs_at_the_first_command_when_root(tmp_path, monkeypatch):
@@ -517,7 +517,7 @@ def test_lockdown_runs_at_the_first_command_when_root(tmp_path, monkeypatch):
     assert w.description().endswith("This machine has 4 CPUs and 12 GB of memory.")
     assert calls == []                        # reset and begin_round never lock a machine down
     assert sh(w, "echo $MAKEFLAGS")["output"] == "-j4\n"
-    assert calls == [(None, ["hf.co"])] and w.lockdown_record["applied"] is True
+    assert calls == [(None, ["hf.co"])] and w.backend_info["applied"] is True
     sh(w, "true")
     assert len(calls) == 1
     docker = ProgramBench(TASK, backend="docker", check_task=False)
@@ -650,3 +650,35 @@ def test_fake_script_needs_a_large_enough_cap(tmp_path):
                      options={"commit": "immediate"})
     with pytest.raises(ValueError, match="max_calls_per_turn must be at least step_limit"):
         exp.run(seed=0, max_rounds=1, out=tmp_path / "runs")
+
+
+def test_failed_docker_tar_keeps_the_container(tmp_path, monkeypatch):
+    fake = FakeDocker(b"")
+
+    def failing(cmd, **kw):
+        if "tar --sort=name" in list(cmd)[-1]:
+            fake.calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 2, stdout=b"", stderr=b"tar: boom")
+        return fake(cmd, **kw)
+
+    monkeypatch.setattr(subprocess, "run", failing)
+    w = ProgramBench(TASK, backend="docker", check_task=False)
+    w.check_experiment(options(max_calls_per_turn=1000))
+    w.reset(random.Random(0), ["a000"])
+    w.begin_round(1)
+    sh(w, "ls")
+    with pytest.raises(RuntimeError, match="workspace tar failed: tar: boom"):
+        w.end_round(1)
+    assert ["docker", "rm", "-f", "cid123"] not in fake.calls and w._runtime.started
+    w._runtime.stop()
+    assert fake.calls[-1] == ["docker", "rm", "-f", "cid123"]
+
+
+def test_machine_facts_come_from_reset_not_the_snapshot(tmp_path):
+    w = make(tmp_path, cpus=8)
+    w.uname = {**UNAME, "machine": "elsewhere"}
+    blob = w.snapshot()
+    other = make(tmp_path, "ws2", cpus=2)
+    other.restore(blob)
+    assert other.resources["cpus"] == 2 and other.uname["machine"] != "elsewhere"
+    assert "This machine has 2 CPUs." in other.description()

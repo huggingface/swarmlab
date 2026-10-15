@@ -134,7 +134,8 @@ Decisions the contract leaves open
   `end_round`, and `score()` and `terminal()` read the stored value, so replay reproduces them.
 - Docker cleanup. The World contract has no end-of-run hook, so `end_round` captures the
   workspace tar (the snapshot that follows uses it) and removes the container (`docker rm -f`)
-  when `terminal()` or when the round equals the `max_rounds` recorded by `check_experiment`. A
+  when `terminal()` or when the round equals the `max_rounds` recorded by `check_experiment`; if
+  the tar fails, the error propagates and the container is kept, since it holds the submission. A
   run that ends otherwise (budget, stop condition, crash) relies on the safety net: a
   `weakref.finalize` per container, which runs when the backend is collected and at interpreter
   exit. Deep copies and pickles of the world never carry the backend handle (`__getstate__`), so
@@ -168,6 +169,10 @@ bytes and the blob store keeps one copy. The local backend builds it in Python
 root (the reference binary is execute-only). Unreadable files (a non-root local run) are skipped
 and listed in `snapshot_skipped`. `None` means the docker backend never started: the workspace
 is the image's, untouched.
+
+The meta is every state attribute except `uname` and `resources`, which describe the machine
+running now and come from `reset` (a resume or fork on another machine states its own); what
+the backend's start did (lockdown record or container id) is kept as `backend_info`.
 
 `restore(blob)` touches no container and no file: the meta goes into ordinary attributes and the
 tar waits in `_pending_workspace`, so the viewer can build a world from any round's snapshot and
@@ -983,7 +988,9 @@ class ProgramBench(World):
     entry_point: ClassVar[str | None] = "programbench"
     name = "programbench"
     requires: ClassVar[Requirements] = Requirements(commit="immediate")
-    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", *_CONFIG)
+    # config, plus facts about the machine running now (recorded at reset, so a resume or fork
+    # on another machine states its own resources)
+    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", *_CONFIG, "uname", "resources")
 
     def __init__(self, task: str, backend: str = "local", workspace: str = "/workspace",
                  user: str | None = "agent", step_limit: int = 1000, wall_limit_s: float = 21600,
@@ -1051,7 +1058,7 @@ class ProgramBench(World):
         self.snapshot_skipped: list[str] = []
         self.resources: dict = {"cpus": None, "memory_gb": None, "source": None}
         self.uname: dict = {}
-        self.lockdown_record: dict = {}
+        self.backend_info: dict = {}            # what the backend's start did (lockdown, container)
 
     @property
     def image(self) -> str:
@@ -1130,7 +1137,7 @@ class ProgramBench(World):
             self._runtime = self._make_runtime()
         if not self._runtime.started:
             t0 = time.monotonic()
-            self.lockdown_record = self._runtime.start()
+            self.backend_info = self._runtime.start()
             self._runtime.execute(GIT_SETUP, self.command_timeout_s)
             if self._clock_start is not None:  # backend start time is not on the clock
                 self._clock_start += time.monotonic() - t0
@@ -1160,12 +1167,12 @@ class ProgramBench(World):
         self._tick()
         last = self.terminal() or (self._max_rounds is not None and round >= self._max_rounds)
         if last and self.backend == "docker" and self._runtime is not None and self._runtime.started:
-            try:
-                tar, self.snapshot_skipped = self._runtime.tar(self.snapshot_exclude)
-                self._pending_workspace = tar
-            finally:
-                self._runtime.stop()
-                self._runtime = None
+            # a failed tar raises and keeps the container (it holds the submission); the
+            # finalizer still removes it at interpreter exit
+            tar, self.snapshot_skipped = self._runtime.tar(self.snapshot_exclude)
+            self._pending_workspace = tar
+            self._runtime.stop()
+            self._runtime = None
         return {"round": round, "steps": self.steps_total, "round_steps": self.round_steps,
                 "submitted": self.submitted, "elapsed_s": self.elapsed_s}
 
