@@ -85,7 +85,8 @@ spec as given (its own `providers:` kept).
   value is ever on the command line, in the plan or in the stage dir. A name unset here is listed
   in `missing_secrets`; `describe` warns and `submit` refuses.
 - Extras (`JobPlan.extras`): the wheel is installed as `swarmlab[<extras>]`: `anthropic` when an
-  arm calls an Anthropic model, `programbench` for a programbench world (its run-start task check).
+  arm calls an Anthropic model, `programbench` for a programbench world (its run-start task check),
+  `minisweagent` when an arm has a `mini_swe_agent` participant (its loop imports mini-swe-agent).
 - No volume: the hidden ProgramBench tests must never be in the agent's container (they are
   mounted only in the grade job, `swarmlab/jobs/programbench.py`).
 - The entry (`job_entry`) installs uv first when the image lacks it (the task image has Python
@@ -571,7 +572,9 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
         notes.append(f"{', '.join(missing)} not set in this environment: the job reads each "
                      "secret from here (hf jobs run --secrets NAME); --launch refuses until set")
     extras = sorted(({"anthropic"} if any(_is_anthropic(p) for p in _providers(exps)) else set())
-                    | ({"programbench"} if pb else set()))
+                    | ({"programbench"} if pb else set())
+                    | ({"minisweagent"} if any(_is_minisweagent(p) for e in exps.values()
+                                               for p in e.participants) else set()))
     return JobPlan(
         **common, model=None, flavor=flavor, image=image, timeout_s=timeout_s, estimate_s=total,
         estimate_detail={"setup_s": setup_s, "arms": per_arm}, vllm_flags="",
@@ -605,6 +608,10 @@ def _models(exp: Any) -> list[str]:
 
 def _providers(exps: Mapping[str, Any]) -> list[Any]:
     return [e.provider_for(m)[0] for e in exps.values() for m in _models(e)]
+
+
+def _is_minisweagent(participant: Any) -> bool:
+    return type(participant).__module__ == "swarmlab.participants.minisweagent"
 
 
 def _is_anthropic(provider: Any) -> bool:
