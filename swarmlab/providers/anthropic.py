@@ -40,7 +40,8 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   fields None). `ChatRequest.attempt` is never sent. The server-side `fallbacks` option is not
   used (passed through `extra` it would silently serve the request from another model).
   `usage.prompt_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens`,
-  `cached_prompt_tokens = cache_read_input_tokens`, `completion_tokens = output_tokens`
+  `cached_prompt_tokens = cache_read_input_tokens`, `cache_write_tokens =
+  cache_creation_input_tokens`, `completion_tokens = output_tokens`
   (thinking included), `reasoning_tokens = output_tokens_details.thinking_tokens` when the API
   reports it (the tokens of the raw reasoning, not of the possibly shorter summary returned).
   `served_by` is None.
@@ -65,6 +66,33 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   jittered backoff as the OpenAI-compatible adapter; exhausted retries raise
   `ProviderError(status=..., attempts=...)` chained to the last SDK error. Other
   `APIStatusError`s (4xx) propagate unchanged at once.
+- Prompt caching (provider params `prompt_cache`, `cache_ttl`; docs/INTERFACE-M1b.md §1
+  amendment). `prompt_cache="prefix"` (the default; `True` means the same) sends two cache
+  breakpoints: an explicit `cache_control` marker on the system text (`system` then goes as one
+  text block `[{"type": "text", "text": <joined system>, "cache_control": {...}}]` instead of a
+  string), which caches the static prefix tools -> system, and the top-level `cache_control`
+  kwarg of `messages.create` (automatic caching: the API puts the breakpoint on the last
+  cacheable block and moves it forward as the conversation grows), which caches the history.
+  `"auto"` sends only the top-level one; `"none"` (or `False`) sends neither, the behaviour
+  before caching existed. A request without system text gets only the top-level breakpoint.
+  Both markers are `{"type": "ephemeral", "ttl": cache_ttl}` with `cache_ttl` `"5m"` (default)
+  or `"1h"`: the same TTL on both, so the API's two 400s (all 4 breakpoint slots taken, or a
+  last-block marker whose TTL differs from the top-level one) cannot occur from what this
+  adapter sends. `extra` is merged after them, so a `cache_control` (or `system`) in `extra`
+  still wins. Why on by default: it changes bills, never behaviour (the API returns the same
+  output with or without a cache hit), and every swarmlab request shape benefits (a fixed system
+  prompt and tool list per agent, a history that only grows within a turn and, under
+  `memory="full"`, across turns); a prefix shorter than the model's minimum (4096 tokens on
+  Haiku 4.5, 512 on the 5.5 models) silently does not cache and costs nothing extra. The cost of
+  being wrong is the write premium on a prefix that is never read again (0.25x of its input
+  price at 5 minutes). The setting is a provider param, not a `ChatRequest` field, so
+  `request_hash` and the record/replay cache are the same with it on or off; the params are kept
+  out of `spec()` while at their defaults, so a spec written before they existed hashes as
+  before. `write_factor` (the cache-write price multiplier `Provider.cost` uses) is 1.25 for
+  `"5m"` and 2.0 for `"1h"`, from `cache_ttl` whatever the mode (writes only happen when
+  something asked for caching). The top-level `cache_control` is passed as a keyword of
+  `messages.create` (a typed parameter in the locked SDK, anthropic 1.11.0), not through
+  `extra_body`, which would collide with an `extra_body` in `extra`.
 - API key: `ANTHROPIC_API_KEY`, else `ANTHROPIC_KEY`; with neither set the SDK's own credential
   resolution applies. The client is created per event loop (the runner uses `asyncio.run` per
   live/resume call). Tests replace `_client` with a stub; a stub set that way is always used.
@@ -95,6 +123,28 @@ from .base import (
 )
 
 THINKING_BUDGET_MODELS = frozenset({"claude-haiku-4-5"})
+PROMPT_CACHE_MODES = ("none", "auto", "prefix")
+DEFAULT_PROMPT_CACHE = "prefix"
+CACHE_WRITE_FACTORS = {"5m": 1.25, "1h": 2.0}  # cache-write price / input price, per TTL
+DEFAULT_CACHE_TTL = "5m"
+
+
+def prompt_cache_mode(value: bool | str) -> str:
+    """`prompt_cache` as one of `PROMPT_CACHE_MODES` (`True` -> `"prefix"`, `False` -> `"none"`)."""
+    if value is True:
+        return DEFAULT_PROMPT_CACHE
+    if value is False:
+        return "none"
+    if value not in PROMPT_CACHE_MODES:
+        raise ValueError(f"prompt_cache must be one of {list(PROMPT_CACHE_MODES)} or a bool, "
+                         f"got {value!r}")
+    return str(value)
+
+
+def check_cache_ttl(ttl: str) -> str:
+    if ttl not in CACHE_WRITE_FACTORS:
+        raise ValueError(f"cache_ttl must be one of {list(CACHE_WRITE_FACTORS)}, got {ttl!r}")
+    return ttl
 
 
 def tool_definition(schema: ToolSchema) -> dict:
@@ -129,8 +179,13 @@ def _blocks(m: ChatMessage) -> list[dict]:
     return out
 
 
-def build_kwargs(request: ChatRequest) -> dict:
-    """The `messages.create` keyword arguments for `request` (pure; unit-tested)."""
+def build_kwargs(request: ChatRequest, *, prompt_cache: bool | str = "none",
+                 cache_ttl: str = DEFAULT_CACHE_TTL) -> dict:
+    """The `messages.create` keyword arguments for `request` (pure; unit-tested).
+
+    `prompt_cache` / `cache_ttl` add the cache breakpoints (module doc); the default here is no
+    caching, the plain mapping. `AnthropicProvider.complete` passes the provider's settings."""
+    mode, ttl = prompt_cache_mode(prompt_cache), check_cache_ttl(cache_ttl)
     mid = model_id(request)
     forced = check_tool_choice(request)
     system = "\n\n".join(text_of(m.content) for m in request.messages if m.role == "system")
@@ -162,6 +217,11 @@ def build_kwargs(request: ChatRequest) -> dict:
             kw["temperature"] = request.temperature
         if request.top_p is not None:
             kw["top_p"] = request.top_p
+    if mode != "none":
+        marker = {"type": "ephemeral", "ttl": ttl}
+        if mode == "prefix" and system:
+            kw["system"] = [{"type": "text", "text": system, "cache_control": dict(marker)}]
+        kw["cache_control"] = dict(marker)
     kw.update(request.extra)
     return kw
 
@@ -193,6 +253,7 @@ def parse_message(message: Any) -> tuple[str, list[ToolCall], Usage, str]:
         completion_tokens=int(_get(u, "output_tokens", 0) or 0),
         cached_prompt_tokens=cache_read,
         reasoning_tokens=int(_get(_get(u, "output_tokens_details"), "thinking_tokens", 0) or 0),
+        cache_write_tokens=cache_write,
     )
     stop = str(_get(message, "stop_reason", "") or "")
     finish = stop if stop == "refusal" else "bad_tool_args" if bad else stop
@@ -247,8 +308,18 @@ class AnthropicProvider(Provider):
     default_pricing: ClassVar[dict[str, PricingRow]] = {"claude-haiku-4-5": (1.00, 5.00, 0.10)}
 
     def __init__(self, pricing: dict | None = None, concurrency: int = 8,
-                 timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES) -> None:
+                 timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES,
+                 prompt_cache: bool | str = DEFAULT_PROMPT_CACHE,
+                 cache_ttl: str = DEFAULT_CACHE_TTL) -> None:
         self._setup(pricing, concurrency, timeout_s, max_retries)
+        self.prompt_cache = prompt_cache_mode(prompt_cache)
+        self.cache_ttl = check_cache_ttl(cache_ttl)
+        self.write_factor = CACHE_WRITE_FACTORS[self.cache_ttl]
+        params = getattr(self, "params", {})
+        if self.prompt_cache == DEFAULT_PROMPT_CACHE:  # defaults stay out of the spec (hashes)
+            params.pop("prompt_cache", None)
+        if self.cache_ttl == DEFAULT_CACHE_TTL:
+            params.pop("cache_ttl", None)
         self._client: Any = None
         self._client_loop: Any = None
 
@@ -268,7 +339,7 @@ class AnthropicProvider(Provider):
 
         self.calls += 1
         client = self._get_client()
-        kwargs = build_kwargs(request)
+        kwargs = build_kwargs(request, prompt_cache=self.prompt_cache, cache_ttl=self.cache_ttl)
         start = time.monotonic()
         timed_out = False
         attempt = 0  # failed attempts so far

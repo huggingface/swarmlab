@@ -285,6 +285,10 @@ async def test_context_limit_trim_drops_all_kept_thinking():
 
 
 # ---- kept thinking is dropped when the request's prefix changes ----------------------------------------
+def system_text(kw):  # the provider caches by default: system goes as one marked text block
+    return "".join(b["text"] for b in kw["system"])
+
+
 def thinking_sigs(kw):
     return [b.get("signature") for m in assistant_turns(kw) for b in m["content"]
             if b["type"] == "thinking"]
@@ -299,7 +303,7 @@ def test_system_prompt_reconfigure_drops_kept_thinking(tmp_path):
                                      at_round=1)]
     run = exp.run(seed=1, max_rounds=2, out=tmp_path)
     r2_first, r2_second = stub.kwargs[2], stub.kwargs[3]
-    assert r2_first["system"] == "A new system prompt."
+    assert system_text(r2_first) == "A new system prompt."
     assert thinking_sigs(r2_first) == []  # sig-1 / sig-2 were bound to the old prompt
     assert thinking_sigs(r2_second) == ["sig-3"]  # new blocks go back as usual
     # what the responses recorded is untouched (analysis keeps it)
@@ -390,7 +394,7 @@ def test_opt_in_prompt_change_strips_before_the_estimate(tmp_path):
     run = exp.run(seed=1, max_rounds=2, out=tmp_path)
     turns = [e for e in run.events if e["type"] == "turn_ended"]
     assert [t["yield_kind"] for t in turns] == ["end_turn", "end_turn"]
-    assert stub.kwargs[2]["system"] == "A new system prompt." and thinking_sigs(stub.kwargs[2]) == []
+    assert system_text(stub.kwargs[2]) == "A new system prompt." and thinking_sigs(stub.kwargs[2]) == []
     assert_round1_traces_on_disk(run)
 
 
