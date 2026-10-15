@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.15' and sys_platform == 'win32'",
@@ -725,6 +725,15 @@ wheels = [
 ]
 
 [[package]]
+name = "junitparser"
+version = "5.0.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6c/c9/edeb58b0565b74ba0ffedf822d63aa40368bb4ff2da49751768eea696f5a/junitparser-5.0.3.tar.gz", hash = "sha256:f824ec1b7afbf2fd3b6813b87967b02fcda750e135d27be17cae497147419a04", size = 12120, upload-time = "2026-09-01T06:13:00.32Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fc/36/dbb6f74621890e5daa831c5f474b81e8b773298adf5ea835c03215a9359c/junitparser-5.0.3-py3-none-any.whl", hash = "sha256:553535b8cd1672a9c8bd2c7326ae1ae69279267fbc562106b5aa44d3c5f769af", size = 15000, upload-time = "2026-09-01T06:12:58.01Z" },
+]
+
+[[package]]
 name = "librt"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1340,6 +1349,25 @@ wheels = [
 ]
 
 [[package]]
+name = "programbench"
+version = "1.2.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "jinja2" },
+    { name = "junitparser" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+    { name = "rich" },
+    { name = "tqdm" },
+    { name = "typer" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/98/8f/0f6b075ec7dd78a5ed8f6e6cb2fa303ed8067bb540f7bf3f3c3ea1ab3080/programbench-1.2.5.tar.gz", hash = "sha256:5f58eba8effc3a969f728a50161e11305434dbd12b1d8074f89d906a3f707e22", size = 3293072, upload-time = "2026-09-29T06:43:09.964Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/05/47/0c0a5a282eb6b4e0603e9db88144afd306cc5af812b513ab3ab1ee290f72/programbench-1.2.5-py3-none-any.whl", hash = "sha256:ed7e350eb01cf8796af093154f90f0c7d5a91405591c23f9e3ec500d20ea62c5", size = 3448325, upload-time = "2026-09-29T06:43:08.002Z" },
+]
+
+[[package]]
 name = "propcache"
 version = "0.5.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1764,6 +1792,9 @@ hub = [
     { name = "datasets" },
     { name = "huggingface-hub" },
 ]
+programbench = [
+    { name = "programbench" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1773,6 +1804,7 @@ requires-dist = [
     { name = "huggingface-hub", marker = "extra == 'hub'", specifier = ">=0.25" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
+    { name = "programbench", marker = "extra == 'programbench'", specifier = "==1.2.5" },
     { name = "pyarrow", specifier = ">=16" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
@@ -1781,7 +1813,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["anthropic", "hub", "dev"]
+provides-extras = ["anthropic", "hub", "dev", "programbench"]
 
 [[package]]
 name = "tqdm"
