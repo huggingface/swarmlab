@@ -17,7 +17,7 @@ safe_opening=True)`
 - `on_mine`: `"end"` (the standard rule: revealing a mine loses the game and the run ends) or
   `"continue"` (the cell shows `*`, the hit is counted and play goes on, so every game can be
   cleared and the round it was cleared in is always defined).
-- `reveals_per_round`: reveals per agent per round (>= 1).
+- `reveals_per_round`: reveals per agent per round (>= 1); per turn under `commit: async`.
 - `free_flags`: flags and unflags do not count toward `reveals_per_round` (False: they do).
 - `safe_opening`: `reset` opens a safe start, the first cell of a seeded shuffle whose number is
   0 (a safe cell with a number when there is no 0), flood-filled. False: the board starts hidden.
@@ -72,8 +72,8 @@ Actions and commit
   one is stale. Unit code that calls the actions without `observe` is judged as round_end.
 - `claim_key(agent, action) -> "cell:<x>,<y>"`, so the registry and claim policies apply.
 
-The world has no requirements (`requires` is empty): any commit mode, scheduler, topology and
-agent count is a legitimate variation. Its task text (`description()`) therefore says nothing
+The world has no requirements (`requires` is empty): any commit mode (`async` included, see
+below), scheduler, topology and agent count is a legitimate variation. Its task text (`description()`) therefore says nothing
 about turns, their order, when actions apply or who reads a post; an experiment states how its
 rounds work in `system_prompt_append`, as `examples/minesweeper.yaml` does.
 
@@ -121,10 +121,44 @@ them): `minesweeper.cleared`, `minesweeper.collisions`, `minesweeper.productive_
 `report_sections` adds one table to `swarmlab report`: per run, the outcome, rounds to clear,
 first mine round, mine hits by kind, collisions and allocation efficiency.
 
+Async mode (`commit: async`, swarmlab/runner.py)
+------------------------------------------------
+No rounds: every agent loops over its own turns, concurrently, each action applying at once; a
+tick is one completed turn (`begin_round(t)` when tick t opens, `close_turn(agent, t)` and
+`end_round(t)` when the agent's turn closes it). The runner sets `commit_mode` before `reset`,
+and only then does the world keep per-turn state (`turn_view`, `turn_tally`, `closing`, created
+by `reset` in async mode only, so round-based snapshots are unchanged):
+
+- `observe(agent)` starts the agent's turn: its `reveals_per_round` budget is reset (a per-turn
+  cap), its tally zeroed, and `deduce` is run on the board it is shown (cached for the world and
+  recomputed only when a reveal changed the board since the last one; flags never change it).
+  `begin_round` only sets the round (tick) number: other agents' turns are in flight.
+- A reveal is judged against what the agent observed at its turn start, not a shared round
+  start: `certain` / `guess` by that turn's provably safe cells, a mine hit `provable` /
+  `unforced` / `forced` by that turn's provable mines and safe cells. Collisions keep the rule
+  above (another agent's reveal opened the cell after this agent last observed); a cell the
+  agent saw open, or opened itself earlier, is stale.
+- `end_round(t)` returns the closing agent's turn: its tally (the reveals of that turn, which
+  may have committed during earlier ticks), `agent`, `agent_turns: 1` (`productive_rate` divides
+  by agent-turns, `n_agents` per round otherwise), `provably_safe` / `provable_mines` as that
+  agent saw them, and `ideal_reveals = min(reveals_per_round, provably safe cells it saw)`, or 1
+  when it saw none (a forced guess), or 0 when it observed a finished game; so
+  `allocation_efficiency` keeps its meaning, per turn. `round_safe` / `round_mines` (the replay
+  page's counts) become that agent's turn-start sets.
+- `cleared_round` / `first_mine_round` are ticks (the tick open when the cell opened); the run
+  ends at the close of that same tick, so `cleared_round == last_round` for a won game.
+- The cumulative counters of `score()` count every committed action, as in the other modes;
+  the `round_resolved` tallies (and the metrics folded from them) count completed turns. They
+  differ only by the commits of turns cancelled when the run ends (or lost at a resume) while
+  in flight; the fake scripts act only after their one model call, so for them they agree.
+- The task text says "per turn" instead of "per round" for the reveal limit.
+
 Fake scripts (no network, no spend): `fake:minesweeper_random` reveals a random provably safe
 cell each turn (when there is none, a random hidden cell not proven to be a mine); `fake:minesweeper_allocator` makes
 agent k take the k-th provably safe cell in row-major order and post its pick when `post` is
 offered. Neither flags. They are plumbing checks and uncoordinated / coordinated references.
+Both read the board from the latest observation in the prompt, so under async an agent picks
+from the board of its own turn start (the allocator's k-th cell is the k-th of what it saw).
 
 Snapshots and forks
 -------------------
@@ -310,6 +344,7 @@ class Minesweeper(World):
     def restore(self, blob: bytes) -> None:
         """Restore game state, then refuse a board whose size or mine count is not the configured one."""
         super().restore(blob)
+        self._deduced = None
         h, w = len(self.minefield), len(self.minefield[0]) if self.minefield else 0
         n = sum(map(sum, self.minefield))
         if self.minefield and (h, w, n) != (self.height, self.width, self.mines):
@@ -336,6 +371,11 @@ class Minesweeper(World):
         self.round_safe, self.round_mines, self.round_used = [], [], {}
         self.tally = dict.fromkeys(_TALLY_KEYS, 0)
         self._zero_stats()
+        self._deduced = None
+        if self.commit_mode == "async":  # created only then, so other modes' snapshots are as before
+            self.turn_view: dict[str, dict] = {}    # per agent: what it saw at its turn start
+            self.turn_tally: dict[str, dict] = {}   # per agent: its turn's tally so far
+            self.closing: str | None = None         # the agent whose turn closes the tick
         order = cells[:]
         rng.shuffle(order)       # drawn even when unused, so safe_opening never shifts the rng
         self.initial_opened = 0
@@ -348,6 +388,8 @@ class Minesweeper(World):
 
     def begin_round(self, round: int) -> None:
         self.round = round
+        if self.commit_mode == "async":  # a tick: turns in flight keep their per-turn state
+            return
         self.round_used, self.seen_seq, self.round_start_seq = {}, {}, self.seq
         self.tally = dict.fromkeys(_TALLY_KEYS, 0)
         self.round_live = not self.terminal()
@@ -358,8 +400,31 @@ class Minesweeper(World):
         self.round_safe = sorted(safe, key=lambda p: (p[1], p[0]))
         self.round_mines = sorted(mines, key=lambda p: (p[1], p[0]))
 
+    def close_turn(self, agent: AgentId, round: int) -> None:
+        """Async commit: `agent`'s turn closes tick `round` (resolved by `end_round`)."""
+        self.closing = agent
+
+    def _end_turn(self, round: int) -> dict:
+        """Async commit: tick `round` is the closing agent's turn, judged against the board it
+        observed at its turn start."""
+        n, agent = len(self.agents), self.closing
+        seen = self.turn_view.get(agent) or {"safe": [], "mines": [], "live": False}
+        tally = self.turn_tally.pop(agent, None) or dict.fromkeys(_TALLY_KEYS, 0)
+        ideal = (min(self.reveals_per_round, len(seen["safe"])) or 1) if seen["live"] else 0
+        self.stats["ideal_reveals"] += ideal
+        self.round_safe = [tuple(p) for p in seen["safe"]]   # the replay page's provable counts
+        self.round_mines = [tuple(p) for p in seen["mines"]]
+        self.closing = None
+        opened = self.safe_cells() - self._safe_left()
+        return {"round": round, "agent": agent, "n_agents": n, "agent_turns": 1,
+                "provably_safe": len(seen["safe"]), "provable_mines": len(seen["mines"]),
+                "ideal_reveals": ideal, **tally, "opened": opened, "safe_cells": self.safe_cells(),
+                "cleared": opened / self.safe_cells(), "won": self.won(), "lost": self.lost}
+
     def end_round(self, round: int) -> dict:
         """Tally round `round` against the round-start board (logged as round_resolved)."""
+        if self.commit_mode == "async":
+            return self._end_turn(round)
         n = len(self.agents)
         ideal = (min(n * self.reveals_per_round, len(self.round_safe)) or 1) if self.round_live else 0
         self.stats["ideal_reveals"] += ideal
@@ -413,10 +478,13 @@ class Minesweeper(World):
                     f"y = row 0-{self.height - 1})")
         return None
 
+    def _per(self) -> str:
+        return "turn" if self.commit_mode == "async" else "round"
+
     def _limit_text(self) -> str:
         n = self.reveals_per_round
         what = "reveal" if self.free_flags else "action"
-        return f"at most {n} {what}{'s' if n != 1 else ''} per round"
+        return f"at most {n} {what}{'s' if n != 1 else ''} per {self._per()}"
 
     # ---- agent-facing ------------------------------------------------------------------------
     def description(self) -> str:
@@ -424,9 +492,10 @@ class Minesweeper(World):
         team = (f"You are one of {n} agents ({', '.join(self.agents)}) playing one shared game of "
                 "Minesweeper." if n > 1 else "You are playing a game of Minesweeper.")
         flags = ("Flags are visible to every agent, and anyone may remove one. " if n > 1 else "")
-        limit = (f"Each agent may reveal at most {k} cell{'s' if k != 1 else ''} per round; flagging "
+        per = self._per()
+        limit = (f"Each agent may reveal at most {k} cell{'s' if k != 1 else ''} per {per}; flagging "
                  "and unflagging are free." if self.free_flags else
-                 f"Each agent may take at most {k} action{'s' if k != 1 else ''} per round (reveal, "
+                 f"Each agent may take at most {k} action{'s' if k != 1 else ''} per {per} (reveal, "
                  "flag or unflag).")
         if n == 1:
             limit = limit.replace("Each agent", "You")
@@ -448,6 +517,8 @@ class Minesweeper(World):
         # `commit: immediate`), so this records what the agent has seen; it only classifies repeat
         # reveals (collision vs stale) and never changes what any agent is shown.
         self.seen_seq[agent] = self.seq
+        if self.commit_mode == "async":
+            self._start_turn(agent)
         label_w = len(str(self.height - 1))
         pad = " " * (label_w + 1)
         lines = [(f"{BOARD_HEADER}{self.width} columns x {self.height} rows; x = column "
@@ -458,6 +529,35 @@ class Minesweeper(World):
         lines += ["", (f"Mines: {self.mines}  Flags: {flat.count(FLAG)}  "
                        f"Exploded: {flat.count(EXPLODED)}  Hidden: {flat.count(HIDDEN)}")]
         return text_observation("\n".join(lines))
+
+    def _deduce_now(self) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """`deduce` of the current board (sorted row-major), recomputed only when a reveal changed
+        the board since the last call (flags never change it: `deduce` ignores them)."""
+        memo = getattr(self, "_deduced", None)
+        if memo is None or memo[0] != self.seq:
+            safe, mines = deduce(self.board)
+            key = lambda p: (p[1], p[0])
+            memo = self._deduced = (self.seq, sorted(safe, key=key), sorted(mines, key=key))
+        return memo[1], memo[2]
+
+    def _start_turn(self, agent: AgentId) -> None:
+        """Async commit, at the agent's observation (its turn start): a fresh reveal budget and
+        tally, and the provable cells of the board it is shown, against which its reveals are
+        judged."""
+        self.round_used.pop(agent, None)
+        self.turn_tally[agent] = dict.fromkeys(_TALLY_KEYS, 0)
+        live = not self.terminal()
+        safe, mines = self._deduce_now() if live else ([], [])
+        self.turn_view[agent] = {"safe": list(safe), "mines": list(mines), "live": live}
+
+    def _judged(self, agent: AgentId) -> tuple[Sequence[tuple[int, int]], Sequence[tuple[int, int]], dict]:
+        """(provably safe, provably mined, tally) a reveal by `agent` is judged and counted
+        against: under async the agent's turn-start board and turn tally, else the round's."""
+        if self.commit_mode == "async" and agent in self.turn_view:
+            seen = self.turn_view[agent]
+            return ([tuple(p) for p in seen["safe"]], [tuple(p) for p in seen["mines"]],
+                    self.turn_tally.setdefault(agent, dict.fromkeys(_TALLY_KEYS, 0)))
+        return self.round_safe, self.round_mines, self.tally
 
     def validate(self, agent: AgentId, action: Action, pending: Sequence[Action] = ()) -> Ack:
         ack = super().validate(agent, action)
@@ -507,7 +607,8 @@ class Minesweeper(World):
             return self._refuse("flagged", "unflag the cell before revealing it", x=x, y=y)
         if (out := self._count(agent, "reveal", x, y)) is not None:
             return out
-        self.tally["reveals"] += 1
+        safe_cells, mine_cells, tally = self._judged(agent)
+        tally["reveals"] += 1
         self.stats["reveals"] += 1
         if cell != HIDDEN:
             # A collision: another agent's reveal opened the cell after this agent last saw the
@@ -515,7 +616,7 @@ class Minesweeper(World):
             # or its own earlier reveal opened it.
             seen = self.seen_seq.get(agent, self.round_start_seq)
             collision = self.opened_by[y][x] not in (None, agent) and self.opened_seq[y][x] > seen
-            self.tally["collisions" if collision else "stale"] += 1
+            tally["collisions" if collision else "stale"] += 1
             self.stats["collisions" if collision else "stale_reveals"] += 1
             return Outcome(accepted=True, feedback={"result": "already_revealed", "x": x, "y": y,
                                                     "collision": collision})
@@ -523,22 +624,22 @@ class Minesweeper(World):
         if self.minefield[y][x]:
             self.board[y][x] = EXPLODED
             self.opened_seq[y][x], self.opened_by[y][x] = self.seq, agent
-            kind = ("provable" if (x, y) in self.round_mines else
-                    "unforced" if self.round_safe else "forced")
+            kind = ("provable" if (x, y) in mine_cells else
+                    "unforced" if safe_cells else "forced")
             for key in ("mine_hits", f"{kind}_mine_hits"):
-                self.tally[key] += 1
+                tally[key] += 1
                 self.stats[key] += 1
             if self.first_mine_round is None:
                 self.first_mine_round = self.round
             self.lost = self.lost or self.on_mine == "end"
             return Outcome(accepted=True, feedback={"result": "exploded", "x": x, "y": y})
-        kind = "certain" if (x, y) in self.round_safe else "guess"
+        kind = "certain" if (x, y) in safe_cells else "guess"
         opened = self._open(x, y, agent)
         for key, stat in (("productive", "productive_reveals"),
                           ("certain" if kind == "certain" else "guesses", f"{kind}_reveals")):
-            self.tally[key] += 1
+            tally[key] += 1
             self.stats[stat] += 1
-        self.tally["cells_opened"] += opened
+        tally["cells_opened"] += opened
         self.stats["cells_opened"] += opened
         if self.cleared_round is None and self.won():
             self.cleared_round = self.round
@@ -648,7 +749,8 @@ class _MinesFold(Metric):
     def update(self, event: Any) -> None:
         if getattr(event, "type", None) == "round_resolved":
             self.last = dict(event.data)
-            self.agent_rounds += int(event.data["n_agents"])
+            # async ticks are one agent-turn each (`agent_turns`); a round is `n_agents` turns
+            self.agent_rounds += int(event.data.get("agent_turns", event.data["n_agents"]))
             for k in ("ideal_reveals", *_TALLY_KEYS):
                 self.sums[k] = self.sums.get(k, 0) + event.data[k]
 

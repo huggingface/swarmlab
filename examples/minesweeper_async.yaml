@@ -1,0 +1,54 @@
+# Minesweeper under `commit: async` (docs/guide/minesweeper.md, Async mode): no rounds; every agent
+# loops over its own turns, all at once, and each reveal or post applies the moment it is made.
+# A completed turn is a tick: `max_rounds` counts ticks over all agents, so `rounds_per_agent: 30`
+# gives 30 turns per agent (max_rounds = 30 x agents). Same boards as examples/minesweeper.yaml
+# (same world params and seeds).
+#   swarmlab validate examples/minesweeper_async.yaml
+#   swarmlab run examples/minesweeper_async.yaml --yes     # 4 arms x 3 seeds, free
+#
+# The fake models answer without waiting, so their turns would never overlap; the fake provider's
+# `yields` makes each model call wait a seeded 0-30 event-loop steps (a deterministic stand-in
+# for latency), so turns interleave and two agents can pick the same cell from the boards they
+# saw. Drop the `providers` block for real models.
+name: minesweeper-async
+seeds: [0, 1, 2]
+budget: {soft_usd: 0, hard_usd: 0}
+options: {rounds_per_agent: 30, commit: async}
+providers:
+  fake: {type: fake, params: {yields: [0, 30]}}
+
+x-world: &world {type: minesweeper, params: {height: 9, width: 9, mines: 10, on_mine: continue}}
+x-medium: &medium {topology: broadcast, delivery: push, push_consume: true, push_limit: 20}
+x-metrics: &metrics [minesweeper.cleared, minesweeper.collisions, minesweeper.productive_rate,
+                     minesweeper.allocation_efficiency, minesweeper.mine_hits, comm.posts_per_round]
+x-async: &async "There are no rounds: every agent takes turns at its own pace, all at the same time. Each action applies the moment you take it, and every turn starts from the current board, so a cell another agent opened while you were thinking is wasted if you reveal it. A message you post reaches every other agent at the start of their next turn."
+
+arms:
+  random4:
+    world: *world
+    medium: *medium
+    participants:
+      - {type: llm, count: 4, params: {model: "fake:minesweeper_random", max_tokens: 256,
+                                       system_prompt_append: *async}}
+    metrics: *metrics
+  allocator4:
+    world: *world
+    medium: *medium
+    participants:
+      - {type: llm, count: 4, params: {model: "fake:minesweeper_allocator", max_tokens: 256,
+                                       system_prompt_append: *async}}
+    metrics: *metrics
+  random8:
+    world: *world
+    medium: *medium
+    participants:
+      - {type: llm, count: 8, params: {model: "fake:minesweeper_random", max_tokens: 256,
+                                       system_prompt_append: *async}}
+    metrics: *metrics
+  allocator8:
+    world: *world
+    medium: *medium
+    participants:
+      - {type: llm, count: 8, params: {model: "fake:minesweeper_allocator", max_tokens: 256,
+                                       system_prompt_append: *async}}
+    metrics: *metrics
