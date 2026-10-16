@@ -95,6 +95,57 @@ def test_extra_still_wins_and_both_markers_carry_its_ttl():
     assert kw["system"] == "S." and kw["cache_control"] == M5
 
 
+def wire_body(provider_kw, request):
+    """The JSON body the real installed `AsyncAnthropic` serialises for `request` (mock HTTP
+    transport; no network): what the API would receive, after the SDK merges `extra_body`."""
+    import anthropic
+    import httpx2  # the SDK's HTTP layer (anthropic 1.x)
+
+    bodies = []
+
+    def handler(http_request):
+        bodies.append(json.loads(http_request.content))
+        return httpx2.Response(200, json={
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-haiku-4-5",
+            "content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn",
+            "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+    async def go():
+        p = AnthropicProvider(**provider_kw)
+        p._client = anthropic.AsyncAnthropic(
+            api_key="test", max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)))
+        await p.complete(request)
+
+    asyncio.run(go())
+    return bodies[0]
+
+
+def test_extra_body_marker_reaches_the_wire_on_both_breakpoints():
+    # the SDK merges extra_body into the body after the kwargs: its marker is the one sent, so
+    # the system block must carry it too (a 5m system marker before a 1h top level is a 400)
+    body = wire_body({}, req(extra={"extra_body": {"cache_control": H1}}))
+    assert body["cache_control"] == H1 and body["system"][-1]["cache_control"] == H1
+    body = wire_body({"cache_ttl": "1h"}, req(extra={"extra_body": {"cache_control": M5}}))
+    assert body["cache_control"] == M5 and body["system"][-1]["cache_control"] == M5
+    # the direct key, for comparison, on the same real client
+    body = wire_body({}, req(extra={"cache_control": H1}))
+    assert body["cache_control"] == H1 and body["system"][-1]["cache_control"] == H1
+
+
+def test_extra_body_marker_wins_over_a_direct_one():
+    r = req(extra={"cache_control": M5, "extra_body": {"cache_control": H1}})
+    body = wire_body({}, r)
+    assert body["cache_control"] == H1 and body["system"][-1]["cache_control"] == H1
+    assert build_kwargs(r, prompt_cache="prefix")["system"][-1]["cache_control"] == H1
+    # the shadowed 5m marker is never sent, so it is not what the fallback bills
+    assert AnthropicProvider(prompt_cache="auto")._cache_settings(r).ttls == {"1h"}
+    r = req(extra={"cache_control": H1, "extra_body": {"cache_control": M5}})
+    body = wire_body({}, r)
+    assert body["cache_control"] == M5 and body["system"][-1]["cache_control"] == M5
+    assert AnthropicProvider().max_write_factor(r) == 1.25
+
+
 def test_bad_settings_are_rejected():
     with pytest.raises(ValueError, match="prompt_cache"):
         AnthropicProvider(prompt_cache="always")
@@ -205,6 +256,11 @@ def test_max_cost_reserves_the_write_premium_of_the_ttl_sent():
         pytest.approx(at[2.0])
     system = {"system": [{"type": "text", "text": "S.", "cache_control": H1}]}
     assert AnthropicProvider(prompt_cache="none").max_cost(big(extra=system)) == pytest.approx(at[2.0])
+    # ... including one in extra_body, which the SDK sends last
+    assert AnthropicProvider().max_cost(big(extra={"extra_body": {"cache_control": H1}})) == \
+        pytest.approx(at[2.0])
+    assert AnthropicProvider().max_write_factor(big(extra={"extra_body": {"cache_control": H1}})) \
+        == 2.0
     # a 5m override of a 1h provider leaves only 5m markers
     assert AnthropicProvider(cache_ttl="1h").max_cost(big(extra={"cache_control": M5})) == \
         pytest.approx(at[1.25])

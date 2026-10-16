@@ -81,10 +81,14 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   longer-TTL marker must come before a shorter one) cannot be broken by what this adapter
   sends. `extra` is merged after them, so a `cache_control` (or `system`) in `extra` still
   wins; the effective settings are resolved once per request after that merge
-  (`cache_settings`): a top-level `cache_control` dict in `extra` is also put on the system
-  block in `"prefix"` mode, so both markers carry the TTL actually sent (a 1h override yields
-  1h on both, never 5m before 1h; the alternative, rejecting the override, would make a valid
-  request an error). Markers `extra` writes elsewhere (its own `system` blocks, tools) are sent
+  (`cache_settings`): the body-level `cache_control` dict that ends up on the wire is also put
+  on the system block in `"prefix"` mode, so both markers carry the TTL actually sent (a 1h
+  override yields 1h on both, never 5m before 1h; the alternative, rejecting the override,
+  would make a valid request an error). Precedence, highest first, is what the wire body ends
+  up with: `extra["extra_body"]["cache_control"]` (the SDK merges `extra_body` into the
+  serialised body after the kwargs, so it beats the kwarg), then `extra["cache_control"]`, then
+  the provider's own marker; a shadowed marker is not sent, so it is neither reserved nor
+  billed. Markers `extra` writes elsewhere (its own `system` blocks, tools) are sent
   as given, and their order is the caller's to get right. Why on by default: it changes bills,
   never behaviour (the API returns the same output with or without a cache hit), and every
   swarmlab request shape benefits (a fixed system prompt and tool list per agent, a history that
@@ -176,6 +180,16 @@ def _markers(value: Any) -> Iterator[dict]:
             yield from _markers(v)
 
 
+def _body_overrides(extra: dict) -> dict:
+    """The top-level request-body keys `extra` sends: its own keys (merged into the
+    `messages.create` kwargs) overlaid by `extra["extra_body"]`, which the SDK merges into the
+    serialised body after the kwargs (shallowly), so its keys are what goes on the wire."""
+    body = extra.get("extra_body")
+    if not isinstance(body, dict):
+        return extra
+    return {**{k: v for k, v in extra.items() if k != "extra_body"}, **body}
+
+
 class CacheSettings(NamedTuple):
     """The cache settings of one request after merging `extra` (module doc)."""
 
@@ -192,15 +206,16 @@ class CacheSettings(NamedTuple):
 
 def cache_settings(request: ChatRequest, prompt_cache: bool | str = "none",
                    cache_ttl: str = DEFAULT_CACHE_TTL) -> CacheSettings:
-    """What `build_kwargs` sends for caching: a top-level `cache_control` dict in `extra`
-    replaces the provider's marker on both breakpoints; any marker in `extra` counts."""
+    """What `build_kwargs` sends for caching: the body-level `cache_control` dict `extra` ends
+    up sending (`extra["extra_body"]`'s over `extra`'s own) replaces the provider's marker on both
+    breakpoints; any marker `extra` sends counts."""
     mode, ttl = prompt_cache_mode(prompt_cache), check_cache_ttl(cache_ttl)
-    extra = request.extra
-    ttls = {_ttl(m) for m in _markers(extra)}
+    body = _body_overrides(request.extra)
+    ttls = {_ttl(m) for m in _markers(body)}
     if mode == "none":
         return CacheSettings(None, frozenset(ttls))
     own = {"type": "ephemeral", "ttl": ttl}
-    top = extra.get("cache_control", own)
+    top = body.get("cache_control", own)
     marker = dict(top) if isinstance(top, dict) else own
     ttls.add(_ttl(marker))  # top level (extra's, already counted) or system block, or both
     return CacheSettings(marker, frozenset(ttls))
