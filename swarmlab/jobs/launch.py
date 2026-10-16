@@ -54,7 +54,11 @@ default 1, and then the env and the command are as before) the job runs up to N 
 against the one server: bootstrap.sh starts the runs in plan order as slots free up, and the
 estimate is the setup plus the makespan of that schedule, assuming concurrent runs do not slow
 each other (one vLLM server batches their requests; raise `--per-round` if they contend). The
-default timeout is 1.5x the estimate, rounded up to 10 minutes.
+default timeout is 1.5x the estimate, rounded up to 10 minutes. An arm's rounds are its
+`max_rounds`, or `rounds_per_agent` x agents when the options (top level, the arm's merged over
+them) set it, as `Experiment` resolves it. Under `commit: async` they are ticks (one turn of one
+agent each): `--per-round` is then seconds per tick, the plan marks such an arm `unit: tick` and
+the printout says "ticks"; the default guess stays the per-round one, so it is pessimistic there.
 """
 from __future__ import annotations
 
@@ -76,7 +80,7 @@ from typing import Any
 
 import yaml
 
-from ..spec import SpecError, experiment_seeds, git_identity, load_experiment_yaml
+from ..spec import SpecError, experiment_seeds, git_identity, load_experiment_yaml, resolve_rounds
 from .profiles import DEFAULT_VLLM_FLAGS, LAUNCHER_FLAGS, resolve_flags  # noqa: F401 (re-export)
 
 DEFAULT_BUCKET = "hf://buckets/cmpatino/swarmlab-runs"
@@ -151,11 +155,24 @@ def arm_agents(doc: dict, arm: str) -> int:
     return sum(int(g.get("count", 1)) for g in doc["arms"][arm]["participants"])
 
 
+def arm_options(doc: dict, arm: str) -> dict:
+    """The arm's run options (top-level `options`, the arm's merged over them), with
+    `rounds_per_agent` resolved into `max_rounds` as the experiment does (`resolve_rounds`)."""
+    opts = {**(doc.get("options") or {}), **(doc["arms"][arm].get("options") or {})}
+    return resolve_rounds(opts, arm_agents(doc, arm))
+
+
 def arm_rounds(doc: dict, arm: str) -> int:
-    opts = {**doc.get("options", {}), **doc["arms"][arm].get("options", {})}
-    if "max_rounds" not in opts:
-        raise SpecError(f"arm {arm!r}: no max_rounds in options")
+    """`max_rounds` of an arm: rounds, or under `commit: async` ticks (one turn each)."""
+    opts = arm_options(doc, arm)
+    if opts.get("max_rounds") is None:
+        raise SpecError(f"arm {arm!r}: no max_rounds (or rounds_per_agent) in options")
     return int(opts["max_rounds"])
+
+
+def arm_unit(doc: dict, arm: str) -> str:
+    """What one of the arm's `max_rounds` is: `round`, or `tick` (one turn) under async."""
+    return "tick" if arm_options(doc, arm).get("commit") == "async" else "round"
 
 
 def check_vllm_models(doc: dict, arms: Sequence[str], model: str) -> None:
@@ -393,6 +410,8 @@ def plan_job(
         pr = per_round_s if per_round_s is not None else per_round_guess(n)
         per_arm[a] = {"agents": n, "rounds": rounds, "per_round_s": pr,
                       "per_run_s": int(rounds * pr), "runs": len(seed_list)}
+        if arm_unit(doc, a) == "tick":  # async: `rounds` are ticks, `per_round_s` is per tick
+            per_arm[a]["unit"] = "tick"
     slots = [0] * parallel   # bootstrap.sh's schedule: each run takes the first free slot
     for a, _ in runs:
         slots[slots.index(min(slots))] += per_arm[a]["per_run_s"]
@@ -504,7 +523,8 @@ def describe(plan: JobPlan) -> str:
              (f"  probe extra: {json.dumps(plan.probe_extra, sort_keys=True)} "
               f"(from {plan.probe_extra_source})")]
     for a, d in plan.estimate_detail["arms"].items():
-        lines.append(f"  {a}: N={d['agents']} x {d['rounds']} rounds x ~{d['per_round_s']:g} s/round"
+        unit = d.get("unit", "round")
+        lines.append(f"  {a}: N={d['agents']} x {d['rounds']} {unit}s x ~{d['per_round_s']:g} s/{unit}"
                      f" = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
     cost = (f"~${rate * est_h:.2f} expected, ${rate * plan.timeout_s / 3600:.2f} worst case "
             f"(${rate:.2f}/h x timeout)" if rate is not None else "rate unknown for this flavor")

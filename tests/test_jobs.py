@@ -155,6 +155,31 @@ def test_estimate_overrides_and_short_timeout_note(tmp_path):
         jl.parse_duration("soon")
 
 
+def test_rounds_per_agent_and_async_ticks_in_the_plan(tmp_path):
+    board = {"world": {"type": "minesweeper", "params": {"on_mine": "continue"}},
+             "participants": [{"type": "llm", "count": 4, "params": {"model": f"vllm:{MODEL}"}}],
+             "metrics": ["minesweeper.cleared"]}
+    doc = {"name": "jobs-async", "seeds": [0], "options": {"commit": "async", "rounds_per_agent": 5},
+           "arms": {"board1": board,
+                    "board2": {**board, "options": {"rounds_per_agent": 3}},
+                    "rounds": {**board, "options": {"commit": "round_end", "max_rounds": 7,
+                                                     "rounds_per_agent": None}}}}
+    spec = tmp_path / "async.yaml"
+    spec.write_text(yaml.safe_dump(doc))
+    p = plan(spec, per_round_s=10, setup_s=60)
+    arms = p.estimate_detail["arms"]
+    assert arms["board1"]["rounds"] == 20 and arms["board2"]["rounds"] == 12  # x 4 agents
+    assert arms["board1"]["unit"] == arms["board2"]["unit"] == "tick"
+    assert arms["rounds"]["rounds"] == 7 and "unit" not in arms["rounds"]
+    assert arms["board2"]["per_run_s"] == 120
+    text = jl.describe(p)
+    assert "board2: N=4 x 12 ticks x ~10 s/tick" in text and "rounds: N=4 x 7 rounds x ~10 s/round" in text
+    doc["options"] = {"commit": "async"}
+    spec.write_text(yaml.safe_dump(doc))
+    with pytest.raises(SpecError, match="board1.*no max_rounds"):
+        plan(spec, arms=["board1"])
+
+
 # ---- bootstrap script ---------------------------------------------------------------------------
 def test_bootstrap_script_has_expected_pieces():
     s = jl.bootstrap_script()
