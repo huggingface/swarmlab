@@ -215,9 +215,10 @@ copied verbatim into `SYSTEM_TEMPLATE` and `INSTANCE_TEMPLATE`. The repository's
 (commit 04d809ceab9df28f9adaed044884180159172930, same version string) rewords both templates
 ("reference executable", "independent implementation", no "wall of shame"); the world follows the
 2.4.6 release, which the mini-swe-agent participant renders too. This world does not depend
-on mini-swe-agent: the package comes with the participant's extra (`swarmlab[minisweagent]`), and a test
-compares the copy with the installed package when it is present (it skips otherwise). The environment and agent code
-(`docker.py`, `local.py`, `default.py`, the `bash` tool schema) are identical in both.
+on mini-swe-agent; the participant uses a vendored copy of 2.4.6's agent loop in
+`swarmlab/vendor/minisweagent/`, and the test that compares these templates with the package's
+runs only when the real package is installed (it skips otherwise). The environment and agent
+code (`docker.py`, `local.py`, `default.py`, the `bash` tool schema) are identical in both.
 """
 from __future__ import annotations
 

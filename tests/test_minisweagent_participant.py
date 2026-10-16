@@ -4,10 +4,13 @@ model scripts defined here (`fake:tests.test_minisweagent_participant:<script>`)
 network, no model keys."""
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import pickle
 import random
 import re
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,15 +18,15 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-pytest.importorskip("minisweagent")
-
 from swarmlab import Experiment, Run
+from swarmlab.budget import Gate, Ledger
 from swarmlab.medium.board import Board
 from swarmlab.participants.base import Participant, TurnUsage
 from swarmlab.participants.minisweagent import (
-    EXTRA,
     FORMAT_ERROR_TEMPLATE,
+    MSA_VERSION,
     OBSERVATION_TEMPLATE,
+    OFFICIAL_BASH,
     WAIT_RESULT,
     MiniSweAgent,
     command_rules,
@@ -31,10 +34,12 @@ from swarmlab.participants.minisweagent import (
     resource_sentence_of,
     rules_block,
 )
-from swarmlab.providers.fake import _assistant_calls, _response
+from swarmlab.providers.fake import FakeProvider, _assistant_calls, _response
 from swarmlab.registry import build, catalog, describe
 from swarmlab.roles import Role, assign
 from swarmlab.snapshot import SnapshotStore
+from swarmlab.spec import Budget
+from swarmlab.tools import ToolResult
 from swarmlab.view import View, text_observation
 from swarmlab.world import programbench as pb
 from swarmlab.world.programbench import SUBMIT_MARKER, ProgramBench, prompt_parts
@@ -70,6 +75,25 @@ def recording_echo(request, rng):
     SEEN.append({"tools": [t.name for t in request.tools],
                  "roles": [m.role for m in request.messages]})
     return pb.fake_echo(request, rng)
+
+
+SCHEMAS: list[list[dict]] = []
+
+
+def recording_schemas(request, rng):
+    """`fake:programbench_echo`, recording the full tool schemas of each request."""
+    SCHEMAS.append([t.model_dump() for t in request.tools])
+    return pb.fake_echo(request, rng)
+
+
+def tries_to_stop(request, rng):
+    """`end_turn`, then text only, then the submission: a solo model that tries to stop."""
+    k = _replies(request)
+    if k == 0:
+        return _response(request, rng, [("end_turn", {})])
+    if k == 1:
+        return _response(request, rng, [], "I am done.")
+    return _response(request, rng, [("bash", {"command": SUBMIT})])
 
 
 def forever(request, rng):
@@ -247,7 +271,7 @@ def test_solo_episode_transcript_has_the_baseline_shape(tmp_path):
                         "extra": {"exit_status": "Submitted", "submission": ""}}
     assert (st["n_calls"], st["finished"]) == (3, True)
     # what the model was sent: the role's tools, mini-swe-agent's messages without `exit`
-    assert [s["tools"] for s in SEEN] == [["bash", "end_turn"]] * 3
+    assert [s["tools"] for s in SEEN] == [["bash"]] * 3
     assert SEEN[1]["roles"] == ["system", "user", "assistant", "tool"]
     (ended,) = turns(run)
     assert ended["usage"]["notes"] == ["exit:Submitted"]
@@ -269,9 +293,8 @@ def test_step_limit_warning_and_exit(tmp_path):
 
 
 def test_wall_limit_warning_and_exit(tmp_path, monkeypatch):
-    from minisweagent.agents import default
-
     import swarmlab.participants.minisweagent as msa_mod
+    from swarmlab.vendor.minisweagent import default
 
     clock = SimpleNamespace(time=lambda: CLOCK[0])
     monkeypatch.setattr(default, "time", clock)
@@ -310,6 +333,59 @@ def test_format_errors_are_the_baseline_messages_and_reset_on_a_clean_step(tmp_p
         in unknown
     assert st["n_consecutive_format_errors"] == 0
     assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+def _official_bash_tool(monkeypatch) -> dict:
+    """mini-swe-agent 2.4.6's `BASH_TOOL`: the installed real package's when present, else the
+    vendored copy's."""
+    monkeypatch.setenv("MSWEA_SILENT_STARTUP", "1")
+    try:
+        from minisweagent.models.utils.actions_toolcall import BASH_TOOL
+    except ImportError:
+        from swarmlab.vendor.minisweagent.actions_toolcall import BASH_TOOL
+    return BASH_TOOL
+
+
+@pytest.mark.parametrize("shape", ["bash role", "board, no role"])
+def test_solo_offers_exactly_the_official_bash_tool(tmp_path, monkeypatch, shape):
+    # the executor's View lists end_turn (and, with a board and no role, read_board and post)
+    SCHEMAS.clear()
+    if shape == "bash role":
+        run = solo(tmp_path, fake("recording_schemas"), role="solo")
+    else:
+        run = _team(tmp_path, [MiniSweAgent(model=fake("recording_schemas"))], rounds=1,
+                    cap=1000)
+    assert run.score["submitted"] and len(SCHEMAS) == 3
+    official = _official_bash_tool(monkeypatch)
+    for tools in SCHEMAS:
+        assert [{"type": "function", "function": t} for t in tools] == [official]
+    called = {e["tool"] for e in run.events if e["type"] == "tool_called"}
+    assert called == {"bash"}
+
+
+def test_official_bash_is_the_installed_mini_swe_agent_bash_tool(monkeypatch):
+    # A cross-check against the real package, which swarmlab does not install: it runs when a
+    # developer has mini-swe-agent 2.4.6 installed. (The vendored copy is checked by hash.)
+    monkeypatch.setenv("MSWEA_SILENT_STARTUP", "1")
+    pytest.importorskip("minisweagent")
+    from minisweagent.models.utils.actions_toolcall import BASH_TOOL
+
+    assert {"type": "function", "function": OFFICIAL_BASH.model_dump()} == BASH_TOOL
+
+
+def test_solo_end_turn_or_no_tool_call_is_a_format_error_and_the_episode_goes_on(tmp_path):
+    run = solo(tmp_path, fake("tries_to_stop"), role="solo")
+    st = state(run)
+    assert roles_of(st) == ["system", "user", "user", "user", "assistant", "exit"]
+    unknown, chat = st["messages"][2]["content"], st["messages"][3]["content"]
+    assert unknown.startswith("Tool call error:\n\n<error>\nUnknown tool 'end_turn'.Missing "
+                              "'command' argument in bash tool call.\n</error>")
+    assert chat.startswith("Tool call error:\n\n<error>\nNo tool calls found in the response.")
+    assert st["n_calls"] == 3 and st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+    assert [e["tool"] for e in run.events if e["type"] == "tool_called"] == ["bash"]
+    (ended,) = turns(run)
+    assert ended["yield_kind"] != "end_turn" and ended["usage"]["inference_calls"] == 3
+    assert ended["usage"]["notes"] == ["exit:Submitted"] and run.score["submitted"]
 
 
 # ---- several rounds, snapshots, forks -------------------------------------------------------------
@@ -389,7 +465,8 @@ def test_push_deliveries_are_one_user_message_inserted_once(tmp_path):
 
 def test_pull_board_reads_run_through_the_adapter_in_call_order(tmp_path):
     run = _team(tmp_path, [Poster(["assignment one"], [1]),
-                           MiniSweAgent(model=fake("interleaved"), steps_per_turn=1)])
+                           MiniSweAgent(model=fake("interleaved"), steps_per_turn=1,
+                                        templates="worker")])
     st = state(run, "a001")
     assert not any(str(m.get("content", "")).startswith("Delivered") for m in st["messages"])
     reply = st["messages"][2]
@@ -409,7 +486,7 @@ def test_pull_board_reads_run_through_the_adapter_in_call_order(tmp_path):
 def test_idle_worker_makes_no_model_call_until_assigned_and_after_its_report(tmp_path):
     run = _team(tmp_path, [Poster(["build it"], [2]),
                            MiniSweAgent(model=fake("worker"), steps_per_turn=10,
-                                        idle_until_assigned=True)],
+                                        templates="worker", idle_until_assigned=True)],
                 channels=("main", "lead"), rounds=3)
     assert sorted(set(inference_rounds(run, "a001"))) == [2]
     assert len(inference_rounds(run, "a001")) == 2
@@ -427,7 +504,7 @@ def test_idle_worker_makes_no_model_call_until_assigned_and_after_its_report(tmp
 
 def test_wait_for_workers_ends_the_turn_and_posts_nothing(tmp_path):
     run = solo(tmp_path, fake("waiting_lead"), rounds=3, cap=20, steps_per_turn=10,
-               wait_tool=True)
+               templates="lead", wait_tool=True)
     assert [e["usage"].get("inference_calls") for e in turns(run)] == [1, 1]
     assert turns(run)[0]["yield_kind"] == "no_tool"
     st = state(run)
@@ -462,7 +539,8 @@ def test_team_shape_from_the_guide(tmp_path):
 # ---- refused calls and the executor's cap ---------------------------------------------------------
 
 def test_a_command_after_end_turn_is_refused_and_the_episode_goes_on(tmp_path):
-    run = solo(tmp_path, fake("ends_then_runs"), rounds=2, cap=20)
+    # end_turn is offered with the lead/worker templates, not with solo
+    run = solo(tmp_path, fake("ends_then_runs"), rounds=2, cap=20, templates="lead")
     st = state(run)
     ended, refused = tools_of(st)[:2]
     assert json.loads(ended["content"]) == {"ok": True, "result": {}, "error": None}
@@ -500,6 +578,90 @@ def test_the_executor_cap_ends_the_turn_with_a_well_formed_history(tmp_path):
     assert "<output>\na\n</output>" in a["content"] and "<output>\nb\n</output>" in b["content"]
     assert c["content"].startswith("<exception>action was not executed</exception>")
     assert state(run)["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+# ---- a cancelled turn ---------------------------------------------------------------------------
+
+class _BlockingTools:
+    """An `AgentTools` stand-in: `infer` holds a real gate reservation; the inference
+    (`block="infer"`) or the second command of the reply (`block="bash"`) blocks until `release`."""
+
+    def __init__(self, block: str) -> None:
+        provider = FakeProvider(pricing={"*": (1.0, 5.0, 0.1)})
+        self.gate = Gate({"fake": provider}, Ledger(), Budget(hard_usd=1.0))
+        self.block = block
+        self.started, self.release = asyncio.Event(), asyncio.Event()
+        self.cancelled: list[str] = []
+        self.returned: list[str] = []
+
+    async def _wait(self, what: str) -> None:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.append(what)
+            raise
+
+    async def infer(self, request, *, category="swarm"):
+        async with self.gate.admit(request, category) as res:
+            self.gate.dispatch(res)
+            if self.block == "infer":
+                await self._wait("infer")
+            res.charge(0.0)
+        self.returned.append("infer")
+        return _response(request, random.Random(0), [("bash", {"command": "echo one"}),
+                                                     ("bash", {"command": "echo two"})])
+
+    async def call(self, name, args=None):
+        if self.block == "bash" and args["command"] == "echo two":
+            await self._wait("bash")
+        self.returned.append(name)
+        return ToolResult(call_id="c1", ok=True, result={"accepted": True, "feedback": {
+            "output": args["command"][len("echo "):] + "\n", "returncode": 0,
+            "exception_info": ""}})
+
+
+@pytest.mark.parametrize("block", ["infer", "bash"])
+async def test_a_cancelled_turn_cancels_and_settles_the_bridge(block):
+    p = MiniSweAgent(model="fake:x")
+    p.bind("a000", random.Random(0))
+    tools = _BlockingTools(block)
+    seen: dict = {}
+    steps = p._steps
+
+    def recorded_steps(agent, turn, msa):
+        seen["turn"] = turn
+        try:
+            steps(agent, turn, msa)
+        finally:
+            seen["returned"] = True
+
+    p._steps = recorded_steps
+    task = asyncio.create_task(p.turn(_view(), tools))
+    await asyncio.wait_for(tools.started.wait(), 10)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # the bridge operation was cancelled, the step thread has returned, nothing is outstanding
+    assert tools.cancelled == [block]
+    assert seen["returned"] and seen["turn"].abort.is_set() and seen["turn"].task is None
+    assert tools.gate.ledger.reserved == 0
+    saved = copy.deepcopy(p.messages)
+    tools.release.set()
+    await asyncio.sleep(0.1)
+    assert p.messages == saved
+    if block == "infer":
+        assert roles_of({"messages": saved}) == ["system", "user"]
+        assert tools.returned == [] and p.n_calls == 1
+    else:
+        # repaired: every call of the interrupted reply has its result, in call order
+        assert roles_of({"messages": saved}) == ["system", "user", "assistant", "tool", "tool"]
+        calls = [c["id"] for c in saved[2]["tool_calls"]]
+        assert [m["tool_call_id"] for m in saved[3:]] == calls
+        assert "<output>\none\n</output>" in saved[3]["content"]
+        assert saved[4]["content"].startswith("<exception>action was not executed</exception>")
+        assert tools.returned == ["infer", "bash"]
+    assert not p.finished
 
 
 # ---- templates ------------------------------------------------------------------------------------
@@ -564,8 +726,11 @@ def test_template_helpers_and_custom_templates(tmp_path):
         MiniSweAgent(model="fake:x", templates="nope")
 
 
-def test_templates_are_the_installed_mini_swe_agent_model_config():
-    import minisweagent
+def test_templates_are_the_installed_mini_swe_agent_model_config(monkeypatch):
+    # A cross-check against the real package, which swarmlab does not install (the participant
+    # uses the vendored copy): it runs when a developer has mini-swe-agent 2.4.6 installed.
+    monkeypatch.setenv("MSWEA_SILENT_STARTUP", "1")
+    minisweagent = pytest.importorskip("minisweagent")
 
     path = Path(minisweagent.__file__).parent / "config" / "benchmarks" / "programbench.yaml"
     cfg = yaml.safe_load(path.read_text())
@@ -574,7 +739,7 @@ def test_templates_are_the_installed_mini_swe_agent_model_config():
     assert (cfg["agent"]["step_limit"], cfg["agent"]["wall_time_limit_seconds"]) == (1000, 21600)
 
 
-# ---- spec, plugins, the extra ---------------------------------------------------------------------
+# ---- spec, plugins, the vendored copy ---------------------------------------------------------------------
 
 def test_params_hold_only_non_defaults_and_round_trip():
     from swarmlab.spec import canonical_json
@@ -600,7 +765,7 @@ def test_params_hold_only_non_defaults_and_round_trip():
 @pytest.mark.parametrize("kw", [{"model": "nocolon"}, {"steps_per_turn": 0},
                                 {"step_limit": True}, {"wall_limit_s": 0},
                                 {"idle_until_assigned": "yes"}, {"lead_channel": ""},
-                                {"worker_channels": "w"}])
+                                {"worker_channels": "w"}, {"wait_tool": True}])
 def test_constructor_rejects_bad_params(kw):
     with pytest.raises(ValueError):
         MiniSweAgent(**{"model": "fake:x", **kw})
@@ -613,11 +778,27 @@ def test_plugins_lists_it_with_a_one_line_description():
     assert desc == describe(MiniSweAgent) and "\n" not in desc and len(desc) <= 160
 
 
-def test_missing_package_names_the_extra(monkeypatch):
-    for name in [m for m in sys.modules if m == "minisweagent" or m.startswith("minisweagent.")]:
-        monkeypatch.setitem(sys.modules, name, None)
-    with pytest.raises(ImportError, match=re.escape(EXTRA)):
-        load_minisweagent()
+VENDOR = Path(__file__).resolve().parents[1] / "swarmlab" / "vendor" / "minisweagent"
+
+
+def test_vendored_version_is_msa_version():
+    from swarmlab.vendor import minisweagent
+
+    assert minisweagent.__version__ == MSA_VERSION
+    assert load_minisweagent().DefaultAgent.__module__ == "swarmlab.vendor.minisweagent.default"
+
+
+def test_vendored_files_carry_the_header_and_need_no_real_package():
+    files = sorted(VENDOR.glob("*.py"))
+    assert {f.name for f in files} == {"__init__.py", "exceptions.py", "serialize.py",
+                                       "openai_multimodal.py", "actions_toolcall.py", "default.py"}
+    for f in files:
+        assert f.read_text().startswith("# Vendored from mini-swe-agent 2.4.6 (MIT): minisweagent/"), f
+    code = ("import sys; import swarmlab.vendor.minisweagent.default, "
+            "swarmlab.vendor.minisweagent.actions_toolcall; "
+            "print(sorted(m for m in sys.modules if m.split('.')[0] == 'minisweagent'))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"
 
 
 def _guide_yaml(name: str) -> dict:
@@ -638,6 +819,6 @@ def test_guide_solo_spec_renders_the_official_prompt(tmp_path):
     path.write_text(yaml.safe_dump(spec))
     (row,) = render_prompts(Experiment.from_yaml(path, "solo"))
     system, instance = prompt_parts()
-    assert (row["type"], row["tools"]) == ("mini_swe_agent", ["bash", "end_turn"])
+    assert (row["type"], row["tools"]) == ("mini_swe_agent", ["bash"])
     assert row["system"] == system
     assert row["user"] == f"{instance}\n\nThis machine has 20 CPUs and 60 GB of memory."
