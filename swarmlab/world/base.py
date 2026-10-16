@@ -174,7 +174,8 @@ def tool(name: str, description: str | Callable[[Any], str], params: Params | No
 class Requirements(BaseModel):
     """Run settings a world needs (see the module docstring); every field is optional.
 
-    - `commit`, `delivery`: the exact value.
+    - `commit`, `delivery`: the exact value; `commit` may also be a tuple of allowed values
+      (`("round_end", "immediate")`: any round-based mode, so `commit: async` is refused).
     - `push_limit`: a minimum; `"n_agents"` means at least the participant count.
     - `scheduler`: an entry-point name (`"one_speaker"`) or `module:Class`; it matches when it
       resolves (`registry.resolve(name, "swarmlab.schedulers")`) to the class of the experiment's
@@ -186,7 +187,8 @@ class Requirements(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    commit: Literal["round_end", "immediate"] | None = None
+    commit: (Literal["round_end", "immediate", "async"]
+             | tuple[Literal["round_end", "immediate", "async"], ...] | None) = None
     delivery: Literal["pull", "push"] | None = None
     push_limit: int | Literal["n_agents"] | None = None
     scheduler: str | None = None
@@ -205,7 +207,10 @@ class Requirements(BaseModel):
         bad: list[tuple[str, Any]] = []  # (field, relation and wanted value; actual value)
         if self.commit is not None:
             got = options.get("commit") or "round_end"
-            if got != self.commit:
+            if isinstance(self.commit, tuple):
+                if got not in self.commit:
+                    bad.append((f"commit in [{', '.join(self.commit)}]", got))
+            elif got != self.commit:
                 bad.append((f"commit={self.commit}", got))
         if self.delivery is not None:
             got = getattr(medium, "delivery", None)
@@ -253,6 +258,18 @@ class Requirements(BaseModel):
 class World(Persistable, Plugin):
     name: str = "world"
     requires: ClassVar[Requirements] = Requirements()  # run settings this world needs
+    _commit_mode: str = "round_end"  # set by the runner (`set_commit_mode`); never snapshotted
+
+    @property
+    def commit_mode(self) -> str:
+        """The run's commit mode (`round_end`, `immediate` or `async`), as the runner set it
+        before `reset`; `round_end` for a world driven without a runner (unit code)."""
+        return self._commit_mode
+
+    def set_commit_mode(self, mode: str) -> None:
+        """Called by the runner on its world copy before `reset` (and in replay). The value is a
+        transient attribute (`_commit_mode`), so it is never part of a snapshot."""
+        self._commit_mode = mode
 
     # ---- required -------------------------------------------------------------------------
     def reset(self, rng: random.Random, agents: list[AgentId]) -> None:
@@ -415,7 +432,9 @@ class World(Persistable, Plugin):
 
     # ---- round, claim and failure hooks (M3b; swarmlab/medium/registry.py) ----------------------
     def begin_round(self, round: int) -> None:
-        """Called by the runner at the start of every round, before any observation (no-op)."""
+        """Called by the runner at the start of every round, before any observation (no-op).
+        Under `commit: async` a round is a tick (one completed turn): `begin_round(t)` runs when
+        tick t opens, while other agents' turns may be in flight."""
 
     def end_round(self, round: int) -> dict | None:
         """Called by the runner once per round right after the world commit (default: None).
@@ -435,6 +454,12 @@ class World(Persistable, Plugin):
         not call it (it folds the logged event and restores the snapshot).
         """
         return None
+
+    def close_turn(self, agent: AgentId, round: int) -> None:
+        """`commit: async` only: `agent`'s turn has just ended and closes tick `round`; the
+        runner calls `end_round(round)` right after, so a world can resolve the tick as that
+        turn (Minesweeper tallies the turn). Default: no-op. Never called in the round-based
+        modes."""
 
     def claim_key(self, agent: AgentId, action: Action) -> str | None:
         """The registry key of the resource `action` works on, or None (not claimable)."""

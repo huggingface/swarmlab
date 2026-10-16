@@ -116,7 +116,9 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
     RunOptions: {
         "seed": "set per run from `seeds` (or `--seed`); not written in the YAML",
         "max_rounds": "rounds per run (required here or as `--max-rounds`)",
-        "commit": "`round_end` (phase commit) or `immediate` (sequential)",
+        "commit": ("`round_end` (phase commit), `immediate` (sequential) or `async` (every agent "
+                   "loops over its own turns at once, no rounds; a round is then a tick, one "
+                   "completed turn; no scheduler, probes or interventions)"),
         "max_calls_per_turn": "tool calls an agent may make per turn",
         "snapshot_every": "write a snapshot every N rounds",
         "concurrency": "concurrent turns",
@@ -124,7 +126,8 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
         "scheduler": "turn order per round, e.g. `seeded_shuffle` (default, every live agent in a "
                      "random order) or `fixed` (every live agent in agent order a000, a001, ...); "
                      "`swarmlab plugins schedulers` lists all",
-        "rounds_per_agent": "sugar: `max_rounds = rounds_per_agent x number of agents`",
+        "rounds_per_agent": ("sugar: `max_rounds = rounds_per_agent x number of agents`; under "
+                             "`commit: async` also a per-agent cap on completed turns"),
         "stop_when": "`{metric, op, value, consecutive}`: end the run (`stop_condition`) when "
                      "the metric compares true at `consecutive` evaluations in a row (probe "
                      "rounds when the run has probes, else every round)",

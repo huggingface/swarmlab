@@ -75,10 +75,11 @@ def group_views(exp: Experiment, seed: int = 0) -> list[tuple[int, int, Any, Any
     group, built exactly as the runner builds them (also used by `swarmlab preflight`)."""
     agents = [agent_id(i) for i in range(len(exp.participants))]
     world = copy.deepcopy(exp.world)
+    commit = exp.options.get("commit", "round_end")
+    world.set_commit_mode(commit)  # before reset, as the runner does (async worlds read it)
     world.reset(derive(seed, "world"), list(agents))
     world.begin_round(1)  # as the runner does before any round-1 observation
     board = copy.deepcopy(exp.medium)
-    commit = exp.options.get("commit", "round_end")
     board.commit_mode = commit
     bound = {a: copy.deepcopy(p) for a, p in zip(agents, exp.participants, strict=True)}
     for a, p in bound.items():

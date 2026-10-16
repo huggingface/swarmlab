@@ -18,7 +18,9 @@ Decisions where the contract is silent:
   (`commit_mode == "immediate"`) the eligible round is `round` when no policy moved it, i.e. when
   there are no policies or every policy returned the default `round + 1`; an explicit delay such
   as `DelayPolicy(rounds=2)` keeps its absolute round. A policy returning a round earlier than
-  the commit round is clamped to the commit round.
+  the commit round is clamped to the commit round. `commit_mode == "async"` (ticks instead of
+  rounds, swarmlab/runner.py) follows the immediate rule: a post is eligible in the tick it is
+  committed in, so every later read or push sees it; a delay counts ticks.
 - `commit_mode` is a run option (`RunOptions.commit`), not part of `MediumSpec`: the runner sets
   `board.commit_mode`, and `spec()` omits it.
 - `spec()` always emits the topology as a nested plugin spec (`{"type", "params"}`), even when the
@@ -79,6 +81,9 @@ from ..base import Persistable, Plugin
 from ..ids import AgentId, DeliveryId, PostId
 from ..registry import build
 from .base import Policy, Topology
+
+# commit modes whose posts are readable in the round (tick) they are committed in
+SAME_ROUND = ("immediate", "async")
 
 
 class BlobStoreLike(Protocol):
@@ -150,15 +155,16 @@ class Board(Persistable, Plugin):
         push_limit: int = 20,
         policies: Sequence[Policy] = (),
         channels: Sequence[str] = ("main",),
-        commit_mode: Literal["round_end", "immediate"] = "round_end",
+        commit_mode: Literal["round_end", "immediate", "async"] = "round_end",
         registry: bool = False,
         claim_policy: Any = "advisory",
         push_consume: bool = False,
     ) -> None:
         if delivery not in ("pull", "push"):
             raise ValueError(f"delivery must be 'pull' or 'push', got {delivery!r}")
-        if commit_mode not in ("round_end", "immediate"):
-            raise ValueError(f"commit_mode must be 'round_end' or 'immediate', got {commit_mode!r}")
+        if commit_mode not in ("round_end", "immediate", "async"):
+            raise ValueError("commit_mode must be 'round_end', 'immediate' or 'async', got "
+                             f"{commit_mode!r}")
         if not channels:
             raise ValueError("a board needs at least one channel")
         self.topology: Topology = _topology(topology)
@@ -235,7 +241,7 @@ class Board(Persistable, Plugin):
     def _resolve(self, reader: AgentId, post: Post, round: int) -> tuple[int, str] | None:
         default = round + 1
         if not self.policies:
-            return (round if self.commit_mode == "immediate" else default), post.text
+            return (round if self.commit_mode in SAME_ROUND else default), post.text
         eligible: int | None = None
         content = post.text
         for policy in self.policies:
@@ -245,7 +251,7 @@ class Board(Persistable, Plugin):
             eligible = result[0] if eligible is None else max(eligible, result[0])
             content = result[1]
         assert eligible is not None
-        if self.commit_mode == "immediate" and eligible == default:
+        if self.commit_mode in SAME_ROUND and eligible == default:
             eligible = round
         return max(eligible, round), content
 

@@ -116,6 +116,8 @@ Per round under **phase-commit** (default):
 
 **Sequential** is the alternative commit policy (`commit: immediate`): agents act one at a time in seeded order with immediate feedback and same-round visibility. Messages are then visible within the same round; propagation is reported in hops computed from read events. The Scheduler interface stays open for async or rate-heterogeneous policies later; nothing depends on wall-clock time.
 
+**Async** (`commit: async`, added after M6) drops the round barrier: every agent loops over its own turns, all at once, each action and post committing the moment it is made, so fast agents take more turns and every turn starts from the current state. The log stays round-shaped: a *tick* (one completed turn) takes the place of a round, carrying that turn's events and every commit made during it in true order, so replay, resume, fork, the viewer and the report work unchanged. It is the one mode whose outcome depends on wall-clock time (model latency decides who acts when); with fake models it is deterministic. No scheduler, probes or interventions; worlds with per-round rules refuse it.
+
 Modes: **live**, **replay** (no inference; events folded), **resume/fork** (restore the last committed snapshot at or before round r, then live, optionally with an edited spec).
 
 **Termination** on world terminal, max rounds, soft budget, or hard ceiling; the end reason is recorded on the run event. Live mid-run interaction (command queue) is deferred to v2; in v1 interventions are spec-declared or applied by stop-and-fork with an edited spec.
@@ -211,7 +213,7 @@ Abbreviations: **tests** = the unit and acceptance tests in `tests/`; **M2** = F
 | component | implemented in | validated by | notes |
 |---|---|---|---|
 | 1 Experiment spec, YAML, CLI | `spec.py`, `experiment.py`, `cli.py`, `templates/` | tests (spec, api, cli, init, total_cap); dogfood | CLI is `validate run estimate replay resume fork view models doctor init export publish fetch-published report prompts job`. The design's `dryrun`, `smoke`, `status`, `metrics` commands and `resume --at` do not exist: a dry run is an arm with scripted or `fake:` agents, status is printed by `run` and `job status` |
-| 2 Runner, scheduler, executor | `runner.py`, `scheduler.py`, `executor.py` | acceptance 1-3 (determinism, recovery, fork); N=256 | phase-commit default; `commit: immediate` supported but impractical on slow providers |
+| 2 Runner, scheduler, executor | `runner.py`, `scheduler.py`, `executor.py` | acceptance 1-3 (determinism, recovery, fork); N=256; `tests/test_async.py` | phase-commit default; `commit: immediate` supported but impractical on slow providers; `commit: async` (no barrier, ticks) validated with fake models only |
 | 3 Event log, snapshots, recovery | `events.py`, `blobs.py`, `snapshot.py`, `export.py`, `publish.py` | tests (events, recovery, export, publish); N=256 (197-260 MB run dirs replay and export) | Parquet export has 13 table families plus pi-format sessions |
 | 4 World: FlagGame | `world/flaggame.py` | tests; M2; N=256 | text variant only; the image variant is not built |
 | 4 World: ColoringGrid | `world/coloring.py` | tests (coloring); S0 and crossed-zones examples with scripted and fake-LLM painters | crossed zones are the core of the world (G groups, M zones, boards generated from the seed, relay-status metric); the viewer panel draws grids and the zone table |
@@ -244,4 +246,4 @@ Process: orchestrator writes the interface contract; Opus subagents implement wo
 - **M4** Parquet and pi-format export, Hub publish, static viewer polish, skill and `AGENTS.md`.
 
 ## Deferred (v2) and open
-Harness-agent participants. Live mid-run command queue. Async scheduler. Thousands of agents (broadcast load is a research object, not a framework problem). Code-execution sandboxes for tasks. Memory rewrite for mid-run counterfactuals. Package rename for publication.
+Harness-agent participants. Live mid-run command queue. Rate-heterogeneous scheduling beyond `commit: async`. Thousands of agents (broadcast load is a research object, not a framework problem). Code-execution sandboxes for tasks. Memory rewrite for mid-run counterfactuals. Package rename for publication.
