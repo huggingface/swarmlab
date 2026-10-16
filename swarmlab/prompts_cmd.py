@@ -87,7 +87,7 @@ def group_views(exp: Experiment, seed: int = 0) -> list[tuple[int, int, Any, Any
     names = [role_name(p) for p in exp.participants]
     roles = bind_roles(board, bound, agent_roles(*spec_roles(exp.roles, names), len(agents)))
     ex = RoundExecutor(run="prompts", round=1, world=world, board=board, blobs=None,
-                       agents=list(agents), commit=commit,
+                       agents=list(agents), commit=commit, turn_based=commit == "async",
                        max_calls_per_turn=int(exp.options.get("max_calls_per_turn", 20)),
                        roles=roles)
     out = []
@@ -95,7 +95,8 @@ def group_views(exp: Experiment, seed: int = 0) -> list[tuple[int, int, Any, Any
         a = agents[first]
         obs = world.observe(a).model_copy(update={"private": {}})
         view = View(round=1, agent=a, observation=obs, outcomes=[], pushed=[],
-                    tools=ex.schemas(a), description=describe(world, a))
+                    tools=ex.schemas(a), description=describe(world, a),
+                    turn=1 if commit == "async" else None)
         out.append((first, count, a, bound[a], view))
     return out
 
@@ -127,6 +128,8 @@ def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
         else:
             row["note"] = (f"{spec['type']} is not prompted: it acts by code and sees the "
                            "observation and tools directly")
+        if view.turn is not None:  # commit: async: the first message is the agent's turn 1
+            row["turn_based"] = True
         out.append(row)
     return out
 
@@ -144,5 +147,6 @@ def prompts_text(rows: list[dict], arm: str | None, seed: int) -> str:
         if r["system"] is None:
             lines.append(f"({r['note']})")
             continue
-        lines += ["--- system prompt ---", r["system"], "--- round 1 user message ---", r["user"]]
+        first = "turn 1" if r.get("turn_based") else "round 1"
+        lines += ["--- system prompt ---", r["system"], f"--- {first} user message ---", r["user"]]
     return "\n".join(lines)

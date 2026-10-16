@@ -98,6 +98,8 @@ Decisions where the contract is silent:
   tick they happen in (ids stay unique: within a turn `n` grows, and an agent's next turn starts
   in a later tick). `cancel()` (the run ended mid-turn) makes every later `call`/`infer` raise
   `asyncio.CancelledError`. Without `on_commit` (every other mode) nothing changes.
+  `turn_based=True` (async) describes `end_turn` as "Finish your turn." instead of "Finish your
+  turn for this round.".
 - Concurrency: `call` contains no `await`, so under asyncio each call is atomic. During round_end
   turns it only reads shared world state and touches the calling agent's own board inbox
   (`board.read`), so concurrent turns cannot observe each other.
@@ -179,6 +181,7 @@ END_TURN_SCHEMA = ToolSchema(
     description="Finish your turn for this round.",
     parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
+END_TURN_SCHEMA_TURNS = END_TURN_SCHEMA.model_copy(update={"description": "Finish your turn."})
 
 
 def board_schemas(board: Board) -> list[ToolSchema]:
@@ -258,6 +261,7 @@ class RoundExecutor:
         claim_policy: ClaimPolicy | None = None,
         roles: dict[AgentId, Role] | None = None,
         on_commit: Callable[[str, Any], None] | None = None,
+        turn_based: bool = False,
     ) -> None:
         self.run = run
         self.round = round
@@ -276,6 +280,7 @@ class RoundExecutor:
         self.hard_ceiling = False
         self.on_commit = on_commit  # async commit: the runner's journal (module docstring)
         self.cancelled = False
+        self.turn_based = turn_based  # async: `end_turn` is described per turn, not per round
         self._state: dict[AgentId, _AgentState] = {}
         self.committed = Committed()
         self._world_tools = {s.name: s for s in world.tool_schemas()}
@@ -408,7 +413,8 @@ class RoundExecutor:
 
     def schemas(self, agent: AgentId) -> list[ToolSchema]:
         reg = registry_schemas() if self.registry is not None else []
-        out = [*self._world_tools.values(), *self._board_schemas(agent), *reg, END_TURN_SCHEMA]
+        end = END_TURN_SCHEMA_TURNS if self.turn_based else END_TURN_SCHEMA
+        out = [*self._world_tools.values(), *self._board_schemas(agent), *reg, end]
         return [s.normalized() for s in out if self._allowed(agent, s.name)]
 
     def pushable(self, agent: AgentId, limit: int) -> list[Delivery]:

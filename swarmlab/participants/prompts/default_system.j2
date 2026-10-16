@@ -4,7 +4,11 @@ You are agent {{ agent }} with the role "{{ role }}" in a multi-agent environmen
 Task: {{ description }}
 
 {% endif %}
+{% if turn_based %}
+You act in turns, at your own pace, at the same time as the other agents. At the start of each turn you receive one message with your current observation, the outcomes of your previous actions, and any items delivered to you. You act only by calling tools; each tool call returns a result to you, and you may make several calls in one turn. Call `end_turn` when you are done for this turn; a reply without any tool call also ends your turn.
+{% else %}
 The environment runs in rounds. At the start of each round you receive one message with the round number, your current observation, the outcomes of your actions in the previous round, and any items delivered to you. You act only by calling tools; each tool call returns a result to you, and you may make several calls in one turn. Call `end_turn` when you are done for this round; a reply without any tool call also ends your turn.
+{% endif %}
 
 {% if system_prompt_append %}
 {{ system_prompt_append }}

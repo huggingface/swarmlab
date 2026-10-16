@@ -26,6 +26,8 @@ class View(BaseModel):
     pushed: list[dict]  # delivered inbox items when delivery == "push", else []
     tools: list[ToolSchema]
     description: str = ""  # M1b: World.description(), the task text for prompt templates
+    # commit: async only: this agent's own turn number (1-based); None in the round-based modes
+    turn: int | None = None
 
 
 def describe(world: Any, agent: str) -> str:

@@ -11,6 +11,7 @@ import pytest
 from typer.testing import CliRunner
 
 from swarmlab import Budget, Experiment, Run
+from swarmlab.blobs import BlobStore
 from swarmlab.cli import app
 from swarmlab.participants import LLMAgent
 from swarmlab.participants.base import Participant, TurnUsage
@@ -371,6 +372,47 @@ def test_estimate_counts_one_turn_per_tick():
     exp = Experiment.from_yaml(ASYNC_SPEC, "random4")
     rounds = Experiment.from_yaml(ROUND_SPEC, "random")  # same 4 agents, one turn each per round
     assert exp.estimate(0, 40)["calls"] * 4 == rounds.estimate(0, 40)["calls"]
+
+
+def _texts(content) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    return [part.get("text") or "" for part in content if part.get("type") == "text"]
+
+
+def test_llm_agents_get_turn_based_prompts_under_async(tmp_path):
+    run = Experiment.from_yaml(ASYNC_SPEC, "allocator4").run(0, max_rounds=12, out=tmp_path)
+    blobs = BlobStore(run.dir / "blobs")
+    events = _events(run.dir)
+    heads: dict[str, list[int]] = {}
+    for e in events:
+        if e["type"] != "inference_attempt":
+            continue
+        req = json.loads(blobs.get(e["request_hash"]))
+        system = req["messages"][0]
+        assert system["role"] == "system"
+        text = "\n".join(_texts(system["content"]))
+        assert "You act in turns, at your own pace, at the same time as the other agents." in text
+        assert "Call `end_turn` when you are done for this turn;" in text
+        assert "runs in rounds" not in text and "for this round" not in text
+        assert {t["name"]: t["description"] for t in req["tools"]}["end_turn"] == "Finish your turn."
+        user = [m for m in req["messages"] if m["role"] == "user"][-1]
+        head = _texts(user["content"])[0]
+        assert head.startswith("Turn ") and "Round" not in head
+        heads.setdefault(e["agent"], []).append(int(head.split()[1].rstrip(".")))
+    done = {a: sum(1 for e in events if e["type"] == "turn_ended" and e["agent"] == a) for a in heads}
+    for agent, numbers in heads.items():  # the agent's own turn count, not the global tick
+        assert numbers == list(range(1, len(numbers) + 1)), (agent, numbers)
+        assert len(numbers) in (done[agent], done[agent] + 1)  # + a turn cancelled at the end
+    assert max(len(n) for n in heads.values()) < 12
+    res = cli.invoke(app, ["prompts", str(ASYNC_SPEC), "--arm", "random4"])
+    assert res.exit_code == 0, res.output
+    assert "You act in turns, at your own pace" in res.output and "runs in rounds" not in res.output
+    assert "--- turn 1 user message ---\nTurn 1." in res.output
+    assert "- end_turn: Finish your turn.\n" in res.output
+    res = cli.invoke(app, ["prompts", str(ROUND_SPEC), "--arm", "random"])
+    assert "The environment runs in rounds." in res.output and "--- round 1 user message ---\nRound 1." in res.output
+    assert "- end_turn: Finish your turn for this round.\n" in res.output
 
 
 # ---- 5. spec hashes and refusals -----------------------------------------------------------------

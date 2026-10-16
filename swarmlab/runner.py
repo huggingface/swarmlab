@@ -73,7 +73,9 @@ loop of turns, all agents concurrently (one asyncio task each in an `asyncio.Tas
 bounded by `Semaphore(options.concurrency)`); the scheduler is not used, and `Experiment`
 refuses an `options.scheduler`, probes and interventions under async (swarmlab/experiment.py
 `check_async`). A turn is what it is in the other modes (observe, pushed deliveries, the
-participant's tool loop, end); it runs on its own `RoundExecutor` in immediate mode, so every
+participant's tool loop, end; its `View.turn` is the agent's own turn number, 1-based and
+counted from the log across resume, which makes LLMAgent render turn-based prompts and the
+executor describe `end_turn` per turn); it runs on its own `RoundExecutor` in immediate mode, so every
 world action, post and registry write commits the moment it is called, and when the turn ends
 the agent starts its next one with a fresh observation. After each turn the loop awaits
 `asyncio.sleep(0)`, so a turn that never awaits (scripted participants, fake models) cannot
@@ -1314,14 +1316,15 @@ class Runner:
         else:
             await self._turn_inner(agent, ex, round)
 
-    async def _turn_inner(self, agent: AgentId, ex: RoundExecutor, round: int) -> None:
+    async def _turn_inner(self, agent: AgentId, ex: RoundExecutor, round: int,
+                          turn: int | None = None) -> None:
         obs = self.world.observe(agent)
         ex.begin_turn(agent, _jsonable(obs.private))
         obs = obs.model_copy(update={"private": {}})  # private never reaches the participant
         pushed = self._pushed(agent, ex, round, consume=True)
         view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
-                    tools=ex.schemas(agent), description=describe(self.world, agent))
+                    tools=ex.schemas(agent), description=describe(self.world, agent), turn=turn)
         usage: dict = {}
         error = None
         try:
@@ -1542,7 +1545,8 @@ class Runner:
                 ex = self._turn_executor(agent)
                 self._inflight[agent] = ex
                 try:
-                    await self._turn_inner(agent, ex, self._tick)
+                    await self._turn_inner(agent, ex, self._tick,
+                                           turn=self._turns_done.get(str(agent), 0) + 1)
                 except HardCeilingReached:
                     self._cancel_inflight()
                     raise
@@ -1563,7 +1567,7 @@ class Runner:
             max_calls_per_turn=self.options.max_calls_per_turn,
             topology_rng=lambda: derive(seed, "topology", ex.round), inference=self.inference,
             registry=self.registry, claim_policy=self.board.claim_policy, roles=self.roles,
-            on_commit=lambda kind, item: self._journal.append((kind, item)),
+            on_commit=lambda kind, item: self._journal.append((kind, item)), turn_based=True,
         )
         self.executor = ex
         return ex
