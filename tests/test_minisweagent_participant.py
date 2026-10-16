@@ -8,6 +8,7 @@ import json
 import pickle
 import random
 import re
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,14 +16,12 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-pytest.importorskip("minisweagent")
-
 from swarmlab import Experiment, Run
 from swarmlab.medium.board import Board
 from swarmlab.participants.base import Participant, TurnUsage
 from swarmlab.participants.minisweagent import (
-    EXTRA,
     FORMAT_ERROR_TEMPLATE,
+    MSA_VERSION,
     OBSERVATION_TEMPLATE,
     WAIT_RESULT,
     MiniSweAgent,
@@ -269,9 +268,8 @@ def test_step_limit_warning_and_exit(tmp_path):
 
 
 def test_wall_limit_warning_and_exit(tmp_path, monkeypatch):
-    from minisweagent.agents import default
-
     import swarmlab.participants.minisweagent as msa_mod
+    from swarmlab.vendor.minisweagent import default
 
     clock = SimpleNamespace(time=lambda: CLOCK[0])
     monkeypatch.setattr(default, "time", clock)
@@ -564,8 +562,11 @@ def test_template_helpers_and_custom_templates(tmp_path):
         MiniSweAgent(model="fake:x", templates="nope")
 
 
-def test_templates_are_the_installed_mini_swe_agent_model_config():
-    import minisweagent
+def test_templates_are_the_installed_mini_swe_agent_model_config(monkeypatch):
+    # A cross-check against the real package, which swarmlab does not install (the participant
+    # uses the vendored copy): it runs when a developer has mini-swe-agent 2.4.6 installed.
+    monkeypatch.setenv("MSWEA_SILENT_STARTUP", "1")
+    minisweagent = pytest.importorskip("minisweagent")
 
     path = Path(minisweagent.__file__).parent / "config" / "benchmarks" / "programbench.yaml"
     cfg = yaml.safe_load(path.read_text())
@@ -574,7 +575,7 @@ def test_templates_are_the_installed_mini_swe_agent_model_config():
     assert (cfg["agent"]["step_limit"], cfg["agent"]["wall_time_limit_seconds"]) == (1000, 21600)
 
 
-# ---- spec, plugins, the extra ---------------------------------------------------------------------
+# ---- spec, plugins, the vendored copy ---------------------------------------------------------------------
 
 def test_params_hold_only_non_defaults_and_round_trip():
     from swarmlab.spec import canonical_json
@@ -613,11 +614,27 @@ def test_plugins_lists_it_with_a_one_line_description():
     assert desc == describe(MiniSweAgent) and "\n" not in desc and len(desc) <= 160
 
 
-def test_missing_package_names_the_extra(monkeypatch):
-    for name in [m for m in sys.modules if m == "minisweagent" or m.startswith("minisweagent.")]:
-        monkeypatch.setitem(sys.modules, name, None)
-    with pytest.raises(ImportError, match=re.escape(EXTRA)):
-        load_minisweagent()
+VENDOR = Path(__file__).resolve().parents[1] / "swarmlab" / "vendor" / "minisweagent"
+
+
+def test_vendored_version_is_msa_version():
+    from swarmlab.vendor import minisweagent
+
+    assert minisweagent.__version__ == MSA_VERSION
+    assert load_minisweagent().DefaultAgent.__module__ == "swarmlab.vendor.minisweagent.default"
+
+
+def test_vendored_files_carry_the_header_and_need_no_real_package():
+    files = sorted(VENDOR.glob("*.py"))
+    assert {f.name for f in files} == {"__init__.py", "exceptions.py", "serialize.py",
+                                       "openai_multimodal.py", "actions_toolcall.py", "default.py"}
+    for f in files:
+        assert f.read_text().startswith("# Vendored from mini-swe-agent 2.4.6 (MIT): minisweagent/"), f
+    code = ("import sys; import swarmlab.vendor.minisweagent.default, "
+            "swarmlab.vendor.minisweagent.actions_toolcall; "
+            "print(sorted(m for m in sys.modules if m.split('.')[0] == 'minisweagent'))")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "[]"
 
 
 def _guide_yaml(name: str) -> dict:

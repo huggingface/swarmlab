@@ -2,20 +2,20 @@
 
 `MiniSweAgent(model, steps_per_turn=None, step_limit=1000, wall_limit_s=21600, max_tokens=8192,
 temperature=None, extra=None, templates="solo", idle_until_assigned=False, wait_tool=False,
-lead_channel="lead", worker_channels=None)`, entry point `mini_swe_agent`. Needs the
-`swarmlab[minisweagent]` extra (mini-swe-agent==2.4.6), imported lazily: building the participant,
-`swarmlab plugins`, replaying the event log and the viewer work without it; a turn, `swarmlab
-prompts` and preflight raise an ImportError naming the extra.
+lead_channel="lead", worker_channels=None)`, entry point `mini_swe_agent`. No extra is needed:
+mini-swe-agent's agent loop, exceptions and tool-call helpers are a vendored copy of 2.4.6 in
+`swarmlab/vendor/minisweagent/` (MIT; its README lists the files, their wheel hashes and the
+changes, which are import paths only).
 
-The loop is mini-swe-agent's own `DefaultAgent` (`minisweagent/agents/default.py`): its
+The loop is mini-swe-agent's own `DefaultAgent` (`minisweagent/agents/default.py`, vendored): its
 `query()` (step and wall limits checked before each model call, `n_model_calls`, cost),
 `execute_actions()` and messages. swarmlab supplies the model and the environment through two
 duck-typed adapters and drives `agent.step()` itself, because `run()` loops to the end of the
 episode while a swarmlab turn may be only part of it. The words the model sees are the
 baseline's: the ProgramBench templates (below), the `observation_template` and
 `format_error_template` of the 2.4.6 `config/benchmarks/programbench.yaml` (copied into this
-module and checked against the installed package by a test), rendered with mini-swe-agent's
-template variables (`step_limit`, `n_model_calls`, `wall_time_limit_seconds`,
+module; a test checks the copy against the real package when it is installed), rendered with
+mini-swe-agent's template variables (`step_limit`, `n_model_calls`, `wall_time_limit_seconds`,
 `elapsed_seconds`), so the step and time warnings appear exactly as in the baseline.
 
 Two shapes
@@ -155,7 +155,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import platform
 import re
 import threading
@@ -169,13 +168,19 @@ import yaml
 
 from ..providers.base import ChatMessage, ChatRequest, ChatResponse, parse_json_args
 from ..tools import AgentTools, ToolCall, ToolSchema
+from ..vendor.minisweagent import __version__ as msa_version
+from ..vendor.minisweagent import exceptions as msa_exceptions
+from ..vendor.minisweagent.actions_toolcall import (
+    format_toolcall_observation_messages,
+    parse_toolcall_actions,
+)
+from ..vendor.minisweagent.default import DefaultAgent
 from ..view import View
 from ..world.programbench import SUBMIT_MARKER, prompt_parts, submission_of
 from .base import Participant
 from .llm import LLMTurnUsage, render_delivered
 
 MSA_VERSION = "2.4.6"
-EXTRA = "swarmlab[minisweagent]"
 TEMPLATES_DIR = Path(__file__).resolve().parent / "prompts" / "minisweagent"
 TEMPLATE_SETS = ("solo", "lead", "worker")
 WAIT_TOOL = "wait_for_workers"
@@ -266,31 +271,18 @@ submit your solution (you will not be able to continue working on this task afte
 """
 
 
-# ---- lazy import --------------------------------------------------------------------------------
+# ---- vendored mini-swe-agent -------------------------------------------------------------------
 
 def load_minisweagent() -> SimpleNamespace:
-    """The pieces of mini-swe-agent this participant uses; ImportError naming the extra when the
-    package is missing, RuntimeError when it is not version 2.4.6. Sets `MSWEA_SILENT_STARTUP`
-    (unless set) so importing it prints no banner."""
-    os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
-    try:
-        import minisweagent
-        from minisweagent import exceptions
-        from minisweagent.agents.default import DefaultAgent
-        from minisweagent.models.utils.actions_toolcall import (
-            format_toolcall_observation_messages,
-            parse_toolcall_actions,
-        )
-    except ImportError as e:
-        raise ImportError(f"the mini_swe_agent participant needs mini-swe-agent=={MSA_VERSION}: "
-                          f'pip install "{EXTRA}"') from e
-    if minisweagent.__version__ != MSA_VERSION:
+    """The pieces of mini-swe-agent this participant uses, from the vendored copy in
+    `swarmlab/vendor/minisweagent/`; RuntimeError when its version is not `MSA_VERSION`."""
+    if msa_version != MSA_VERSION:
         raise RuntimeError(f"the mini_swe_agent participant follows mini-swe-agent {MSA_VERSION}, "
-                           f"found {minisweagent.__version__}: pip install \"{EXTRA}\"")
+                           f"the vendored copy is {msa_version}")
     return SimpleNamespace(
-        DefaultAgent=DefaultAgent, InterruptAgentFlow=exceptions.InterruptAgentFlow,
-        FormatError=exceptions.FormatError, Submitted=exceptions.Submitted,
-        TimeExceeded=exceptions.TimeExceeded,
+        DefaultAgent=DefaultAgent, InterruptAgentFlow=msa_exceptions.InterruptAgentFlow,
+        FormatError=msa_exceptions.FormatError, Submitted=msa_exceptions.Submitted,
+        TimeExceeded=msa_exceptions.TimeExceeded,
         parse_toolcall_actions=parse_toolcall_actions,
         format_observations=format_toolcall_observation_messages)
 

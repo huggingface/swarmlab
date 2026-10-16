@@ -92,10 +92,10 @@ The `llm` participant is swarmlab's own loop and does not reproduce the baseline
 `mini_swe_agent` runs mini-swe-agent 2.4.6, the official ProgramBench baseline agent, as a swarmlab participant. The agent loop is mini-swe-agent's own `DefaultAgent`: its step and wall-clock limits, its step counting, its messages and its templates. swarmlab supplies the model (requests go through `tools.infer`, so the budget, the ledger and the cache apply) and the environment (commands go through the executor to the world's `bash` tool). Module: `swarmlab/participants/minisweagent.py` (its docstring is the exact reference).
 
 ```
-pip install "swarmlab[programbench,minisweagent]"
+pip install "swarmlab[programbench]"
 ```
 
-The `minisweagent` extra pins `mini-swe-agent==2.4.6`. mini-swe-agent requires litellm, whose pins (`huggingface-hub<2`, `filelock<4`) would downgrade both for every swarmlab install, while swarmlab never imports it (models go through swarmlab's providers). So the project's uv settings leave litellm out (`[tool.uv] override-dependencies` in `pyproject.toml`): `uv sync --extra minisweagent` installs mini-swe-agent without it. A plain `pip install` does not read uv settings and installs litellm with its pins in that environment.
+The participant does not install mini-swe-agent: its agent loop, exceptions and tool-call helpers are a vendored copy of mini-swe-agent 2.4.6 in `swarmlab/vendor/minisweagent/` (MIT; its README lists the files, their wheel hashes and the changes, which are import paths only).
 
 `participants: [{type: mini_swe_agent, params: {...}}]`
 
