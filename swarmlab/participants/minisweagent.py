@@ -74,8 +74,8 @@ template offers `OFFICIAL_BASH` alone: mini-swe-agent 2.4.6's `BASH_TOOL` (from 
 when the view has no `bash`. The other templates offer the executor's tools for this agent
 (`view.tools`: `bash` and `end_turn`; with a board also `post` and `read_board`) plus
 `wait_for_workers` when `wait_tool` (which therefore needs a template other than `solo`).
-swarmlab's provider adapters still normalise schemas on the wire (`additionalProperties:
-false`, and Anthropic's `strict` when the schema allows). The reply becomes the assistant message
+Provider adapters send a schema exactly as offered, so the wire schema is the baseline's (no
+`additionalProperties`, and on Anthropic no `strict`). The reply becomes the assistant message
 dict (`role`, `content`, `tool_calls` with `id`/`type`/`function.name`/`function.arguments`, and
 the provider's `provider_content` when it carried thinking blocks, sent back unchanged) with
 `extra = {"actions", "response", "cost"}` as `LitellmModel.query` returns it; `cost` is swarmlab's

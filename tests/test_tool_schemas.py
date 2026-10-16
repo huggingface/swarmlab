@@ -111,14 +111,17 @@ def test_freeform_nested_object_is_left_open_and_sent_non_strict():
     assert "strict" not in d and d["input_schema"]["additionalProperties"] is False
 
 
-def test_adapters_normalise_unnormalised_schemas_before_sending():
+def test_adapters_send_unnormalised_schemas_as_given():
+    """Adapters no longer re-normalise: what a participant offers is what the model sees."""
     raw = ToolSchema(name="my_status", description="s", parameters={"type": "object", "properties": {}})
     req = ChatRequest(model="anthropic:claude-haiku-4-5", tools=[raw],
                       messages=[ChatMessage(role="user", content="hi")])
     sent = build_kwargs(req)["tools"][0]
-    assert sent["strict"] is True and sent["input_schema"]["additionalProperties"] is False
+    assert "strict" not in sent and sent["input_schema"] == raw.parameters
     body = build_body(req.model_copy(update={"model": "hf:Qwen/Qwen3.5-9B"}))
-    assert body["tools"][0]["function"]["parameters"]["required"] == []
+    assert body["tools"][0]["function"]["parameters"] == raw.parameters
+    norm = req.model_copy(update={"tools": [raw.normalized()]})
+    assert build_kwargs(norm)["tools"][0]["strict"] is True
 
 
 def test_smoke_request_tools_index_4_was_post():
