@@ -110,7 +110,7 @@ The participant does not install mini-swe-agent: its agent loop, exceptions and 
 | `extra` | `{}` | provider body fields, as for `llm` |
 | `templates` | `solo` | `solo`, `lead`, `worker`, or `file:<path>` (a YAML mapping with `system_template` and `instance_template`) |
 | `idle_until_assigned` | false | a worker: no model call until something is delivered; its report to `lead_channel` ends the assignment |
-| `wait_tool` | false | a lead: offer `wait_for_workers`, which ends the turn after the step |
+| `wait_tool` | false | a lead: offer `wait_for_workers`, which ends the turn after the step (not with `templates: solo`) |
 | `lead_channel` | `lead` | where workers post reports |
 | `worker_channels` | null | the lead's channels to its workers; null: the agent's `post` channels other than `lead_channel` |
 
@@ -135,11 +135,13 @@ arms:
 
 How the transcript matches the baseline:
 
+- The model is offered exactly the baseline's one tool, mini-swe-agent's `BASH_TOOL` (`bash`, "Execute a bash command", one `command` string), and nothing else: not `end_turn`, which swarmlab's executor lists for every agent, nor the board's tools. `swarmlab prompts` shows `tools: bash`.
 - The system message is the baseline's system template and the first user message its instance template, rendered with the same machine details; the world's resource sentence follows it (the one added sentence).
 - Each reply is stored as the model's assistant message with its tool calls. Each `bash` result comes back as a tool message rendered with the baseline's `observation_template`: the return code, the output (head and tail past 10000 characters), and the warnings when fewer than 20 steps or less than 10 minutes are left.
-- A reply without a tool call, with bad `bash` arguments or calling a tool that is not offered gets the baseline's `format_error_template` message (the "output token limit" variant when the reply was cut off); three in a row end the episode (`RepeatedFormatError`).
+- A reply without a tool call, with bad `bash` arguments or calling any other tool (`end_turn` included) gets the baseline's `format_error_template` message (the "output token limit" variant when the reply was cut off) and counts as a step; the episode goes on, and three in a row end it (`RepeatedFormatError`).
 - A submission, the step limit and the wall limit end the episode with the baseline's exit messages (`Submitted`, `LimitsExceeded`, `TimeExceeded`). The workspace is graded as it is in every case.
-- Differences: swarmlab always offers `end_turn` next to `bash`; a model that calls it ends its turn, which in the solo shape ends the run with the workspace as it is. Requests go through swarmlab's providers (see the deviations above). The participant's whole conversation, mini-swe-agent's message dicts, is in its snapshot state (`messages`), and the model calls are in the event log as for any participant.
+- The turn ends only when the episode does (submission, step limit, wall limit, repeated format errors) or when swarmlab's own limits stop it (the executor's `max_calls_per_turn`, the budget's hard ceiling).
+- Differences: requests go through swarmlab's providers (see the deviations above), whose adapters normalise tool schemas on the wire (`additionalProperties: false`, and Anthropic's `strict` where the schema allows). The participant's whole conversation, mini-swe-agent's message dicts, is in its snapshot state (`messages`), and the model calls are in the event log as for any participant.
 
 ## Swarm shape
 

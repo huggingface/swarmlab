@@ -24,7 +24,11 @@ Two shapes
   `max_rounds: 1`, `options.max_calls_per_turn` above the number of commands the episode can
   run). The turn steps until the episode ends: a submission, the step limit (`LimitsExceeded`),
   the wall limit (`TimeExceeded`) or `max_consecutive_format_errors` (3) format errors in a row
-  (`RepeatedFormatError`), each recorded as the baseline's `exit` message.
+  (`RepeatedFormatError`), each recorded as the baseline's `exit` message, or until the runner
+  ends it (the executor's cap, the hard ceiling, cancellation). The `solo` template offers the
+  model exactly the baseline's one tool, mini-swe-agent's `BASH_TOOL`: not the `end_turn` the
+  executor always lists, so a model cannot end the episode early by calling it (it is an unknown
+  tool, the baseline's format error, and the episode goes on).
 - Swarm: `steps_per_turn=k` runs at most k steps (model calls) per turn; the episode continues at
   the agent's next turn from its stored messages. Typically a lead with the `lead` templates and
   workers with the `worker` templates and `idle_until_assigned` (docs/guide/programbench.md,
@@ -55,19 +59,26 @@ The turn
 6. Steps in a worker thread (the bridge, below): up to `steps_per_turn`, handling
    `InterruptAgentFlow` exactly as `run()`: a `FormatError` adds its cost and messages (and the
    `RepeatedFormatError` exit at the limit), any other (`Submitted`, `LimitsExceeded`,
-   `TimeExceeded`) appends its exit message. The turn also ends after a step in which the model
-   called `end_turn`, `wait_for_workers`, or a call was refused `turn_ended`.
+   `TimeExceeded`) appends its exit message. With the other templates the turn also ends after
+   a step in which the model called `end_turn`, `wait_for_workers`, or a call was refused
+   `turn_ended`; with `solo` none of these is offered.
 
 Model adapter
 -------------
 `query(messages)` turns mini-swe-agent's messages (system, user, assistant with OpenAI-style
 `tool_calls`, tool; `extra` stripped as `_prepare_messages_for_api` does; `exit` skipped) into a
-`ChatRequest` with the tools the executor offers this agent (`view.tools`: in a bash-only role
-`bash` and `end_turn`; with a board also `post` and `read_board`) plus `wait_for_workers` when
-`wait_tool`, and awaits `tools.infer`. The reply becomes the assistant message dict (`role`,
-`content`, `tool_calls` with `id`/`type`/`function.name`/`function.arguments`, and the provider's
-`provider_content` when it carried thinking blocks, sent back unchanged) with `extra =
-{"actions", "response", "cost"}` as `LitellmModel.query` returns it; `cost` is swarmlab's
+`ChatRequest` with the tools of `offered_tools(view)`, and awaits `tools.infer`. The `solo`
+template offers `OFFICIAL_BASH` alone: mini-swe-agent 2.4.6's `BASH_TOOL` (from the vendored
+`actions_toolcall.py`; its name, description and parameters unchanged, so no
+`additionalProperties`; a test compares it with the real package when installed), and nothing
+when the view has no `bash`. The other templates offer the executor's tools for this agent
+(`view.tools`: `bash` and `end_turn`; with a board also `post` and `read_board`) plus
+`wait_for_workers` when `wait_tool` (which therefore needs a template other than `solo`).
+swarmlab's provider adapters still normalise schemas on the wire (`additionalProperties:
+false`, and Anthropic's `strict` when the schema allows). The reply becomes the assistant message
+dict (`role`, `content`, `tool_calls` with `id`/`type`/`function.name`/`function.arguments`, and
+the provider's `provider_content` when it carried thinking blocks, sent back unchanged) with
+`extra = {"actions", "response", "cost"}` as `LitellmModel.query` returns it; `cost` is swarmlab's
 `ChatResponse.cost_usd` and `response` a small summary (model, provider, finish reason, usage,
 cached), since the full response is in the run's blobs. Timestamps are left out of `extra` so the
 stored state is a function of the responses.
@@ -112,8 +123,18 @@ error) is re-raised in the thread, leaves `step()` (which does not catch it), an
 `turn()` after the state is saved, so the runner ends the turn as usual (`cap`, `error`, abort).
 Such an exception ends the turn, not the episode. Calls of the interrupted reply that got no
 result get the baseline's "not executed" observation (`returncode -1`, `action was not
-executed`), so the stored conversation never has a tool call without a result. When the turn is
-cancelled, the thread is told to stop at its next adapter call.
+executed`), so the stored conversation never has a tool call without a result.
+
+When the turn is cancelled (the runner cancels the other turns of a round on `HardCeilingReached`),
+`turn()` cancels the bridge operation in flight (its task is tracked on the loop; the
+`CancelledError` reaches `tools.infer`, whose gate releases the reservation and charges it if the
+request was dispatched, as for any cancelled participant, or `tools.call`), refuses any further one
+(the abort flag is checked under a lock before scheduling, and again when the operation starts),
+and waits until the step thread has returned before it repairs the transcript as above, saves the
+state and re-raises. So nothing is appended to the saved messages afterwards. The cancelled step's
+model call is counted in `n_calls` (mini-swe-agent counts it before the call) and has no message. A
+command the world already started is not interrupted: the world runs a command synchronously, so a
+cancellation lands between commands.
 
 Templates
 ---------
@@ -154,6 +175,8 @@ always there.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import copy
 import json
 import platform
 import re
@@ -171,6 +194,7 @@ from ..tools import AgentTools, ToolCall, ToolSchema
 from ..vendor.minisweagent import __version__ as msa_version
 from ..vendor.minisweagent import exceptions as msa_exceptions
 from ..vendor.minisweagent.actions_toolcall import (
+    BASH_TOOL,
     format_toolcall_observation_messages,
     parse_toolcall_actions,
 )
@@ -184,6 +208,12 @@ MSA_VERSION = "2.4.6"
 TEMPLATES_DIR = Path(__file__).resolve().parent / "prompts" / "minisweagent"
 TEMPLATE_SETS = ("solo", "lead", "worker")
 WAIT_TOOL = "wait_for_workers"
+# The solo template's only tool: mini-swe-agent 2.4.6's `BASH_TOOL` (vendored
+# `actions_toolcall.py`, verbatim from the wheel), the one tool `LitellmModel` sends in the
+# baseline, as a ToolSchema with its name, description and parameters unchanged.
+OFFICIAL_BASH = ToolSchema(name=BASH_TOOL["function"]["name"],
+                           description=BASH_TOOL["function"]["description"],
+                           parameters=copy.deepcopy(BASH_TOOL["function"]["parameters"]))
 WAIT_SCHEMA = ToolSchema(
     name=WAIT_TOOL,
     description="Pause until your workers report: your turn ends after this step, and their "
@@ -359,7 +389,7 @@ def _strip_timestamps(messages: list[dict]) -> list[dict]:
 # ---- the turn's transient state and the adapters --------------------------------------------------
 
 class _Aborted(Exception):
-    """The turn was cancelled; the step thread stops at its next adapter call."""
+    """The turn was cancelled: the step thread's adapter call was cancelled or refused."""
 
 
 @dataclass
@@ -369,6 +399,8 @@ class _Turn:
     tools: AgentTools | None
     offered: list[ToolSchema]
     abort: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    task: asyncio.Task | None = None  # the bridge operation running on the loop, if any
     end: bool = False
     order: list[str] = field(default_factory=list)       # call ids of the current reply
     pending: list[ToolCall] = field(default_factory=list)  # its non-bash calls not yet run
@@ -376,11 +408,40 @@ class _Turn:
     outputs: dict[str, dict] = field(default_factory=dict)  # bash call id -> its output
 
     def run(self, coro: Any) -> Any:
-        """Run a coroutine on the turn's event loop from the step thread and wait for it."""
-        if self.loop is None or self.abort.is_set():
-            coro.close()
-            raise _Aborted("the turn was cancelled" if self.loop else "no event loop (preview)")
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+        """Run a coroutine on the turn's event loop from the step thread and wait for it (module
+        doc, Bridge). Refused once the turn is cancelled."""
+        with self.lock:  # cancel() cannot slip in between the check and the scheduling
+            if self.loop is None or self.abort.is_set():
+                coro.close()
+                raise _Aborted("the turn was cancelled" if self.loop else "no event loop (preview)")
+            fut = asyncio.run_coroutine_threadsafe(self._tracked(coro), self.loop)
+        try:
+            return fut.result()
+        except concurrent.futures.CancelledError:
+            raise _Aborted("the turn was cancelled") from None
+
+    async def _tracked(self, coro: Any) -> Any:
+        """The bridge operation on the loop: recorded in `task` so `cancel()` can cancel it."""
+        with self.lock:
+            if self.abort.is_set():  # cancelled between scheduling and start
+                coro.close()
+                raise _Aborted("the turn was cancelled")
+            self.task = asyncio.current_task()
+        try:
+            return await coro
+        finally:
+            with self.lock:
+                self.task = None
+
+    def cancel(self) -> None:
+        """On the loop: refuse further bridge operations and cancel the running one. Its
+        `CancelledError` reaches `tools.infer`/`tools.call` (the gate releases the reservation);
+        the step thread then gets `_Aborted` once that task has finished."""
+        with self.lock:
+            self.abort.set()
+            task = self.task
+        if task is not None:
+            task.cancel()
 
 
 class _Model:
@@ -591,6 +652,9 @@ class MiniSweAgent(Participant):
         for name, flag in (("idle_until_assigned", idle_until_assigned), ("wait_tool", wait_tool)):
             if type(flag) is not bool:
                 raise ValueError(f"{name} must be true or false")
+        if wait_tool and templates == "solo":
+            raise ValueError("wait_tool needs the lead (or a file:) templates: the solo template "
+                             "offers only bash")
         if not isinstance(lead_channel, str) or not lead_channel:
             raise ValueError(f"lead_channel must be a channel name, got {lead_channel!r}")
         if worker_channels is not None and (isinstance(worker_channels, str) or not all(
@@ -654,7 +718,13 @@ class MiniSweAgent(Participant):
         return None
 
     # ---- templates ------------------------------------------------------------------------------
-    def _offered(self, view: View) -> list[ToolSchema]:
+    def offered_tools(self, view: View) -> list[ToolSchema]:
+        """The tools the model is offered (module doc, Model adapter); `swarmlab prompts` shows
+        these. The solo template: `OFFICIAL_BASH` alone when the view has `bash`, as the
+        baseline. Other templates: the view's tools plus `wait_for_workers` when `wait_tool`."""
+        if self.templates == "solo":
+            return ([OFFICIAL_BASH.model_copy(deep=True)]
+                    if any(t.name == "bash" for t in view.tools) else [])
         tools = list(view.tools)
         if self.wait_tool and all(t.name != WAIT_TOOL for t in tools):
             tools.append(WAIT_SCHEMA)
@@ -708,7 +778,7 @@ class MiniSweAgent(Participant):
 
     def _preview(self, view: View) -> list[dict]:
         msa = load_minisweagent()
-        turn = _Turn(usage=LLMTurnUsage(), loop=None, tools=None, offered=self._offered(view))
+        turn = _Turn(usage=LLMTurnUsage(), loop=None, tools=None, offered=self.offered_tools(view))
         agent = msa.DefaultAgent(_Model(self, turn, msa), _Env(self, turn, msa), **self._config())
         agent.extra_template_vars |= self.template_vars(view, turn.offered)
         return self._first_messages(agent)
@@ -746,16 +816,18 @@ class MiniSweAgent(Participant):
                 return usage
             self.assigned = True
         turn = _Turn(usage=usage, loop=asyncio.get_running_loop(), tools=tools,
-                     offered=self._offered(view))
+                     offered=self.offered_tools(view))
         agent = self._build(view, turn, msa)
         if new:
             agent.add_messages({"role": "user", "content": render_delivered(new)})
             self.delivered_upto = _delivery_key(new[-1])
+        worker = asyncio.ensure_future(asyncio.to_thread(self._steps, agent, turn, msa))
         try:
-            await asyncio.to_thread(self._steps, agent, turn, msa)
-        except asyncio.CancelledError:
-            turn.abort.set()  # the thread may still run: stop it at its next adapter call
-            raise
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                await self._settle(turn, worker)
+                raise
         except BaseException:
             if agent.messages[-1].get("role") != "exit":
                 self._repair(agent, turn, msa)
@@ -766,6 +838,20 @@ class MiniSweAgent(Participant):
             if status is not None:
                 usage.notes.append(f"exit:{status}")
         return usage
+
+    @staticmethod
+    async def _settle(turn: _Turn, worker: asyncio.Future) -> None:
+        """The turn was cancelled: cancel the bridge operation and wait until the step thread
+        has returned (so nothing touches the messages afterwards). A repeated cancellation while
+        waiting cancels again and keeps waiting; the caller re-raises the cancellation."""
+        turn.cancel()
+        while not worker.done():
+            try:
+                await asyncio.wait({worker})
+            except asyncio.CancelledError:
+                turn.cancel()
+        if not worker.cancelled():
+            worker.exception()  # retrieved: `_Aborted` (or the step's own error) is expected
 
     def _steps(self, agent: Any, turn: _Turn, msa: SimpleNamespace) -> None:
         """Up to `steps_per_turn` steps, handling `InterruptAgentFlow` as `DefaultAgent.run()`."""
