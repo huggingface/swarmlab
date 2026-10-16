@@ -141,7 +141,7 @@ How the transcript matches the baseline:
 - A reply without a tool call, with bad `bash` arguments or calling any other tool (`end_turn` included) gets the baseline's `format_error_template` message (the "output token limit" variant when the reply was cut off) and counts as a step; the episode goes on, and three in a row end it (`RepeatedFormatError`).
 - A submission, the step limit and the wall limit end the episode with the baseline's exit messages (`Submitted`, `LimitsExceeded`, `TimeExceeded`). The workspace is graded as it is in every case.
 - The turn ends only when the episode does (submission, step limit, wall limit, repeated format errors) or when swarmlab's own limits stop it (the executor's `max_calls_per_turn`, the budget's hard ceiling).
-- Differences: requests go through swarmlab's providers (see the deviations above), whose adapters normalise tool schemas on the wire (`additionalProperties: false`, and Anthropic's `strict` where the schema allows). The participant's whole conversation, mini-swe-agent's message dicts, is in its snapshot state (`messages`), and the model calls are in the event log as for any participant.
+- Differences: requests go through swarmlab's providers (see the deviations above). Their adapters send a tool schema exactly as the participant offers it, so the wire schema is the baseline's: `BASH_TOOL` without `additionalProperties`, and on Anthropic without `strict`. The participant's whole conversation, mini-swe-agent's message dicts, is in its snapshot state (`messages`), and the model calls are in the event log as for any participant.
 
 ## Swarm shape
 

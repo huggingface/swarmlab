@@ -24,9 +24,12 @@ Mapping:
   tool calls -> `tool_calls: [{"id", "type": "function", "function": {"name", "arguments": <JSON>}}]`
   (content None when empty). Tool messages -> `{"role": "tool", "tool_call_id", "content": <text>}`.
 - `tools: [{"type": "function", "function": {"name", "description", "parameters"}}]` (parameters
-  from `ToolSchema.normalized()`) and `tool_choice: "auto"` when `tool_protocol == "native"` and
-  tools are present; `tool_choice: {"type": "function", "function": {"name": <name>}}` instead
-  when `ChatRequest.tool_choice` names a tool (checked by `base.check_tool_choice`: the tool must
+  exactly as the participant gives them, not re-normalised: what a participant offers is what the
+  model sees; the executor and the world normalise the schemas they emit, so harness tools are
+  unchanged on the wire; a participant that wants a closed schema normalises its own) and
+  `tool_choice: "auto"` when `tool_protocol == "native"` and tools are present;
+  `tool_choice: {"type": "function", "function": {"name": <name>}}` instead when
+  `ChatRequest.tool_choice` names a tool (checked by `base.check_tool_choice`: the tool must
   be offered, the protocol native, and `extra` must not carry its own `tool_choice`, top level or in `extra_body`).
 - `max_tokens`, `temperature`, `top_p`, `seed` when given; `thinking_budget` is ignored; `extra`
   is merged into the body last, as top-level body fields. This is the provider passthrough:
@@ -131,7 +134,7 @@ def build_body(request: ChatRequest) -> dict:
     if request.tools and request.tool_protocol == "native":
         body["tools"] = [{"type": "function", "function": {
             "name": t.name, "description": t.description, "parameters": t.parameters}}
-            for t in (s.normalized() for s in request.tools)]
+            for t in request.tools]
         body["tool_choice"] = ({"type": "function", "function": {"name": forced}} if forced
                                else "auto")
     for key in ("temperature", "top_p", "seed"):

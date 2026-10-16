@@ -34,7 +34,10 @@ from swarmlab.participants.minisweagent import (
     resource_sentence_of,
     rules_block,
 )
+from swarmlab.providers.anthropic import tool_definition
+from swarmlab.providers.base import ChatMessage, ChatRequest
 from swarmlab.providers.fake import FakeProvider, _assistant_calls, _response
+from swarmlab.providers.openai_compat import build_body
 from swarmlab.registry import build, catalog, describe
 from swarmlab.roles import Role, assign
 from swarmlab.snapshot import SnapshotStore
@@ -361,6 +364,13 @@ def test_solo_offers_exactly_the_official_bash_tool(tmp_path, monkeypatch, shape
         assert [{"type": "function", "function": t} for t in tools] == [official]
     called = {e["tool"] for e in run.events if e["type"] == "tool_called"}
     assert called == {"bash"}
+    # and the adapters send it as the baseline does: unchanged, and on Anthropic not strict
+    fn = official["function"]
+    assert tool_definition(OFFICIAL_BASH) == {"name": fn["name"], "description": fn["description"],
+                                              "input_schema": fn["parameters"]}
+    request = ChatRequest(model="hf:m", messages=[ChatMessage(role="user", content="hi")],
+                          tools=[OFFICIAL_BASH])
+    assert build_body(request)["tools"] == [official]
 
 
 def test_official_bash_is_the_installed_mini_swe_agent_bash_tool(monkeypatch):
