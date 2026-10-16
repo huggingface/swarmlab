@@ -77,22 +77,33 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   before caching existed. A request without system text gets only the top-level breakpoint.
   Both markers are `{"type": "ephemeral", "ttl": cache_ttl}` with `cache_ttl` `"5m"` (default)
   or `"1h"`: the same TTL on both, so the API's two 400s (all 4 breakpoint slots taken, or a
-  last-block marker whose TTL differs from the top-level one) cannot occur from what this
-  adapter sends. `extra` is merged after them, so a `cache_control` (or `system`) in `extra`
-  still wins. Why on by default: it changes bills, never behaviour (the API returns the same
-  output with or without a cache hit), and every swarmlab request shape benefits (a fixed system
-  prompt and tool list per agent, a history that only grows within a turn and, under
-  `memory="full"`, across turns); a prefix shorter than the model's minimum (4096 tokens on
-  Haiku 4.5, 512 on the 5.5 models) silently does not cache and costs nothing extra. The cost of
-  being wrong is the write premium on a prefix that is never read again (0.25x of its input
-  price at 5 minutes). The setting is a provider param, not a `ChatRequest` field, so
-  `request_hash` and the record/replay cache are the same with it on or off; the params are kept
-  out of `spec()` while at their defaults, so a spec written before they existed hashes as
-  before. `write_factor` (the cache-write price multiplier `Provider.cost` uses) is 1.25 for
-  `"5m"` and 2.0 for `"1h"`, from `cache_ttl` whatever the mode (writes only happen when
-  something asked for caching). The top-level `cache_control` is passed as a keyword of
-  `messages.create` (a typed parameter in the locked SDK, anthropic 1.11.0), not through
-  `extra_body`, which would collide with an `extra_body` in `extra`.
+  last-block marker whose TTL differs from the top-level one) and its ordering rule (a
+  longer-TTL marker must come before a shorter one) cannot be broken by what this adapter
+  sends. `extra` is merged after them, so a `cache_control` (or `system`) in `extra` still
+  wins; the effective settings are resolved once per request after that merge
+  (`cache_settings`): a top-level `cache_control` dict in `extra` is also put on the system
+  block in `"prefix"` mode, so both markers carry the TTL actually sent (a 1h override yields
+  1h on both, never 5m before 1h; the alternative, rejecting the override, would make a valid
+  request an error). Markers `extra` writes elsewhere (its own `system` blocks, tools) are sent
+  as given, and their order is the caller's to get right. Why on by default: it changes bills,
+  never behaviour (the API returns the same output with or without a cache hit), and every
+  swarmlab request shape benefits (a fixed system prompt and tool list per agent, a history that
+  only grows within a turn and, under `memory="full"`, across turns); a prefix shorter than the
+  model's minimum (4096 tokens on Haiku 4.5, 512 on the 5.5 models) silently does not cache and
+  costs nothing extra. The cost of being wrong is the write premium on a prefix that is never read
+  again (0.25x of its input price at 5 minutes). The setting is a provider param, not a
+  `ChatRequest` field, so `request_hash` and the record/replay cache are the same with it on or
+  off; the params are kept out of `spec()` while at their defaults, so a spec written before they
+  existed hashes as before. Pricing: writes are billed from the response's per-TTL split,
+  `usage.cache_creation.ephemeral_5m_input_tokens` at 1.25x and `ephemeral_1h_input_tokens` at 2x
+  the input price, passed to `Provider.cost` as their token-weighted factor
+  (`response_write_factor`); without the split, at the factor of the TTLs this request sent (the
+  largest, if several), or, when it sent no marker, `write_factor`, 1.25 for `cache_ttl "5m"` and
+  2.0 for `"1h"` whatever the mode. `max_cost` (the gate's reservation) prices every prompt token
+  as a write at the largest factor among the TTLs the request sends (`max_write_factor`), and at
+  1x when it sends no marker (`"none"` and nothing in `extra`). The top-level `cache_control` is
+  passed as a keyword of `messages.create` (a typed parameter in the locked SDK, anthropic
+  1.11.0), not through `extra_body`, which would collide with an `extra_body` in `extra`.
 - API key: `ANTHROPIC_API_KEY`, else `ANTHROPIC_KEY`; with neither set the SDK's own credential
   resolution applies. The client is created per event loop (the runner uses `asyncio.run` per
   live/resume call). Tests replace `_client` with a stub; a stub set that way is always used.
@@ -102,7 +113,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from typing import Any, ClassVar
+from collections.abc import Iterator
+from typing import Any, ClassVar, NamedTuple
 
 from ..tools import ToolCall, ToolSchema
 from .base import (
@@ -147,6 +159,64 @@ def check_cache_ttl(ttl: str) -> str:
     return ttl
 
 
+def _ttl(marker: dict) -> str:
+    return str(marker.get("ttl", DEFAULT_CACHE_TTL))  # the API's default TTL is 5 minutes
+
+
+def _markers(value: Any) -> Iterator[dict]:
+    """Every `cache_control` dict at any depth of `value` (an `extra` mapping)."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k == "cache_control" and isinstance(v, dict):
+                yield v
+            else:
+                yield from _markers(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _markers(v)
+
+
+class CacheSettings(NamedTuple):
+    """The cache settings of one request after merging `extra` (module doc)."""
+
+    marker: dict | None  # what this adapter's own breakpoints carry; None in "none" mode
+    ttls: frozenset[str]  # the TTL of every cache_control marker sent
+
+    @property
+    def write_factor(self) -> float:
+        """The largest cache-write factor among `ttls` (an unknown TTL counts as the largest);
+        1.0 when no marker is sent."""
+        top = max(CACHE_WRITE_FACTORS.values())
+        return max((CACHE_WRITE_FACTORS.get(t, top) for t in self.ttls), default=1.0)
+
+
+def cache_settings(request: ChatRequest, prompt_cache: bool | str = "none",
+                   cache_ttl: str = DEFAULT_CACHE_TTL) -> CacheSettings:
+    """What `build_kwargs` sends for caching: a top-level `cache_control` dict in `extra`
+    replaces the provider's marker on both breakpoints; any marker in `extra` counts."""
+    mode, ttl = prompt_cache_mode(prompt_cache), check_cache_ttl(cache_ttl)
+    extra = request.extra
+    ttls = {_ttl(m) for m in _markers(extra)}
+    if mode == "none":
+        return CacheSettings(None, frozenset(ttls))
+    own = {"type": "ephemeral", "ttl": ttl}
+    top = extra.get("cache_control", own)
+    marker = dict(top) if isinstance(top, dict) else own
+    ttls.add(_ttl(marker))  # top level (extra's, already counted) or system block, or both
+    return CacheSettings(marker, frozenset(ttls))
+
+
+def response_write_factor(message: Any, fallback: float) -> float:
+    """The cache-write factor of a response: its 5m / 1h write tokens weighted by 1.25 / 2.0
+    (`usage.cache_creation`), or `fallback` when the response has no such split."""
+    split = _get(_get(message, "usage"), "cache_creation")
+    w5 = int(_get(split, "ephemeral_5m_input_tokens", 0) or 0)
+    w1 = int(_get(split, "ephemeral_1h_input_tokens", 0) or 0)
+    if w5 + w1 <= 0:
+        return fallback
+    return (w5 * CACHE_WRITE_FACTORS["5m"] + w1 * CACHE_WRITE_FACTORS["1h"]) / (w5 + w1)
+
+
 def tool_definition(schema: ToolSchema) -> dict:
     norm = schema.normalized()
     tool: dict[str, Any] = {"name": norm.name, "description": norm.description,
@@ -185,7 +255,8 @@ def build_kwargs(request: ChatRequest, *, prompt_cache: bool | str = "none",
 
     `prompt_cache` / `cache_ttl` add the cache breakpoints (module doc); the default here is no
     caching, the plain mapping. `AnthropicProvider.complete` passes the provider's settings."""
-    mode, ttl = prompt_cache_mode(prompt_cache), check_cache_ttl(cache_ttl)
+    mode = prompt_cache_mode(prompt_cache)
+    marker = cache_settings(request, mode, cache_ttl).marker
     mid = model_id(request)
     forced = check_tool_choice(request)
     system = "\n\n".join(text_of(m.content) for m in request.messages if m.role == "system")
@@ -217,8 +288,7 @@ def build_kwargs(request: ChatRequest, *, prompt_cache: bool | str = "none",
             kw["temperature"] = request.temperature
         if request.top_p is not None:
             kw["top_p"] = request.top_p
-    if mode != "none":
-        marker = {"type": "ephemeral", "ttl": ttl}
+    if marker is not None:
         if mode == "prefix" and system:
             kw["system"] = [{"type": "text", "text": system, "cache_control": dict(marker)}]
         kw["cache_control"] = dict(marker)
@@ -323,6 +393,13 @@ class AnthropicProvider(Provider):
         self._client: Any = None
         self._client_loop: Any = None
 
+    def _cache_settings(self, request: ChatRequest) -> CacheSettings:
+        return cache_settings(request, self.prompt_cache, self.cache_ttl)
+
+    def max_write_factor(self, request: ChatRequest) -> float:
+        """The largest write factor among the TTLs `request` sends; 1.0 when it sends none."""
+        return self._cache_settings(request).write_factor
+
     def _get_client(self) -> Any:
         loop = asyncio.get_running_loop()
         if self._client is not None and self._client_loop in (None, loop):
@@ -369,8 +446,11 @@ class AnthropicProvider(Provider):
             await asyncio.sleep(self._delay(attempt, retry_after))
             attempt += 1
         text, calls, usage, finish = parse_message(message)
+        settings = self._cache_settings(request)
+        fallback = settings.write_factor if settings.ttls else self.write_factor
+        factor = response_write_factor(message, fallback)
         return ChatResponse(
-            text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage),
+            text=text, tool_calls=calls, usage=usage, cost_usd=self.cost(request, usage, factor),
             provider=self.name, model=model_id(request), served_by=None,
             latency_s=time.monotonic() - start, finish_reason=finish,
             attempts=attempt + 1, retried_after_timeout=timed_out, refusal=parse_refusal(message),
