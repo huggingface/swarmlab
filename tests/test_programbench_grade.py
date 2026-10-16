@@ -5,15 +5,18 @@ CLI), the score write-back and what `Run.load`, `report` and `export` show after
 bootstrap.sh's grade branch against stubs. Nothing is launched; no Docker, image or dataset."""
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
 import pickle
+import pwd
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -46,6 +49,8 @@ def machine(tmp_path, **kw):
     kw.setdefault("environ", {"PATH": os.environ["PATH"], "HOME": str(tmp_path),
                               "HF_TOKEN": "secret", "ANTHROPIC_KEY": "k", "SWARMLAB_TAG": "t",
                               "PROGRAMBENCH_BLOB_DIR": "/x", "KEEP_ME": "1"})
+    kw.setdefault("run_as", None)   # even when the suite runs as root: no drop, no chmod of /root
+    kw.setdefault("private", ())
     return g.LocalMachine(tmp_path / "store", workspace=str(ws),
                           keep=(str(tmp_path / "stash"),), **kw)
 
@@ -172,6 +177,175 @@ def test_grade_env_strips_secrets_swarmlab_and_the_venv():
                        "UV_PYTHON_INSTALL_DIR": "/p", "HF_HOME": "/h", "LANG": "C.UTF-8",
                        "PYTHONDONTWRITEBYTECODE": "1"}, "/venv/bin")
     assert out == {"PATH": "/usr/bin", "LANG": "C.UTF-8"}
+    declared = g.grade_env({"MODEL_AUTH": "dummy-value", "LANG": "C",
+                            "SWARMLAB_SECRET_NAMES": "HF_TOKEN MODEL_AUTH"})
+    assert declared == {"LANG": "C"}
+
+
+def test_only_the_commands_running_submitted_code_drop_to_the_user(tmp_path):
+    """Non-root: the drop itself needs root, so the prefix is a stub that marks the command."""
+    me = pwd.getpwuid(os.getuid()).pw_name
+    m = machine(tmp_path, run_as=me)
+    assert m.prefix == ["setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}",
+                        "--init-groups", "--no-new-privs", "--"]
+    assert not m.isolating  # not root: no chown, no killing the user's processes
+    assert g.default_run_as() == (g.DEFAULT_RUN_AS if os.geteuid() == 0 and
+                                  _user_exists(g.DEFAULT_RUN_AS) else None)
+    with pytest.raises(ValueError, match="does not exist"):
+        machine(tmp_path, run_as="no-such-user-swarmlab")
+    m.prefix = ["env", "AS_USER=1"]
+    m.identity = {"HOME": str(tmp_path / "userhome")}
+    e = env(m)
+    ws = Path(m.workspace)
+    (ws / "compile.sh").write_text("#!/bin/sh\necho compile ${AS_USER:-root} $HOME\n")
+    (ws / "eval").mkdir()
+    (ws / "eval" / "run.sh").write_text("#!/bin/sh\necho tests ${AS_USER:-root}\n")
+    assert e.execute(g.COMPILE_COMMAND)["output"] == f"compile 1 {tmp_path}/userhome\n"
+    assert e.execute(g.RUN_TESTS_COMMAND)["output"] == "tests 1\n"
+    assert e.execute(f"export A=1 && {g.RUN_TESTS_COMMAND}")["output"] == "tests 1\n"
+    assert g.runs_submitted_code(g.SEED_GIT_COMMAND)
+    for cmd in ("./compile.sh", "chmod +x ./compile.sh && ./compile.sh; true",
+                "./eval/run.sh", "mv ./compile.sh ./c.sh && mv ./c.sh ./compile.sh && ./compile.sh"):
+        assert not g.runs_submitted_code(cmd)
+        assert e.execute(cmd)["output"].split()[:2] in (["compile", "root"], ["tests", "root"])
+    assert e.execute("echo ${AS_USER:-root} $HOME")["output"] == f"root {tmp_path}\n"
+
+
+def test_the_matched_commands_are_the_pinned_evaluators(tmp_path, monkeypatch):
+    """The predicate is tied to programbench==1.2.5: the literals are in its source, and driving
+    its Evaluator (compile, then a branch with the retry plugin) sends exactly three commands that
+    match: the git seed, compile.sh and the finalized eval/run.sh command."""
+    pytest.importorskip("programbench")
+    import inspect
+
+    from programbench.eval import eval as pb_eval
+
+    src = inspect.getsource(pb_eval)
+    assert f'"{g.COMPILE_COMMAND}"' in src and f'run_cmd = "{g.RUN_TESTS_COMMAND}"' in src
+    sent: list[str] = []
+
+    class Recorder:
+        executable, container_id = "true", "recorder"
+
+        def __init__(self, **_kw):
+            pass
+
+        def execute(self, command, timeout=None):
+            sent.append(command)
+            return {"output": "nameserver 0.0.0.0\n", "returncode": 0, "exception_info": ""}
+
+        def copy_in(self, *_a):
+            pass
+
+        copy_in_tar = copy_in
+
+        def cleanup(self):
+            pass
+
+    monkeypatch.setattr(pb_eval, "ContainerEnvironment", Recorder)
+    ev = pb_eval.Evaluator(tests_branches=["b1"], submission_archive=tmp_path / "s.tar.gz",
+                           blob_dir=tmp_path, remove_hashes=["0" * 64])
+    log: list[dict] = []
+    ev._compile_executable(Recorder(), log)
+    assert ev._has_rerunfailures
+    ev._run_test_branch("b1", "img", log)
+    matched = {s["step"]: s["command"] for s in log if g.runs_submitted_code(s["command"])}
+    assert set(matched) == {"seed_git", "compile", "run_tests"}
+    assert matched["seed_git"] == g.SEED_GIT_COMMAND
+    assert matched["run_tests"].startswith("export ") and \
+        matched["run_tests"].endswith(" && " + g.RUN_TESTS_COMMAND)
+    logged = {s["command"] for s in log}
+    assert [c for c in sent if c not in logged]  # the DNS blackhole and restore, as root
+    assert not any(g.runs_submitted_code(c) for c in sent if c not in logged)
+
+
+def test_chown_tree_never_follows_a_link_or_hands_over_a_hard_link(tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    (ws / "sub").mkdir(parents=True)
+    (ws / "sub" / "f").write_text("x")
+    outside = tmp_path / "outside"
+    outside.write_text("root's")
+    (ws / "hard").hardlink_to(outside)        # e.g. a link to a file elsewhere
+    (ws / "sym").symlink_to(outside)
+    (ws / "symdir").symlink_to(tmp_path)
+    calls = []
+    monkeypatch.setattr(os, "chown", lambda path, uid, gid, *, follow_symlinks=True:
+                        calls.append((os.path.relpath(path, ws), uid, gid, follow_symlinks)))
+    g.chown_tree(str(ws), 4242, 4242)
+    assert sorted(calls) == [(n, 4242, 4242, False) for n in (".", "sub", "sub/f", "sym",
+                                                              "symdir")]
+    calls.clear()
+    g.chown_tree(str(ws), os.getuid(), os.getgid())   # already the owner: nothing to do
+    assert calls == []
+
+
+def _user_exists(name: str) -> bool:
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(os.geteuid() != 0 or not _user_exists("agent"),
+                    reason="needs root and a user 'agent' (the grade job's situation)")
+def test_submitted_code_cannot_read_a_root_only_dir(tmp_path):
+    base = Path(tempfile.mkdtemp(prefix="swarmlab-isolation-", dir="/tmp"))
+    try:
+        base.chmod(0o755)
+        hidden = base / "hidden"
+        hidden.mkdir()
+        hidden.chmod(0o700)
+        (hidden / "marker").write_text("hidden-tests")
+        ws = base / "ws"
+        ws.mkdir()
+        m = g.LocalMachine(tmp_path / "store", workspace=str(ws), keep=(str(base / "stash"),),
+                           run_as="agent", private=(str(hidden),),
+                           environ={"PATH": os.environ["PATH"]})
+        assert m.isolating
+        e = env(m)
+        (ws / "compile.sh").write_text(
+            f"#!/bin/sh\nid -un\ncat {hidden}/marker && echo LEAKED\n"
+            f"sudo -n cat {hidden}/marker 2>/dev/null && echo SUDO_LEAKED\n"
+            "touch built\nsetsid sleep 60 >/dev/null 2>&1 </dev/null &\necho $! > daemon.pid\n")
+        assert e.execute(f"cat {hidden}/marker")["output"] == "hidden-tests"  # a root step
+        out = e.execute(g.COMPILE_COMMAND)["output"]
+        assert out.startswith("agent\n") and "LEAKED" not in out and "hidden-tests" not in out
+        agent_uid = pwd.getpwnam("agent").pw_uid
+        assert (ws / "built").stat().st_uid == agent_uid
+        assert m.hidden_from_user(hidden / "marker") and not m.hidden_from_user(ws / "built")
+        assert m.hidden_from_user(m.store) and m.hidden_from_user(hidden)
+        daemon = int((ws / "daemon.pid").read_text())
+        e.cleanup()
+        assert _gone(daemon)
+    finally:
+        shutil.rmtree(base)
+
+
+def _gone(pid: int, wait_s: float = 5.0) -> bool:
+    """The process no longer exists (or is a zombie waiting for its reaper)."""
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        with contextlib.suppress(OSError):
+            if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                return True
+        time.sleep(0.05)
+    return False
+
+
+def test_cleanup_kills_a_daemon_that_left_the_session(tmp_path):
+    m = machine(tmp_path)
+    e = env(m)
+    pid = int(e.execute("setsid sleep 30 >/dev/null 2>&1 </dev/null & echo $!")["output"])
+    os.kill(pid, 0)
+    assert f"SWARMLAB_EVAL_ENV={e.container_id}".encode() in \
+        Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    e.cleanup()
+    assert _gone(pid)
 
 
 # ---- the real Evaluator on the package's fixture task -------------------------------------------
@@ -222,7 +396,7 @@ def test_official_evaluator_runs_on_the_local_environment(tmp_path, monkeypatch)
     (ws / "stale").write_text("from the image")
     out = tmp_path / "out" / "grade.json"
     doc = g.grade(FIXTURE, sub, tests, out, workspace=str(ws), stash=str(tmp_path / "stash"),
-                  environ=environ)
+                  environ=environ, run_as=None)
     official = json.loads((data / "test_runs" / "correct" / FIXTURE /
                            f"{FIXTURE}.eval.json").read_text())
     ev = doc["evaluation"]
@@ -273,6 +447,20 @@ def test_submission_is_the_last_snapshot_workspace(tmp_path):
         assert sorted(tar.getnames()) == ["compile.sh", "executable"]
         assert tar.extractfile("compile.sh").read().startswith(b"#!/bin/bash")
     assert pbj.run_task(run.dir) == TASK
+
+
+def test_a_snapshot_older_than_the_last_round_is_refused(tmp_path):
+    """snapshot_every skipped the final round (fabricated: the run ends at round 3, the last
+    snapshot is of round 1): the final workspace was never saved, so nothing is graded."""
+    run = dry_run(tmp_path)
+    meta = json.loads((run.dir / "run.json").read_text())
+    assert meta["last_round"] == 1 and SnapshotStore(run.dir).list_rounds() == [1]
+    meta["last_round"] = 3
+    (run.dir / "run.json").write_text(json.dumps(meta))
+    with pytest.raises(SpecError, match=r"last round is 3 but its last snapshot is of round 1.*"
+                                        r"max_rounds: 1.*snapshot_every: 1"):
+        pbj.submission_from_run(run.dir)
+    assert not (run.dir / "artifacts" / "submission.tar.gz").exists()
 
 
 def test_untouched_workspace_writes_a_marker_and_is_not_graded(tmp_path):
@@ -394,6 +582,25 @@ def test_write_grade_then_load_report_and_export(tmp_path):
     assert "pb-dry__" in final and "skipped (not ended / unreadable): none" in report
     exported = json.loads((run.export(tmp_path / "exp") / "run.json").read_text())
     assert exported["score"]["graded"] is True and exported["score"]["passed"] == 4
+
+
+def test_a_grade_written_after_an_export_makes_publishing_re_export(tmp_path):
+    from swarmlab.export import is_current
+    from swarmlab.publish import ensure_export
+
+    run = dry_run(tmp_path)
+    out = ensure_export(run.dir)  # what publishing does: export, or reuse a current export
+    assert json.loads((out / "run.json").read_text())["score"].get("graded") is False
+    assert is_current(run.dir, out) and ensure_export(run.dir) == out
+    gj = tmp_path / "grade.json"
+    gj.write_text(json.dumps(grade_doc()))
+    pbj.write_grade(run.dir, gj)
+    assert not is_current(run.dir, out)  # the log is unchanged; run.json is not
+    out = ensure_export(run.dir)
+    doc = json.loads((out / "run.json").read_text())
+    assert doc["score"]["graded"] is True and doc["score"]["score"] == 0.75
+    assert json.loads((out / "raw" / "run.json").read_text())["score"]["graded"] is True
+    assert is_current(run.dir, out)
 
 
 def test_write_grade_refuses_another_task_and_partial_scores(tmp_path):

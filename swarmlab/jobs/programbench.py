@@ -5,7 +5,10 @@ The world never grades (swarmlab/world/programbench.py, "Grade seam"); a run end
 
 1. `submission_from_run(run_dir)`: the run's last committed snapshot (`snapshots/` manifest of
    `run.json["last_round"]` -> blob `world` -> `workspace_tar_of`) is written to
-   `<run>/artifacts/submission.tar.gz`. A snapshot holding no tar means the image's untouched
+   `<run>/artifacts/submission.tar.gz`. That snapshot must be of the last round itself: the
+   runner snapshots only every `snapshot_every` rounds and takes no extra one at the end, so a
+   run whose last round was skipped has no record of its final workspace, and grading refuses
+   (SpecError naming both rounds) rather than grade an older one. A snapshot holding no tar means the image's untouched
    workspace (no command ever ran): `artifacts/submission.untouched` (empty) is written instead
    and grading is refused (there is nothing of the agent's to grade).
 2. `plan_grade(run_dir)` -> `GradePlan`: the task from the run's spec
@@ -98,10 +101,18 @@ def submission_from_run(run_dir: Path | str) -> Path | None:
     run_dir = Path(run_dir)
     meta = RunRunner._read_meta_at(run_dir)
     store = SnapshotStore(run_dir)
-    manifest = store.latest(max_round=meta.get("last_round"))
+    last = meta.get("last_round")
+    manifest = store.latest(max_round=last)
     if manifest is None or "world" not in manifest.plugins:
         raise FileNotFoundError(f"{run_dir}: no world snapshot to grade (the run committed no "
                                 "round)")
+    if last is not None and manifest.round != last:
+        raise SpecError(
+            f"{run_dir}: the run's last round is {last} but its last snapshot is of round "
+            f"{manifest.round} (snapshot_every skipped the final round), so the workspace the "
+            "agent ended with was never saved; grading the older one would score the wrong "
+            "submission. Run the official solo shape (max_rounds: 1) or set options."
+            "snapshot_every: 1 so the final round is snapshotted.")
     tar = workspace_tar_of(store.blobs.get(manifest.plugins["world"]))
     art = run_dir / "artifacts"
     art.mkdir(exist_ok=True)
