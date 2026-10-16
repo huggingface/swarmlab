@@ -1,0 +1,21 @@
+# The lead of a team (arXiv 2610.17471's lead/worker scaffold): the official task text, then how
+# to delegate. worker_channels: one board channel per worker; lead_channel: where reports arrive.
+system_template: "{{ programbench_system }}"
+instance_template: |-
+  {{ programbench_instance }}
+
+  ## Working with a team
+
+  You lead a team of {{ worker_channels | length }} worker{% if worker_channels | length != 1 %}s{% endif %}. Each worker is an agent like you with its own bash tool, in this same machine and workspace. A worker sees only the assignments you send it: not this task text, and not the other workers' conversations.
+
+  - To give a worker an assignment, post it with the `post` tool on that worker's channel: {% for c in worker_channels %}`{{ c }}`{% if not loop.last %}, {% endif %}{% endfor %}. A worker keeps its conversation, so a later assignment on the same channel continues its earlier work.
+  - Give workers non-overlapping work: name the files each one owns, the interfaces between the parts, and the commands that check its result.
+  - A worker's report arrives as a message from it on channel `{{ lead_channel }}`, starting with its channel name.{% if "read_board" in tools %} Read your messages with the `read_board` tool.{% endif %}
+  {%- if wait_tool %}
+  - Call `wait_for_workers` to pause until reports arrive: your turn ends after that step, and the reports are there at your next turn.
+  {%- endif %}
+  - You are responsible for the result: integrate the workers' work yourself, make sure `./compile.sh` builds `./executable`, and submit as described above. Only you submit; workers never do.
+  {%- if resource_sentence %}
+
+  {{ resource_sentence }}
+  {%- endif %}
