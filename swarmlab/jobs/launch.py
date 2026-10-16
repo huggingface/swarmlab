@@ -49,8 +49,12 @@ flags the launcher always adds (`LAUNCHER_FLAGS`).
 Wall-time estimate: `setup_s` (default 600: install + weights download + vLLM start) plus, per
 run, `rounds * per_round_s(N)` with `per_round_s(N) = 30 + 2 * N` seconds (a guess: the
 router-served Qwen phase-1 runs took ~1 min per round at N=16; a local server should not be
-slower). `--per-round` overrides it. The default timeout is 1.5x the estimate, rounded up to
-10 minutes.
+slower). `--per-round` overrides it. With `parallel=N` (`--parallel`, sent as `SWARMLAB_PARALLEL`;
+default 1, and then the env and the command are as before) the job runs up to N runs at once
+against the one server: bootstrap.sh starts the runs in plan order as slots free up, and the
+estimate is the setup plus the makespan of that schedule, assuming concurrent runs do not slow
+each other (one vLLM server batches their requests; raise `--per-round` if they contend). The
+default timeout is 1.5x the estimate, rounded up to 10 minutes.
 """
 from __future__ import annotations
 
@@ -229,6 +233,7 @@ class JobPlan:
     probe_extra: dict[str, Any] = field(default_factory=dict)
     probe_extra_source: str = "default"   # "--probe-extra" | "profile" | "default" | "none"
     port: int = DEFAULT_PORT   # vLLM's port; the job spec's provider URL points at it
+    parallel: int = 1   # runs at once in the job (SWARMLAB_PARALLEL)
 
     @property
     def stage_remote(self) -> str:
@@ -282,6 +287,8 @@ class JobPlan:
         }
         if self.revision:
             env["VLLM_REVISION"] = self.revision
+        if self.parallel > 1:
+            env["SWARMLAB_PARALLEL"] = str(self.parallel)
         return env
 
     def as_dict(self) -> dict[str, Any]:
@@ -321,6 +328,7 @@ def plan_job(
     sync_every_s: int = DEFAULT_SYNC_EVERY_S,
     per_round_s: float | None = None,
     setup_s: int = DEFAULT_SETUP_S,
+    parallel: int = 1,
     tag: str | None = None,
     now: float | None = None,
     git: Callable[[], tuple[str, bool]] | None = None,
@@ -336,6 +344,8 @@ def plan_job(
     if not bucket.startswith("hf://buckets/"):
         raise SpecError(f"--bucket must look like hf://buckets/<namespace>/<name>, got {bucket!r}")
     bucket = bucket.rstrip("/")
+    if parallel < 1:
+        raise SpecError(f"--parallel must be >= 1, got {parallel}")
 
     resolved = resolve_flags(model, vllm_flags=vllm_flags, profile=profile,
                              append=vllm_flags_append, probe_extra=probe_extra)
@@ -377,14 +387,19 @@ def plan_job(
 
     runs = [(a, int(s)) for a in chosen for s in seed_list]
     per_arm = {}
-    total = setup_s
     for a in chosen:
         n = arm_agents(doc, a)
         rounds = arm_rounds(doc, a)
         pr = per_round_s if per_round_s is not None else per_round_guess(n)
         per_arm[a] = {"agents": n, "rounds": rounds, "per_round_s": pr,
                       "per_run_s": int(rounds * pr), "runs": len(seed_list)}
-        total += int(rounds * pr) * len(seed_list)
+    slots = [0] * parallel   # bootstrap.sh's schedule: each run takes the first free slot
+    for a, _ in runs:
+        slots[slots.index(min(slots))] += per_arm[a]["per_run_s"]
+    total = setup_s + max(slots)
+    if parallel > 1:
+        notes.append(f"up to {parallel} runs at once share the one vLLM server; the estimate "
+                     "assumes they do not slow each other (raise --per-round if they contend)")
     timeout_s = (parse_duration(timeout) if timeout is not None
                  else math.ceil(total * 1.5 / 600.0) * 600)
     if timeout_s < total:
@@ -395,13 +410,14 @@ def plan_job(
     return JobPlan(
         spec_path=str(spec), name=doc["name"], tag=tag, model=model, flavor=flavor, image=image,
         bucket=bucket, commit=commit, dirty=dirty, runs=runs, timeout_s=timeout_s,
-        estimate_s=total, estimate_detail={"setup_s": setup_s, "arms": per_arm},
+        estimate_s=total, estimate_detail={"setup_s": setup_s, "parallel": parallel,
+                                           "arms": per_arm},
         vllm_version=vllm_version, vllm_flags=resolved.flags, max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization, revision=revision,
         sync_every_s=sync_every_s, job_spec_yaml=job_yaml, orig_spec_yaml=spec.read_text(),
         notes=notes, vllm_flags_source=resolved.source, vllm_profile=resolved.profile,
         probe_extra=resolved.probe_extra, probe_extra_source=resolved.probe_extra_source,
-        port=port,
+        port=port, parallel=parallel,
     )
 
 
@@ -492,8 +508,9 @@ def describe(plan: JobPlan) -> str:
                      f" = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
     cost = (f"~${rate * est_h:.2f} expected, ${rate * plan.timeout_s / 3600:.2f} worst case "
             f"(${rate:.2f}/h x timeout)" if rate is not None else "rate unknown for this flavor")
+    at_once = f", {plan.parallel} runs at once" if plan.parallel > 1 else ""
     lines.append(f"estimate: ~{plan.estimate_s / 60:.0f} min wall (incl. "
-                 f"{plan.estimate_detail['setup_s'] // 60} min setup); timeout "
+                 f"{plan.estimate_detail['setup_s'] // 60} min setup{at_once}); timeout "
                  f"{fmt_duration(plan.timeout_s)}; flavor {plan.flavor}: {cost}")
     lines.append("model calls are self-hosted: the ledger shows $0, the cost is the job's compute")
     lines += [f"note: {n}" for n in plan.notes]

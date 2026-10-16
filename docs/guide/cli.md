@@ -19,7 +19,7 @@ swarmlab prompts SPEC --arm A [--seed N]  swarmlab report RUNS_DIR [--out report
 swarmlab export RUN_DIR [--out DIR] [--no-raw]
 swarmlab publish RUNS_DIR_OR_RUN [--repo OWNER/REPO] [--public] [--tag T] [--no-raw]
 swarmlab fetch-published OWNER/REPO RUN_ID [--out runs/] [--force]
-swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 2h] [--per-round S]
+swarmlab job run SPEC --model M [--flavor F] [--arm A] [--seeds 1,2] [--timeout 2h] [--per-round S] [--parallel N]
                  [--vllm-version V] [--max-model-len L] [--profile auto|none|MODEL] [--vllm-flags F] [--vllm-flags-append F] [--probe-extra JSON] [--launch]
 swarmlab job status JOB_ID    swarmlab job logs JOB_ID [--follow]    swarmlab job fetch RUN_ID [--out runs/]
 ```

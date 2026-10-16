@@ -6,7 +6,10 @@
 #   SWARMLAB_TAG          job tag, e.g. m2-vllm-qwen9b-1a2b3c4-20261006-120000
 #   SWARMLAB_STAGE        hf://buckets/<ns>/<bucket>/jobs/<tag>  (wheel, spec.yaml, this script)
 #   SWARMLAB_RUNS_REMOTE  hf://buckets/<ns>/<bucket>/runs/<tag>  (run dirs are synced here)
-#   SWARMLAB_RUNS         space-separated "arm:seed" pairs, run in this order
+#   SWARMLAB_RUNS         space-separated "arm:seed" pairs, started in this order
+#   SWARMLAB_PARALLEL     runs at once against the one vLLM server (default 1: one after another);
+#                         each is its own `swarmlab run` process with its own joblogs/run-* files,
+#                         and results.jsonl gets its line when it ends (completion order)
 #   SWARMLAB_GIT_COMMIT / SWARMLAB_GIT_DIRTY / SWARMLAB_JOB_SPEC_SHA256 / SWARMLAB_FLAVOR / SWARMLAB_IMAGE
 #   SWARMLAB_SYNC_EVERY   seconds between background syncs of $SWARMLAB_JOB_TMP/runs (default 300)
 #   VLLM_MODEL VLLM_PORT VLLM_VERSION VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_FLAGS
@@ -44,6 +47,7 @@ VENV="$ROOT/venv"
 WORK="$ROOT/work"
 OUT="$JT/runs"
 SYNC_EVERY="${SWARMLAB_SYNC_EVERY:-300}"
+PARALLEL="${SWARMLAB_PARALLEL:-1}"
 VLLM_WAIT_S="${VLLM_WAIT_S:-1200}"
 VLLM_PORT="${VLLM_PORT:-8000}"   # the spec's providers override points at this port
 BASE="http://127.0.0.1:$VLLM_PORT"
@@ -51,7 +55,8 @@ export HF_HOME="${HF_HOME:-$JT/hf}" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export SWARMLAB_OFFLINE=1   # never fetch the router catalog inside the job
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-STATUS=starting RC=0 VLLM_PID="" SYNC_PID="" RUN_PID="" READY_S="" FAILED_RUNS="" DONE_RUNS=""
+STATUS=starting RC=0 VLLM_PID="" SYNC_PID="" READY_S="" FAILED_RUNS="" DONE_RUNS=""
+declare -A RUNNING=()   # pid -> "arm:seed" of the `swarmlab run` processes in flight
 VLLM_CMDLINE=""
 if [ -z "${VLLM_PROBE_EXTRA:-}" ]; then   # launched by hand: the launcher's default
   VLLM_PROBE_EXTRA='{"chat_template_kwargs":{"enable_thinking":false}}'
@@ -87,7 +92,7 @@ doc = {
     "status": e("STATUS"), "exit_code": int(e("RC") or 0),
     "runs_planned": (e("SWARMLAB_RUNS") or "").split(),
     "runs_done": (e("DONE_RUNS") or "").split(), "runs_failed": (e("FAILED_RUNS") or "").split(),
-    "runs_remote": e("SWARMLAB_RUNS_REMOTE"),
+    "runs_remote": e("SWARMLAB_RUNS_REMOTE"), "parallel": int(e("SWARMLAB_PARALLEL") or 1),
     "vllm": {"model": e("VLLM_MODEL"), "revision": e("VLLM_REVISION") or None,
              "version": e("VLLM_VERSION"), "max_model_len": e("VLLM_MAX_MODEL_LEN"),
              "gpu_memory_utilization": e("VLLM_GPU_MEMORY_UTILIZATION"),
@@ -115,7 +120,8 @@ sync_runs() {
 
 finish() {
   trap - EXIT TERM INT
-  [ -n "$RUN_PID" ] && kill -TERM "$RUN_PID" 2>/dev/null && wait "$RUN_PID" 2>/dev/null
+  for pid in "${!RUNNING[@]}"; do kill -TERM "$pid" 2>/dev/null; done
+  for pid in "${!RUNNING[@]}"; do wait "$pid" 2>/dev/null; done
   [ -n "$SYNC_PID" ] && kill "$SYNC_PID" 2>/dev/null
   if [ "$STATUS" != "completed" ]; then STATUS="failed"; fi
   [ "$RC" -eq 0 ] && [ "$STATUS" = "failed" ] && RC=1
@@ -135,6 +141,7 @@ finish() {
 trap 'RC=$?; finish' EXIT
 trap 'log "signal: stopping (job timeout or cancel)"; RC=143; finish' TERM INT
 fail() { RC="$1"; shift; log "FATAL: $*"; exit "$RC"; }
+[ $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] )) -ge 501 ] || fail 10 "bash >= 5.1 needed (wait -n -p)"
 
 log "tag=$SWARMLAB_TAG job=${JOB_ID:-?} commit=${SWARMLAB_GIT_COMMIT:-?} accelerator=${ACCELERATOR:-?}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || log "no GPU visible"
@@ -262,20 +269,34 @@ write_manifest
 ( while sleep "$SYNC_EVERY"; do sync_runs; done ) &
 SYNC_PID=$!
 cd "$WORK" || fail 10 "no work dir"
+# a run ends: its summary line, DONE/FAILED, a sync (the shell is single-threaded, so these never
+# interleave). `wait -n -p` (bash >= 5.1) returns at a SIGTERM too, so the trap runs at once.
+reap_one() {
+  local pid rc item
+  wait -n -p pid "${!RUNNING[@]}"
+  rc=$?
+  if [ -z "$pid" ]; then   # no child left to wait for (should not happen): count them failed
+    log "WARNING: lost track of runs ${RUNNING[*]} (wait -n exit $rc)"
+    FAILED_RUNS="$FAILED_RUNS ${RUNNING[*]}"; RUNNING=(); return
+  fi
+  item="${RUNNING[$pid]}"
+  unset "RUNNING[$pid]"
+  arm="${item%:*}"; seed="${item##*:}"
+  cat "$JT/joblogs/run-$arm-s$seed.json" >>"$JT/results.jsonl"
+  if [ "$rc" -eq 0 ]; then DONE_RUNS="$DONE_RUNS $item"; else FAILED_RUNS="$FAILED_RUNS $item"; log "run $item failed (exit $rc)"; fi
+  sync_runs
+  hf_q buckets cp "$JT/results.jsonl" "$SWARMLAB_STAGE/results.jsonl"
+}
+[ "$PARALLEL" -gt 1 ] && log "running up to $PARALLEL runs at once"
 for item in $SWARMLAB_RUNS; do
+  [ "${#RUNNING[@]}" -ge "$PARALLEL" ] && reap_one
   arm="${item%:*}"; seed="${item##*:}"
   log "run arm=$arm seed=$seed"
   # in the background + `wait`, so a SIGTERM (job timeout) reaches the trap at once
   "$SWARMLAB" run "$STAGE_DIR/spec.yaml" --arm "$arm" --seed "$seed" --yes --out "$OUT" --json \
     >"$JT/joblogs/run-$arm-s$seed.json" 2> >(tee "$JT/joblogs/run-$arm-s$seed.err" >&2) &
-  RUN_PID=$!
-  wait "$RUN_PID"
-  rc=$?
-  RUN_PID=""
-  cat "$JT/joblogs/run-$arm-s$seed.json" >>"$JT/results.jsonl"
-  if [ "$rc" -eq 0 ]; then DONE_RUNS="$DONE_RUNS $item"; else FAILED_RUNS="$FAILED_RUNS $item"; log "run $item failed (exit $rc)"; fi
-  sync_runs
-  hf_q buckets cp "$JT/results.jsonl" "$SWARMLAB_STAGE/results.jsonl"
+  RUNNING[$!]="$item"
 done
+while [ "${#RUNNING[@]}" -gt 0 ]; do reap_one; done
 if [ -z "$FAILED_RUNS" ]; then STATUS=completed; RC=0; else STATUS=failed; RC=1; fi
 exit "$RC"

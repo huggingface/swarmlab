@@ -1166,6 +1166,9 @@ def job_run(
     revision: Annotated[str | None, typer.Option("--revision", help="Model revision to pin.")] = None,
     per_round: Annotated[float | None, typer.Option(
         "--per-round", help="Seconds per round for the estimate (default 30 + 2*N).")] = None,
+    parallel: Annotated[int, typer.Option(
+        "--parallel", min=1, help="Runs at once in the job, all against the one vLLM server "
+        "(default 1: one after another); the estimate and default --timeout account for it.")] = 1,
     stage_dir: Annotated[Path | None, typer.Option(
         "--stage-dir", help="Also write the stage files (spec, bootstrap, plan, wheel) here.")] = None,
     launch: Annotated[bool, typer.Option(
@@ -1191,7 +1194,8 @@ def job_run(
                 kw[key] = val
         plan = jl.plan_job(spec, model=model, flavor=flavor, arms=arm or None,
                            seeds=_seed_list(seeds), bucket=bucket, vllm_flags=vllm_flags,
-                           vllm_flags_append=vllm_flags_append, profile=profile, **kw)
+                           vllm_flags_append=vllm_flags_append, profile=profile,
+                           parallel=parallel, **kw)
         data: dict[str, Any] = {"ok": True, "plan": plan.as_dict(), "launched": False}
         text = jl.describe(plan)
         if stage_dir is not None:
