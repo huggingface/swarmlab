@@ -138,6 +138,13 @@ Decisions where the contract is silent:
 - `EXPORT_SCHEMA` is recorded in `run.json["export_schema"]`; outputs are deterministic for a
   given run directory and code version (no export timestamp), so re-publishing an unchanged run
   uploads nothing.
+- Freshness (`is_current`, which `publish.ensure_export` uses to reuse an export): the same
+  `EXPORT_SCHEMA` and `raw` choice, the sha256 of the log (`run.json["events"]["sha256"]`) and
+  the sha256 of the run's `run.json` (`run.json["run_json"]["sha256"]`). `run.json` can change
+  without the log: `swarmlab programbench fetch-grade` writes a grade into it
+  (`jobs.programbench.write_grade`), and the export copies its score, and the file itself into
+  `raw/`. Any rewrite of `run.json` therefore re-exports, a byte-identical one does not; an
+  export made before this field existed is not current.
 """
 from __future__ import annotations
 
@@ -1042,7 +1049,8 @@ def export_run(run_dir: Path | str, out: Path | str | None = None, *, raw: bool 
     meta_path = run_dir / "run.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"{run_dir} is not a run directory (no run.json)")
-    meta = json.loads(meta_path.read_text())
+    meta_bytes = meta_path.read_bytes()
+    meta = json.loads(meta_bytes)
     out = Path(out) if out is not None else run_dir / "export"
     if out.resolve() == run_dir.resolve():
         raise ValueError("export out dir must differ from the run dir")
@@ -1088,6 +1096,7 @@ def export_run(run_dir: Path | str, out: Path | str | None = None, *, raw: bool 
         "tables": {f: {"rows": counts[f], "path": f"tables/{f}.parquet"} for f in FAMILIES},
         "sessions": sorted(f"sessions/{a}.jsonl" for a in sessions),
         "events": {"n": len(events), "sha256": hashlib.sha256(ev_bytes).hexdigest()},
+        "run_json": {"sha256": hashlib.sha256(meta_bytes).hexdigest()},
         "blobs": blob_info,
         "export_raw": raw,
         "unreadable_blobs": dict(sorted(blobs.unreadable.items())),
@@ -1098,15 +1107,18 @@ def export_run(run_dir: Path | str, out: Path | str | None = None, *, raw: bool 
 
 
 def is_current(run_dir: Path | str, out: Path | str | None = None, *, raw: bool = True) -> bool:
-    """True when `out` holds an export of the run's current log with this EXPORT_SCHEMA, made
-    with the same `raw` choice."""
+    """True when `out` holds an export of the run's current log and current `run.json` (a grade
+    written back changes only the latter) with this EXPORT_SCHEMA, made with the same `raw`
+    choice."""
     run_dir = Path(run_dir)
     out = Path(out) if out is not None else run_dir / "export"
     try:
         doc = json.loads((out / "run.json").read_text())
         sha = hashlib.sha256((run_dir / "events.jsonl").read_bytes()).hexdigest()
+        meta_sha = hashlib.sha256((run_dir / "run.json").read_bytes()).hexdigest()
     except (OSError, ValueError):
         return False
     return (doc.get("export_schema") == EXPORT_SCHEMA and doc.get("events", {}).get("sha256") == sha
+            and (doc.get("run_json") or {}).get("sha256") == meta_sha
             and doc.get("export_raw", True) == raw)
 

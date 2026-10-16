@@ -125,6 +125,27 @@ def test_submit_api_plan_records_mode_and_secret_names(tmp_path):
     assert "sk-x" not in json.dumps(staged)
 
 
+def test_a_custom_api_key_env_is_declared_and_never_reaches_commands(tmp_path):
+    """A key in a variable without a secret-looking name (`MODEL_AUTH`) is passed by name and
+    listed in SWARMLAB_SECRET_NAMES, which the agent's and the grader's filters both honour."""
+    from swarmlab.jobs.grade import grade_env
+    from swarmlab.world.programbench import command_env
+
+    doc = solo_doc()
+    doc["providers"] = {"gw": {"type": "openai_compat", "params": {
+        "name": "gw", "base_url": "https://gw.example/v1", "api_key_env": "MODEL_AUTH",
+        "pricing": {"m": [1.0, 2.0, 0.0]}}}}
+    doc["arms"]["solo"]["participants"][0]["params"]["model"] = "gw:m"
+    p = plan(write(tmp_path, doc), environ={"HF_TOKEN": "h", "MODEL_AUTH": "dummy-value"})
+    assert p.secrets == ["HF_TOKEN", "MODEL_AUTH"]
+    cmd = jl.hf_command(p)
+    assert "--secrets MODEL_AUTH" in shlex.join(cmd)
+    job_env = {**env_of(cmd), "MODEL_AUTH": "dummy-value", "HF_TOKEN": "h"}
+    assert job_env["SWARMLAB_SECRET_NAMES"] == "HF_TOKEN MODEL_AUTH"
+    for filtered in (command_env(job_env), grade_env(job_env)):
+        assert "MODEL_AUTH" not in filtered and "dummy-value" not in filtered.values()
+
+
 def test_programbench_refusals(tmp_path):
     with pytest.raises(SpecError, match="backend is 'docker'.*cannot run Docker"):
         plan(write(tmp_path, solo_doc(backend="docker")))
