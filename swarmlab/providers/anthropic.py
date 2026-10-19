@@ -13,9 +13,12 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   the same Anthropic role are merged into one message, so all tool results of one assistant turn go
   back in a single user message (parallel tool use) and a user message right after tool results
   joins them.
-- Tools -> `{"name", "description", "input_schema"}` with the schema passed through
-  `ToolSchema.normalized()` first (defensive: the harness already emits normalised schemas), plus
-  `"strict": True` only when the normalised schema has no `strict_violations()` at any depth. (The
+- Tools -> `{"name", "description", "input_schema"}` with the schema exactly as the participant
+  gives it (no re-normalisation: what a participant offers is what the model sees; the executor
+  and the world normalise the schemas they emit, so harness tools are unchanged on the wire; a
+  participant that wants strict mode normalises its own schema), plus `"strict": True` only when
+  that schema has no `strict_violations()` at any depth, so a schema without
+  `additionalProperties: false` is sent non-strict. (The
   2026-10-06 smoke got `400 tools.4.custom: For 'object' type, 'additionalProperties' must be
   explicitly set to false` because `post` was sent strict while its nested `fields: {"type":
   "object"}` was open; a schema with a free-form nested object is now sent non-strict.) `tool_choice` is `{"type": "auto"}` (sent only when tools
@@ -243,10 +246,9 @@ def response_write_factor(message: Any, fallback: float) -> float:
 
 
 def tool_definition(schema: ToolSchema) -> dict:
-    norm = schema.normalized()
-    tool: dict[str, Any] = {"name": norm.name, "description": norm.description,
-                            "input_schema": norm.parameters}
-    if not norm.strict_violations():
+    tool: dict[str, Any] = {"name": schema.name, "description": schema.description,
+                            "input_schema": schema.parameters}
+    if not schema.strict_violations():
         tool["strict"] = True
     return tool
 
