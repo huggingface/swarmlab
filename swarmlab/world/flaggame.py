@@ -130,6 +130,9 @@ Decisions where the contract is silent
   unchanged.
 - Snapshots carry game state only. Constructor config (the kwargs) is skipped, so a restored or
   forked world keeps the config it was constructed with (e.g. a fork may change `guess_limit`).
+- `requires = Requirements(commit=("round_end", "immediate"))`: the game, its probes and belief
+  metrics are defined per round, so `commit: async` (no round barrier) is refused at `Experiment`
+  construction.
 
 Real flags and name-only candidates (M6, docs/INTERFACE-M6.md §1)
 -----------------------------------------------------------------
@@ -172,7 +175,7 @@ from typing import Any, ClassVar
 from ..ids import AgentId, agent_id
 from ..rng import derive
 from ..view import Observation, Part, text_observation
-from .base import Ack, Action, Outcome, World, tool
+from .base import Ack, Action, Outcome, Requirements, World, tool
 from .flags_real import (
     ALLOWED_PREFIX,
     BY_NAME,
@@ -409,6 +412,8 @@ class FlagGame(World):
 
     entry_point: ClassVar[str | None] = "flaggame"
     name: str = "flaggame"
+    # round-based only: the game, its probes and its belief metrics are defined per round
+    requires: ClassVar[Requirements] = Requirements(commit=("round_end", "immediate"))
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", *_CONFIG)
 
     def __init__(

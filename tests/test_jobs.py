@@ -1,6 +1,7 @@
 """WP8: HF Jobs placement with a co-located vLLM server. Offline: every `hf` call is mocked,
 and the bootstrap script runs against stub `uv`, `hf` and `vllm` executables."""
 import json
+import math
 import os
 import shlex
 import shutil
@@ -154,6 +155,31 @@ def test_estimate_overrides_and_short_timeout_note(tmp_path):
         jl.parse_duration("soon")
 
 
+def test_rounds_per_agent_and_async_ticks_in_the_plan(tmp_path):
+    board = {"world": {"type": "minesweeper", "params": {"on_mine": "continue"}},
+             "participants": [{"type": "llm", "count": 4, "params": {"model": f"vllm:{MODEL}"}}],
+             "metrics": ["minesweeper.cleared"]}
+    doc = {"name": "jobs-async", "seeds": [0], "options": {"commit": "async", "rounds_per_agent": 5},
+           "arms": {"board1": board,
+                    "board2": {**board, "options": {"rounds_per_agent": 3}},
+                    "rounds": {**board, "options": {"commit": "round_end", "max_rounds": 7,
+                                                     "rounds_per_agent": None}}}}
+    spec = tmp_path / "async.yaml"
+    spec.write_text(yaml.safe_dump(doc))
+    p = plan(spec, per_round_s=10, setup_s=60)
+    arms = p.estimate_detail["arms"]
+    assert arms["board1"]["rounds"] == 20 and arms["board2"]["rounds"] == 12  # x 4 agents
+    assert arms["board1"]["unit"] == arms["board2"]["unit"] == "tick"
+    assert arms["rounds"]["rounds"] == 7 and "unit" not in arms["rounds"]
+    assert arms["board2"]["per_run_s"] == 120
+    text = jl.describe(p)
+    assert "board2: N=4 x 12 ticks x ~10 s/tick" in text and "rounds: N=4 x 7 rounds x ~10 s/round" in text
+    doc["options"] = {"commit": "async"}
+    spec.write_text(yaml.safe_dump(doc))
+    with pytest.raises(SpecError, match="board1.*no max_rounds"):
+        plan(spec, arms=["board1"])
+
+
 # ---- bootstrap script ---------------------------------------------------------------------------
 def test_bootstrap_script_has_expected_pieces():
     s = jl.bootstrap_script()
@@ -235,13 +261,13 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def _run_bootstrap(tmp_path, runs, plan_kw=None, **extra_env):
+def _run_bootstrap(tmp_path, runs, plan_kw=None, on_start=None, **extra_env):
     """Run bootstrap.sh for real with stub uv/hf/vllm on PATH and a scripted spec.
 
     The stage dir gets the plan.json of a real plan (`plan_kw` over: model MODEL, flags
     `--reasoning-parser qwen3`, max-model-len 4096, a free port), whose `vllm_serve_argv` the
     script executes; the VLLM_* env comes from that plan. `extra_env` overrides any variable
-    (None unsets it)."""
+    (None unsets it). `on_start(proc)`, when given, is called once the script is started."""
     stub = tmp_path / "stubs"
     stub.mkdir()
     for name, body in (("hf", STUB_HF), ("uv", STUB_UV), ("vllm", STUB_VLLM)):
@@ -276,8 +302,11 @@ def _run_bootstrap(tmp_path, runs, plan_kw=None, **extra_env):
         **extra_env,
     }
     env = {k: v for k, v in env.items() if v is not None}
-    proc = subprocess.run(["bash", str(REPO / "swarmlab" / "jobs" / "bootstrap.sh")], env=env,
-                          capture_output=True, text=True, timeout=180, cwd=tmp_path, check=False)
+    proc = subprocess.Popen(["bash", str(REPO / "swarmlab" / "jobs" / "bootstrap.sh")], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=tmp_path)
+    if on_start is not None:
+        on_start(proc)
+    proc.stdout, proc.stderr = proc.communicate(timeout=180)
     return proc, bucket, (tmp_path / "stub.log").read_text()
 
 
@@ -313,6 +342,97 @@ def test_bootstrap_failed_run_exits_nonzero(tmp_path):
     assert manifest["status"] == "failed" and manifest["exit_code"] == 1
     assert manifest["runs_failed"] == ["missing-arm:1"] and manifest["runs_done"] == ["scripted:1"]
     assert (bucket / "runs" / "t1" / "boot__scripted__s1" / "run.json").exists()
+
+
+def _swarmlab_wrapper(tmp_path, body):
+    """A `swarmlab` for the job venv that logs `start ARM SEED` for each `run`, then runs `body`."""
+    w = tmp_path / "swarmlab-wrapper"
+    w.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        [ "$1" = run ] && echo "start $4 $6" >> {tmp_path}/runs.log
+        {body}
+        """))
+    w.chmod(0o755)
+    return str(w)
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_bootstrap_parallel_runs_overlap_and_keep_accounting(tmp_path):
+    real = Path(sys.executable).parent / "swarmlab"
+    wrapper = _swarmlab_wrapper(tmp_path, f"""[ "$1" = run ] && sleep 1
+        "{real}" "$@"; rc=$?
+        [ "$1" = run ] && echo "end $4 $6" >> {tmp_path}/runs.log
+        exit $rc""")
+    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1 scripted:2 missing-arm:1 scripted:3",
+                                     REAL_SWARMLAB=wrapper, SWARMLAB_PARALLEL="2")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "running up to 2 runs at once" in proc.stdout
+    events = (tmp_path / "runs.log").read_text().splitlines()
+    assert sorted(events[:2]) == ["start scripted 1", "start scripted 2"]   # both before an end
+    assert len(events) == 8
+    manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
+    assert manifest["parallel"] == 2 and manifest["status"] == "failed"
+    assert sorted(manifest["runs_done"]) == ["scripted:1", "scripted:2", "scripted:3"]
+    assert manifest["runs_failed"] == ["missing-arm:1"]
+    results = (bucket / "jobs" / "t1" / "results.jsonl").read_text().splitlines()
+    assert sorted(json.loads(r)["run_id"] for r in results if json.loads(r).get("run_id")) == [
+        "boot__scripted__s1", "boot__scripted__s2", "boot__scripted__s3"]
+    assert len(results) == 4
+    logs = bucket / "jobs" / "t1" / "logs"
+    for name in ("scripted-s1", "scripted-s2", "scripted-s3", "missing-arm-s1"):
+        assert (logs / f"run-{name}.json").exists() and (logs / f"run-{name}.err").exists()
+    for s in (1, 2, 3):
+        assert Run.load(bucket / "runs" / "t1" / f"boot__scripted__s{s}").status == "ended"
+
+
+@pytest.mark.skipif(shutil.which("curl") is None, reason="needs curl")
+def test_bootstrap_sigterm_stops_every_run_in_flight(tmp_path):
+    import signal
+    import time
+
+    log = tmp_path / "runs.log"
+    real = Path(sys.executable).parent / "swarmlab"
+    wrapper = _swarmlab_wrapper(tmp_path, f'[ "$1" = run ] && exec sleep 60\nexec "{real}" "$@"')
+
+    def term_when_both_started(proc):
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if log.exists() and len(log.read_text().splitlines()) == 2:
+                break
+            time.sleep(0.2)
+        time.sleep(0.5)
+        proc.send_signal(signal.SIGTERM)
+
+    t0 = time.time()
+    proc, bucket, _ = _run_bootstrap(tmp_path, "scripted:1 scripted:2 scripted:3",
+                                     on_start=term_when_both_started,
+                                     REAL_SWARMLAB=wrapper, SWARMLAB_PARALLEL="2")
+    assert proc.returncode == 143, proc.stdout + proc.stderr
+    assert time.time() - t0 < 60   # the two sleeping runs were killed, not waited for
+    assert sorted(log.read_text().splitlines()) == ["start scripted 1", "start scripted 2"]
+    manifest = json.loads((bucket / "jobs" / "t1" / "job.json").read_text())
+    assert manifest["status"] == "failed" and manifest["exit_code"] == 143
+    assert manifest["runs_done"] == [] and manifest["parallel"] == 2
+
+
+def test_parallel_estimate_env_and_spec_hash(tmp_path):
+    spec = vllm_spec(tmp_path, extra_arm={"bc2": {**yaml.safe_load(vllm_spec(tmp_path).read_text())[
+        "arms"]["bc"], "options": {"max_rounds": 4}}})
+    seq = plan(spec, per_round_s=100, setup_s=60, seeds=[1, 2])
+    # bc: 2 rounds (200 s/run), bc2: 4 rounds (400 s/run); runs bc:1 bc:2 bc2:1 bc2:2
+    assert seq.estimate_s == 60 + 2 * 200 + 2 * 400 and seq.parallel == 1
+    assert "SWARMLAB_PARALLEL" not in seq.env()
+    par = plan(spec, per_round_s=100, setup_s=60, seeds=[1, 2], parallel=2)
+    assert par.estimate_s == 60 + 200 + 400   # slot A: bc:1 then bc2:1, slot B: bc:2 then bc2:2
+    assert par.env()["SWARMLAB_PARALLEL"] == "2" and par.as_dict()["parallel"] == 2
+    assert par.timeout_s == math.ceil(par.estimate_s * 1.5 / 600) * 600 < seq.timeout_s
+    assert any("runs at once" in n for n in par.notes)
+    assert "2 runs at once" in jl.describe(par)
+    wide = plan(spec, per_round_s=100, setup_s=60, seeds=[1, 2], parallel=8)
+    assert wide.estimate_s == 60 + 400   # never below the longest run
+    assert par.job_spec_sha256 == seq.job_spec_sha256 == wide.job_spec_sha256
+    with pytest.raises(SpecError):
+        plan(spec, parallel=0)
 
 
 # ---- stage and submit ---------------------------------------------------------------------------

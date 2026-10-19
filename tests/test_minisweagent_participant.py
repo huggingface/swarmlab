@@ -832,3 +832,14 @@ def test_guide_solo_spec_renders_the_official_prompt(tmp_path):
     assert (row["type"], row["tools"]) == ("mini_swe_agent", ["bash"])
     assert row["system"] == system
     assert row["user"] == f"{instance}\n\nThis machine has 20 CPUs and 60 GB of memory."
+
+
+def test_render_delivered_drops_the_round_when_turn_based():
+    from swarmlab.participants.llm import render_delivered
+
+    items = [{"post_id": "p1", "eligible_round": 3, "content": "hi"},
+             {"post_id": "p2", "eligible_round": 4, "content": {"k": 1}}]
+    assert render_delivered(items) == \
+        'Delivered to you:\n- p1 (round 3): hi\n- p2 (round 4): {"k": 1}'
+    assert render_delivered(items, turn_based=True) == \
+        'Delivered to you:\n- p1: hi\n- p2: {"k": 1}'

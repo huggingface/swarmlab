@@ -88,12 +88,25 @@ Decisions where the contract is silent:
   `max_calls_per_turn` for that agent. `turn_started.role` is the role's name (None for an
   agent without one). `pushable(agent, limit)` is the push-delivery selection with the same
   channel filter.
+- Async commit (`commit: async`, swarmlab/runner.py): the runner builds one executor per turn
+  in immediate mode, so every action and post commits at call time, and passes `on_commit(kind,
+  item)`, called after each commit with `("post", Post)`, `("delivery", Delivery)`,
+  `("registry", RegistryOutcome)`, `("claim", dict)` and `("action", (agent, action_id, action,
+  outcome))`, in application order: one journal shared by every agent's turn, so the runner can
+  log commits in their true order across agents. `round` is not fixed for such an executor: the
+  runner sets it to the open tick whenever a tick closes, so reads, posts and actions use the
+  tick they happen in (ids stay unique: within a turn `n` grows, and an agent's next turn starts
+  in a later tick). `cancel()` (the run ended mid-turn) makes every later `call`/`infer` raise
+  `asyncio.CancelledError`. Without `on_commit` (every other mode) nothing changes.
+  `turn_based=True` (async) describes `end_turn` as "Finish your turn." instead of "Finish your
+  turn for this round.".
 - Concurrency: `call` contains no `await`, so under asyncio each call is atomic. During round_end
   turns it only reads shared world state and touches the calling agent's own board inbox
   (`board.read`), so concurrent turns cannot observe each other.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import random
 from collections.abc import Callable
@@ -168,6 +181,7 @@ END_TURN_SCHEMA = ToolSchema(
     description="Finish your turn for this round.",
     parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
+END_TURN_SCHEMA_TURNS = END_TURN_SCHEMA.model_copy(update={"description": "Finish your turn."})
 
 
 def board_schemas(board: Board) -> list[ToolSchema]:
@@ -246,6 +260,8 @@ class RoundExecutor:
         registry: Registry | None = None,
         claim_policy: ClaimPolicy | None = None,
         roles: dict[AgentId, Role] | None = None,
+        on_commit: Callable[[str, Any], None] | None = None,
+        turn_based: bool = False,
     ) -> None:
         self.run = run
         self.round = round
@@ -262,6 +278,9 @@ class RoundExecutor:
         self.claim_policy = claim_policy
         self.roles = dict(roles or {})  # M3c: effective role per agent
         self.hard_ceiling = False
+        self.on_commit = on_commit  # async commit: the runner's journal (module docstring)
+        self.cancelled = False
+        self.turn_based = turn_based  # async: `end_turn` is described per turn, not per round
         self._state: dict[AgentId, _AgentState] = {}
         self.committed = Committed()
         self._world_tools = {s.name: s for s in world.tool_schemas()}
@@ -394,7 +413,8 @@ class RoundExecutor:
 
     def schemas(self, agent: AgentId) -> list[ToolSchema]:
         reg = registry_schemas() if self.registry is not None else []
-        out = [*self._world_tools.values(), *self._board_schemas(agent), *reg, END_TURN_SCHEMA]
+        end = END_TURN_SCHEMA_TURNS if self.turn_based else END_TURN_SCHEMA
+        out = [*self._world_tools.values(), *self._board_schemas(agent), *reg, end]
         return [s.normalized() for s in out if self._allowed(agent, s.name)]
 
     def pushable(self, agent: AgentId, limit: int) -> list[Delivery]:
@@ -405,7 +425,18 @@ class RoundExecutor:
         items = self.board.pushable(agent, self.round, 1 << 30)
         return [d for d in items if self.board.channel_of(d) in readable][: max(limit, 0)]
 
+    def cancel(self) -> None:
+        """Async commit: the run ended while this turn was in flight. Every later `call` or
+        `infer` raises `asyncio.CancelledError` (nothing is applied, logged or sent)."""
+        self.cancelled = True
+
+    def _journal(self, kind: str, item: Any) -> None:
+        if self.on_commit is not None:
+            self.on_commit(kind, item)
+
     async def call(self, agent: AgentId, name: str, args: dict | None = None) -> ToolResult:
+        if self.cancelled:
+            raise asyncio.CancelledError()
         st = self._st(agent)
         args = dict(args or {})
         st.calls += 1
@@ -436,6 +467,8 @@ class RoundExecutor:
         return self._ret(agent, res)
 
     async def infer(self, agent: AgentId, request: ChatRequest, category: str = "swarm") -> ChatResponse:
+        if self.cancelled:
+            raise asyncio.CancelledError()
         if self.inference is None:
             raise RuntimeError("inference is not available in this executor")
         st = self._st(agent)
@@ -544,6 +577,10 @@ class RoundExecutor:
         posts, deliveries = self.board.commit(self.round, self.agents, self._topology_rng(), self.blobs)
         self.committed.posts.extend(posts)
         self.committed.deliveries.extend(deliveries)
+        for p in posts:
+            self._journal("post", p)
+        for d in deliveries:
+            self._journal("delivery", d)
         return ToolResult(call_id=call_id, ok=True, result={"id": post_id}, pending=False)
 
     def _status(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
@@ -576,6 +613,9 @@ class RoundExecutor:
         outcome.action_id = action_id
         self.committed.claims.extend(claims)
         self.committed.actions.append((agent, action_id, action, outcome))
+        for c in claims:
+            self._journal("claim", c)
+        self._journal("action", (agent, action_id, action, outcome))
         return ToolResult(call_id=call_id, ok=True, pending=False, result={
             "id": action_id, "accepted": outcome.accepted, "feedback": dict(outcome.feedback)})
 
@@ -597,5 +637,6 @@ class RoundExecutor:
             return ToolResult(call_id=call_id, ok=True, result={"id": op.op_id}, pending=True)
         outcome = self.registry.apply(op, self.round)
         self.committed.registry.append(outcome)
+        self._journal("registry", outcome)
         return ToolResult(call_id=call_id, ok=True, pending=False,
                           result={"id": op.op_id, "accepted": outcome.ok, "feedback": outcome.feedback()})

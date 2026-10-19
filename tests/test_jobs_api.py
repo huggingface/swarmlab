@@ -279,3 +279,17 @@ def test_mini_swe_agent_participant_needs_no_extra(tmp_path):
     doc["options"]["max_calls_per_turn"] = 3000
     p = plan(write(tmp_path, doc))
     assert p.extras == ["anthropic", "programbench"]  # the participant's loop is vendored
+
+
+def test_api_mode_parallel_schedules_runs_and_refuses_programbench(tmp_path):
+    spec = vllm_spec(tmp_path, model="anthropic:claude-haiku-5-5", n=2)
+    seq = plan(spec, per_round_s=100, setup_s=60)
+    par = plan(spec, per_round_s=100, setup_s=60, parallel=2)
+    assert par.mode == "api" and par.parallel == 2 and par.estimate_detail["parallel"] == 2
+    assert seq.estimate_s == 60 + 2 * 200 and par.estimate_s == 60 + 200
+    assert "SWARMLAB_PARALLEL" not in env_of(jl.hf_command(seq))
+    assert env_of(jl.hf_command(par))["SWARMLAB_PARALLEL"] == "2"
+    assert "2 runs at once" in jl.describe(par)
+    with pytest.raises(SpecError, match="--parallel 2 with a programbench run"):
+        plan(write(tmp_path, solo_doc()), parallel=2)
+    assert plan(write(tmp_path, solo_doc()), parallel=1).timeout_s == 7 * 3600

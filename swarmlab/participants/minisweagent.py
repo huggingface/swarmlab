@@ -49,7 +49,8 @@ The turn
    "", ...}` and the rendered system and instance messages. Later turns rebuild the agent from
    the stored state (below).
 4. New deliveries become one user message, `Delivered to you:` and a line per item `- <post_id>
-   (round <r>): <content>` (`llm.render_delivered`, the `llm` participant's rendering).
+   (round <r>): <content>` (`llm.render_delivered`, the `llm` participant's rendering; under
+   `commit: async` without the ` (round <r>)`, as there).
 5. `idle_until_assigned`: a worker without a current assignment returns before 3 with no model
    call (note `idle`) unless something new was delivered: pushed items, or else (when it has
    `read_board`) the items of one `read_board` call the participant makes itself. Something new
@@ -819,7 +820,8 @@ class MiniSweAgent(Participant):
                      offered=self.offered_tools(view))
         agent = self._build(view, turn, msa)
         if new:
-            agent.add_messages({"role": "user", "content": render_delivered(new)})
+            agent.add_messages({"role": "user", "content": render_delivered(
+                new, turn_based=view.turn is not None)})
             self.delivered_upto = _delivery_key(new[-1])
         worker = asyncio.ensure_future(asyncio.to_thread(self._steps, agent, turn, msa))
         try:

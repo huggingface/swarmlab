@@ -68,6 +68,66 @@ then the resulting `post*`, `delivery*`, `action_committed*` events are logged a
 events in application order, followed by `round_resolved`, so the log has the same shape in both
 modes.
 
+Async commit (`commit == "async"`): no rounds and no barrier. Every live agent runs its own
+loop of turns, all agents concurrently (one asyncio task each in an `asyncio.TaskGroup`, turns
+bounded by `Semaphore(options.concurrency)`); the scheduler is not used, and `Experiment`
+refuses an `options.scheduler`, probes and interventions under async (swarmlab/experiment.py
+`check_async`). A turn is what it is in the other modes (observe, pushed deliveries, the
+participant's tool loop, end; its `View.turn` is the agent's own turn number, 1-based and
+counted from the log across resume, which makes LLMAgent render turn-based prompts and the
+executor describe `end_turn` per turn); it runs on its own `RoundExecutor` in immediate mode, so every
+world action, post and registry write commits the moment it is called, and when the turn ends
+the agent starts its next one with a fresh observation. After each turn the loop awaits
+`asyncio.sleep(0)`, so a turn that never awaits (scripted participants, fake models) cannot
+starve the other agents; with such participants the agents simply take turns in agent order.
+
+A *tick* is the async round: tick t is open from the end of tick t - 1 until the next turn
+(of any agent) ends, which closes it, so ticks number completed turns over all agents and
+`max_rounds` counts them. `rounds_per_agent` (which sets `max_rounds = rounds_per_agent x
+agents`) is also a per-agent cap under async: an agent that has completed that many turns
+(counted from the log, so across resume) starts no other, and the run ends `max_rounds` when the
+last one finishes; without it a faster agent simply gets more of the `max_rounds` ticks. Opening tick t calls `world.begin_round(t)` (and drops
+`world.killed_at(t)` from the live set; a dead agent finishes its turn in flight and starts no
+other) and sets `round = t` on every in-flight turn's executor, so a read, post or action is
+made in the tick it happens in (board eligibility: a post is readable in the tick it is
+committed in, as under `immediate`). Each executor reports its commits to a journal shared by
+all turns (`on_commit`), in application order. When agent A's turn ends, tick t closes, all
+synchronously (asyncio is single-threaded, so no other turn runs meanwhile and the world state
+is consistent):
+
+1. `round_started(t, order=[A], live=<live agents>)`, then A's turn events (`turn_started` ..
+   `turn_ended`, buffered by its executor while it ran, re-stamped with `round = t`).
+2. Every commit of the tick, from the journal, in true commit order across agents: `post`,
+   `delivery`, `registry`, `claim`, `action_committed`, with `round = t`. They include other
+   agents' commits from turns still in flight, and none of A's commits made in earlier ticks
+   (those were logged there): an action's `action_committed` is in the tick it committed in,
+   its `tool_called` in the tick its turn ended. Every event's `round` is the round of the next
+   `round_committed` in the log, which is what recovery, fork and replay rely on, and `seq`
+   increases with the true commit order.
+3. `outcomes_prev[A]` becomes A's own outcomes of the turn (its next `View.outcomes`);
+   `world.close_turn(A, t)`, then `world.end_round(t)` (`round_resolved`, per tick, i.e. per
+   completed turn), metrics folded over the tick's logical events, `metric*`, `budget`, the
+   snapshot when `t % snapshot_every == 0`, `round_committed`, run.json, `snapshot`.
+4. Termination as in the other modes, checked here, at each tick boundary (`terminal`,
+   `stop_condition`, `max_rounds`, `soft_budget`, `total_budget`). When the run ends, every
+   in-flight turn is cancelled at once (its executor refuses any further call or inference with
+   `CancelledError`, then the TaskGroup cancels the tasks): its commits made so far stand and
+   are logged in the ticks they happened in, its turn events (`turn_started`, tool calls,
+   `turn_ended`) are dropped, and it is not a tick. A model call it had in flight keeps its
+   `inference_attempt` (no response) and is charged at its reservation (the gate's rule for a
+   cancelled call); run.json is rewritten once every task has unwound, so it holds that spend. A `HardCeilingReached` in any turn cancels
+   the others and ends the run `hard_ceiling` at the last closed tick, the open tick's commits
+   unlogged (as a round is discarded in the other modes).
+
+Snapshots are taken at tick close, between commits; the participant blob of every agent is its
+state after its last completed turn (`_participant_blobs`; an in-flight LLMAgent's memory is
+mid-turn), while the world, board and registry include in-flight turns' commits so far. Resume
+(and fork) from tick c restores that snapshot and restarts every agent's loop at tick c + 1 with
+a fresh turn: turns that were in flight at c are lost (their commits up to c stay in the world;
+deliveries they had read stay read), and the log after `round_committed(c)` is discarded as in
+the other modes. Replay folds the log as for every mode: metrics see exactly the events of each
+tick in log order, in live and in replay.
+
 Termination: after each commit, `world.terminal()` -> `run_ended(terminal)`, else (M6)
 `options.stop_when` held at `consecutive` evaluations in a row (probe rounds when the run has
 probes, else every round; the streak is re-derived from the logged metric events on resume) ->
@@ -288,6 +348,11 @@ NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "ru
 # run_ended reasons that resume() continues from
 BUDGET_REASONS = ("soft_budget", "hard_ceiling", "hard_ceiling_probes", "total_budget")
 REPO_DIR = Path(__file__).resolve().parent.parent
+
+
+class _RunEnded(Exception):
+    """Async commit: raised by the turn that closed the run's last tick, so the TaskGroup cancels
+    the other agents' loops."""
 
 
 class ReplayMismatch(RuntimeError):
@@ -604,6 +669,7 @@ class Runner:
         self.world = copy.deepcopy(exp.world)
         self.board = copy.deepcopy(exp.medium)
         self.board.commit_mode = self.options.commit
+        self.world.set_commit_mode(self.options.commit)
         self.scheduler = build_scheduler(self.options.scheduler)  # M6: SeededShuffle by default
         listeners = getattr(self.scheduler, "listeners", None)
         topo = self.board.topology
@@ -676,8 +742,9 @@ class Runner:
     def _plugin_blobs(self) -> dict[str, bytes]:
         out = {"world": self.world.snapshot(), "board": self.board.snapshot(),
                "scheduler": self.scheduler.snapshot(), "ledger": self.ledger.snapshot()}
+        last_turn = getattr(self, "_participant_blobs", None)  # async: state after the last turn
         for a, p in self.participants.items():
-            out[f"participant:{a}"] = p.snapshot()
+            out[f"participant:{a}"] = last_turn[a] if last_turn is not None else p.snapshot()
         for m in self.metrics:
             out[f"metric:{m.name}"] = m.snapshot()
         for iv in self.interventions:
@@ -1093,6 +1160,9 @@ class Runner:
                 values.setdefault(e.round, {})[e.name] = e.value
         for rr in sorted(values):
             self._check_stop(rr, values[rr])
+        if self.options.commit == "async":
+            await self._async_loop(start, logged)
+            return
         r = start
         while True:
             reason = self._end_reason(r - 1)
@@ -1250,14 +1320,15 @@ class Runner:
         else:
             await self._turn_inner(agent, ex, round)
 
-    async def _turn_inner(self, agent: AgentId, ex: RoundExecutor, round: int) -> None:
+    async def _turn_inner(self, agent: AgentId, ex: RoundExecutor, round: int,
+                          turn: int | None = None) -> None:
         obs = self.world.observe(agent)
         ex.begin_turn(agent, _jsonable(obs.private))
         obs = obs.model_copy(update={"private": {}})  # private never reaches the participant
         pushed = self._pushed(agent, ex, round, consume=True)
         view = View(round=round, agent=agent, observation=obs,
                     outcomes=list(self.outcomes_prev.get(agent, [])), pushed=pushed,
-                    tools=ex.schemas(agent), description=describe(self.world, agent))
+                    tools=ex.schemas(agent), description=describe(self.world, agent), turn=turn)
         usage: dict = {}
         error = None
         try:
@@ -1427,3 +1498,183 @@ class Runner:
         self._write_meta()
         if snap:
             self._append(SnapshotEvent, r, manifest_path=self._manifest_rel(r))
+
+    # ---- async commit (options.commit == "async"; module docstring, Async commit) -------------
+    async def _async_loop(self, start: int, logged: list[Event]) -> None:
+        """Every live agent loops over its own turns; each completed turn closes one tick."""
+        reason = self._end_reason(start - 1)
+        if reason is not None:
+            self._end(start - 1, reason)
+            return
+        self._turns_done: dict[str, int] = {}  # completed turns per agent (resume: from the log)
+        for e in logged:
+            if e.type == "turn_ended":
+                self._turns_done[str(e.agent)] = self._turns_done.get(str(e.agent), 0) + 1
+        self._inflight: dict[AgentId, RoundExecutor] = {}
+        self._participant_blobs = {a: p.snapshot() for a, p in self.participants.items()}
+        self._async_done = False
+        self._open_tick(start)
+        sem = asyncio.Semaphore(max(1, self.options.concurrency))
+        ceiling = False
+        try:
+            async with asyncio.TaskGroup() as tg:  # the first error or _RunEnded cancels the rest
+                for a in list(self.live_agents):
+                    tg.create_task(self._agent_loop(a, sem))
+        except* _RunEnded:
+            pass  # the closing turn has already logged run_ended
+        except* HardCeilingReached:
+            ceiling = True
+        if ceiling:
+            self._abort_round(self._tick)
+        elif self.status == "ended":
+            # the cancelled turns' dispatched model calls were charged at their reservation as
+            # they unwound, after the closing tick wrote run.json: record that spend too
+            self._ledger_last = None
+            self._write_meta()
+        elif not self._async_done:  # every loop stopped without ending the run
+            capped = all(not self._may_start(a) for a in self.live_agents)
+            self._end(self._tick - 1, "max_rounds" if capped and self.live_agents else "error")
+
+    def _may_start(self, agent: AgentId) -> bool:
+        """Async: `agent` may start another turn (live, run not over, under `rounds_per_agent`)."""
+        cap = self.options.rounds_per_agent
+        return (not self._async_done and agent in self.live_agents
+                and (cap is None or self._turns_done.get(str(agent), 0) < cap))
+
+    async def _agent_loop(self, agent: AgentId, sem: asyncio.Semaphore) -> None:
+        while self._may_start(agent):
+            async with sem:
+                if not self._may_start(agent):
+                    return
+                ex = self._turn_executor(agent)
+                self._inflight[agent] = ex
+                try:
+                    await self._turn_inner(agent, ex, self._tick,
+                                           turn=self._turns_done.get(str(agent), 0) + 1)
+                except HardCeilingReached:
+                    self._cancel_inflight()
+                    raise
+                finally:
+                    self._inflight.pop(agent, None)
+                if self._async_done:
+                    return
+                self._close_tick(agent, ex)  # synchronous: no other turn runs meanwhile
+            # a turn that never awaits (scripted, fake models) would otherwise run every turn of
+            # this agent before any other agent's
+            await asyncio.sleep(0)
+
+    def _turn_executor(self, agent: AgentId) -> RoundExecutor:
+        seed = self.options.seed
+        ex = RoundExecutor(
+            run=self.run_id, round=self._tick, world=self.world, board=self.board,
+            blobs=self.blobs, agents=list(self.live_agents), commit="immediate",
+            max_calls_per_turn=self.options.max_calls_per_turn,
+            topology_rng=lambda: derive(seed, "topology", ex.round), inference=self.inference,
+            registry=self.registry, claim_policy=self.board.claim_policy, roles=self.roles,
+            on_commit=lambda kind, item: self._journal.append((kind, item)), turn_based=True,
+        )
+        self.executor = ex
+        return ex
+
+    def _cancel_inflight(self) -> None:
+        self._async_done = True
+        for ex in self._inflight.values():
+            ex.cancel()
+
+    def _open_tick(self, t: int) -> None:
+        """Open tick t: the world's `begin_round(t)`, then every in-flight turn reads, posts and
+        acts in tick t from now on."""
+        self._tick = t
+        self._round_events = []
+        self._journal: list[tuple[str, Any]] = []
+        self.world.begin_round(t)
+        failed = [a for a in self.world.killed_at(t) if a in self.live_agents]
+        if failed:
+            Ops(self, "worker_failures", t).kill(failed)
+        if self.live_agents != getattr(self, "_metric_agents", None):
+            self._set_agents()
+        for ex in self._inflight.values():
+            ex.round = t
+
+    def _close_tick(self, agent: AgentId, ex: RoundExecutor) -> None:
+        """`agent`'s turn ended: log tick t (the turn, then every commit of the tick in its true
+        order), resolve, fold metrics, snapshot, commit; then end the run or open tick t + 1."""
+        t = self._tick
+        order = [agent]
+        live = None if sorted(order) == sorted(self.live_agents) else list(self.live_agents)
+        self._append(RoundStartedEvent, t, order=order, live=live)
+        for ev in ex.events(agent):
+            self._log_event(ev.model_copy(update={"round": t}))
+        journal, self._journal = self._journal, []
+        n_posts = n_actions = n_deliveries = 0
+        for kind, item in journal:
+            if kind == "post":
+                n_posts += 1
+                self._append(PostEvent, t, item.agent, post_id=item.post_id,
+                             provisional_id=item.post_id, channel=item.channel, text=item.text,
+                             fields=dict(item.fields))
+            elif kind == "delivery":
+                n_deliveries += 1
+                self._append(DeliveryEvent, t, item.recipient, post_id=item.post_id,
+                             recipient=item.recipient, delivery_id=item.delivery_id,
+                             eligible_round=item.eligible_round, content_hash=item.content_hash)
+            elif kind == "registry":
+                self._append(RegistryEvent, t, item.agent, op_id=item.op_id, op=item.op,
+                             key=item.key, ok=item.ok, version=item.version, owner=item.owner,
+                             expires_round=item.expires_round, value=_jsonable(item.value),
+                             error=item.error)
+            elif kind == "claim":
+                self._append(ClaimEvent, t, item["agent"],
+                             **{k: v for k, v in item.items() if k != "agent"})
+            else:
+                n_actions += 1
+                a, aid, act, out = item
+                self._append(ActionCommittedEvent, t, a, action_id=aid,
+                             action=act.model_dump(mode="json"), accepted=out.accepted,
+                             feedback=_jsonable(out.feedback))
+        # the agent's next View.outcomes: its own commits of the turn just ended
+        self.outcomes_prev[agent] = [
+            {"action_id": aid, "tool": act.name, "accepted": out.accepted,
+             "feedback": _jsonable(out.feedback)} for _, aid, act, out in ex.committed.actions
+        ] + [_jsonable(o.view_outcome()) for o in ex.committed.registry]
+        self.world.close_turn(agent, t)
+        resolved = self.world.end_round(t)
+        if resolved is not None and not isinstance(resolved, dict):
+            raise TypeError(f"{type(self.world).__name__}.end_round must return a dict or None, "
+                            f"got {type(resolved).__name__}")
+        if resolved is not None:
+            self._append(RoundResolvedEvent, t, data=_jsonable(resolved))
+        fed = [parse_event(ev.model_dump_json()) for ev in self._round_events if ev.type not in NOT_FED]
+        for m in self.metrics:
+            for ev in fed:
+                m.update(ev)
+        logged: dict[str, float | None] = {}
+        for m in self.metrics:
+            for name, value, denom, label in m.outputs():
+                self._append(MetricEvent, t, name=name, value=value, denominator=denom, label=label)
+                logged[name] = value
+        self._check_stop(t, logged)
+        led = self.ledger.spent
+        self._append(BudgetEvent, t, spent_swarm=led["swarm"], spent_measurement=led["measurement"],
+                     reserved=self.ledger.reserved, calls=self.ledger.calls)
+        self._participant_blobs[agent] = self.participants[agent].snapshot()
+        self._turns_done[str(agent)] = self._turns_done.get(str(agent), 0) + 1
+        snap = t % max(1, self.options.snapshot_every) == 0
+        if snap:
+            manifest = SnapshotManifest(run=self.run_id, round=t, log_seq=self.log.next_seq,
+                                        outcomes_prev=self.outcomes_prev,
+                                        live=list(self.live_agents))
+            self.snapshots.write(manifest, self._plugin_blobs())
+        self._append(RoundCommittedEvent, t, n_posts=n_posts, n_actions=n_actions,
+                     n_deliveries=n_deliveries)
+        self.last_round = t
+        self._write_meta()
+        if snap:
+            self._append(SnapshotEvent, t, manifest_path=self._manifest_rel(t))
+        reason = self._end_reason(t)
+        if reason is not None:
+            self._cancel_inflight()  # before any other turn resumes: nothing commits after this
+            self._end(t, reason)
+            raise _RunEnded(reason)
+        self._open_tick(t + 1)
+

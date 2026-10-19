@@ -35,6 +35,9 @@ Decisions where the contract is silent:
   model an `UnknownModelPricing` there, not at call time. The resolved providers are cached on the
   experiment (`resolved_providers()`) and shared by its runs, so a provider's `calls` counter
   sees every run of the experiment. Providers are never deep-copied or pickled.
+- `commit: async`: `check_run` first calls `check_async` (no `options.scheduler`, probes or
+  interventions), and `estimate` scales each participant's turns by 1/n (a round is a tick,
+  one turn of one agent; prompt growth is still applied per tick).
 - M6: `estimate` scales each participant's turns by the scheduler's `turns_per_round(n) / n`
   (`options.scheduler`; 1 for SeededShuffle, 1/n for OneSpeaker) and caps calls per turn by a
   participant's `calls_per_turn_cap` (LLMAgent: `max_calls`, or 2 under `report_json`) when it
@@ -149,6 +152,20 @@ from .spec import (
 from .world.base import World
 
 
+def check_async(experiment: Any, options: dict) -> None:
+    """`commit: async` (swarmlab/runner.py, Async commit) runs no scheduler, probes or
+    interventions: each of those is defined per round. Raise `ValueError` naming what is set."""
+    bad = []
+    if options.get("scheduler") is not None:
+        bad.append("options.scheduler (async mode has no schedule: every live agent loops)")
+    if experiment.probes:
+        bad.append("probes")
+    if experiment.interventions:
+        bad.append("interventions")
+    if bad:
+        raise ValueError("commit: async does not support " + ", ".join(bad))
+
+
 class Experiment(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -222,6 +239,8 @@ class Experiment(BaseModel):
         """
         options = self._merged_options(max_rounds, **overrides)
         options.pop("rounds_per_agent", None)  # already resolved into max_rounds
+        if options.get("commit") == "async":
+            check_async(self, options)
         type(self.world).requires.check(self.world, self.model_copy(update={"options": options}))
 
     def _pin_price(self, prefix: str, provider: Provider, mid: str, row: tuple) -> None:
@@ -267,6 +286,8 @@ class Experiment(BaseModel):
         n_agents = len(self.participants)
         sched = build_scheduler(self.options.get("scheduler"))
         share = sched.turns_per_round(n_agents) / n_agents if n_agents else 0.0
+        if self.options.get("commit") == "async":  # a round is a tick: one agent's turn
+            share = 1 / n_agents if n_agents else 0.0
         for p in self.participants:
             model = participant_model(p)
             if model is None:
@@ -327,7 +348,7 @@ class Experiment(BaseModel):
         seed: int,
         max_rounds: int | None = None,
         *,
-        commit: Literal["round_end", "immediate"] | None = None,
+        commit: Literal["round_end", "immediate", "async"] | None = None,
         max_calls_per_turn: int | None = None,
         snapshot_every: int | None = None,
         out: Path | str = "runs",

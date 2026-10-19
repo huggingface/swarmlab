@@ -27,13 +27,13 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `arms.NAME.interventions`: `[{type: NAME, params: {...}}, ...]` (optional): interventions (`inject_post`, `mute`, ...) for this arm
   - `arms.NAME.options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat, scheduler, rounds_per_agent, stop_when}` (optional): run options for this arm, merged over the top-level `options`
     - `arms.NAME.options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
-    - `arms.NAME.options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
+    - `arms.NAME.options.commit`: `round_end | immediate | async` (default `round_end`): `round_end` (phase commit), `immediate` (sequential) or `async` (every agent loops over its own turns at once, no rounds; a round is then a tick, one completed turn; no scheduler, probes or interventions)
     - `arms.NAME.options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
     - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
     - `arms.NAME.options.concurrency`: `int` (default `32`): concurrent turns
     - `arms.NAME.options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
     - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round, e.g. `seeded_shuffle` (default, every live agent in a random order) or `fixed` (every live agent in agent order a000, a001, ...); `swarmlab plugins schedulers` lists all
-    - `arms.NAME.options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
+    - `arms.NAME.options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`; under `commit: async` also a per-agent cap on completed turns
     - `arms.NAME.options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
       - `arms.NAME.options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
       - `arms.NAME.options.stop_when.op`: `>= | > | <= | < | ==` (default `>=`): comparison: `>=`, `>`, `<=`, `<` or `==`
@@ -61,13 +61,13 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `budget.total_usd`: `float` (default `0.0`): top level only: cap on the whole experiment's spend (all arms x seeds, finished and resumed runs included) (0: off)
 - `options`: `{max_rounds, commit, max_calls_per_turn, snapshot_every, concurrency, repeat, scheduler, rounds_per_agent, stop_when}` (optional): run options for every arm (each arm's `options` is merged over them)
   - `options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
-  - `options.commit`: `round_end | immediate` (default `round_end`): `round_end` (phase commit) or `immediate` (sequential)
+  - `options.commit`: `round_end | immediate | async` (default `round_end`): `round_end` (phase commit), `immediate` (sequential) or `async` (every agent loops over its own turns at once, no rounds; a round is then a tick, one completed turn; no scheduler, probes or interventions)
   - `options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
   - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
   - `options.concurrency`: `int` (default `32`): concurrent turns
   - `options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
   - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round, e.g. `seeded_shuffle` (default, every live agent in a random order) or `fixed` (every live agent in agent order a000, a001, ...); `swarmlab plugins schedulers` lists all
-  - `options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`
+  - `options.rounds_per_agent`: `int | null` (optional): sugar: `max_rounds = rounds_per_agent x number of agents`; under `commit: async` also a per-agent cap on completed turns
   - `options.stop_when`: `{metric, op, value, consecutive} | null` (optional): `{metric, op, value, consecutive}`: end the run (`stop_condition`) when the metric compares true at `consecutive` evaluations in a row (probe rounds when the run has probes, else every round)
     - `options.stop_when.metric`: `str` (required): a logged metric name, e.g. `belief.consensus@probe:belief`
     - `options.stop_when.op`: `>= | > | <= | < | ==` (default `>=`): comparison: `>=`, `>`, `<=`, `<` or `==`

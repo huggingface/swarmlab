@@ -58,7 +58,20 @@ Wall-time estimate: `setup_s` (default 600: install + weights download + vLLM st
 run, `rounds * per_round_s(N)` with `per_round_s(N) = 30 + 2 * N` seconds (a guess: the
 router-served Qwen phase-1 runs took ~1 min per round at N=16; a local server should not be
 slower). `--per-round` overrides it. The default timeout is 1.5x the estimate, rounded up to
-10 minutes.
+10 minutes. An arm's rounds are its `max_rounds`, or `rounds_per_agent` x agents when the options
+(top level, the arm's merged over them) set it, as `Experiment` resolves it. Under `commit: async`
+they are ticks (one turn of one agent each): `--per-round` is then seconds per tick, the plan marks
+such an arm `unit: tick` and the printout says "ticks"; the default guess stays the per-round one,
+so it is pessimistic there.
+
+Parallel runs (both modes): with `parallel=N` (`--parallel`, sent as `SWARMLAB_PARALLEL`; default
+1, and then the env and the command are as before) the job runs up to N runs at once:
+bootstrap.sh starts the runs in plan order as slots free up, and the estimate is the setup plus
+the makespan of that schedule (`estimate_detail["parallel"]`), assuming concurrent runs do not
+slow each other (in vllm mode one server batches their requests; raise `--per-round` if they
+contend). In API mode the concurrent runs call their providers at once (each run keeps its own
+budget). A plan with a programbench run refuses `parallel > 1` (the run's lockdown and
+`/workspace` are job-wide).
 
 API mode
 --------
@@ -119,7 +132,7 @@ from typing import Any
 
 import yaml
 
-from ..spec import SpecError, experiment_seeds, git_identity, load_experiment_yaml
+from ..spec import SpecError, experiment_seeds, git_identity, load_experiment_yaml, resolve_rounds
 from .profiles import DEFAULT_VLLM_FLAGS, LAUNCHER_FLAGS, resolve_flags  # noqa: F401 (re-export)
 
 DEFAULT_BUCKET = "hf://buckets/cmpatino/swarmlab-runs"
@@ -199,11 +212,24 @@ def arm_agents(doc: dict, arm: str) -> int:
     return sum(int(g.get("count", 1)) for g in doc["arms"][arm]["participants"])
 
 
+def arm_options(doc: dict, arm: str) -> dict:
+    """The arm's run options (top-level `options`, the arm's merged over them), with
+    `rounds_per_agent` resolved into `max_rounds` as the experiment does (`resolve_rounds`)."""
+    opts = {**(doc.get("options") or {}), **(doc["arms"][arm].get("options") or {})}
+    return resolve_rounds(opts, arm_agents(doc, arm))
+
+
 def arm_rounds(doc: dict, arm: str) -> int:
-    opts = {**doc.get("options", {}), **doc["arms"][arm].get("options", {})}
-    if "max_rounds" not in opts:
-        raise SpecError(f"arm {arm!r}: no max_rounds in options")
+    """`max_rounds` of an arm: rounds, or under `commit: async` ticks (one turn each)."""
+    opts = arm_options(doc, arm)
+    if opts.get("max_rounds") is None:
+        raise SpecError(f"arm {arm!r}: no max_rounds (or rounds_per_agent) in options")
     return int(opts["max_rounds"])
+
+
+def arm_unit(doc: dict, arm: str) -> str:
+    """What one of the arm's `max_rounds` is: `round`, or `tick` (one turn) under async."""
+    return "tick" if arm_options(doc, arm).get("commit") == "async" else "round"
 
 
 def check_vllm_models(doc: dict, arms: Sequence[str], model: str) -> None:
@@ -283,6 +309,7 @@ class JobPlan:
     probe_extra: dict[str, Any] = field(default_factory=dict)
     probe_extra_source: str = "default"   # "--probe-extra" | "profile" | "default" | "none"
     port: int = DEFAULT_PORT   # vLLM's port; the job spec's provider URL points at it
+    parallel: int = 1          # runs at once in the job (SWARMLAB_PARALLEL)
     mode: str = "vllm"         # "vllm" | "api" (module docstring)
     secrets: list[str] = field(default_factory=lambda: ["HF_TOKEN"])  # names, never values
     missing_secrets: list[str] = field(default_factory=list)          # unset where planned
@@ -339,6 +366,7 @@ class JobPlan:
         return env
 
     def _common_env(self) -> dict[str, str]:
+        parallel = {"SWARMLAB_PARALLEL": str(self.parallel)} if self.parallel > 1 else {}
         return {
             "SWARMLAB_TAG": self.tag,
             "SWARMLAB_STAGE": self.stage_remote,
@@ -350,6 +378,7 @@ class JobPlan:
             "SWARMLAB_FLAVOR": self.flavor,
             "SWARMLAB_IMAGE": self.image,
             "SWARMLAB_SYNC_EVERY": str(self.sync_every_s),
+            **parallel,
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -389,6 +418,7 @@ def plan_job(
     sync_every_s: int = DEFAULT_SYNC_EVERY_S,
     per_round_s: float | None = None,
     setup_s: int = DEFAULT_SETUP_S,
+    parallel: int = 1,
     tag: str | None = None,
     now: float | None = None,
     git: Callable[[], tuple[str, bool]] | None = None,
@@ -407,6 +437,8 @@ def plan_job(
     if not bucket.startswith("hf://buckets/"):
         raise SpecError(f"--bucket must look like hf://buckets/<namespace>/<name>, got {bucket!r}")
     bucket = bucket.rstrip("/")
+    if parallel < 1:
+        raise SpecError(f"--parallel must be >= 1, got {parallel}")
     api = model is None and not any(m.startswith("vllm:") for a in chosen
                                     for m in arm_models(doc, a))
     if not api and model is None:
@@ -426,7 +458,8 @@ def plan_job(
     if api:
         plan = _plan_api(doc, chosen, len(seed_list), flavor=flavor, image=image,
                          timeout=timeout, per_round_s=per_round_s, setup_s=setup_s,
-                         environ=os.environ if environ is None else environ, common=common)
+                         parallel=parallel, environ=os.environ if environ is None else environ,
+                         common=common)
     else:
         assert model is not None
         plan = _plan_vllm(doc, chosen, len(seed_list), model=model, flavor=flavor or VLLM_FLAVOR,
@@ -434,21 +467,23 @@ def plan_job(
                           profile=profile, vllm_flags_append=vllm_flags_append,
                           probe_extra=probe_extra, concurrency=concurrency,
                           request_timeout_s=request_timeout_s, per_round_s=per_round_s,
-                          setup_s=setup_s, common=common)
+                          setup_s=setup_s, parallel=parallel, common=common)
     if dirty:
         plan.notes.append("the checkout has uncommitted changes: the wheel will not match the "
                           "commit")
     return plan
 
 
-def _estimate(doc: dict, chosen: Sequence[str], n_seeds: int, per_round_s: float | None,
-              setup_s: int, wall_s: Mapping[str, float] | None = None) -> tuple[int, dict]:
-    """(total seconds, per-arm detail): rounds x per-round guess per run, or the world's wall
-    limit for the arms in `wall_s` (programbench)."""
+def _estimate(doc: dict, chosen: Sequence[str], runs: Sequence[tuple[str, int]],
+              per_round_s: float | None, setup_s: int, parallel: int = 1,
+              wall_s: Mapping[str, float] | None = None) -> tuple[int, dict]:
+    """(total seconds, per-arm detail): per run, rounds (ticks under async) x the per-round
+    guess, or the world's wall limit for the arms in `wall_s` (programbench); the total is the
+    setup plus the makespan of bootstrap.sh's schedule of `runs` over `parallel` slots (each run
+    takes the first free slot, in plan order; with one slot, the sum)."""
     per_arm = {}
-    total = setup_s
     for a in chosen:
-        n = arm_agents(doc, a)
+        n, n_seeds = arm_agents(doc, a), sum(1 for r, _ in runs if r == a)
         if wall_s and a in wall_s:
             per_arm[a] = {"agents": n, "wall_limit_s": wall_s[a], "per_run_s": int(wall_s[a]),
                           "runs": n_seeds}
@@ -457,15 +492,20 @@ def _estimate(doc: dict, chosen: Sequence[str], n_seeds: int, per_round_s: float
             pr = per_round_s if per_round_s is not None else per_round_guess(n)
             per_arm[a] = {"agents": n, "rounds": rounds, "per_round_s": pr,
                           "per_run_s": int(rounds * pr), "runs": n_seeds}
-        total += per_arm[a]["per_run_s"] * n_seeds
-    return total, per_arm
+            if arm_unit(doc, a) == "tick":  # async: `rounds` are ticks, `per_round_s` per tick
+                per_arm[a]["unit"] = "tick"
+    slots = [0] * parallel
+    for a, _ in runs:
+        slots[slots.index(min(slots))] += per_arm[a]["per_run_s"]
+    return setup_s + max(slots), per_arm
 
 
 def _plan_vllm(doc: dict, chosen: list[str], n_seeds: int, *, model: str, flavor: str,
                image: str, timeout: str | int | None, vllm_flags: str | None,
                profile: str | None, vllm_flags_append: str | None,
                probe_extra: dict[str, Any] | None, concurrency: int, request_timeout_s: float,
-               per_round_s: float | None, setup_s: int, common: dict[str, Any]) -> JobPlan:
+               per_round_s: float | None, setup_s: int, parallel: int,
+               common: dict[str, Any]) -> JobPlan:
     check_vllm_models(doc, chosen, model)
     max_model_len, vllm_version = common["max_model_len"], common["vllm_version"]
     resolved = resolve_flags(model, vllm_flags=vllm_flags, profile=profile,
@@ -504,7 +544,10 @@ def _plan_vllm(doc: dict, chosen: list[str], n_seeds: int, *, model: str, flavor
     if pb:
         raise SpecError(f"arm(s) {pb}: a programbench world runs in an API-model job inside its "
                         "task image (no vLLM there); call an API model instead of vllm:")
-    total, per_arm = _estimate(doc, chosen, n_seeds, per_round_s, setup_s)
+    total, per_arm = _estimate(doc, chosen, common["runs"], per_round_s, setup_s, parallel)
+    if parallel > 1:
+        notes.append(f"up to {parallel} runs at once share the one vLLM server; the estimate "
+                     "assumes they do not slow each other (raise --per-round if they contend)")
     timeout_s = (parse_duration(timeout) if timeout is not None
                  else math.ceil(total * 1.5 / 600.0) * 600)
     if timeout_s < total:
@@ -512,15 +555,18 @@ def _plan_vllm(doc: dict, chosen: list[str], n_seeds: int, *, model: str, flavor
                      "the job may be cut (runs synced so far stay in the bucket, resumable)")
     return JobPlan(
         **common, model=model, flavor=flavor, image=image, timeout_s=timeout_s,
-        estimate_s=total, estimate_detail={"setup_s": setup_s, "arms": per_arm},
+        estimate_s=total, estimate_detail={"setup_s": setup_s, "parallel": parallel,
+                                           "arms": per_arm},
         vllm_flags=resolved.flags, job_spec_yaml=job_yaml, notes=notes,
         vllm_flags_source=resolved.source, vllm_profile=resolved.profile,
-        probe_extra=resolved.probe_extra, probe_extra_source=resolved.probe_extra_source)
+        probe_extra=resolved.probe_extra, probe_extra_source=resolved.probe_extra_source,
+        parallel=parallel)
 
 
 def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
               image: str | None, timeout: str | int | None, per_round_s: float | None,
-              setup_s: int, environ: Mapping[str, str], common: dict[str, Any]) -> JobPlan:
+              setup_s: int, parallel: int, environ: Mapping[str, str],
+              common: dict[str, Any]) -> JobPlan:
     job_yaml = dump_yaml(job_spec_doc(doc, None, arms=chosen))
     exps = _check_job_spec(job_yaml, chosen)
     notes: list[str] = []
@@ -538,6 +584,10 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
                 f"({', '.join(f'{a}:{s}' for a, s in runs_pb)}): a run works in the image's "
                 "own /workspace, which nothing resets between runs, so one job runs one arm x "
                 "seed; narrow it with --arm and --seeds")
+        if parallel > 1:
+            raise SpecError(f"--parallel {parallel} with a programbench run: its lockdown (network, "
+                            "sudo) and /workspace are job-wide, so nothing may run beside it; "
+                            "drop --parallel or launch the other arms as their own job")
         first = pb[next(iter(pb))]
         facts = {"task": tasks[0], "image": first.image, "wall_limit_s": first.wall_limit_s,
                  "lockdown": first.lockdown, "pin_hosts": list(first.pin_hosts),
@@ -555,7 +605,10 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
         notes.append(f"--image {image} is not the task image {facts['image']}")
     flavor = flavor or API_FLAVOR
     wall = {a: float(w.wall_limit_s) for a, w in pb.items()}
-    total, per_arm = _estimate(doc, chosen, n_seeds, per_round_s, setup_s, wall)
+    total, per_arm = _estimate(doc, chosen, common["runs"], per_round_s, setup_s, parallel, wall)
+    if parallel > 1:
+        notes.append(f"up to {parallel} runs at once, each calling its providers (each keeps its own "
+                     "budget); the estimate assumes they do not slow each other")
     if timeout is not None:
         timeout_s = parse_duration(timeout)
     elif wall:  # the wall limit + 1 h (setup, final snapshot, sync); other runs at 1.5x
@@ -575,10 +628,11 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
                     | ({"programbench"} if pb else set()))
     return JobPlan(
         **common, model=None, flavor=flavor, image=image, timeout_s=timeout_s, estimate_s=total,
-        estimate_detail={"setup_s": setup_s, "arms": per_arm}, vllm_flags="",
+        estimate_detail={"setup_s": setup_s, "parallel": parallel, "arms": per_arm},
+        vllm_flags="",
         job_spec_yaml=job_yaml, notes=notes, vllm_flags_source="none", vllm_profile=None,
         probe_extra={}, probe_extra_source="none", mode="api", secrets=secrets,
-        missing_secrets=missing, extras=extras, programbench=facts)
+        missing_secrets=missing, extras=extras, programbench=facts, parallel=parallel)
 
 
 def programbench_arms(exps: Mapping[str, Any]) -> dict[str, Any]:
@@ -743,17 +797,19 @@ def describe(plan: JobPlan) -> str:
                          f"{', '.join(pb['pin_hosts'])})" if pb["lockdown"] else
                          f"  programbench task {pb['task']} (backend local, lockdown off)")
     for a, d in plan.estimate_detail["arms"].items():
+        unit = d.get("unit", "round")
         if "wall_limit_s" in d:
             lines.append(f"  {a}: N={d['agents']}, bounded by the world's wall limit "
                          f"{fmt_duration(int(d['wall_limit_s']))}/run x {d['runs']} seed(s)")
         else:
-            lines.append(f"  {a}: N={d['agents']} x {d['rounds']} rounds x ~{d['per_round_s']:g}"
-                         f" s/round = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
+            lines.append(f"  {a}: N={d['agents']} x {d['rounds']} {unit}s x ~{d['per_round_s']:g}"
+                         f" s/{unit} = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
     cost = (f"~${rate * est_h:.2f} expected, ${rate * plan.timeout_s / 3600:.2f} worst case "
             f"(${rate:.2f}/h x timeout)" if rate is not None else "rate unknown for this flavor")
     bounded = any("wall_limit_s" in d for d in plan.estimate_detail["arms"].values())
+    at_once = f", {plan.parallel} runs at once" if plan.parallel > 1 else ""
     lines.append(f"estimate: ~{plan.estimate_s / 60:.0f} min wall (incl. "
-                 f"{plan.estimate_detail['setup_s'] // 60} min setup"
+                 f"{plan.estimate_detail['setup_s'] // 60} min setup{at_once}"
                  f"{'; an upper bound: the wall limit' if bounded else ''}); timeout "
                  f"{fmt_duration(plan.timeout_s)}; flavor {plan.flavor}: {cost}")
     lines.append("model calls are self-hosted: the ledger shows $0, the cost is the job's compute"

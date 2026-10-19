@@ -21,7 +21,12 @@
 #   SWARMLAB_TAG          job tag, e.g. m2-vllm-qwen9b-1a2b3c4-20261006-120000
 #   SWARMLAB_STAGE        hf://buckets/<ns>/<bucket>/jobs/<tag>  (wheel, spec.yaml, this script)
 #   SWARMLAB_RUNS_REMOTE  hf://buckets/<ns>/<bucket>/runs/<tag>  (run dirs are synced here)
-#   SWARMLAB_RUNS         space-separated "arm:seed" pairs, run in this order
+#   SWARMLAB_RUNS         space-separated "arm:seed" pairs, started in this order
+#   SWARMLAB_PARALLEL     runs at once (default 1: one after another), vllm and api modes alike
+#                         (vllm: against the one server); each is its own `swarmlab run` process
+#                         with its own joblogs/run-* files, and results.jsonl gets its line when
+#                         it ends (completion order). >1 needs bash >= 5.1 (`wait -n -p`). The
+#                         launcher never sends it with a programbench run (one run per job there)
 #   SWARMLAB_GIT_COMMIT / SWARMLAB_GIT_DIRTY / SWARMLAB_JOB_SPEC_SHA256 / SWARMLAB_FLAVOR / SWARMLAB_IMAGE
 #   SWARMLAB_SYNC_EVERY   seconds between background syncs of $SWARMLAB_JOB_TMP/runs (default 300)
 #   VLLM_MODEL VLLM_PORT VLLM_VERSION VLLM_MAX_MODEL_LEN VLLM_GPU_MEMORY_UTILIZATION VLLM_FLAGS
@@ -44,9 +49,9 @@
 # mirrored to the bucket with `hf buckets sync` after every run and every SWARMLAB_SYNC_EVERY s.
 # job.json (manifest), results.jsonl (one CLI summary per run), vllm.log and job-side logs land
 # in SWARMLAB_STAGE. Exit codes: 0 all runs ran (grade: grade.json written); 1 a run failed;
-# 10 install; 11 vLLM install; 12 vLLM not ready (or plan.json's argv missing / disagreeing with
-# the env); 13 endpoint probe failed (HTTP error); 14 grading failed (no grade.json);
-# 143 SIGTERM (job timeout or cancel).
+# 10 install (or a bad SWARMLAB_PARALLEL, or > 1 under bash < 5.1); 11 vLLM install; 12 vLLM not
+# ready (or plan.json's argv missing / disagreeing with the env); 13 endpoint probe failed (HTTP
+# error); 14 grading failed (no grade.json); 143 SIGTERM (job timeout or cancel).
 # A probe answer without a parsed tool call only warns: grep the log for SWARMLAB_PROBE_WARNING;
 # job.json "probe" records the outcome (ok | no_tool_call | error).
 set -uo pipefail
@@ -70,6 +75,7 @@ VENV="$ROOT/venv"
 WORK="$ROOT/work"
 OUT="$JT/runs"
 SYNC_EVERY="${SWARMLAB_SYNC_EVERY:-300}"
+PARALLEL="${SWARMLAB_PARALLEL:-1}"
 VLLM_WAIT_S="${VLLM_WAIT_S:-1200}"
 VLLM_PORT="${VLLM_PORT:-8000}"   # the spec's providers override points at this port
 BASE="http://127.0.0.1:$VLLM_PORT"
@@ -79,7 +85,8 @@ if [ "$MODE" = vllm ]; then
   export SWARMLAB_OFFLINE=1   # never fetch the router catalog inside the job
 fi
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-STATUS=starting RC=0 VLLM_PID="" SYNC_PID="" RUN_PID="" READY_S="" FAILED_RUNS="" DONE_RUNS=""
+STATUS=starting RC=0 VLLM_PID="" SYNC_PID="" READY_S="" FAILED_RUNS="" DONE_RUNS=""
+declare -A RUNNING=()   # pid -> "arm:seed" of the `swarmlab run` processes in flight
 VLLM_CMDLINE=""
 if [ -z "${VLLM_PROBE_EXTRA:-}" ]; then   # launched by hand: the launcher's default
   VLLM_PROBE_EXTRA='{"chat_template_kwargs":{"enable_thinking":false}}'
@@ -127,7 +134,7 @@ doc = {
     "status": e("STATUS"), "exit_code": int(e("RC") or 0),
     "runs_planned": (e("SWARMLAB_RUNS") or "").split(),
     "runs_done": (e("DONE_RUNS") or "").split(), "runs_failed": (e("FAILED_RUNS") or "").split(),
-    "runs_remote": e("SWARMLAB_RUNS_REMOTE"),
+    "runs_remote": e("SWARMLAB_RUNS_REMOTE"), "parallel": int(e("SWARMLAB_PARALLEL") or 1),
     "vllm": None if e("MODE") != "vllm" else {
              "model": e("VLLM_MODEL"), "revision": e("VLLM_REVISION") or None,
              "version": e("VLLM_VERSION"), "max_model_len": e("VLLM_MAX_MODEL_LEN"),
@@ -157,7 +164,8 @@ sync_runs() {
 
 finish() {
   trap - EXIT TERM INT
-  [ -n "$RUN_PID" ] && kill -TERM "$RUN_PID" 2>/dev/null && wait "$RUN_PID" 2>/dev/null
+  for pid in "${!RUNNING[@]}"; do kill -TERM "$pid" 2>/dev/null; done
+  for pid in "${!RUNNING[@]}"; do wait "$pid" 2>/dev/null; done
   [ -n "$SYNC_PID" ] && kill "$SYNC_PID" 2>/dev/null
   if [ "$STATUS" != "completed" ]; then STATUS="failed"; fi
   [ "$RC" -eq 0 ] && [ "$STATUS" = "failed" ] && RC=1
@@ -177,6 +185,10 @@ finish() {
 trap 'RC=$?; finish' EXIT
 trap 'log "signal: stopping (job timeout or cancel)"; RC=143; finish' TERM INT
 fail() { RC="$1"; shift; log "FATAL: $*"; exit "$RC"; }
+[[ "$PARALLEL" =~ ^[1-9][0-9]*$ ]] || fail 10 "SWARMLAB_PARALLEL must be an integer >= 1, got $PARALLEL"
+# only the slot pool needs `wait -n -p`; one run at a time works on older bash (task images)
+[ "$PARALLEL" -eq 1 ] || [ $(( BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] )) -ge 501 ] \
+  || fail 10 "bash >= 5.1 needed for SWARMLAB_PARALLEL > 1 (wait -n -p)"
 
 log "mode=$MODE tag=$SWARMLAB_TAG job=${JOB_ID:-?} commit=${SWARMLAB_GIT_COMMIT:-?} accelerator=${ACCELERATOR:-?}"
 if [ "$MODE" = vllm ]; then
@@ -332,10 +344,10 @@ if [ "$MODE" = grade ]; then
     --submission "$STAGE_DIR/submission.tar.gz" --tests "$SWARMLAB_GRADE_TESTS" \
     --image "${SWARMLAB_IMAGE:-}" --out "$JT/grade.json" --sweep-on-timeout \
     > >(tee "$JT/joblogs/grade.log") 2>&1 &
-  RUN_PID=$!
-  wait "$RUN_PID"
+  RUNNING[$!]="grade"   # finish() stops it on a SIGTERM
+  wait "$!"
   rc=$?
-  RUN_PID=""
+  RUNNING=()
   [ -f "$JT/grade.json" ] || fail 14 "grading failed (exit $rc, no grade.json; see logs/grade.log)"
   hf_q buckets cp "$JT/grade.json" "$SWARMLAB_STAGE/grade.json" || fail 14 "upload of grade.json failed"
   log "grade.json uploaded to $SWARMLAB_STAGE/grade.json"
@@ -349,20 +361,39 @@ write_manifest
 ( while sleep "$SYNC_EVERY"; do sync_runs; done ) &
 SYNC_PID=$!
 cd "$WORK" || fail 10 "no work dir"
+# a run ends: its summary line, DONE/FAILED, a sync (the shell is single-threaded, so these never
+# interleave). `wait -n -p` (bash >= 5.1) returns at a SIGTERM too, so the trap runs at once.
+reap_one() {
+  local pid rc item
+  if [ "${#RUNNING[@]}" -eq 1 ]; then   # one in flight: a plain wait (any bash)
+    pid="${!RUNNING[*]}"
+    wait "$pid"
+  else
+    wait -n -p pid "${!RUNNING[@]}"
+  fi
+  rc=$?
+  if [ -z "$pid" ]; then   # no child left to wait for (should not happen): count them failed
+    log "WARNING: lost track of runs ${RUNNING[*]} (wait -n exit $rc)"
+    FAILED_RUNS="$FAILED_RUNS ${RUNNING[*]}"; RUNNING=(); return
+  fi
+  item="${RUNNING[$pid]}"
+  unset "RUNNING[$pid]"
+  arm="${item%:*}"; seed="${item##*:}"
+  cat "$JT/joblogs/run-$arm-s$seed.json" >>"$JT/results.jsonl"
+  if [ "$rc" -eq 0 ]; then DONE_RUNS="$DONE_RUNS $item"; else FAILED_RUNS="$FAILED_RUNS $item"; log "run $item failed (exit $rc)"; fi
+  sync_runs
+  hf_q buckets cp "$JT/results.jsonl" "$SWARMLAB_STAGE/results.jsonl"
+}
+[ "$PARALLEL" -gt 1 ] && log "running up to $PARALLEL runs at once"
 for item in $SWARMLAB_RUNS; do
+  [ "${#RUNNING[@]}" -ge "$PARALLEL" ] && reap_one
   arm="${item%:*}"; seed="${item##*:}"
   log "run arm=$arm seed=$seed"
   # in the background + `wait`, so a SIGTERM (job timeout) reaches the trap at once
   "$SWARMLAB" run "$STAGE_DIR/spec.yaml" --arm "$arm" --seed "$seed" --yes --out "$OUT" --json \
     >"$JT/joblogs/run-$arm-s$seed.json" 2> >(tee "$JT/joblogs/run-$arm-s$seed.err" >&2) &
-  RUN_PID=$!
-  wait "$RUN_PID"
-  rc=$?
-  RUN_PID=""
-  cat "$JT/joblogs/run-$arm-s$seed.json" >>"$JT/results.jsonl"
-  if [ "$rc" -eq 0 ]; then DONE_RUNS="$DONE_RUNS $item"; else FAILED_RUNS="$FAILED_RUNS $item"; log "run $item failed (exit $rc)"; fi
-  sync_runs
-  hf_q buckets cp "$JT/results.jsonl" "$SWARMLAB_STAGE/results.jsonl"
+  RUNNING[$!]="$item"
 done
+while [ "${#RUNNING[@]}" -gt 0 ]; do reap_one; done
 if [ -z "$FAILED_RUNS" ]; then STATUS=completed; RC=0; else STATUS=failed; RC=1; fi
 exit "$RC"

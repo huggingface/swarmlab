@@ -184,7 +184,8 @@ class RunOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     seed: int
     max_rounds: int
-    commit: Literal["round_end", "immediate"] = "round_end"
+    # "async": every live agent loops over its own turns, no round barrier (swarmlab/runner.py)
+    commit: Literal["round_end", "immediate", "async"] = "round_end"
     max_calls_per_turn: int = 20
     snapshot_every: int = 1
     concurrency: int = 32

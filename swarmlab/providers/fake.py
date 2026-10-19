@@ -42,12 +42,21 @@ text is then cleared: the answer moves into the call, which is what a JSON-answe
 `derive(<request hash>, "fake_tool_choice")`, so the script's own rng draws are unchanged. A
 refused response (`finish_reason == "refusal"`) is left as it is: a refusal is not a tool call.
 
+Simulated latency: `yields` (default 0, left out of `spec()` then) makes every call await
+`asyncio.sleep(0)` that many times before answering: an int n, or `[lo, hi]` for a count drawn
+uniformly from `derive(<request hash>, "fake_yields")` (a separate stream, so the script's draws
+are unchanged). The latency is measured in event-loop steps, not seconds, so it is
+deterministic: under `commit: async` it makes the turns of fake agents overlap (each turn
+otherwise runs to its end without yielding) while runs stay reproducible. Set it with
+`providers: {fake: {type: fake, params: {yields: [0, 30]}}}`.
+
 Tool-call ids are `fake_<8 hex from the rng>`. Under `tool_protocol == "json"` the calls are
 returned as a JSON array `[{"name", "args"}]` in `text` instead of `tool_calls`; earlier calls are
 recognised in either form.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import math
@@ -306,8 +315,14 @@ class FakeProvider(Provider):
     default_pricing: ClassVar[dict[str, PricingRow]] = {"*": (1.0, 5.0, 0.1)}
 
     def __init__(self, script: str | None = None, pricing: dict | None = None,
-                 concurrency: int = 8) -> None:
+                 concurrency: int = 8, yields: int | list[int] = 0) -> None:
         self.script = script
+        lo, hi = (yields, yields) if isinstance(yields, int) else tuple(yields)
+        if isinstance(lo, bool) or not isinstance(lo, int) or not isinstance(hi, int) or not 0 <= lo <= hi:
+            raise ValueError(f"yields must be an integer >= 0 or [lo, hi] with 0 <= lo <= hi, got {yields!r}")
+        self.yields = (lo, hi)
+        if not hi:  # the default stays out of spec(), so existing specs keep their hash
+            self.params.pop("yields", None)
         self._setup(pricing, concurrency)
 
     def script_for(self, request: ChatRequest) -> Script:
@@ -318,6 +333,10 @@ class FakeProvider(Provider):
         h = request_hash(request)
         rng = derive(int(h[:8], 16), "fake")
         forced = check_tool_choice(request)  # before the script: an impossible choice is an error
+        lo, hi = getattr(self, "yields", (0, 0))
+        if hi:  # simulated latency in event-loop steps (module docstring), deterministic
+            for _ in range(derive(int(h[:8], 16), "fake_yields").randint(lo, hi)):
+                await asyncio.sleep(0)
         resp = self.script_for(request)(request, rng)
         if forced and resp.finish_reason != "refusal":
             resp = _force_tool(request, resp, int(h[:8], 16))

@@ -73,6 +73,10 @@ parts unchanged (text and image parts pass through), then, when present, one tex
 `Outcomes of your actions last round:` with a line per outcome
 (`- <tool> <action_id>: accepted|rejected <feedback JSON>`), and one text part
 `Delivered to you:` with a line per pushed item (`- <post_id> (round <eligible_round>): <content>`).
+Under `commit: async` (`view.turn` set: the agent's own turn number) the message starts
+`Turn {n}.`, the outcomes part says `last turn`, delivered items carry no round, and the default
+system template renders its turn-based paragraph instead of the round-based one (template
+variable `turn_based`); in the round-based modes the rendering is unchanged.
 
 **Turn loop.** `turn()` sets up memory (below), then runs one loop until the reply ends the turn
 or `calls_per_turn_cap` responses (`max_calls`; at most 2 under `report_json`) were acted on:
@@ -303,12 +307,14 @@ _ENV = jinja2.Environment(trim_blocks=True, lstrip_blocks=True, undefined=jinja2
 
 def render_system_prompt(template: str | None, *, agent: str, role: str, description: str,
                          tools: list[ToolSchema], append: str | None = None,
-                         default: Path = DEFAULT_SYSTEM_TEMPLATE, **variables: Any) -> str:
+                         default: Path = DEFAULT_SYSTEM_TEMPLATE, turn_based: bool = False,
+                         **variables: Any) -> str:
     """Render `template` (text, `file:<path>`, or None for the default) with the agent's context.
 
     `append` (`system_prompt_append`) is the template variable `system_prompt_append`; the
     default template puts it after the task section, before the tool list. A custom template
-    that does not use the variable gets it appended at the end."""
+    that does not use the variable gets it appended at the end. `turn_based` (`commit: async`)
+    makes the default template describe turns instead of rounds."""
     if template is None:
         text = default.read_text()
     elif template.startswith("file:"):
@@ -318,21 +324,23 @@ def render_system_prompt(template: str | None, *, agent: str, role: str, descrip
     extra = (append or "").strip()
     out = _ENV.from_string(text).render(agent=agent, role=role, description=description,
                                         tools=tools, system_prompt_append=extra,
-                                        **variables).strip()
+                                        turn_based=turn_based, **variables).strip()
     if extra and "system_prompt_append" not in text:
         out += "\n\n" + extra
     return out
 
 
-def render_delivered(items: list[dict]) -> str:
+def render_delivered(items: list[dict], *, turn_based: bool = False) -> str:
     """Delivered board items as text: `Delivered to you:` and a line per item,
-    `- <post_id> (round <eligible_round>): <content>` (non-string content as JSON)."""
+    `- <post_id> (round <eligible_round>): <content>` (non-string content as JSON). With
+    `turn_based` (`commit: async`, `view.turn` set) the ` (round <eligible_round>)` is left out."""
     lines = ["Delivered to you:"]
     for item in items:
         content = item.get("content")
         if not isinstance(content, str):
             content = json.dumps(content, sort_keys=True)
-        lines.append(f"- {item.get('post_id')} (round {item.get('eligible_round')}): {content}")
+        when = "" if turn_based else f" (round {item.get('eligible_round')})"
+        lines.append(f"- {item.get('post_id')}{when}: {content}")
     return "\n".join(lines)
 
 
@@ -836,7 +844,8 @@ class LLMAgent(Participant):
                                     description=view.description, tools=view.tools,
                                     append=getattr(self, "system_prompt_append", None),
                                     default=REPORT_SYSTEM_TEMPLATE if report else DEFAULT_SYSTEM_TEMPLATE,
-                                    answer=(getattr(self, "report_fields", None) or ["country"])[0])
+                                    answer=(getattr(self, "report_fields", None) or ["country"])[0],
+                                    turn_based=view.turn is not None)
         role_append = getattr(self, "_role_prompt_append", None)  # M3c: the role's text, at the end
         if role_append:
             text += "\n\n" + role_append.strip()
@@ -846,17 +855,20 @@ class LLMAgent(Participant):
 
     @staticmethod
     def round_message(view: View) -> ChatMessage:
-        parts = [Part(type="text", text=f"Round {view.round}.")]
+        turn_based = view.turn is not None  # commit: async (module doc, Round message)
+        head = f"Turn {view.turn}." if turn_based else f"Round {view.round}."
+        parts = [Part(type="text", text=head)]
         parts += [p.model_copy() for p in view.observation.parts]
         if view.outcomes:
-            lines = ["Outcomes of your actions last round:"]
+            lines = [f"Outcomes of your actions last {'turn' if turn_based else 'round'}:"]
             for o in view.outcomes:
                 verdict = "accepted" if o.get("accepted") else "rejected"
                 fb = json.dumps(o.get("feedback") or {}, sort_keys=True)
                 lines.append(f"- {o.get('tool')} {o.get('action_id')}: {verdict} {fb}")
             parts.append(Part(type="text", text="\n".join(lines)))
         if view.pushed:
-            parts.append(Part(type="text", text=render_delivered(view.pushed)))
+            parts.append(Part(type="text", text=render_delivered(view.pushed,
+                                                                 turn_based=turn_based)))
         return ChatMessage(role="user", content=parts)
 
     def turn_message(self, view: View) -> ChatMessage:

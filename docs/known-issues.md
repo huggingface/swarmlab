@@ -28,6 +28,14 @@ Last checked against main on 2026-10-08. Items fixed since the first version (pe
 - `ibm-granite/granite-4.2-8b` does not fit a 24 GB card at `--max-model-len 32768`: on `a10g-large` vLLM ran out of KV cache (2.66 GiB free, 5 GiB needed) and the job failed with exit 12. Use `--flavor l40sx1` or `a100-large` (the profile's `min_gpu_gb` is 48 and the plan prints a note for a smaller flavor). `l40sx1` had no capacity when the benchmark ran, so it used `a100-large`.
 - `plan_job(port=...)` changes the provider URL in the job spec but bootstrap.sh still serves on `VLLM_PORT` (default 8000) and the plan does not set it; only the default port works. The CLI does not expose `--port`.
 - The job wall-time estimate (30 + 2N s per round) is 3-4x pessimistic for self-hosted vLLM (measured: N=64 about 40 s/round). Pass `--per-round` or `--timeout` from a measured run.
+- `job run --parallel` in API mode (several API-model runs at once in one job) is checked only by the launcher and bootstrap tests, not in a real job; a plan with a programbench run refuses it.
+
+## Async commit (`commit: async`)
+
+- Validated with fake models only (scripted participants and `fake:` scripts, with and without the fake provider's `yields`); no real-model run yet. With real models the outcome depends on latency (who acts when), so two runs of one seed differ; replay of a run is still exact.
+- Turns in flight when the run ends are cancelled: their commits so far stand (logged in their ticks), their tool and turn events are dropped, and a model call they had in flight is charged at its worst-case reservation. So the score's cumulative Minesweeper counters can exceed the metric sums (which count completed turns) by those turns' commits. Resume and fork lose the turns in flight at the snapshot the same way (the agent's memory restarts from its last completed turn; deliveries it had read stay read).
+- No scheduler, probes or interventions under async (refused at construction). `estimate` scales calls by 1/n per tick but applies `prompt_growth` per tick, which overstates growth by about n.
+- Comm metrics are per tick (one agent's turn): `comm.posts_per_round` and similar mean "per turn" there.
 
 ## ProgramBench in HF Jobs and grading
 
