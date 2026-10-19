@@ -426,7 +426,7 @@ def test_snapshot_holds_plain_state_and_round_trips(tmp_path):
     st = state(run)
     assert set(st) == {"model", "steps_per_turn", "step_limit", "wall_limit_s", "max_tokens",
                        "temperature", "extra", "templates", "idle_until_assigned", "wait_tool",
-                       "lead_channel", "worker_channels", "messages", "n_calls", "cost",
+                       "lead_channel", "worker_channels", "guidance", "messages", "n_calls", "cost",
                        "n_consecutive_format_errors", "elapsed_s", "finished", "assigned",
                        "delivered_upto", "agent", "rng"}
     p = MiniSweAgent(model=fake("submit_fifth"))
