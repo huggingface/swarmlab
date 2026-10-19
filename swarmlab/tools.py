@@ -93,7 +93,8 @@ class ToolSchema(BaseModel):
         not in `properties` dropped) and `additionalProperties: false`; nested objects likewise
         unless they explicitly allow extra keys. Idempotent. Every schema the harness emits
         (world `@tool`s, board, status and `end_turn` tools) is already normalised; provider
-        adapters call this again defensively.
+        adapters do not call this: they send a schema as the participant gives it, so a
+        participant that offers its own tools and wants strict mode normalises them itself.
         """
         params = dict(self.parameters or {})
         params.setdefault("type", "object")
