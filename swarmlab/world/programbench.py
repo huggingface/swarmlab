@@ -38,6 +38,9 @@ cpus=None, memory_gb=None, snapshot_exclude=(), check_task=True)`
   official limit counts model calls, and one call may run several commands): the participant
   does, and in the one-round solo shape `check_experiment` requires
   `options.max_calls_per_turn >= step_limit` so the executor's cap cannot end the episode first.
+  The same holds under `commit: async`, where `max_rounds: 1` is one tick, i.e. one turn. With
+  more rounds or ticks the cap ends a turn, not the episode: the participant goes on at its next
+  turn, so nothing is checked.
 - `wall_limit_s`: the 6 h wall-clock limit. Once the world's clock passes it, `terminal()` is
   true and `validate` refuses further commands (`wall_limit`).
 - `command_timeout_s`: the per-command timeout (180 s).
@@ -93,18 +96,27 @@ Official semantics replicated
   `--secrets` names, so a key in a variable like `MODEL_AUTH` is dropped too; `declared_secrets`)
   and minus swarmlab's own virtualenv (`VIRTUAL_ENV` and its `bin` on `PATH`), so the
   agent's `python3` is the image's; plus the thread-count variables below when the CPU count is
-  known.
+  known; plus `SWARMLAB_PROGRAMBENCH_RUN=<random id>` (`RUN_MARKER`), which marks the run's
+  processes for the sweep below (an added variable the baseline does not set).
 - Timeout (`command_timeout_s`): the call returns the output captured so far, `returncode: -1`
   and `exception_info` in the baseline's wording, `An error occurred while executing the command:
   Command '<command>' timed out after 180 seconds` (docker: the `docker exec` argument list, as
   `docker.py` prints it). The process keeps running, as under Docker, where only the waiting
   client is killed. The local backend starts the command in its own session writing to an
-  unlinked temp file and stops waiting at the deadline.
+  unlinked temp file and stops waiting at the deadline. A timed-out command stays tracked
+  (below) until it exits or swarmlab kills it.
 - Submission: a command whose output's first non-blank line is exactly
   `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` with return code 0 submits (`submission_of`). The world
   records `submitted`, the rest of the output as `submission`, who and when; `terminal()` is true
   from then on and `validate` refuses every later `bash` (`Ack(ok=False, error="submitted")`).
-  There is no `submit` tool.
+  There is no `submit` tool. Submission freezes the workspace (below). The first submission is
+  final: under `commit: async` two agents' commands may both print the marker and exit before
+  either completion is handled; the first one handled (on the loop, after its await) is the
+  submission, and a later one is not (no submission field changes, `terminal()` follows the
+  first submitter). It still counts as a step and returns its real `output` and `returncode`,
+  with `exception_info` `This command was not taken as the submission: <agent> already
+  submitted the final output (the episode is over)` (a mini_swe_agent participant still ends
+  its episode on the marker, as on any refused command after a submission).
 - Docker: `docker run -d --name <n> -w <workspace> --rm --network none --cpus 20 --memory 60g
   --memory-swap 60g --user agent --cap-drop SYS_PTRACE <image> sleep 7h`, then per call
   `docker exec -w <workspace> -e K=V ... <id> bash -lc <command>`, as mini-swe-agent's
@@ -115,6 +127,85 @@ Official semantics replicated
   touched); it is not a step and is not shown to the agent.
 - The task text (`description()`) is the baseline's `system_template` followed by its
   `instance_template`, rendered as mini-swe-agent renders them (`prompt_parts`).
+
+Running commands, the submission freeze and the run's end
+-------------------------------------------------------
+`bash` is an `async def` tool (swarmlab/world/base.py, Async tools): `validate` is synchronous as
+before; the tool checks its arguments and the submission, starts the backend if needed
+(synchronously, before its one await), starts the command and awaits it. The wait for the
+process happens in a dedicated daemon thread (`_in_thread`: not the loop's default executor,
+which also runs the mini_swe_agent participant's step threads), so under `commit: async` other
+agents' turns run, and run their own commands, meanwhile. Every state change (the clock,
+`steps`, `history`, `timeouts`, the submission fields) happens after the await, on the event-loop
+thread, so nothing is locked. Under `commit: immediate` turns run one at a time, so a run's log
+is what the synchronous tool gave.
+
+Each backend tracks its commands, `{pid: (agent, process)}` (`running()`; `running_commands()`
+gives `{agent: [pid]}`), including the timed-out ones the baseline leaves running.
+`kill_all(reason)` kills them all; the docker backend kills the `docker exec` clients and then
+runs `kill -9 -1` as root in the container, which kills every process there but its init
+(commands, timed-out ones and background jobs alike). The local backend:
+
+- tracks each command's process GROUP, not its shell: every command starts in its own session,
+  so its pgid is the shell's pid, and the command stays tracked while the group has a live (not
+  zombie) member (`procs.group_alive`: `killpg(pgid, 0)`, confirmed in `/proc`), after its shell
+  has exited and `bash` has returned. So `(sleep 1; touch late) &` is tracked until it ends.
+  `kill_all` SIGKILLs the whole group whatever the shell's state and polls until it is empty
+  (`procs.kill_group`, at most 2 s);
+- then sweeps the processes that left their group (`setsid`, a double fork into a new
+  session, a daemon): every process whose environment carries this backend's `RUN_MARKER`
+  entry (it is inherited down every fork), and, when the commands run as a dedicated user under
+  the lockdown (the HF Jobs shape: `setpriv` to `user`, never root, never the uid swarmlab runs
+  as), every process of that uid (`procs.kill_matching`, shared with the grader);
+- remaining gap: a process that scrubs its environment (`env -i`, or rewrites the marker) AND
+  leaves its command's process group, on a run with no dedicated user (a dry run as the current
+  user, `user: null`, or no lockdown), is not tracked and keeps running until the job or the
+  machine ends. Under the HF Jobs shape the uid sweep covers it.
+
+A command swarmlab killed while its shell ran returns the baseline's three keys: its output so
+far, the killed process's return code (`-9`) and `exception_info` `An error occurred while
+executing the command: Command '<command>' was killed: <reason>`; it counts as a step (it ran).
+A command whose shell had already returned keeps the feedback it returned; killing its
+background jobs changes nothing in the log.
+
+- Submission freezes the workspace. When a command submits (on the loop, right after its
+  await), the world kills every other command still running (`<agent> submitted the final
+  output (the episode is over)`): under `commit: async` the other agents' commands, in any mode
+  the timed-out ones. `validate` and `bash` already refuse new commands. The workspace the final
+  snapshot holds is therefore the one the submission saw, give or take the instant between the
+  submitting command's exit and the kill.
+- The run's end. `end_run(reason)` (the runner's end-of-run hook, swarmlab/world/base.py), which
+  the runner calls on every end (terminal, `max_rounds` or an exhausted `rounds_per_agent`, a
+  stop condition, a budget, the hard ceiling, a crash) after the in-flight turns have unwound
+  and before the final snapshot, kills every command still running (`the run ended`) and the
+  background jobs (the sweep above), then, under docker, captures the workspace for the final
+  snapshot (Docker cleanup, below). A timed-out command that already returned from `bash` is
+  therefore killed before the final snapshot however the run ends. The local backend's
+  `weakref.finalize` (when it is collected and at interpreter exit) and the container's own
+  finalizer stay as safety nets.
+- Cancellation. A `bash` cancelled while its command runs (the run ended with the turn in flight)
+  kills that command (local: its process group; docker: its `docker exec` client, the process in
+  the container then ends with `kill_all` or the container) and re-raises; nothing was recorded
+  before the await, so the world is as if the command had never been issued (except for what it
+  did to the workspace).
+
+Under `commit: async`
+---------------------
+`requires = Requirements(commit=("immediate", "async"))`. A round is a tick (one completed turn
+of any agent): `begin_round(t)` opens tick t while other turns run, `end_round(t)` closes it (the
+clock, the per-tick `round_steps`); `end_run` does the kill and the docker cleanup at the run's
+end, whichever tick that is. `terminal()` is read by the runner at each tick close. After a submission it turns
+true only once the submitter's own turn has closed (`close_turn` sets `submission_closed`, an
+attribute that exists only under async, so round-based snapshots are unchanged): ticks other
+agents close in between cannot end the run and cut the submitter's last turn out of the log and
+its participant snapshot. Those agents can do nothing meanwhile (every command is refused,
+`submitted`). The turns still in flight when the run ends are cancelled; their commands were
+already killed by the freeze. A tick-close snapshot (`snapshot_every`) may
+capture a workspace that other agents' commands are writing (a file that shrinks while it is
+read is padded with NUL bytes to its stat'ed size, `_Exact`, so the archive stays well-formed):
+resume and fork lose the in-flight turns anyway. The final snapshot is consistent: the
+submission froze the workspace (or the run's end killed every command) and the runner always
+snapshots the tick that ends the run.
 
 Documented deviations (world-relevant items, from the settled plan)
 -------------------------------------------------------------------
@@ -133,14 +224,17 @@ Decisions the contract leaves open
   run, or the local lockdown) at the first `bash` call, or in `begin_round` when a restored
   workspace is waiting to be materialised (resume, fork). The time a backend start takes (an
   image pull) is not on the world's clock, as the baseline starts its clock after the container.
+  The start (and the lockdown's shell commands, and the git identity) is synchronous and runs
+  before `bash`'s first await, so it is single-shot even when two agents' first commands race
+  under `commit: async`: the first blocks the loop while it starts, the second finds it started.
 - Clock. `elapsed_s` runs from the first `begin_round` of a process and accumulates across
   resumes (time between processes is not counted). It is updated after every command and in
   `end_round`, and `score()` and `terminal()` read the stored value, so replay reproduces them.
-- Docker cleanup. The World contract has no end-of-run hook, so `end_round` captures the
-  workspace tar (the snapshot that follows uses it) and removes the container (`docker rm -f`)
-  when `terminal()` or when the round equals the `max_rounds` recorded by `check_experiment`; if
-  the tar fails, the error propagates and the container is kept, since it holds the submission. A
-  run that ends otherwise (budget, stop condition, crash) relies on the safety net: a
+- Docker cleanup. `end_run` (after killing every running command, above) captures the
+  workspace tar (the final snapshot that follows uses it) and removes the container (`docker rm
+  -f`), on every end that writes a final snapshot; on `hard_ceiling` and `crash`, which write
+  none, it only kills, and the container goes with its finalizer. If the tar fails, the error
+  propagates and the container is kept, since it holds the submission. The safety net is a
   `weakref.finalize` per container, which runs when the backend is collected and at interpreter
   exit. Deep copies and pickles of the world never carry the backend handle (`__getstate__`), so
   a copy cannot remove a container it does not own.
@@ -193,14 +287,14 @@ Evaluator side
 --------------
 - `score()` (cheap, every round): `{"submitted", "steps", "elapsed_s", "graded": False}`.
 - `end_round(r)` -> `{"round", "steps", "round_steps", "submitted", "elapsed_s"}` (logged as
-  `round_resolved`), plus the docker cleanup above.
+  `round_resolved`); `end_run(reason)`: the kill and the docker cleanup above.
 - `render_state()`: task, backend, steps, submitted, elapsed, the workspace's top-level entries
   with sizes (from the snapshot's meta, never the filesystem) and the last 10 commands (first 200
   characters each) with their return codes.
 - `observe(agent)`: a short text (workspace, the agent's own command count, submitted or not);
   `private` is empty. Nothing agent-visible reveals correctness (there is none until grading).
-- `requires = Requirements(commit="immediate")`: a ReAct coding loop needs each command's output
-  before its next call.
+- `requires = Requirements(commit=("immediate", "async"))`: a ReAct coding loop needs each
+  command's output before its next call, which `round_end` cannot give.
 
 Fake script
 -----------
@@ -222,6 +316,7 @@ code (`docker.py`, `local.py`, `default.py`, the `bash` tool schema) are identic
 """
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import gzip
 import io
@@ -237,6 +332,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 import weakref
@@ -245,6 +341,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
+from .. import procs
 from ..ids import AgentId
 from ..view import Observation, text_observation
 from .base import Ack, Action, Outcome, Requirements, World, tool
@@ -264,7 +361,9 @@ DOCKER_CPUS, DOCKER_MEMORY_GB = 20, 60          # programbench.yaml run_args
 DOCKER_CONTAINER_TIMEOUT = "7h"                 # programbench.yaml container_timeout
 DOCKER_START_TIMEOUT_S = 1800                   # a pull of a 1-2 GB image; not task semantics
 HISTORY_KEEP = 10
+RUN_MARKER = "SWARMLAB_PROGRAMBENCH_RUN"         # =<random id> in every local command's environment
 _ERROR_PREFIX = "An error occurred while executing the command: "
+NOT_THE_SUBMISSION = "This command was not taken as the submission: "
 log = logging.getLogger(__name__)
 
 # ---- the official task text (mini-swe-agent, MIT; see the module docstring) -----------------
@@ -754,7 +853,15 @@ def workspace_tar(root: str | Path, exclude: Sequence[str] = ()) -> tuple[bytes,
                 continue
             full = os.path.join(root, rel)
             try:
-                tar.add(full, arcname=rel, recursive=False, filter=tidy)
+                ti = tar.gettarinfo(full, arcname=rel)
+                if ti is None:  # a socket
+                    continue
+                ti = tidy(ti)
+                if ti.isreg():
+                    with open(full, "rb") as f:
+                        tar.addfile(ti, _Exact(f, ti.size))
+                else:
+                    tar.addfile(ti)
             except (PermissionError, FileNotFoundError):
                 skipped.append(rel)
                 continue
@@ -765,6 +872,22 @@ def workspace_tar(root: str | Path, exclude: Sequence[str] = ()) -> tuple[bytes,
             tarfile.open(fileobj=gz, mode="w|", format=tarfile.PAX_FORMAT) as tar:
         add_dir(tar, "")
     return buf.getvalue(), skipped
+
+
+class _Exact:
+    """A file read as exactly `size` bytes (its size when stat'ed): a file that shrank while it
+    was read (an agent's command writing it during a snapshot under `commit: async`) is padded
+    with NUL bytes, so the archive stays well-formed instead of the snapshot failing."""
+
+    def __init__(self, f: Any, size: int) -> None:
+        self.f, self.left = f, size
+
+    def read(self, n: int = -1) -> bytes:
+        n = self.left if n is None or n < 0 else min(n, self.left)
+        data = self.f.read(n)
+        data += b"\0" * (n - len(data))
+        self.left -= n
+        return data
 
 
 def workspace_entries(tar_bytes: bytes | None) -> list[dict]:
@@ -833,9 +956,138 @@ class Backend(Protocol):
 
     def start(self) -> dict: ...
     def execute(self, command: str, timeout: float) -> dict: ...
+    async def aexecute(self, command: str, timeout: float, agent: str = "") -> dict: ...
+    def running(self) -> dict[str, list[int]]: ...
+    def kill_all(self, reason: str) -> int: ...
     def tar(self, exclude: Sequence[str]) -> tuple[bytes | None, list[str]]: ...
     def restore_workspace(self, tar_bytes: bytes) -> None: ...
     def stop(self) -> None: ...
+
+
+async def _in_thread(fn: Callable[..., Any], *args: Any) -> Any:
+    """`fn(*args)` in a dedicated daemon thread, awaited on the running loop. Not the loop's
+    default executor: that one also runs the participants' step threads, so a blocked command
+    could starve it, and `asyncio.run` joins its threads at exit while a cancelled command's
+    wait may still be draining. Cancelling the await leaves the thread to finish on its own (the
+    caller kills the process, so it returns at once); a result arriving after the loop closed is
+    dropped."""
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+
+    def deliver(result: Any, exc: BaseException | None) -> None:
+        if fut.done():
+            return
+        if exc is not None:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+    def run() -> None:
+        try:
+            result, exc = fn(*args), None
+        except BaseException as e:  # noqa: BLE001 - handed to the awaiting coroutine
+            result, exc = None, e
+        try:
+            loop.call_soon_threadsafe(deliver, result, exc)
+        except RuntimeError:  # the loop is closed: nobody awaits this any more
+            pass
+
+    threading.Thread(target=run, name="programbench-command", daemon=True).start()
+    return await fut
+
+
+def _wait_or_none(proc: subprocess.Popen, timeout: float) -> int | None:
+    """The process's return code, or None when it is still running at the deadline."""
+    try:
+        return proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+@dataclass
+class _Command:
+    """A tracked command: its process, the agent that ran it, and why swarmlab killed it.
+    `group`: the command was started in its own session (local backend), so its process group
+    (pgid = its pid) is tracked, and killed, independently of the shell that leads it."""
+    agent: str
+    proc: subprocess.Popen
+    killed: str | None = None
+    group: bool = True
+
+    def alive(self) -> bool:
+        """The shell still runs or (`group`) its process group still has a live member: a
+        background job (`cmd &`) outlives the shell that started it."""
+        if self.proc.poll() is None:
+            return True
+        return self.group and procs.group_alive(self.proc.pid)
+
+
+def _kill_command(cmd: _Command) -> None:
+    """SIGKILL the command: its whole process group whatever the shell's state, polled until
+    empty (`procs.kill_group`); the `docker exec` client alone otherwise."""
+    if cmd.group:
+        if not procs.kill_group(cmd.proc.pid):  # pragma: no cover - a member we may not signal
+            log.warning("programbench: process group %d survived SIGKILL", cmd.proc.pid)
+    else:
+        try:
+            cmd.proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+def _kill_commands(commands: dict[int, _Command], reason: str) -> int:
+    """Kill every tracked command still alive (a running shell is marked `killed = reason`, so
+    its feedback says so); reap them; drop them all. Returns how many were alive."""
+    n = 0
+    for pid, cmd in list(commands.items()):
+        if cmd.alive():
+            if cmd.proc.poll() is None:
+                cmd.killed = cmd.killed or reason
+            _kill_command(cmd)
+            n += 1
+        try:
+            cmd.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL is not ignorable
+            pass
+        commands.pop(pid, None)
+    return n
+
+
+def _sweep_local(sweep: Mapping[str, Any]) -> list[int]:
+    """The processes that left their command's process group (`setsid`, a double fork into a
+    new session): every process carrying this backend's `RUN_MARKER` entry in its environment,
+    and, when commands run as a dedicated user (lockdown, the HF Jobs shape), every process of
+    that uid. Returns the pids killed."""
+    killed = procs.kill_matching(lambda pid: procs.environ_has(pid, sweep["marker"]))
+    uid = sweep.get("uid")
+    if uid is not None:
+        killed += procs.kill_matching(lambda pid: procs.uid_of(pid) == uid)
+    return killed
+
+
+def _kill_local(commands: dict[int, _Command], sweep: Mapping[str, Any], reason: str) -> int:
+    n = _kill_commands(commands, reason)
+    _sweep_local(sweep)
+    return n
+
+
+def _running(commands: dict[int, _Command]) -> dict[str, list[int]]:
+    out: dict[str, list[int]] = {}
+    for pid, cmd in list(commands.items()):
+        if cmd.alive():
+            out.setdefault(cmd.agent, []).append(pid)
+        else:
+            cmd.proc.poll()
+            commands.pop(pid, None)
+    return out
+
+
+def _killed_result(output: str, returncode: int | None, command: str, reason: str) -> dict:
+    """The feedback of a command swarmlab killed (a submission froze the workspace, or the run
+    ended): the baseline's three keys, the output so far, the killed process's return code
+    (-9) and the reason in the baseline's error wording."""
+    return _result(output, -9 if returncode is None else returncode,
+                   f"{_ERROR_PREFIX}Command '{command}' was killed: {reason}")
 
 
 class LocalBackend:
@@ -851,6 +1103,14 @@ class LocalBackend:
         self.started = False
         self.prefix: list[str] = []
         self.env: dict[str, str] = {}
+        self.commands: dict[int, _Command] = {}  # pid -> every command whose group is alive
+        # the sweep for processes that left their group: the marker every command's environment
+        # carries, and the dedicated user's uid (set at start, under lockdown)
+        self.marker = f"{RUN_MARKER}={uuid.uuid4().hex}"
+        self._sweep: dict[str, Any] = {"marker": self.marker.encode(), "uid": None}
+        # interpreter exit (or the backend collected): nothing the agents started outlives the run
+        self._finalizer = weakref.finalize(self, _kill_local, self.commands, self._sweep,
+                                           "the run ended")
 
     def start(self) -> dict:
         record: dict[str, Any] = {"applied": False}
@@ -870,27 +1130,75 @@ class LocalBackend:
                                "--init-groups", "--"]
                 identity = {"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
                             "SHELL": pw.pw_shell or "/bin/bash"}
-        self.env = command_env(dict(os.environ), {**identity, **self.extra_env}, _venv_bin())
+                # a dedicated user under lockdown: every process of that uid is the agents'.
+                # Never root, never the uid swarmlab really runs as (read from /proc, not from
+                # os.geteuid, which tests patch)
+                if (self.lockdown is not None and pw.pw_uid != 0
+                        and pw.pw_uid != procs.uid_of(os.getpid())):
+                    self._sweep["uid"] = pw.pw_uid
+        name, value = self.marker.split("=", 1)
+        self.env = command_env(dict(os.environ), {**identity, **self.extra_env, name: value},
+                               _venv_bin())
         self.started = True
         record["run_as"] = run_as or pwd.getpwuid(os.geteuid()).pw_name
         return record
 
-    def execute(self, command: str, timeout: float) -> dict:
+    def _spawn(self, command: str, out: Any, agent: str) -> _Command:
+        proc = subprocess.Popen([*self.prefix, "bash", "-lc", command], cwd=self.workspace,
+                                env=self.env, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+        _running(self.commands)  # drop the ones whose group has ended since
+        self.commands[proc.pid] = cmd = _Command(agent, proc)
+        return cmd
+
+    def _finish(self, cmd: _Command, out: Any, rc: int | None, command: str,
+                timeout: float) -> dict:
+        proc = cmd.proc
+        if cmd.killed is not None:
+            return _killed_result(_decode(_read_capped(out, self.max_output_bytes), False),
+                                  proc.returncode, command, cmd.killed)
+        if rc is None:
+            # the process keeps running (Docker semantics), tracked until it exits or is killed
+            data = _read_capped(out, self.max_output_bytes)
+            err = subprocess.TimeoutExpired(command, timeout)
+            return _result(_decode(data, translate=False), -1, f"{_ERROR_PREFIX}{err}")
+        if not cmd.alive():  # else a background job holds its group: tracked until it ends
+            self.commands.pop(proc.pid, None)
+        return _result(_decode(_read_capped(out, self.max_output_bytes), translate=True), rc)
+
+    def execute(self, command: str, timeout: float, agent: str = "") -> dict:
+        """Run one command, blocking (the backend's own setup command)."""
         with tempfile.TemporaryFile() as out:
             try:
-                proc = subprocess.Popen([*self.prefix, "bash", "-lc", command], cwd=self.workspace,
-                                        env=self.env, stdin=subprocess.DEVNULL, stdout=out,
-                                        stderr=subprocess.STDOUT, start_new_session=True)
+                cmd = self._spawn(command, out, agent)
+            except OSError as e:
+                return _result("", -1, f"{_ERROR_PREFIX}{e}")
+            return self._finish(cmd, out, _wait_or_none(cmd.proc, timeout), command, timeout)
+
+    async def aexecute(self, command: str, timeout: float, agent: str = "") -> dict:
+        """Run one command; the wait for it happens in a thread, off the event loop. Cancelled
+        while waiting: the command is killed and the cancellation propagates."""
+        with tempfile.TemporaryFile() as out:
+            try:
+                cmd = self._spawn(command, out, agent)
             except OSError as e:
                 return _result("", -1, f"{_ERROR_PREFIX}{e}")
             try:
-                rc = proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                # the process keeps running (Docker semantics); Popen reaps it once it exits
-                data = _read_capped(out, self.max_output_bytes)
-                err = subprocess.TimeoutExpired(command, timeout)
-                return _result(_decode(data, translate=False), -1, f"{_ERROR_PREFIX}{err}")
-            return _result(_decode(_read_capped(out, self.max_output_bytes), translate=True), rc)
+                rc = await _in_thread(_wait_or_none, cmd.proc, timeout)
+            except asyncio.CancelledError:
+                cmd.killed = cmd.killed or "the run ended"
+                _kill_command(cmd)
+                self.commands.pop(cmd.proc.pid, None)
+                raise
+            return self._finish(cmd, out, rc, command, timeout)
+
+    def running(self) -> dict[str, list[int]]:
+        return _running(self.commands)
+
+    def kill_all(self, reason: str) -> int:
+        """Kill every tracked command's process group (running shells, timed-out ones, and
+        finished ones whose background jobs live on), then sweep what left the groups."""
+        return _kill_local(self.commands, self._sweep, reason)
 
     def tar(self, exclude: Sequence[str]) -> tuple[bytes | None, list[str]]:
         if not os.path.isdir(self.workspace):
@@ -901,6 +1209,7 @@ class LocalBackend:
         extract_workspace(tar_bytes, self.workspace)
 
     def stop(self) -> None:
+        self.kill_all("the run ended")
         self.started = False
 
 
@@ -928,6 +1237,7 @@ class DockerBackend:
         self.container_id: str | None = None
         self.started = False
         self._finalizer: weakref.finalize | None = None
+        self.commands: dict[int, _Command] = {}  # pid -> running `docker exec` client
 
     def run_command(self, name: str) -> list[str]:
         mem = (f"{int(self.memory_gb)}g" if float(self.memory_gb).is_integer()
@@ -963,6 +1273,55 @@ class DockerBackend:
             raw = cap_bytes(raw, self.max_output_bytes) if isinstance(raw, bytes) else raw
             return _result(_decode(raw, translate=False), -1, f"{_ERROR_PREFIX}{e}")
 
+    async def aexecute(self, command: str, timeout: float, agent: str = "") -> dict:
+        """`execute` with the `docker exec` client waited on in a thread (`subprocess.run`'s own
+        steps: communicate with a timeout, kill the client at the deadline, keep the partial
+        output), so the feedback is `execute`'s. Cancelled while waiting: the client is killed
+        (the process in the container ends with `kill_all` or the container)."""
+        args = self.exec_command(command)
+        try:
+            # starting a process does not block; the wait for it happens in a thread
+            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL,  # noqa: ASYNC220
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except Exception as e:  # noqa: BLE001 - the baseline reports every failure the same way
+            return _result("", -1, f"{_ERROR_PREFIX}{e}")
+        _running(self.commands)
+        self.commands[proc.pid] = cmd = _Command(agent, proc, group=False)
+        try:
+            data, err = await _in_thread(_communicate, proc, timeout)
+        except asyncio.CancelledError:
+            cmd.killed = cmd.killed or "the run ended"
+            proc.kill()
+            self.commands.pop(proc.pid, None)
+            raise
+        self.commands.pop(proc.pid, None)
+        if cmd.killed is not None:
+            raw = data if err is None else getattr(err, "output", None)
+            raw = cap_bytes(raw, self.max_output_bytes) if isinstance(raw, bytes) else raw
+            return _killed_result(_decode(raw, False), proc.returncode, command, cmd.killed)
+        if err is not None:
+            raw = getattr(err, "output", None)
+            raw = cap_bytes(raw, self.max_output_bytes) if isinstance(raw, bytes) else raw
+            return _result(_decode(raw, translate=False), -1, f"{_ERROR_PREFIX}{err}")
+        data = cap_bytes(data or b"", self.max_output_bytes)
+        return _result(_decode(data, translate=True), proc.returncode)
+
+    def running(self) -> dict[str, list[int]]:
+        return _running(self.commands)
+
+    def kill_all(self, reason: str) -> int:
+        """Kill the running `docker exec` clients, then every process in the container but its
+        init (`kill -9 -1` as root): commands, timed-out commands and background jobs alike."""
+        n = _kill_commands(self.commands, reason)
+        if self.started and self.container_id:
+            try:
+                subprocess.run([self.executable, "exec", "-u", "root", str(self.container_id),
+                                "bash", "-c", "kill -9 -1"], capture_output=True, timeout=60,
+                               check=False)
+            except Exception as e:  # noqa: BLE001 - best effort; the container goes at run end
+                log.warning("programbench: could not kill the container's processes: %s", e)
+        return n
+
     def tar(self, exclude: Sequence[str]) -> tuple[bytes | None, list[str]]:
         if not self.started:
             return None, []
@@ -984,9 +1343,23 @@ class DockerBackend:
                        input=tar_bytes, capture_output=True, timeout=3600, check=True)
 
     def stop(self) -> None:
+        _kill_commands(self.commands, "the run ended")
         if self._finalizer is not None:
             self._finalizer()
         self.started = False
+
+
+def _communicate(proc: subprocess.Popen, timeout: float) -> tuple[bytes | None,
+                                                                  subprocess.TimeoutExpired | None]:
+    """(stdout, None), or (None, the TimeoutExpired carrying the partial output) after killing
+    the client at the deadline: what `subprocess.run(..., timeout=)` does."""
+    try:
+        data, _ = proc.communicate(timeout=timeout)
+        return data, None
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        proc.wait()
+        return None, exc
 
 
 # ---- the world ---------------------------------------------------------------------------------
@@ -1009,7 +1382,7 @@ class ProgramBench(World):
 
     entry_point: ClassVar[str | None] = "programbench"
     name = "programbench"
-    requires: ClassVar[Requirements] = Requirements(commit="immediate")
+    requires: ClassVar[Requirements] = Requirements(commit=("immediate", "async"))
     # config, plus facts about the machine running now (recorded at reset, so a resume or fork
     # on another machine states its own resources)
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", *_CONFIG, "uname", "resources")
@@ -1115,10 +1488,13 @@ class ProgramBench(World):
         self.uname = {"system": u.system, "release": u.release, "version": u.version,
                       "machine": u.machine}
         self.resources = self._detect_resources()
+        if self.commit_mode == "async":  # async-only state: round-based snapshots are unchanged
+            self.submission_closed = False
 
     def check_experiment(self, experiment: Any) -> None:
-        """Requirements, then: in the one-round solo shape `max_calls_per_turn >= step_limit`;
-        records `max_rounds` (docker cleanup); with `check_task`, the task must be known."""
+        """Requirements, then: in the one-round solo shape `max_calls_per_turn >= step_limit`
+        (under `commit: async` too: `max_rounds: 1` is one tick, one turn); with `check_task`, the
+        task must be known."""
         super().check_experiment(experiment)
         options = dict(getattr(experiment, "options", None) or {})
         self._max_rounds = options.get("max_rounds")
@@ -1154,7 +1530,10 @@ class ProgramBench(World):
                             self.max_output_bytes, lockdown)
 
     def _ensure_started(self) -> Backend:
-        """The running backend, started now if needed (lockdown, docker run, git identity)."""
+        """The running backend, started now if needed (lockdown, docker run, git identity).
+        Synchronous and single-shot: `bash` calls it before its first await, so under `commit:
+        async` two agents' first commands cannot both start it (the first blocks the loop for
+        the start; the second finds it started)."""
         if self._runtime is None:
             self._runtime = self._make_runtime()
         if not self._runtime.started:
@@ -1184,22 +1563,37 @@ class ProgramBench(World):
             self._clock_base, self._clock_start = self.elapsed_s, time.monotonic()
 
     def end_round(self, round: int) -> dict:
-        """Update the clock; on the last round (terminal, or `max_rounds`), capture the docker
-        workspace for the snapshot and remove the container."""
+        """Update the clock (every round or tick). The run's end is `end_run`."""
         self._tick()
-        last = self.terminal() or (self._max_rounds is not None and round >= self._max_rounds)
-        if last and self.backend == "docker" and self._runtime is not None and self._runtime.started:
+        return {"round": round, "steps": self.steps_total, "round_steps": self.round_steps,
+                "submitted": self.submitted, "elapsed_s": self.elapsed_s}
+
+    def end_run(self, reason: str) -> None:
+        """The run is ending (any reason; the runner calls this before the final snapshot): kill
+        every command still running, timed-out ones and background jobs included; under docker,
+        when a final snapshot follows, capture the workspace for it and remove the container."""
+        if self._runtime is None:
+            return
+        self._runtime.kill_all("the run ended")
+        if (self.backend == "docker" and self._runtime.started
+                and reason not in ("hard_ceiling", "crash")):  # these write no final snapshot
             # a failed tar raises and keeps the container (it holds the submission); the
             # finalizer still removes it at interpreter exit
             tar, self.snapshot_skipped = self._runtime.tar(self.snapshot_exclude)
             self._pending_workspace = tar
             self._runtime.stop()
             self._runtime = None
-        return {"round": round, "steps": self.steps_total, "round_steps": self.round_steps,
-                "submitted": self.submitted, "elapsed_s": self.elapsed_s}
+
+    def close_turn(self, agent: AgentId, round: int) -> None:
+        """`commit: async`: the submitter's turn has ended, so the run may end now."""
+        if self.submitted and str(agent) == self.submitted_by:
+            self.submission_closed = True
 
     def terminal(self) -> bool:
-        return self.submitted or self.elapsed_s >= self.wall_limit_s
+        # under async a submission ends the run at the tick its submitter's turn closes, so the
+        # submitter's last turn is complete in the log and its final snapshot
+        submitted = self.submitted and getattr(self, "submission_closed", True)
+        return submitted or self.elapsed_s >= self.wall_limit_s
 
     # ---- snapshot / restore ------------------------------------------------------------------------
     def _meta(self) -> dict:
@@ -1252,16 +1646,23 @@ class ProgramBench(World):
             return Ack(ok=False, error="wall_limit")
         return ack
 
+    def running_commands(self) -> dict[str, list[int]]:
+        """{agent: [pid, ...]} of the commands still running, timed-out ones included."""
+        return self._runtime.running() if self._runtime is not None else {}
+
     @tool("bash", "Execute a bash command",
           {"command": {"type": "string", "description": "The bash command to execute"}})
-    def bash(self, agent: AgentId, command: str) -> Outcome:
+    async def bash(self, agent: AgentId, command: str) -> Outcome:
         if not isinstance(command, str):
             return Outcome(accepted=False, feedback={"error": "bad args: command must be a string"})
         if self.submitted:
             return Outcome(accepted=False, feedback={"error": "submitted"})
-        out = self._ensure_started().execute(command, self.command_timeout_s)
-        self._tick()
+        runtime = self._ensure_started()  # synchronous, before the first await
         a = str(agent)
+        # the only await: the command runs; a cancellation here kills it and records nothing
+        out = await runtime.aexecute(command, self.command_timeout_s, a)
+        # from here on synchronous, on the loop: no other agent's tool runs in between
+        self._tick()
         self.steps[a] = self.steps.get(a, 0) + 1
         self.steps_total += 1
         self.round_steps += 1
@@ -1270,9 +1671,17 @@ class ProgramBench(World):
         self.history = [*self.history, {"round": self.round, "agent": a, "command": command[:200],
                                         "returncode": out["returncode"]}][-HISTORY_KEEP:]
         sub = submission_of(out["output"], out["returncode"])
-        if sub is not None:
+        if sub is not None and self.submitted:
+            # another command that submits completed first (both were running when neither had
+            # been handled): the first handled is the submission, frozen; this one only ran
+            out = {**out, "exception_info": f"{NOT_THE_SUBMISSION}{self.submitted_by} already "
+                                            f"submitted the final output (the episode is over)"}
+        elif sub is not None:
             self.submitted, self.submission = True, sub
             self.submitted_by, self.submitted_round = a, self.round
+            # the submission freezes the workspace: every other command still running (other
+            # agents' under async, timed-out ones in any mode) is killed now
+            runtime.kill_all(f"{a} submitted the final output (the episode is over)")
         return Outcome(accepted=True, feedback=out)
 
     # ---- evaluator-only --------------------------------------------------------------------------

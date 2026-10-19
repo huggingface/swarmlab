@@ -88,7 +88,8 @@ spec as given (its own `providers:` kept).
   resets between runs: one job per arm x seed).
 - Flavor: `cpu-upgrade` by default (`vllm` mode keeps `a100-large`).
 - Timeout and estimate: a programbench run counts its world's `wall_limit_s` (the 6 h limit),
-  plus `API_SLACK_S` (1 h: setup, the final snapshot, the sync), so the official limit gives 7 h;
+  plus `API_SLACK_S` (1 h: setup, the final snapshot, the sync), so the official limit gives 7 h
+  (an async programbench arm also prints its tick cap, `up to N ticks`, in the estimate detail);
   other arms use the per-round estimate as in vllm mode (1.5x, rounded up to 10 minutes).
 - Secrets (`JobPlan.secrets`, names only, in plan.json and the job's job.json): `HF_TOKEN` (the
   bootstrap's bucket access), plus each model's key variable: the Anthropic provider's
@@ -487,6 +488,10 @@ def _estimate(doc: dict, chosen: Sequence[str], runs: Sequence[tuple[str, int]],
         if wall_s and a in wall_s:
             per_arm[a] = {"agents": n, "wall_limit_s": wall_s[a], "per_run_s": int(wall_s[a]),
                           "runs": n_seeds}
+            opts = arm_options(doc, a)
+            if arm_unit(doc, a) == "tick" and opts.get("max_rounds") is not None:
+                # async: the tick cap (rounds_per_agent x agents) is shown, the wall limit bounds
+                per_arm[a].update(rounds=int(opts["max_rounds"]), unit="tick")
         else:
             rounds = arm_rounds(doc, a)
             pr = per_round_s if per_round_s is not None else per_round_guess(n)
@@ -799,7 +804,8 @@ def describe(plan: JobPlan) -> str:
     for a, d in plan.estimate_detail["arms"].items():
         unit = d.get("unit", "round")
         if "wall_limit_s" in d:
-            lines.append(f"  {a}: N={d['agents']}, bounded by the world's wall limit "
+            ticks = f", up to {d['rounds']} ticks (async)" if "rounds" in d else ""
+            lines.append(f"  {a}: N={d['agents']}{ticks}, bounded by the world's wall limit "
                          f"{fmt_duration(int(d['wall_limit_s']))}/run x {d['runs']} seed(s)")
         else:
             lines.append(f"  {a}: N={d['agents']} x {d['rounds']} {unit}s x ~{d['per_round_s']:g}"

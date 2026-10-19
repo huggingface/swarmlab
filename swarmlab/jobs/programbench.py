@@ -5,10 +5,11 @@ The world never grades (swarmlab/world/programbench.py, "Grade seam"); a run end
 
 1. `submission_from_run(run_dir)`: the run's last committed snapshot (`snapshots/` manifest of
    `run.json["last_round"]` -> blob `world` -> `workspace_tar_of`) is written to
-   `<run>/artifacts/submission.tar.gz`. That snapshot must be of the last round itself: the
-   runner snapshots only every `snapshot_every` rounds and takes no extra one at the end, so a
-   run whose last round was skipped has no record of its final workspace, and grading refuses
-   (SpecError naming both rounds) rather than grade an older one. A snapshot holding no tar means the image's untouched
+   `<run>/artifacts/submission.tar.gz`. That snapshot must be of the last round itself. The
+   runner always snapshots the round (or async tick) that ends the run, whatever
+   `snapshot_every`, so a run that ended normally has it; a run that did not (a hard ceiling or
+   a crash discards the round in flight, and resuming such a run needs a snapshot) may have only
+   an older one, and grading refuses (SpecError naming both rounds) rather than grade it. A snapshot holding no tar means the image's untouched
    workspace (no command ever ran): `artifacts/submission.untouched` (empty) is written instead
    and grading is refused (there is nothing of the agent's to grade).
 2. `plan_grade(run_dir)` -> `GradePlan`: the task from the run's spec
@@ -109,10 +110,10 @@ def submission_from_run(run_dir: Path | str) -> Path | None:
     if last is not None and manifest.round != last:
         raise SpecError(
             f"{run_dir}: the run's last round is {last} but its last snapshot is of round "
-            f"{manifest.round} (snapshot_every skipped the final round), so the workspace the "
-            "agent ended with was never saved; grading the older one would score the wrong "
-            "submission. Run the official solo shape (max_rounds: 1) or set options."
-            "snapshot_every: 1 so the final round is snapshotted.")
+            f"{manifest.round}: the run did not end normally (a hard ceiling or a crash discards "
+            "the round in flight; a normal end always snapshots its last round), so the "
+            "workspace the agent ended with was never saved; grading the older one would score "
+            "the wrong submission. Resume the run to finish it, or rerun it.")
     tar = workspace_tar_of(store.blobs.get(manifest.plugins["world"]))
     art = run_dir / "artifacts"
     art.mkdir(exist_ok=True)

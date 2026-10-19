@@ -11,10 +11,16 @@ instance_template: |-
   - To give a worker an assignment, post it with the `post` tool on that worker's channel: {% for c in worker_channels %}`{{ c }}`{% if not loop.last %}, {% endif %}{% endfor %}. A worker keeps its conversation, so a later assignment on the same channel continues its earlier work.
   - Give workers non-overlapping work: name the files each one owns, the interfaces between the parts, and the commands that check its result.
   - A worker's report arrives as a message from it on channel `{{ lead_channel }}`, starting with its channel name.{% if "read_board" in tools %} Read your messages with the `read_board` tool.{% endif %}
-  {%- if wait_tool %}
+  {%- if wait_tool and turn_based %}
+  - Call `wait_for_workers` to wait until reports arrive: it returns them as its result, so you do not need `read_board` for them. Your workers keep working while you work, so wait only when you have nothing else to do. If no worker can report (all of them are idle or finished), it says so at once.
+  {%- elif wait_tool %}
   - Call `wait_for_workers` to pause until reports arrive: your turn ends after that step, and the reports are there at your next turn.
   {%- endif %}
   - You are responsible for the result: integrate the workers' work yourself, make sure `./compile.sh` builds `./executable`, and submit as described above. Only you submit; workers never do.
+  {%- if guidance %}
+
+  {{ guidance }}
+  {%- endif %}
   {%- if resource_sentence %}
 
   {{ resource_sentence }}

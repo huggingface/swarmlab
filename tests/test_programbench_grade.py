@@ -450,15 +450,16 @@ def test_submission_is_the_last_snapshot_workspace(tmp_path):
 
 
 def test_a_snapshot_older_than_the_last_round_is_refused(tmp_path):
-    """snapshot_every skipped the final round (fabricated: the run ends at round 3, the last
-    snapshot is of round 1): the final workspace was never saved, so nothing is graded."""
+    """A run that did not end normally (fabricated: the run ends at round 3, the last snapshot
+    is of round 1; a normal end always snapshots its last round): the final workspace was never
+    saved, so nothing is graded."""
     run = dry_run(tmp_path)
     meta = json.loads((run.dir / "run.json").read_text())
     assert meta["last_round"] == 1 and SnapshotStore(run.dir).list_rounds() == [1]
     meta["last_round"] = 3
     (run.dir / "run.json").write_text(json.dumps(meta))
     with pytest.raises(SpecError, match=r"last round is 3 but its last snapshot is of round 1.*"
-                                        r"max_rounds: 1.*snapshot_every: 1"):
+                                        r"did not end normally.*Resume the run"):
         pbj.submission_from_run(run.dir)
     assert not (run.dir / "artifacts" / "submission.tar.gz").exists()
 

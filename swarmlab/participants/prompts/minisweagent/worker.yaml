@@ -11,11 +11,15 @@ instance_template: |-
 
   Your assignment arrives as a message from the lead{% if worker_channels %} on channel `{{ worker_channels[0] }}`{% endif %}. Work on what it asks. Other workers share this machine and workspace, so change only the files your assignment gives you.
 
-  When you have finished an assignment, post your final report with the `post` tool to channel `{{ lead_channel }}`{% if worker_channels %}, starting it with `{{ worker_channels[0] }}:` so the lead knows who reports{% endif %}: what you did, what you found, and what is left. That report ends the assignment; your next assignment continues this conversation.
+  When you have finished an assignment, post your final report with the `post` tool to channel `{{ lead_channel }}`{% if worker_channels %}, starting it with `{{ worker_channels[0] }}:` so the lead knows who reports{% endif %}: what you did, what you found, and what is left. That report ends the assignment; your next assignment continues this conversation.{% if turn_based %} When you have no assignment, you wait until the lead sends one.{% endif %}
 
   Never run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`: only the lead submits, and a submission ends the work of the whole team.
 
   {{ programbench_command_rules }}
+  {%- if guidance %}
+
+  {{ guidance }}
+  {%- endif %}
   {%- if resource_sentence %}
 
   {{ resource_sentence }}
