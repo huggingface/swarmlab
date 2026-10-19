@@ -62,10 +62,16 @@ Round `r` (phase-commit, `commit == "round_end"`):
    `round_committed` will get), so a committed round always has its snapshot on disk. Whether r
    ends the run (`_end_reason(r)`: terminal, stop condition, max_rounds, soft or total budget; or
    `hard_ceiling_probes`) is decided here, before the snapshot, and the loop ends with that
-   reason, so a run's last snapshot is always its `last_round`. The one exception is
+   reason, so a run's last snapshot is always its `last_round`. When r ends the run, the world's
+   `end_run(reason)` (swarmlab/world/base.py; awaited when it returns an awaitable) runs right
+   after that decision, before the round's `budget` event, the snapshot, `round_committed`,
+   run.json and `run_ended`, so the final snapshot and score hold what it did. The one exception is
    `hard_ceiling` (and a crash): the round in flight is discarded and the run ends at r - 1,
    which has a snapshot only when `snapshot_every` gave it one. Then `round_committed`, `run.json`, and the `snapshot` event
    (`manifest_path` is relative to the run dir, `snapshots/<round:06d>.json`).
+   `end_run` is called at most once per process, on every end: also before `run_ended` when the
+   end is decided at a round boundary with no round run (resume, fork) and on `hard_ceiling`;
+   on a crash (an exception out of the loop) best effort with reason `crash`.
 
 Immediate mode (`commit == "immediate"`) runs turns one at a time in `order`; each `post` and
 world action commits at once inside the executor. After the last turn, `world.end_round(r)` runs;
@@ -113,7 +119,8 @@ is consistent), except for the one await of a tick that ends the run (step 4):
 3. `outcomes_prev[A]` becomes A's own outcomes of the turn (its next `View.outcomes`);
    `world.close_turn(A, t)`, then `world.end_round(t)` (`round_resolved`, per tick, i.e. per
    completed turn), metrics folded over the tick's logical events, `metric*`; whether tick t
-   ends the run (step 4); `budget`, the snapshot when `t % snapshot_every == 0` or tick t ends
+   ends the run (step 4; then the in-flight turns are settled and `world.end_run(reason)`
+   runs); `budget`, the snapshot when `t % snapshot_every == 0` or tick t ends
    the run, `round_committed`, run.json, `snapshot`; then `run_ended`, or tick t + 1 opens.
 4. Termination as in the other modes, checked here, at each tick boundary (`terminal`,
    `stop_condition`, `max_rounds`, `soft_budget`, `total_budget`), and also when no turn is in
@@ -124,13 +131,15 @@ is consistent), except for the one await of a tick that ends the run (step 4):
    further call or inference with `CancelledError` and the turn's task is cancelled, so an
    async tool's pending await raises and the tool's undo (world/base.py, Async tools) has run,
    and a model call in flight keeps its `inference_attempt` (no response) and is charged at its
-   reservation (the gate's rule for a cancelled call), all before the final `budget` event, the
-   snapshot, run.json's score and ledger and `run_ended` are written. The cancelled turns'
+   reservation (the gate's rule for a cancelled call); then the world's `end_run(reason)` runs;
+   all before the final `budget` event, the snapshot, run.json's score and ledger and
+   `run_ended` are written. The cancelled turns'
    commits made so far stand and are logged in the ticks they happened in; their turn events
    (`turn_started`, tool calls, `turn_ended`) are dropped; they are not ticks. Nothing is
    logged while the turns unwind but operational events (an `inference_attempt` already
    written stays). A `HardCeilingReached` in any turn cancels
-   the others and ends the run `hard_ceiling` at the last closed tick, the open tick's commits
+   the others, calls `world.end_run("hard_ceiling")` and ends the run `hard_ceiling` at the last
+   closed tick, the open tick's commits
    unlogged (as a round is discarded in the other modes).
 5. An empty final tick: when opening tick t (the first tick included) leaves no turn in flight
    and no live agent that may start one (its `killed_at(t)` removed the last ones), no turn
@@ -296,7 +305,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import inspect
 import json
+import logging
 import random
 import shutil
 import threading
@@ -379,6 +390,7 @@ NOT_FED = frozenset({"run_started", "metric", "round_committed", "snapshot", "ru
 # run_ended reasons that resume() continues from
 BUDGET_REASONS = ("soft_budget", "hard_ceiling", "hard_ceiling_probes", "total_budget")
 REPO_DIR = Path(__file__).resolve().parent.parent
+_log = logging.getLogger(__name__)
 
 
 class _RunEnded(Exception):
@@ -1178,6 +1190,31 @@ class Runner:
 
     # ---- the round loop ----------------------------------------------------------------------
     async def _loop(self, start: int) -> None:
+        """The run loop; an exception leaving it (a crash) still gives the world its `end_run`
+        (best effort, reason `crash`) unless the run's end already did."""
+        self._world_ended = False
+        try:
+            await self._run_loop(start)
+        except BaseException:
+            if not self._world_ended:
+                try:
+                    await self._end_world_run("crash")
+                except Exception:  # noqa: BLE001 - the crash is what propagates
+                    _log.exception("world end_run failed after a crash")
+            raise
+
+    async def _end_world_run(self, reason: str) -> None:
+        """`world.end_run(reason)` (awaited when it returns an awaitable), at most once per
+        process: the world releases what it owns before the final budget, snapshot, score and
+        `run_ended` (swarmlab/world/base.py, `end_run`)."""
+        if self._world_ended:
+            return
+        self._world_ended = True
+        result = self.world.end_run(reason)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _run_loop(self, start: int) -> None:
         logged = list(self.log)
         self._probe_no_context = {
             (e.probe, str(e.agent)) for e in logged
@@ -1198,11 +1235,13 @@ class Runner:
         reason = self._end_reason(r - 1)
         while True:
             if reason is not None:
+                await self._end_world_run(reason)
                 self._end(r - 1, reason)
                 return
             try:
                 reason = await self._round(r)  # decided before round r's snapshot (step 7)
             except HardCeilingReached:
+                await self._end_world_run("hard_ceiling")
                 self._abort_round(r)
                 return
             if self._probe_hard_ceiling:  # a probe hit the ceiling after round r was committed
@@ -1513,14 +1552,18 @@ class Runner:
                 self._append(MetricEvent, r, name=name, value=value, denominator=denom, label=label)
                 logged[name] = value
         self._check_stop(r, logged)
+        # whether round r ends the run (`_end_reason` is pure, so deciding it here is what the
+        # loop would decide after the commit); the world's `end_run` comes before the round's
+        # budget event and snapshot, so the final snapshot holds what it did
+        reason = None if self._probe_hard_ceiling else self._end_reason(r)
+        final = reason is not None or self._probe_hard_ceiling
+        if final:
+            await self._end_world_run(reason or "hard_ceiling_probes")
         led = self.ledger.spent
         self._append(BudgetEvent, r, spent_swarm=led["swarm"], spent_measurement=led["measurement"],
                      reserved=self.ledger.reserved, calls=self.ledger.calls)
         # snapshot (before the commit marker), commit marker, run.json, snapshot event; the round
-        # that ends the run is always snapshotted (`_end_reason` is pure, so deciding it here is
-        # what the loop would decide after the commit)
-        reason = None if self._probe_hard_ceiling else self._end_reason(r)
-        final = reason is not None or self._probe_hard_ceiling
+        # that ends the run is always snapshotted
         snap = final or r % max(1, self.options.snapshot_every) == 0
         if snap:
             manifest = SnapshotManifest(
@@ -1541,6 +1584,7 @@ class Runner:
         """Every live agent loops over its own turns; each completed turn closes one tick."""
         reason = self._end_reason(start - 1)
         if reason is not None:
+            await self._end_world_run(reason)
             self._end(start - 1, reason)
             return
         self._turns_done: dict[str, int] = {}  # completed turns per agent (resume: from the log)
@@ -1567,9 +1611,12 @@ class Runner:
         except* HardCeilingReached:
             ceiling = True
         if ceiling:
+            await self._end_world_run("hard_ceiling")
             self._abort_round(self._tick)
         elif not self._async_done:  # defensive: every loop stopped and no tick close ended the run
-            self._end(self.last_round, "max_rounds" if self.live_agents else "error")
+            reason = "max_rounds" if self.live_agents else "error"
+            await self._end_world_run(reason)
+            self._end(self.last_round, reason)
 
     def _may_start(self, agent: AgentId) -> bool:
         """Async: `agent` may start another turn (live, run not over, under `rounds_per_agent`)."""
@@ -1740,8 +1787,10 @@ class Runner:
             reason = "max_rounds"
         if reason is not None:
             # the other turns are cancelled and have unwound (their tools' undo included) before
-            # anything below reads the world or the ledger; no tick is opened after this one
+            # anything below reads the world or the ledger; no tick is opened after this one;
+            # then the world's `end_run`, before the final budget event and snapshot
             await self._settle()
+            await self._end_world_run(reason)
         led = self.ledger.spent
         self._append(BudgetEvent, t, spent_swarm=led["swarm"], spent_measurement=led["measurement"],
                      reserved=self.ledger.reserved, calls=self.ledger.calls)

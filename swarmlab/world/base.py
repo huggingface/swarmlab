@@ -513,6 +513,24 @@ class World(Persistable, Plugin):
         turn (Minesweeper tallies the turn). Default: no-op. Never called in the round-based
         modes."""
 
+    def end_run(self, reason: str) -> Any:
+        """The run is ending now, for `reason` (the `run_ended` reason: `terminal`, `max_rounds`,
+        `stop_condition`, `soft_budget`, `total_budget`, `hard_ceiling`, `hard_ceiling_probes`,
+        `error`; or `crash` when an exception leaves the run loop). Default: no-op.
+
+        Called by the runner at most once per live process (`live`, `resume`, `fork`) on every
+        path that ends the run: in the round or tick that ends it, after its `end_round` and
+        metrics and the end decision, and under `commit: async` after the in-flight turns have
+        been cancelled and have unwound (their tools' undo included), and BEFORE that round's
+        `budget` event, its snapshot, `round_committed`, run.json's score and `run_ended`, so
+        what the hook does to world state is in the final snapshot and score. On `hard_ceiling`
+        (the round in flight discarded, no new snapshot) it is called before `run_ended`; on a
+        crash, best effort (an exception from the hook is logged, the crash propagates).
+        It is for releasing what the world owns outside its state (stop processes, capture a
+        container's workspace for the final snapshot); it logs nothing, and `replay` never calls
+        it. It may return an awaitable (an `async def`), which the runner awaits on the
+        event-loop thread."""
+
     def claim_key(self, agent: AgentId, action: Action) -> str | None:
         """The registry key of the resource `action` works on, or None (not claimable)."""
         return None
