@@ -100,6 +100,16 @@ Decisions where the contract is silent:
   `asyncio.CancelledError`. Without `on_commit` (every other mode) nothing changes.
   `turn_based=True` (async) describes `end_turn` as "Finish your turn." instead of "Finish your
   turn for this round.".
+- Wait (`commit: async` only; docs/INTERFACE.md §9): `wait(timeout_s=None)` parks the turn until
+  `_unread(agent)` (an item `read_board()` would return now: eligible, unread, on a readable
+  channel), the timeout, or `WaitHub.stalled(agent)` (every other running agent is waiting or
+  its loop ended: return at once, `timed_out: true`). Result `{"posts", "timed_out",
+  "waited_s"}`; the posts are read through `_read_readable` with read_board's default limit
+  (50), so they are marked read and a `read` event is logged; on a timeout nothing is read.
+  Offered and allowed only with a hub (`waits`, async) and when the agent's role lists `wait`
+  explicitly (`_wait_listed`); otherwise `not_allowed`. Parked turns await the hub's event
+  through `_suspend`, so `cancel()` releases them with `CancelledError`. `_post` notifies the
+  hub after every committed post.
 - Concurrency: for a synchronous world tool (and every board, status and registry tool) `call`
   never suspends, so under asyncio each such call is atomic. During round_end turns it only reads
   shared world state and touches the calling agent's own board inbox (`board.read`), so
@@ -193,6 +203,50 @@ END_TURN_SCHEMA = ToolSchema(
     parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
 END_TURN_SCHEMA_TURNS = END_TURN_SCHEMA.model_copy(update={"description": "Finish your turn."})
+WAIT_SCHEMA = ToolSchema(
+    name="wait",
+    description="Wait until a new message is delivered to you (or the timeout); returns the new messages.",
+    parameters=_obj({"timeout_s": {"type": "number", "description": "Seconds to wait at most; "
+                                   "omit to wait until a message arrives."}}, []),
+)
+WAIT_LIMIT = 50  # posts a `wait` returns at most (read_board's default limit)
+
+
+class WaitHub:
+    """`commit: async`: wakes the turns parked in `wait` (module docstring, Wait).
+
+    One per async run, shared by every turn's executor. `running` holds the agents whose turn loop
+    is live (the runner registers every live agent before any loop starts and removes an agent when
+    its loop ends), `waiting` the agents parked in `wait` right now. `notify()` wakes every parked
+    `wait` to re-check: the executors call it after each committed post, the runner when a tick
+    opens (a delayed delivery may have become eligible) and when an agent's loop ends (the waiters
+    may now be the only agents left). No polling: a parked `wait` awaits an `asyncio.Event` that
+    `notify()` sets and replaces."""
+
+    def __init__(self) -> None:
+        self.running: set[AgentId] = set()
+        self.waiting: set[AgentId] = set()
+        self._event = asyncio.Event()
+
+    @property
+    def event(self) -> asyncio.Event:
+        return self._event
+
+    def notify(self) -> None:
+        event, self._event = self._event, asyncio.Event()
+        event.set()
+
+    def started(self, agent: AgentId) -> None:
+        self.running.add(agent)
+
+    def finished(self, agent: AgentId) -> None:
+        self.running.discard(agent)
+        self.waiting.discard(agent)
+        self.notify()
+
+    def stalled(self, agent: AgentId) -> bool:
+        """True when no agent but `agent` could post: every other running agent is waiting."""
+        return all(a in self.waiting for a in self.running if a != agent)
 
 
 def board_schemas(board: Board) -> list[ToolSchema]:
@@ -273,6 +327,7 @@ class RoundExecutor:
         roles: dict[AgentId, Role] | None = None,
         on_commit: Callable[[str, Any], None] | None = None,
         turn_based: bool = False,
+        waits: WaitHub | None = None,
     ) -> None:
         self.run = run
         self.round = round
@@ -293,6 +348,7 @@ class RoundExecutor:
         self.cancelled = False
         self._suspended: set[asyncio.Task] = set()  # turns awaiting inside a call (cancel())
         self.turn_based = turn_based  # async: `end_turn` is described per turn, not per round
+        self.waits = waits  # async: the run's WaitHub (`wait` is offered only with one)
         self._state: dict[AgentId, _AgentState] = {}
         self.committed = Committed()
         self._world_tools = {s.name: s for s in world.tool_schemas()}
@@ -365,11 +421,19 @@ class RoundExecutor:
     def _allowed(self, agent: AgentId, name: str) -> bool:
         if name == "end_turn":
             return True
+        if name == "wait" and not self._wait_listed(agent):
+            return False
         if self.allowlist is not None and agent in self.allowlist and name not in self.allowlist[agent]:
             return False
         if name in self._world_tools and not self._world_allows(agent, name):
             return False  # WP16: the world withholds this tool from the agent (blind agents)
         return self._role_allows(agent, name)
+
+    def _wait_listed(self, agent: AgentId) -> bool:
+        """`wait` is opt-in: only under async (a hub) and only when the agent's role lists it."""
+        role = self.roles.get(agent)
+        return (self.waits is not None and role is not None and role.tools is not None
+                and "wait" in role.tools)
 
     def _world_allows(self, agent: AgentId, name: str) -> bool:
         allows = getattr(self.world, "allows_tool", None)
@@ -426,7 +490,7 @@ class RoundExecutor:
     def schemas(self, agent: AgentId) -> list[ToolSchema]:
         reg = registry_schemas() if self.registry is not None else []
         end = END_TURN_SCHEMA_TURNS if self.turn_based else END_TURN_SCHEMA
-        out = [*self._world_tools.values(), *self._board_schemas(agent), *reg, end]
+        out = [*self._world_tools.values(), *self._board_schemas(agent), *reg, WAIT_SCHEMA, end]
         return [s.normalized() for s in out if self._allowed(agent, s.name)]
 
     def pushable(self, agent: AgentId, limit: int) -> list[Delivery]:
@@ -482,6 +546,8 @@ class RoundExecutor:
             res = self._read_board(agent, call_id, args)
         elif name == "post":
             res = self._post(agent, call_id, args)
+        elif name == "wait":
+            res = await self._wait(agent, call_id, args)
         elif name in REGISTRY_TOOLS and self.registry is not None:
             res = self._registry(agent, call_id, name, args)
         elif name in STATUS_TOOLS and name in self._world_tools:
@@ -607,7 +673,47 @@ class RoundExecutor:
             self._journal("post", p)
         for d in deliveries:
             self._journal("delivery", d)
+        if self.waits is not None:
+            self.waits.notify()
         return ToolResult(call_id=call_id, ok=True, result={"id": post_id}, pending=False)
+
+    def _unread(self, agent: AgentId) -> bool:
+        """`agent` has an item a `read_board()` would return now (eligible, unread, readable)."""
+        readable = set(self._channels(agent, "read"))
+        return any(self.board.channel_of(d) in readable
+                   for d in self.board.pushable(agent, self.round, 1 << 30))
+
+    async def _wait(self, agent: AgentId, call_id: CallId, args: dict) -> ToolResult:
+        extra = set(args) - {"timeout_s"}
+        timeout = args.get("timeout_s")
+        if extra or (timeout is not None and (not isinstance(timeout, int | float)
+                                              or isinstance(timeout, bool) or timeout < 0)):
+            return self._err(call_id, "bad args: wait(timeout_s?: number >= 0)")
+        hub = self.waits
+        assert hub is not None  # `_allowed` refuses `wait` without a hub
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        deadline = None if timeout is None else start + float(timeout)
+        timed_out = False
+        while not self._unread(agent):
+            remaining = None if deadline is None else deadline - loop.time()
+            if hub.stalled(agent) or (remaining is not None and remaining <= 0):
+                timed_out = True
+                break
+            hub.waiting.add(agent)
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._suspend(hub.event.wait())
+            except TimeoutError:
+                timed_out = True
+                break
+            finally:
+                hub.waiting.discard(agent)
+        posts: list[dict] = []
+        if not timed_out:  # the same read as `read_board()`: marks read, logs `read`
+            posts = self._read_readable(agent, call_id, WAIT_LIMIT).result["items"]
+        return ToolResult(call_id=call_id, ok=True, result={
+            "posts": posts, "timed_out": timed_out, "waited_s": round(loop.time() - start, 3)})
 
     def _status(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
         if args:

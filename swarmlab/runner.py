@@ -120,6 +120,11 @@ is consistent):
    the others and ends the run `hard_ceiling` at the last closed tick, the open tick's commits
    unlogged (as a round is discarded in the other modes).
 
+`wait` (swarmlab/executor.py): the runner owns one `WaitHub` per async run, registers every live
+agent as running before any loop starts, removes an agent when its loop ends (which wakes the
+waiters to re-check the deadlock rule) and notifies the hub at every tick open (a delayed
+delivery may have become eligible); every turn's executor gets it.
+
 Snapshots are taken at tick close, between commits; the participant blob of every agent is its
 state after its last completed turn (`_participant_blobs`; an in-flight LLMAgent's memory is
 mid-turn), while the world, board and registry include in-flight turns' commits so far. Resume
@@ -304,7 +309,7 @@ from .events import (
     parse_event,
     write_jsonl,
 )
-from .executor import RoundExecutor
+from .executor import RoundExecutor, WaitHub
 from .ids import AgentId, agent_id, fork_run_id
 from .ids import run_id as make_run_id
 from .inference import Inference, InferenceCache
@@ -1514,6 +1519,9 @@ class Runner:
         self._inflight: dict[AgentId, RoundExecutor] = {}
         self._participant_blobs = {a: p.snapshot() for a, p in self.participants.items()}
         self._async_done = False
+        self._waits = WaitHub()  # `wait`: every live agent's loop counts as running from the start
+        for a in self.live_agents:
+            self._waits.started(a)
         self._open_tick(start)
         sem = asyncio.Semaphore(max(1, self.options.concurrency))
         ceiling = False
@@ -1543,6 +1551,12 @@ class Runner:
                 and (cap is None or self._turns_done.get(str(agent), 0) < cap))
 
     async def _agent_loop(self, agent: AgentId, sem: asyncio.Semaphore) -> None:
+        try:
+            await self._agent_turns(agent, sem)
+        finally:
+            self._waits.finished(agent)  # a waiter that nobody else could post to is released
+
+    async def _agent_turns(self, agent: AgentId, sem: asyncio.Semaphore) -> None:
         while self._may_start(agent):
             async with sem:
                 if not self._may_start(agent):
@@ -1573,6 +1587,7 @@ class Runner:
             topology_rng=lambda: derive(seed, "topology", ex.round), inference=self.inference,
             registry=self.registry, claim_policy=self.board.claim_policy, roles=self.roles,
             on_commit=lambda kind, item: self._journal.append((kind, item)), turn_based=True,
+            waits=self._waits,
         )
         self.executor = ex
         return ex
@@ -1596,6 +1611,7 @@ class Runner:
             self._set_agents()
         for ex in self._inflight.values():
             ex.round = t
+        self._waits.notify()  # a delayed delivery may be eligible in tick t
 
     def _close_tick(self, agent: AgentId, ex: RoundExecutor) -> None:
         """`agent`'s turn ended: log tick t (the turn, then every commit of the tick in its true

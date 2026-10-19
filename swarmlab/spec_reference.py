@@ -142,7 +142,7 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
         "name": "set from the key under `roles:`",
         "prompt_append": "text appended to the system prompt",
         "system_prompt": "replaces the system prompt",
-        "tools": "allowlist of tool names (null: all)",
+        "tools": "allowlist of tool names (null: all but `wait`, which is offered only when listed and only under `commit: async`)",
         "channels_read": "channels the role reads (null: all)",
         "channels_write": "channels the role writes (null: all)",
         "registry": "registry access: `none`, `read`, `write`",

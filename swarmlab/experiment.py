@@ -35,6 +35,8 @@ Decisions where the contract is silent:
   model an `UnknownModelPricing` there, not at call time. The resolved providers are cached on the
   experiment (`resolved_providers()`) and shared by its runs, so a provider's `calls` counter
   sees every run of the experiment. Providers are never deep-copied or pickled.
+- `wait` (swarmlab/executor.py): outside `commit: async`, `check_run` refuses a declared role
+  whose `tools` lists `wait` (`check_wait`, naming the role).
 - `commit: async`: `check_run` first calls `check_async` (no `options.scheduler`, probes or
   interventions), and `estimate` scales each participant's turns by 1/n (a round is a tick,
   one turn of one agent; prompt growth is still applied per tick).
@@ -166,6 +168,18 @@ def check_async(experiment: Any, options: dict) -> None:
         raise ValueError("commit: async does not support " + ", ".join(bad))
 
 
+def check_wait(roles: dict[str, Any], commit: str) -> None:
+    """The `wait` tool (swarmlab/executor.py) parks a turn until another agent posts; under a
+    round-based commit the waiting turn would block the only running turn (`immediate`) or the
+    round barrier (`round_end`), so a role listing it is refused there. Raise `ValueError` naming
+    every such role."""
+    bad = sorted(name for name, role in roles.items() if "wait" in (getattr(role, "tools", None) or ()))
+    if bad:
+        names = ", ".join(f"role {n!r}" for n in bad)
+        raise ValueError(f"{names} lists the `wait` tool, which needs commit: async (got {commit}): "
+                         "a waiting turn would block the round")
+
+
 class Experiment(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -241,6 +255,8 @@ class Experiment(BaseModel):
         options.pop("rounds_per_agent", None)  # already resolved into max_rounds
         if options.get("commit") == "async":
             check_async(self, options)
+        else:
+            check_wait(self.roles, options.get("commit") or "round_end")
         type(self.world).requires.check(self.world, self.model_copy(update={"options": options}))
 
     def _pin_price(self, prefix: str, provider: Provider, mid: str, row: tuple) -> None:
