@@ -137,7 +137,7 @@ when there is none), then, when the agent has answered before, `Your previous an
 newest): <JSON list>`, then under `report_json` the schema line. There is no `Round r.` line and
 no outcome lines (the paper's prompt has neither; under OneSpeaker the round number would leak
 the population's step count). Remembered items are delivered board items, ingested from
-`View.pushed` at turn start, from `read_board` results during a turn (pull works too) and from
+`View.pushed` at turn start, from `read_board` and `wait` results during a turn (pull works too) and from
 the runner's `prepare_probe` hook before probes; an item is added only when its
 `(eligible_round, delivery_id)` is newer than every item ingested so far (so re-pushed items are
 not duplicated), and only the last `memory_messages` are kept. Author ids are not shown (pushed
@@ -712,8 +712,8 @@ class LLMAgent(Participant):
             self.own_answers = (self.own_answers + [str(value)])[-keep:]
 
     def _note_read(self, name: str, result: Any) -> None:
-        if self.memory == "received" and name == "read_board" and isinstance(result, dict):
-            items = result.get("items")
+        if self.memory == "received" and name in ("read_board", "wait") and isinstance(result, dict):
+            items = result.get("items" if name == "read_board" else "posts")
             if isinstance(items, list):
                 self.ingest([i for i in items if isinstance(i, dict)])
 

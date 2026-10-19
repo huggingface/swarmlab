@@ -120,7 +120,7 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
                    "loops over its own turns at once, no rounds; a round is then a tick, one "
                    "completed turn; no scheduler, probes or interventions)"),
         "max_calls_per_turn": "tool calls an agent may make per turn",
-        "snapshot_every": "write a snapshot every N rounds",
+        "snapshot_every": "write a snapshot every N rounds (the round that ends the run is always snapshotted)",
         "concurrency": "concurrent turns",
         "repeat": "paired-run repeat index (0: a plain run)",
         "scheduler": "turn order per round, e.g. `seeded_shuffle` (default, every live agent in a "
@@ -142,7 +142,7 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
         "name": "set from the key under `roles:`",
         "prompt_append": "text appended to the system prompt",
         "system_prompt": "replaces the system prompt",
-        "tools": "allowlist of tool names (null: all)",
+        "tools": "allowlist of tool names (null: all but `wait`, which is offered only when listed and only under `commit: async`)",
         "channels_read": "channels the role reads (null: all)",
         "channels_write": "channels the role writes (null: all)",
         "registry": "registry access: `none`, `read`, `write`",

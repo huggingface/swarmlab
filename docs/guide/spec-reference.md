@@ -29,7 +29,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
     - `arms.NAME.options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
     - `arms.NAME.options.commit`: `round_end | immediate | async` (default `round_end`): `round_end` (phase commit), `immediate` (sequential) or `async` (every agent loops over its own turns at once, no rounds; a round is then a tick, one completed turn; no scheduler, probes or interventions)
     - `arms.NAME.options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
-    - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
+    - `arms.NAME.options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds (the round that ends the run is always snapshotted)
     - `arms.NAME.options.concurrency`: `int` (default `32`): concurrent turns
     - `arms.NAME.options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
     - `arms.NAME.options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round, e.g. `seeded_shuffle` (default, every live agent in a random order) or `fixed` (every live agent in agent order a000, a001, ...); `swarmlab plugins schedulers` lists all
@@ -46,7 +46,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `arms.NAME.roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations for this arm, merged over the top-level `roles`
     - `arms.NAME.roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
     - `arms.NAME.roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
-    - `arms.NAME.roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
+    - `arms.NAME.roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all but `wait`, which is offered only when listed and only under `commit: async`)
     - `arms.NAME.roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
     - `arms.NAME.roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
     - `arms.NAME.roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`
@@ -63,7 +63,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `options.max_rounds`: `int` (required): rounds per run (required here or as `--max-rounds`)
   - `options.commit`: `round_end | immediate | async` (default `round_end`): `round_end` (phase commit), `immediate` (sequential) or `async` (every agent loops over its own turns at once, no rounds; a round is then a tick, one completed turn; no scheduler, probes or interventions)
   - `options.max_calls_per_turn`: `int` (default `20`): tool calls an agent may make per turn
-  - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds
+  - `options.snapshot_every`: `int` (default `1`): write a snapshot every N rounds (the round that ends the run is always snapshotted)
   - `options.concurrency`: `int` (default `32`): concurrent turns
   - `options.repeat`: `int` (default `0`): paired-run repeat index (0: a plain run)
   - `options.scheduler`: `{type: NAME, params: {...}} | null` (optional): turn order per round, e.g. `seeded_shuffle` (default, every live agent in a random order) or `fixed` (every live agent in agent order a000, a001, ...); `swarmlab plugins schedulers` lists all
@@ -79,7 +79,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
 - `roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations by name, for every arm (an arm's `roles` is merged per name)
   - `roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
   - `roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
-  - `roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
+  - `roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all but `wait`, which is offered only when listed and only under `commit: async`)
   - `roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
   - `roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
   - `roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`
