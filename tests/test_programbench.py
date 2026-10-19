@@ -116,6 +116,10 @@ def test_command_env_unit():
             "AWS_SECRET": "x", "HOME": "/root", "LESS": "-X"}
     env = command_env(base, {"HOME": "/home/agent", "MAKEFLAGS": "-j8"}, venv_bin="/venv/bin")
     assert env == {"PATH": "/usr/bin", "HOME": "/home/agent", "MAKEFLAGS": "-j8", **BASELINE_ENV}
+    # a secret whose name looks harmless, declared by the job launcher, is dropped too
+    declared = command_env({"MODEL_AUTH": "dummy-value", "SWARMLAB_SECRET_NAMES": "HF_TOKEN MODEL_AUTH",
+                            "LANG": "C"})
+    assert "MODEL_AUTH" not in declared and declared["LANG"] == "C"
     assert all(is_secret(k) for k in ("HF_TOKEN", "ANTHROPIC_BASE_URL", "GH_TOKEN", "X_KEY"))
     assert not any(is_secret(k) for k in ("PATH", "HOME", "KEYBOARD", "TOKENIZERS_PARALLELISM"))
 
