@@ -46,7 +46,9 @@ Mapping:
 - Response: `choices[0].message.content` (None -> ""), `tool_calls[].function.arguments` parsed as
   JSON; a non-JSON string becomes `{"_raw": <string>}` and `finish_reason = "bad_tool_args"`.
   Usage from `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens`,
-  `completion_tokens_details.reasoning_tokens`. `served_by` = the `x-inference-provider` header.
+  `completion_tokens_details.reasoning_tokens`; `cache_write_tokens` stays 0 (OpenAI-style
+  prompt caching is automatic and has no write premium, so `write_factor` is the base 1.0).
+  `served_by` = the `x-inference-provider` header.
   `finish_reason == "content_filter"` (the server's safety filter declined) becomes
   `"refusal"` with `ChatResponse.refusal = Refusal()` (no category: the API gives none), so
   refusals read the same across providers. `ChatRequest.attempt` is never sent.

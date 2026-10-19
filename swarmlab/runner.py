@@ -105,7 +105,8 @@ Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
   exception does not prevent this (the executor flags it).
 - `turn_ended.usage` is the participant's `TurnUsage` updated with the executor's nominal
   inference totals (`prompt_tokens`, `completion_tokens`, `cached_prompt_tokens`,
-  `reasoning_tokens`, `cost_usd`, `inference_calls`) when the agent made swarm inference calls.
+  `reasoning_tokens`, `cache_write_tokens` when non-zero, `cost_usd`, `inference_calls`) when the
+  agent made swarm inference calls.
 - `replay()` builds a gate but never calls it; it raises `ReplayMismatch` if the gate's
   `provider_calls` is non-zero and reports it as `provider_calls`.
 - `fork()` also copies the parent's cache entries for rounds <= the fork round and the request and

@@ -63,9 +63,12 @@ def test_estimate_and_cost_math():
                                           Part(type="image", image_png_b64="AAAA")]),
     ])
     assert p.estimate_prompt_tokens(r) == 110 + 1000
-    assert p.max_cost(r) == pytest.approx((1110 * 1.0 + 100 * 5.0) / 1e6)
+    # caching is on by default (5m), so every prompt token is reserved as a possible write
+    assert p.max_cost(r) == pytest.approx((1110 * 1.25 + 100 * 5.0) / 1e6)
     r2 = r.model_copy(update={"thinking_budget": 1024})
-    assert p.max_cost(r2) == pytest.approx((1110 * 1.0 + 1124 * 5.0) / 1e6)
+    assert p.max_cost(r2) == pytest.approx((1110 * 1.25 + 1124 * 5.0) / 1e6)
+    assert AnthropicProvider(prompt_cache="none").max_cost(r) == pytest.approx(
+        (1110 * 1.0 + 100 * 5.0) / 1e6)
     u = Usage(prompt_tokens=1000, cached_prompt_tokens=400, completion_tokens=200)
     assert p.cost(r, u) == pytest.approx((600 * 1.0 + 400 * 0.10 + 200 * 5.0) / 1e6)
 
