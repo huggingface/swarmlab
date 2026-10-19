@@ -623,7 +623,9 @@ def test_docker_backend_commands(tmp_path, monkeypatch):
     assert fb["exception_info"].startswith("An error occurred while executing the command: Command '[")
     assert fb["exception_info"].endswith("timed out after 180 seconds")
     assert len([c for c in fake.calls if c[1] == "run"]) == 1   # one container for the episode
-    w.end_round(1)                                               # max_rounds 1: capture, remove
+    w.end_round(1)
+    assert fake.calls[-1][-1] == "sleep 999"                     # end_round only ticks
+    w.end_run("max_rounds")                                      # the run's end: capture, remove
     # the run's end kills what is still running in the container before the tar
     assert fake.calls[-3] == ["docker", "exec", "-u", "root", "cid123", "bash", "-c", "kill -9 -1"]
     assert fake.calls[-2][:5] == ["docker", "exec", "-u", "root", "cid123"]
@@ -715,8 +717,9 @@ def test_failed_docker_tar_keeps_the_container(tmp_path, monkeypatch):
     w.reset(random.Random(0), ["a000"])
     w.begin_round(1)
     sh(w, "ls")
+    w.end_round(1)
     with pytest.raises(RuntimeError, match="workspace tar failed: tar: boom"):
-        w.end_round(1)
+        w.end_run("terminal")
     assert ["docker", "rm", "-f", "cid123"] not in fake.calls and w._runtime.started
     w._runtime.stop()
     assert fake.calls[-1] == ["docker", "rm", "-f", "cid123"]
@@ -827,8 +830,10 @@ def test_run_end_kills_orphans(tmp_path):
     pid = _pid(tmp_path / "ws" / "o.pid")
     w.end_round(1)
     w.begin_round(2)
-    assert _alive(pid)                                       # not the last round: still running
-    w.end_round(3)                                           # max_rounds: the run's end
+    assert _alive(pid)                                       # not the run's end: still running
+    w.end_round(3)                                           # end_round alone kills nothing
+    assert _alive(pid)
+    w.end_run("max_rounds")                                  # the run's end
     assert not _alive(pid) and w.running_commands() == {}
 
 
@@ -874,7 +879,8 @@ def test_a_finished_shells_background_job_is_killed_at_run_end(tmp_path):
     ws = tmp_path / "ws"
     sh(w, BACKGROUND)
     pid = _pid(ws / "bg.pid")
-    w.end_round(1)                                       # the run's end
+    w.end_round(1)
+    w.end_run("max_rounds")                              # the run's end
     assert not _alive(pid) and w.running_commands() == {}
     time.sleep(1.2)
     assert not (ws / "late").exists()
@@ -1021,6 +1027,83 @@ def test_async_submission_freezes_the_workspace_and_ends_the_run(tmp_path):
     assert latest.round == run.meta["last_round"]                # the final tick is snapshotted
     assert workspace_tar_of(store.load(latest)["world"]) == workspace_tar(ws)[0]
     assert Run.load(run.dir).replay()["score"] == run.score
+
+
+ORPHAN = "echo $$ > o.pid; sleep 2; echo changed > late"
+AT_SNAPSHOT: list[bool] = []   # was the orphan alive when the runner took each snapshot
+
+
+class Watched(ProgramBench):
+    """ProgramBench that notes, at every snapshot, whether the orphan (`o.pid`) still runs."""
+
+    entry_point = None
+
+    def snapshot(self) -> bytes:
+        pid_file = Path(self.workspace) / "o.pid"
+        if pid_file.exists() and pid_file.read_text().strip():
+            AT_SNAPSHOT.append(_alive(int(pid_file.read_text())))
+        return super().snapshot()
+
+
+def _orphan_world(tmp_path) -> Watched:
+    return Watched(TASK, workspace=str(tmp_path / "ws"), user=None, lockdown=False,
+                   check_task=False, command_timeout_s=0.1, step_limit=20)
+
+
+def _check_orphan_killed_before_the_final_snapshot(tmp_path, run) -> None:
+    ws = tmp_path / "ws"
+    assert AT_SNAPSHOT and AT_SNAPSHOT[-1] is False        # killed before the final snapshot
+    pid = int((ws / "o.pid").read_text())
+    assert not _alive(pid)
+    store = SnapshotStore(run.dir)
+    latest = store.latest()
+    assert latest.round == run.meta["last_round"]
+    time.sleep(2.2)
+    assert not (ws / "late").exists()                       # and it never wrote its file
+    assert workspace_tar_of(store.load(latest)["world"]) == workspace_tar(ws)[0]
+    assert Run.load(run.dir).replay()["score"] == run.score
+
+
+def test_async_run_ended_by_the_per_agent_cap_kills_a_timed_out_command(tmp_path):
+    """The run ends `max_rounds` at tick 1 (rounds_per_agent 1), long before `max_rounds` 10:
+    the world's `end_run`, not a guess in `end_round`, kills the timed-out command."""
+    SEEN.clear()
+    AT_SNAPSHOT.clear()
+    exp = Experiment(name="orphan-async", world=_orphan_world(tmp_path),
+                     participants=[Commander([ORPHAN])],
+                     options={"commit": "async", "rounds_per_agent": 1, "max_calls_per_turn": 20})
+    run = exp.run(seed=0, max_rounds=10, out=tmp_path / "runs")
+    assert (run.meta["end_reason"], run.meta["last_round"]) == ("max_rounds", 1)
+    assert SEEN["a000"][0]["feedback"]["returncode"] == -1  # it timed out and was left running
+    _check_orphan_killed_before_the_final_snapshot(tmp_path, run)
+
+
+def orphan_then_end(request, rng):
+    """Fake script: the orphan command once, then `end_turn` (every turn after that too)."""
+    from swarmlab.providers.fake import _assistant_calls, _response
+
+    done = sum(1 for m in request.messages for name, _ in _assistant_calls(m) if name == "bash")
+    if done == 0:
+        return _response(request, rng, [("bash", {"command": ORPHAN})])
+    return _response(request, rng, [("end_turn", {})])
+
+
+def test_immediate_run_ended_by_the_soft_budget_kills_a_timed_out_command(tmp_path):
+    from swarmlab import Budget
+    from swarmlab.providers.fake import FakeProvider
+
+    AT_SNAPSHOT.clear()
+    exp = Experiment(name="orphan-soft", world=_orphan_world(tmp_path),
+                     participants=[LLMAgent(model=f"fake:{__name__}:orphan_then_end",
+                                            max_tokens=256)],
+                     budget=Budget(soft_usd=0.0001),
+                     providers={"fake": FakeProvider(pricing={"*": (10.0, 50.0, 1.0)})},
+                     options={"commit": "immediate", "max_calls_per_turn": 20})
+    run = exp.run(seed=0, max_rounds=10, out=tmp_path / "runs")
+    assert (run.meta["end_reason"], run.meta["last_round"]) == ("soft_budget", 1)
+    fb = [e["feedback"] for e in run.events if e["type"] == "action_committed"]
+    assert fb[0]["returncode"] == -1 and "timed out" in fb[0]["exception_info"]
+    _check_orphan_killed_before_the_final_snapshot(tmp_path, run)
 
 
 def test_submission_closed_exists_only_under_async(tmp_path):

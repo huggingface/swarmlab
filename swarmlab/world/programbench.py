@@ -167,11 +167,15 @@ background jobs changes nothing in the log.
   the timed-out ones. `validate` and `bash` already refuse new commands. The workspace the final
   snapshot holds is therefore the one the submission saw, give or take the instant between the
   submitting command's exit and the kill.
-- The run's end. `end_round` on the last round or tick (terminal, or `max_rounds`) kills every
-  command still running (`the run ended`) before the docker tar. A run that ends otherwise
-  (budget, stop condition, hard ceiling, crash) relies on the safety nets: the local backend's
-  `weakref.finalize` kills its tracked commands when it is collected and at interpreter exit,
-  the docker container goes with its own finalizer.
+- The run's end. `end_run(reason)` (the runner's end-of-run hook, swarmlab/world/base.py), which
+  the runner calls on every end (terminal, `max_rounds` or an exhausted `rounds_per_agent`, a
+  stop condition, a budget, the hard ceiling, a crash) after the in-flight turns have unwound
+  and before the final snapshot, kills every command still running (`the run ended`) and the
+  background jobs (the sweep above), then, under docker, captures the workspace for the final
+  snapshot (Docker cleanup, below). A timed-out command that already returned from `bash` is
+  therefore killed before the final snapshot however the run ends. The local backend's
+  `weakref.finalize` (when it is collected and at interpreter exit) and the container's own
+  finalizer stay as safety nets.
 - Cancellation. A `bash` cancelled while its command runs (the run ended with the turn in flight)
   kills that command (local: its process group; docker: its `docker exec` client, the process in
   the container then ends with `kill_all` or the container) and re-raises; nothing was recorded
@@ -182,9 +186,8 @@ Under `commit: async`
 ---------------------
 `requires = Requirements(commit=("immediate", "async"))`. A round is a tick (one completed turn
 of any agent): `begin_round(t)` opens tick t while other turns run, `end_round(t)` closes it (the
-clock, the per-tick `round_steps`, and on the last tick the kill and the docker cleanup above);
-`max_rounds`, recorded by `check_experiment`, is the tick count (`rounds_per_agent` x agents
-when set). `terminal()` is read by the runner at each tick close. After a submission it turns
+clock, the per-tick `round_steps`); `end_run` does the kill and the docker cleanup at the run's
+end, whichever tick that is. `terminal()` is read by the runner at each tick close. After a submission it turns
 true only once the submitter's own turn has closed (`close_turn` sets `submission_closed`, an
 attribute that exists only under async, so round-based snapshots are unchanged): ticks other
 agents close in between cannot end the run and cut the submitter's last turn out of the log and
@@ -220,12 +223,11 @@ Decisions the contract leaves open
 - Clock. `elapsed_s` runs from the first `begin_round` of a process and accumulates across
   resumes (time between processes is not counted). It is updated after every command and in
   `end_round`, and `score()` and `terminal()` read the stored value, so replay reproduces them.
-- Docker cleanup. The World contract has no end-of-run hook, so `end_round` captures the
-  workspace tar (the snapshot that follows uses it) and removes the container (`docker rm -f`)
-  when `terminal()` or when the round equals the `max_rounds` recorded by `check_experiment`
-  (after killing every running command, above); if
-  the tar fails, the error propagates and the container is kept, since it holds the submission. A
-  run that ends otherwise (budget, stop condition, crash) relies on the safety net: a
+- Docker cleanup. `end_run` (after killing every running command, above) captures the
+  workspace tar (the final snapshot that follows uses it) and removes the container (`docker rm
+  -f`), on every end that writes a final snapshot; on `hard_ceiling` and `crash`, which write
+  none, it only kills, and the container goes with its finalizer. If the tar fails, the error
+  propagates and the container is kept, since it holds the submission. The safety net is a
   `weakref.finalize` per container, which runs when the backend is collected and at interpreter
   exit. Deep copies and pickles of the world never carry the backend handle (`__getstate__`), so
   a copy cannot remove a container it does not own.
@@ -278,7 +280,7 @@ Evaluator side
 --------------
 - `score()` (cheap, every round): `{"submitted", "steps", "elapsed_s", "graded": False}`.
 - `end_round(r)` -> `{"round", "steps", "round_steps", "submitted", "elapsed_s"}` (logged as
-  `round_resolved`), plus the docker cleanup above.
+  `round_resolved`); `end_run(reason)`: the kill and the docker cleanup above.
 - `render_state()`: task, backend, steps, submitted, elapsed, the workspace's top-level entries
   with sizes (from the snapshot's meta, never the filesystem) and the last 10 commands (first 200
   characters each) with their return codes.
@@ -1483,9 +1485,8 @@ class ProgramBench(World):
 
     def check_experiment(self, experiment: Any) -> None:
         """Requirements, then: in the one-round solo shape `max_calls_per_turn >= step_limit`
-        (under `commit: async` too: `max_rounds: 1` is one tick, one turn); records `max_rounds`
-        (the last round or tick: kill, docker cleanup); with `check_task`, the task must be
-        known."""
+        (under `commit: async` too: `max_rounds: 1` is one tick, one turn); with `check_task`, the
+        task must be known."""
         super().check_experiment(experiment)
         options = dict(getattr(experiment, "options", None) or {})
         self._max_rounds = options.get("max_rounds")
@@ -1554,22 +1555,26 @@ class ProgramBench(World):
             self._clock_base, self._clock_start = self.elapsed_s, time.monotonic()
 
     def end_round(self, round: int) -> dict:
-        """Update the clock; on the last round or tick (terminal, or `max_rounds`), kill every
-        command still running (timed-out ones included), capture the docker workspace for the
-        snapshot and remove the container."""
+        """Update the clock (every round or tick). The run's end is `end_run`."""
         self._tick()
-        last = self.terminal() or (self._max_rounds is not None and round >= self._max_rounds)
-        if last and self._runtime is not None:
-            self._runtime.kill_all("the run ended")
-        if last and self.backend == "docker" and self._runtime is not None and self._runtime.started:
+        return {"round": round, "steps": self.steps_total, "round_steps": self.round_steps,
+                "submitted": self.submitted, "elapsed_s": self.elapsed_s}
+
+    def end_run(self, reason: str) -> None:
+        """The run is ending (any reason; the runner calls this before the final snapshot): kill
+        every command still running, timed-out ones and background jobs included; under docker,
+        when a final snapshot follows, capture the workspace for it and remove the container."""
+        if self._runtime is None:
+            return
+        self._runtime.kill_all("the run ended")
+        if (self.backend == "docker" and self._runtime.started
+                and reason not in ("hard_ceiling", "crash")):  # these write no final snapshot
             # a failed tar raises and keeps the container (it holds the submission); the
             # finalizer still removes it at interpreter exit
             tar, self.snapshot_skipped = self._runtime.tar(self.snapshot_exclude)
             self._pending_workspace = tar
             self._runtime.stop()
             self._runtime = None
-        return {"round": round, "steps": self.steps_total, "round_steps": self.round_steps,
-                "submitted": self.submitted, "elapsed_s": self.elapsed_s}
 
     def close_turn(self, agent: AgentId, round: int) -> None:
         """`commit: async`: the submitter's turn has ended, so the run may end now."""
