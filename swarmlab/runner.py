@@ -57,9 +57,14 @@ Round `r` (phase-commit, `commit == "round_end"`):
 6. Metrics are folded over this round's logical events (every event from `round_started`
    through `round_resolved`, or the last `action_committed` when there is none, parsed back
    from JSON so live and replay feed identical objects); log `metric*`.
-7. If `r % snapshot_every == 0` the snapshot manifest is written *before* `round_committed`
-   (its `log_seq` is the seq that `round_committed` will get), so a committed round always has
-   its snapshot on disk. Then `round_committed`, `run.json`, and the `snapshot` event
+7. If `r % snapshot_every == 0` (`snapshot_every <= 0` counts as 1), or round r ends the run, the
+   snapshot manifest is written *before* `round_committed` (its `log_seq` is the seq that
+   `round_committed` will get), so a committed round always has its snapshot on disk. Whether r
+   ends the run (`_end_reason(r)`: terminal, stop condition, max_rounds, soft or total budget; or
+   `hard_ceiling_probes`) is decided here, before the snapshot, and the loop ends with that
+   reason, so a run's last snapshot is always its `last_round`. The one exception is
+   `hard_ceiling` (and a crash): the round in flight is discarded and the run ends at r - 1,
+   which has a snapshot only when `snapshot_every` gave it one. Then `round_committed`, `run.json`, and the `snapshot` event
    (`manifest_path` is relative to the run dir, `snapshots/<round:06d>.json`).
 
 Immediate mode (`commit == "immediate"`) runs turns one at a time in `order`; each `post` and
@@ -108,7 +113,9 @@ is consistent):
 3. `outcomes_prev[A]` becomes A's own outcomes of the turn (its next `View.outcomes`);
    `world.close_turn(A, t)`, then `world.end_round(t)` (`round_resolved`, per tick, i.e. per
    completed turn), metrics folded over the tick's logical events, `metric*`, `budget`, the
-   snapshot when `t % snapshot_every == 0`, `round_committed`, run.json, `snapshot`.
+   snapshot when `t % snapshot_every == 0` or tick t ends the run (an end reason, or no agent
+   may start another turn and none is in flight, so every loop stops: `rounds_per_agent`),
+   `round_committed`, run.json, `snapshot`.
 4. Termination as in the other modes, checked here, at each tick boundary (`terminal`,
    `stop_condition`, `max_rounds`, `soft_budget`, `total_budget`). When the run ends, every
    in-flight turn is cancelled at once (its executor refuses any further call or inference with
@@ -1166,13 +1173,13 @@ class Runner:
             await self._async_loop(start, logged)
             return
         r = start
+        reason = self._end_reason(r - 1)
         while True:
-            reason = self._end_reason(r - 1)
             if reason is not None:
                 self._end(r - 1, reason)
                 return
             try:
-                await self._round(r)
+                reason = await self._round(r)  # decided before round r's snapshot (step 7)
             except HardCeilingReached:
                 self._abort_round(r)
                 return
@@ -1384,7 +1391,8 @@ class Runner:
                     pushed=self._pushed(agent, ex, r, consume=False), tools=ex.schemas(agent),
                     description=describe(self.world, agent))
 
-    async def _round(self, r: int) -> None:
+    async def _round(self, r: int) -> str | None:
+        """Run and commit round r; return the reason to end the run after it (`_end_reason`)."""
         seed = self.options.seed
         self._round_events = []
         self.world.begin_round(r)  # M3b: world dynamics, then scheduled worker failures
@@ -1486,8 +1494,12 @@ class Runner:
         led = self.ledger.spent
         self._append(BudgetEvent, r, spent_swarm=led["swarm"], spent_measurement=led["measurement"],
                      reserved=self.ledger.reserved, calls=self.ledger.calls)
-        # snapshot (before the commit marker), commit marker, run.json, snapshot event
-        snap = r % max(1, self.options.snapshot_every) == 0
+        # snapshot (before the commit marker), commit marker, run.json, snapshot event; the round
+        # that ends the run is always snapshotted (`_end_reason` is pure, so deciding it here is
+        # what the loop would decide after the commit)
+        reason = None if self._probe_hard_ceiling else self._end_reason(r)
+        final = reason is not None or self._probe_hard_ceiling
+        snap = final or r % max(1, self.options.snapshot_every) == 0
         if snap:
             manifest = SnapshotManifest(
                 run=self.run_id, round=r, log_seq=self.log.next_seq,
@@ -1500,6 +1512,7 @@ class Runner:
         self._write_meta()
         if snap:
             self._append(SnapshotEvent, r, manifest_path=self._manifest_rel(r))
+        return reason
 
     # ---- async commit (options.commit == "async"; module docstring, Async commit) -------------
     async def _async_loop(self, start: int, logged: list[Event]) -> None:
@@ -1672,7 +1685,12 @@ class Runner:
                      reserved=self.ledger.reserved, calls=self.ledger.calls)
         self._participant_blobs[agent] = self.participants[agent].snapshot()
         self._turns_done[str(agent)] = self._turns_done.get(str(agent), 0) + 1
-        snap = t % max(1, self.options.snapshot_every) == 0
+        # the tick that ends the run is always snapshotted: an end reason, or no agent left that
+        # may start a turn and none in flight (the loops then stop and the run ends `max_rounds`)
+        reason = self._end_reason(t)
+        final = reason is not None or (not self._inflight and not any(
+            self._may_start(a) for a in self.live_agents))
+        snap = final or t % max(1, self.options.snapshot_every) == 0
         if snap:
             manifest = SnapshotManifest(run=self.run_id, round=t, log_seq=self.log.next_seq,
                                         outcomes_prev=self.outcomes_prev,
@@ -1684,7 +1702,6 @@ class Runner:
         self._write_meta()
         if snap:
             self._append(SnapshotEvent, t, manifest_path=self._manifest_rel(t))
-        reason = self._end_reason(t)
         if reason is not None:
             self._cancel_inflight()  # before any other turn resumes: nothing commits after this
             self._end(t, reason)

@@ -130,7 +130,7 @@ Every event has `seq: int` (dense, assigned on append), `run: RunId`, `round: in
 | `world_changed` | `payload` (opaque) | at commit, optional |
 | `metric` | `name, value, denominator` | after fold, per metric |
 | `round_committed` | `n_posts, n_actions, n_deliveries` | last logical event of the round |
-| `snapshot` | `manifest_path` | after `round_committed`, every `snapshot_every` |
+| `snapshot` | `manifest_path` | after `round_committed`, every `snapshot_every`, and always for the round (tick) that ends the run |
 | `run_ended` | `reason: "terminal"|"max_rounds"|"soft_budget"|"hard_ceiling"|"hard_ceiling_probes"|"total_budget"|"error"` (`hard_ceiling_probes`: the ceiling was reached by post-commit probes; that round is kept; `total_budget`: the experiment-wide `budget.total_usd` was reached at a round boundary, swarmlab/budget.py `ExperimentLedger`) | once |
 
 **Logical versus operational.** `inference_attempt`, `inference_response`, and `ts` are operational; `logical_view(events)` strips them and also drops `seq`, because operational events are appended as they happen and shift later sequence numbers. Acceptance tests compare logical views.
@@ -301,7 +301,8 @@ outcomes = world.commit(actions in `order`, each agent's in call order)
 resolved = world.end_round(r)
 log post*, delivery*, action_committed*; if resolved is a dict: log round_resolved(data=resolved); outcomes_prev = by agent
 fold metrics on this round's logical events; log metric*
-if r % snapshot_every == 0: write snapshot (so every committed round has one on disk); log round_committed; log snapshot
+reason = end reason after round r (terminal, stop condition, max_rounds, budgets; None to go on)
+if r % snapshot_every == 0 or reason: write snapshot (so every committed round has one on disk); log round_committed; log snapshot
 ```
 Sequential (`immediate`): agents run one at a time in `order`; every tool call applies immediately through single-item `board.commit` / `world.commit`; `read_board` sees deliveries with `eligible_round <= r` including same-round posts.
 
@@ -319,6 +320,8 @@ class SnapshotManifest(BaseModel):
     plugins: dict[str, str]       # "world" | "board" | "scheduler" | f"participant:{agent}" | f"metric:{name}" -> blob sha
     outcomes_prev: dict[AgentId, list[dict]]; live: list[AgentId]
 ```
+The round (under `async`, the tick) that ends the run is always snapshotted, whatever `snapshot_every` is, so a finished run's last snapshot is its `last_round` (what `replay`'s score check and graders read); `snapshot_every` only thins the snapshots before it. The exception is a run ended by `hard_ceiling` (or a crash): the round in flight is discarded, and the last committed round has a snapshot only when `snapshot_every` gave it one.
+
 `SnapshotStore(run_dir)`: `write(manifest, blobs) -> path`, `latest(max_round=None)`, `load(manifest) -> dict[str, bytes]`. Manifests at `snapshots/<round:06d>.json`. Plugins never see the manifest; they only implement `snapshot()`/`restore()`, which `Persistable` provides by default.
 
 ## 14. Metrics
