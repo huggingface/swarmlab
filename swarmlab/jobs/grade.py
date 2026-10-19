@@ -150,10 +150,15 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
+from ..procs import ancestors as _ancestors
+from ..procs import environ_has as _environ_has
+from ..procs import kill_matching
+from ..procs import pids as _pids
+from ..procs import uid_of as _uid_of
 from ..world.programbench import (
     IMAGE_TAG,
     _venv_bin,
@@ -227,18 +232,6 @@ def _text(data: bytes) -> str:
     return data.decode(locale.getpreferredencoding(False)).replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _ancestors() -> set[int]:
-    pids, pid = {os.getpid()}, os.getpid()
-    while pid > 1:
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            pid = int(stat.rsplit(")", 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
-            break
-        pids.add(pid)
-    return pids
-
-
 def _sessions() -> set[int]:
     """Session ids of the processes alive now (`/proc/<pid>/stat` field 6)."""
     out = set()
@@ -249,51 +242,6 @@ def _sessions() -> set[int]:
             except (OSError, ValueError, IndexError):
                 pass
     return out
-
-
-def _pids() -> set[int]:
-    return {int(e) for e in os.listdir("/proc") if e.isdigit()}
-
-
-def _stat_fields(pid: int) -> list[str]:
-    """`/proc/<pid>/stat` after the command name: [state, ppid, pgrp, session, ...] ([] if gone)."""
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-    except (OSError, IndexError):
-        return []
-
-
-def _uid_of(pid: int) -> int | None:
-    try:
-        return os.stat(f"/proc/{pid}").st_uid
-    except OSError:
-        return None
-
-
-def _environ_has(pid: int, entry: bytes) -> bool:
-    try:
-        return entry in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        return False
-
-
-def kill_matching(match: Callable[[int], bool], passes: int = 20) -> list[int]:
-    """SIGKILL every live (not zombie) process `match` selects, except PID 1 and this process
-    and its ancestors; repeated until a pass finds none (a process may fork meanwhile), at most
-    `passes` times. Returns the pids killed."""
-    keep = _ancestors() | {1}
-    killed: list[int] = []
-    for _ in range(passes):
-        found = [pid for pid in _pids() if pid not in keep and match(pid)
-                 and _stat_fields(pid)[:1] not in ([], ["Z"])]
-        if not found:
-            break
-        for pid in found:
-            with contextlib.suppress(OSError):
-                os.kill(pid, signal.SIGKILL)
-                killed.append(pid)
-        time.sleep(0.05)
-    return killed
 
 
 def chown_tree(root: str, uid: int, gid: int) -> None:

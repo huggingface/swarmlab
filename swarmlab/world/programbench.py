@@ -96,7 +96,8 @@ Official semantics replicated
   `--secrets` names, so a key in a variable like `MODEL_AUTH` is dropped too; `declared_secrets`)
   and minus swarmlab's own virtualenv (`VIRTUAL_ENV` and its `bin` on `PATH`), so the
   agent's `python3` is the image's; plus the thread-count variables below when the CPU count is
-  known.
+  known; plus `SWARMLAB_PROGRAMBENCH_RUN=<random id>` (`RUN_MARKER`), which marks the run's
+  processes for the sweep below (an added variable the baseline does not set).
 - Timeout (`command_timeout_s`): the call returns the output captured so far, `returncode: -1`
   and `exception_info` in the baseline's wording, `An error occurred while executing the command:
   Command '<command>' timed out after 180 seconds` (docker: the `docker exec` argument list, as
@@ -132,16 +133,33 @@ agents' turns run, and run their own commands, meanwhile. Every state change (th
 thread, so nothing is locked. Under `commit: immediate` turns run one at a time, so a run's log
 is what the synchronous tool gave.
 
-Each backend tracks every command still running, `{pid: (agent, process)}` (`running()`;
-`running_commands()` gives `{agent: [pid]}`), including the timed-out ones the baseline leaves
-running; a finished command is dropped. `kill_all(reason)` kills them: the local backend
-SIGKILLs each command's process group (its own session), the docker backend kills the `docker
-exec` clients and then runs `kill -9 -1` as root in the container, which kills every process
-there but its init (commands, timed-out ones and background jobs alike). Background jobs a
-finished local command left behind (`cmd &` in its own session group) are not tracked; they end
-with the job or machine. A command swarmlab killed returns the baseline's three keys: its output
-so far, the killed process's return code (`-9`) and `exception_info` `An error occurred while
+Each backend tracks its commands, `{pid: (agent, process)}` (`running()`; `running_commands()`
+gives `{agent: [pid]}`), including the timed-out ones the baseline leaves running.
+`kill_all(reason)` kills them all; the docker backend kills the `docker exec` clients and then
+runs `kill -9 -1` as root in the container, which kills every process there but its init
+(commands, timed-out ones and background jobs alike). The local backend:
+
+- tracks each command's process GROUP, not its shell: every command starts in its own session,
+  so its pgid is the shell's pid, and the command stays tracked while the group has a live (not
+  zombie) member (`procs.group_alive`: `killpg(pgid, 0)`, confirmed in `/proc`), after its shell
+  has exited and `bash` has returned. So `(sleep 1; touch late) &` is tracked until it ends.
+  `kill_all` SIGKILLs the whole group whatever the shell's state and polls until it is empty
+  (`procs.kill_group`, at most 2 s);
+- then sweeps the processes that left their group (`setsid`, a double fork into a new
+  session, a daemon): every process whose environment carries this backend's `RUN_MARKER`
+  entry (it is inherited down every fork), and, when the commands run as a dedicated user under
+  the lockdown (the HF Jobs shape: `setpriv` to `user`, never root, never the uid swarmlab runs
+  as), every process of that uid (`procs.kill_matching`, shared with the grader);
+- remaining gap: a process that scrubs its environment (`env -i`, or rewrites the marker) AND
+  leaves its command's process group, on a run with no dedicated user (a dry run as the current
+  user, `user: null`, or no lockdown), is not tracked and keeps running until the job or the
+  machine ends. Under the HF Jobs shape the uid sweep covers it.
+
+A command swarmlab killed while its shell ran returns the baseline's three keys: its output so
+far, the killed process's return code (`-9`) and `exception_info` `An error occurred while
 executing the command: Command '<command>' was killed: <reason>`; it counts as a step (it ran).
+A command whose shell had already returned keeps the feedback it returned; killing its
+background jobs changes nothing in the log.
 
 - Submission freezes the workspace. When a command submits (on the loop, right after its
   await), the world kills every other command still running (`<agent> submitted the final
@@ -300,7 +318,6 @@ import platform
 import pwd
 import random
 import shlex
-import signal
 import socket
 import subprocess
 import sys
@@ -315,6 +332,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
+from .. import procs
 from ..ids import AgentId
 from ..view import Observation, text_observation
 from .base import Ack, Action, Outcome, Requirements, World, tool
@@ -334,6 +352,7 @@ DOCKER_CPUS, DOCKER_MEMORY_GB = 20, 60          # programbench.yaml run_args
 DOCKER_CONTAINER_TIMEOUT = "7h"                 # programbench.yaml container_timeout
 DOCKER_START_TIMEOUT_S = 1800                   # a pull of a 1-2 GB image; not task semantics
 HISTORY_KEEP = 10
+RUN_MARKER = "SWARMLAB_PROGRAMBENCH_RUN"         # =<random id> in every local command's environment
 _ERROR_PREFIX = "An error occurred while executing the command: "
 log = logging.getLogger(__name__)
 
@@ -977,56 +996,79 @@ def _wait_or_none(proc: subprocess.Popen, timeout: float) -> int | None:
 
 @dataclass
 class _Command:
-    """A tracked command: its process, the agent that ran it, and why swarmlab killed it."""
+    """A tracked command: its process, the agent that ran it, and why swarmlab killed it.
+    `group`: the command was started in its own session (local backend), so its process group
+    (pgid = its pid) is tracked, and killed, independently of the shell that leads it."""
     agent: str
     proc: subprocess.Popen
     killed: str | None = None
+    group: bool = True
+
+    def alive(self) -> bool:
+        """The shell still runs or (`group`) its process group still has a live member: a
+        background job (`cmd &`) outlives the shell that started it."""
+        if self.proc.poll() is None:
+            return True
+        return self.group and procs.group_alive(self.proc.pid)
 
 
-def _kill_group(proc: subprocess.Popen) -> None:
-    """SIGKILL the command's process group (it was started in its own session, so the group id
-    is its pid); the process alone when the group is gone or not ours."""
-    if proc.poll() is not None:
-        return
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+def _kill_command(cmd: _Command) -> None:
+    """SIGKILL the command: its whole process group whatever the shell's state, polled until
+    empty (`procs.kill_group`); the `docker exec` client alone otherwise."""
+    if cmd.group:
+        if not procs.kill_group(cmd.proc.pid):  # pragma: no cover - a member we may not signal
+            log.warning("programbench: process group %d survived SIGKILL", cmd.proc.pid)
+    else:
         try:
-            proc.kill()
+            cmd.proc.kill()
         except ProcessLookupError:
             pass
 
 
-def _kill_commands(commands: dict[int, _Command], reason: str, group: bool = True) -> int:
-    """Kill every tracked command still running (marking it `killed = reason`); reap them; drop
-    the finished ones. Returns how many were killed."""
+def _kill_commands(commands: dict[int, _Command], reason: str) -> int:
+    """Kill every tracked command still alive (a running shell is marked `killed = reason`, so
+    its feedback says so); reap them; drop them all. Returns how many were alive."""
     n = 0
     for pid, cmd in list(commands.items()):
-        if cmd.proc.poll() is None:
-            cmd.killed = cmd.killed or reason
-            if group:
-                _kill_group(cmd.proc)
-            else:
-                try:
-                    cmd.proc.kill()
-                except ProcessLookupError:
-                    pass
+        if cmd.alive():
+            if cmd.proc.poll() is None:
+                cmd.killed = cmd.killed or reason
+            _kill_command(cmd)
             n += 1
         try:
             cmd.proc.wait(timeout=2)
         except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL is not ignorable
-            continue
+            pass
         commands.pop(pid, None)
+    return n
+
+
+def _sweep_local(sweep: Mapping[str, Any]) -> list[int]:
+    """The processes that left their command's process group (`setsid`, a double fork into a
+    new session): every process carrying this backend's `RUN_MARKER` entry in its environment,
+    and, when commands run as a dedicated user (lockdown, the HF Jobs shape), every process of
+    that uid. Returns the pids killed."""
+    killed = procs.kill_matching(lambda pid: procs.environ_has(pid, sweep["marker"]))
+    uid = sweep.get("uid")
+    if uid is not None:
+        killed += procs.kill_matching(lambda pid: procs.uid_of(pid) == uid)
+    return killed
+
+
+def _kill_local(commands: dict[int, _Command], sweep: Mapping[str, Any], reason: str) -> int:
+    n = _kill_commands(commands, reason)
+    _sweep_local(sweep)
     return n
 
 
 def _running(commands: dict[int, _Command]) -> dict[str, list[int]]:
     out: dict[str, list[int]] = {}
     for pid, cmd in list(commands.items()):
-        if cmd.proc.poll() is not None:
-            commands.pop(pid, None)
-        else:
+        if cmd.alive():
             out.setdefault(cmd.agent, []).append(pid)
+        else:
+            cmd.proc.poll()
+            commands.pop(pid, None)
     return out
 
 
@@ -1051,9 +1093,14 @@ class LocalBackend:
         self.started = False
         self.prefix: list[str] = []
         self.env: dict[str, str] = {}
-        self.commands: dict[int, _Command] = {}  # pid -> every command still running
+        self.commands: dict[int, _Command] = {}  # pid -> every command whose group is alive
+        # the sweep for processes that left their group: the marker every command's environment
+        # carries, and the dedicated user's uid (set at start, under lockdown)
+        self.marker = f"{RUN_MARKER}={uuid.uuid4().hex}"
+        self._sweep: dict[str, Any] = {"marker": self.marker.encode(), "uid": None}
         # interpreter exit (or the backend collected): nothing the agents started outlives the run
-        self._finalizer = weakref.finalize(self, _kill_commands, self.commands, "the run ended")
+        self._finalizer = weakref.finalize(self, _kill_local, self.commands, self._sweep,
+                                           "the run ended")
 
     def start(self) -> dict:
         record: dict[str, Any] = {"applied": False}
@@ -1073,7 +1120,15 @@ class LocalBackend:
                                "--init-groups", "--"]
                 identity = {"HOME": pw.pw_dir, "USER": pw.pw_name, "LOGNAME": pw.pw_name,
                             "SHELL": pw.pw_shell or "/bin/bash"}
-        self.env = command_env(dict(os.environ), {**identity, **self.extra_env}, _venv_bin())
+                # a dedicated user under lockdown: every process of that uid is the agents'.
+                # Never root, never the uid swarmlab really runs as (read from /proc, not from
+                # os.geteuid, which tests patch)
+                if (self.lockdown is not None and pw.pw_uid != 0
+                        and pw.pw_uid != procs.uid_of(os.getpid())):
+                    self._sweep["uid"] = pw.pw_uid
+        name, value = self.marker.split("=", 1)
+        self.env = command_env(dict(os.environ), {**identity, **self.extra_env, name: value},
+                               _venv_bin())
         self.started = True
         record["run_as"] = run_as or pwd.getpwuid(os.geteuid()).pw_name
         return record
@@ -1082,7 +1137,7 @@ class LocalBackend:
         proc = subprocess.Popen([*self.prefix, "bash", "-lc", command], cwd=self.workspace,
                                 env=self.env, stdin=subprocess.DEVNULL, stdout=out,
                                 stderr=subprocess.STDOUT, start_new_session=True)
-        _running(self.commands)  # drop the ones that finished since
+        _running(self.commands)  # drop the ones whose group has ended since
         self.commands[proc.pid] = cmd = _Command(agent, proc)
         return cmd
 
@@ -1097,7 +1152,8 @@ class LocalBackend:
             data = _read_capped(out, self.max_output_bytes)
             err = subprocess.TimeoutExpired(command, timeout)
             return _result(_decode(data, translate=False), -1, f"{_ERROR_PREFIX}{err}")
-        self.commands.pop(proc.pid, None)
+        if not cmd.alive():  # else a background job holds its group: tracked until it ends
+            self.commands.pop(proc.pid, None)
         return _result(_decode(_read_capped(out, self.max_output_bytes), translate=True), rc)
 
     def execute(self, command: str, timeout: float, agent: str = "") -> dict:
@@ -1121,7 +1177,7 @@ class LocalBackend:
                 rc = await _in_thread(_wait_or_none, cmd.proc, timeout)
             except asyncio.CancelledError:
                 cmd.killed = cmd.killed or "the run ended"
-                _kill_group(cmd.proc)
+                _kill_command(cmd)
                 self.commands.pop(cmd.proc.pid, None)
                 raise
             return self._finish(cmd, out, rc, command, timeout)
@@ -1130,7 +1186,9 @@ class LocalBackend:
         return _running(self.commands)
 
     def kill_all(self, reason: str) -> int:
-        return _kill_commands(self.commands, reason)
+        """Kill every tracked command's process group (running shells, timed-out ones, and
+        finished ones whose background jobs live on), then sweep what left the groups."""
+        return _kill_local(self.commands, self._sweep, reason)
 
     def tar(self, exclude: Sequence[str]) -> tuple[bytes | None, list[str]]:
         if not os.path.isdir(self.workspace):
@@ -1218,7 +1276,7 @@ class DockerBackend:
         except Exception as e:  # noqa: BLE001 - the baseline reports every failure the same way
             return _result("", -1, f"{_ERROR_PREFIX}{e}")
         _running(self.commands)
-        self.commands[proc.pid] = cmd = _Command(agent, proc)
+        self.commands[proc.pid] = cmd = _Command(agent, proc, group=False)
         try:
             data, err = await _in_thread(_communicate, proc, timeout)
         except asyncio.CancelledError:
@@ -1244,7 +1302,7 @@ class DockerBackend:
     def kill_all(self, reason: str) -> int:
         """Kill the running `docker exec` clients, then every process in the container but its
         init (`kill -9 -1` as root): commands, timed-out commands and background jobs alike."""
-        n = _kill_commands(self.commands, reason, group=False)
+        n = _kill_commands(self.commands, reason)
         if self.started and self.container_id:
             try:
                 subprocess.run([self.executable, "exec", "-u", "root", str(self.container_id),
@@ -1275,7 +1333,7 @@ class DockerBackend:
                        input=tar_bytes, capture_output=True, timeout=3600, check=True)
 
     def stop(self) -> None:
-        _kill_commands(self.commands, "the run ended", group=False)
+        _kill_commands(self.commands, "the run ended")
         if self._finalizer is not None:
             self._finalizer()
         self.started = False

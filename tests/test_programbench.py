@@ -849,6 +849,78 @@ def test_cancelled_command_is_killed_and_records_nothing(tmp_path):
     assert (w.steps_total, w.steps, w.history, w.elapsed_s) == (0, {"a000": 0}, [], 0.0)
 
 
+BACKGROUND = "(echo $BASHPID > bg.pid; sleep 1; echo changed > late) &"
+
+
+def test_a_finished_shells_background_job_stays_tracked_and_the_freeze_kills_it(tmp_path):
+    w = make(tmp_path)
+    ws = tmp_path / "ws"
+    fb = sh(w, BACKGROUND)
+    assert fb == {"output": "", "returncode": 0, "exception_info": ""}
+    pid = _pid(ws / "bg.pid")
+    shell = next(iter(w.running_commands()["a000"]))
+    assert w.running_commands() == {"a000": [shell]} and _alive(pid)   # its group is alive
+    sh(w, f"echo {SUBMIT_MARKER}")                       # the submission freezes the workspace
+    assert not _alive(pid) and w.running_commands() == {}
+    blob = w.snapshot()
+    time.sleep(1.2)
+    assert not (ws / "late").exists()
+    assert workspace_tar_of(blob) == workspace_tar(ws)[0]
+
+
+def test_a_finished_shells_background_job_is_killed_at_run_end(tmp_path):
+    w = make(tmp_path)
+    w.check_experiment(options(max_rounds=1, max_calls_per_turn=1000))
+    ws = tmp_path / "ws"
+    sh(w, BACKGROUND)
+    pid = _pid(ws / "bg.pid")
+    w.end_round(1)                                       # the run's end
+    assert not _alive(pid) and w.running_commands() == {}
+    time.sleep(1.2)
+    assert not (ws / "late").exists()
+
+
+def test_a_job_that_left_its_group_is_killed_by_the_marker_sweep(tmp_path):
+    w = make(tmp_path)
+    ws = tmp_path / "ws"
+    fb = sh(w, f"echo ${pb.RUN_MARKER}; setsid sh -c 'echo $$ > s.pid; sleep 1; "
+               "echo changed > late' > /dev/null 2>&1 < /dev/null &")
+    assert fb["returncode"] == 0 and fb["output"].strip() == w._runtime.marker.split("=", 1)[1]
+    pid = _pid(ws / "s.pid")
+    assert _alive(pid)
+    assert pb.procs.stat_fields(pid)[2] != str(next(iter(w._runtime.commands), -1))
+    sh(w, f"echo {SUBMIT_MARKER}")
+    assert not _alive(pid)
+    time.sleep(1.2)
+    assert not (ws / "late").exists()
+
+
+def test_the_dedicated_users_uid_is_swept_only_under_lockdown(tmp_path, monkeypatch):
+    user = SimpleNamespace(pw_uid=4242, pw_gid=4242, pw_dir="/home/agent", pw_name="agent",
+                           pw_shell="/bin/bash")
+    monkeypatch.setattr(pb.pwd, "getpwnam", lambda name: user)
+    monkeypatch.setattr(pb.os, "geteuid", lambda: 0)
+    locked = pb.LocalBackend(str(tmp_path / "ws"), "agent", {}, None,
+                             lockdown=lambda: {"applied": True})
+    locked.start()
+    assert locked._sweep["uid"] == 4242 and locked.prefix[0] == "setpriv"
+    assert locked.env[pb.RUN_MARKER] == locked.marker.split("=", 1)[1]
+    plain = pb.LocalBackend(str(tmp_path / "ws"), "agent", {}, None)
+    plain.start()
+    assert plain._sweep["uid"] is None                   # a dry run: the marker sweep only
+    user.pw_uid = pb.procs.uid_of(os.getpid())           # never the uid swarmlab runs as
+    mine = pb.LocalBackend(str(tmp_path / "ws"), "agent", {}, None,
+                           lockdown=lambda: {"applied": True})
+    mine.start()
+    assert mine._sweep["uid"] is None
+    seen = []
+    monkeypatch.setattr(pb.procs, "kill_matching", lambda match: seen.append(match) or [])
+    monkeypatch.setattr(pb.procs, "uid_of", lambda pid: {1: 4242, 2: 7}[pid])
+    pb._sweep_local(locked._sweep)
+    _, uid_match = seen
+    assert (uid_match(1), uid_match(2)) == (True, False)
+
+
 def test_snapshot_tar_survives_a_file_shrinking_while_read(tmp_path):
     root = tmp_path / "ws"
     root.mkdir()
