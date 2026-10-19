@@ -24,7 +24,8 @@ Decisions where the contract is silent:
 - **Source.** `source` is a run directory (has `run.json`) or a directory of run directories.
   Only runs with `status == "ended"` are published; others are reported as skipped. Each run is
   exported into `<run_dir>/export` first unless that export is current (`export.is_current`:
-  same log sha256 and export schema).
+  same log sha256, `run.json` sha256 (a grade written back after the export makes it stale) and
+  export schema).
 - **Repo.** Default `<namespace>/<experiment>` with the namespace from `HfApi.whoami()`. Runs of
   several experiments with no `--repo` go to one repo each; an explicit `--repo` with runs of
   several experiments is an error. The repo is created private (`private=not public`); an

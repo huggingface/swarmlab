@@ -6,8 +6,10 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from swarmlab import Board
+from swarmlab.executor import RoundExecutor
 from swarmlab.providers import resolve
-from swarmlab.providers.anthropic import AnthropicProvider, build_kwargs
+from swarmlab.providers.anthropic import AnthropicProvider, build_kwargs, tool_definition
 from swarmlab.providers.base import (
     ChatMessage,
     ChatRequest,
@@ -61,9 +63,12 @@ def test_estimate_and_cost_math():
                                           Part(type="image", image_png_b64="AAAA")]),
     ])
     assert p.estimate_prompt_tokens(r) == 110 + 1000
-    assert p.max_cost(r) == pytest.approx((1110 * 1.0 + 100 * 5.0) / 1e6)
+    # caching is on by default (5m), so every prompt token is reserved as a possible write
+    assert p.max_cost(r) == pytest.approx((1110 * 1.25 + 100 * 5.0) / 1e6)
     r2 = r.model_copy(update={"thinking_budget": 1024})
-    assert p.max_cost(r2) == pytest.approx((1110 * 1.0 + 1124 * 5.0) / 1e6)
+    assert p.max_cost(r2) == pytest.approx((1110 * 1.25 + 1124 * 5.0) / 1e6)
+    assert AnthropicProvider(prompt_cache="none").max_cost(r) == pytest.approx(
+        (1110 * 1.0 + 100 * 5.0) / 1e6)
     u = Usage(prompt_tokens=1000, cached_prompt_tokens=400, completion_tokens=200)
     assert p.cost(r, u) == pytest.approx((600 * 1.0 + 400 * 0.10 + 200 * 5.0) / 1e6)
 
@@ -147,9 +152,9 @@ def test_anthropic_request_mapping():
     assert "temperature" not in kw  # not sent with thinking
     assert kw["tool_choice"] == {"type": "auto"}
     strict = {t["name"]: t.get("strict") for t in kw["tools"]}
-    assert strict == {"guess": True, "read_board": True}  # normalised before sending
+    assert strict == {"guess": True, "read_board": None}  # LOOSE has no required list
     loose = next(t for t in kw["tools"] if t["name"] == "read_board")["input_schema"]
-    assert loose["required"] == [] and loose["additionalProperties"] is False
+    assert loose == LOOSE.parameters  # sent as given, not re-normalised
     msgs = kw["messages"]
     assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
     assert msgs[0]["content"][1] == {"type": "image", "source": {
@@ -308,6 +313,41 @@ def compat(handler, name="hf"):
     p._transport = httpx.MockTransport(handler)
     p._backoff_s = 0.0
     return p
+
+
+# A participant's own schema, not normalised: no `required`, no `additionalProperties`, and a
+# nested object without them either (mini-swe-agent's BASH_TOOL has the same top-level shape).
+RAW = ToolSchema(name="run", description="Run it.", parameters={
+    "type": "object", "properties": {"command": {"type": "string"},
+                                     "opts": {"type": "object", "properties": {"cwd": {"type": "string"}}}}})
+
+
+def test_anthropic_sends_a_participant_schema_unchanged_and_not_strict():
+    raw = RAW.model_copy(deep=True)
+    tools = build_kwargs(req(tools=[raw]))["tools"]
+    assert tools == [{"name": "run", "description": "Run it.", "input_schema": RAW.parameters}]
+    assert raw == RAW  # the participant's schema is not modified either
+
+
+def test_anthropic_sends_executor_normalised_schemas_strict():
+    world = FlagGame()
+    world.reset(random.Random(1), ["a000"])
+    ex = RoundExecutor(run="r", round=1, world=world, board=Board(), blobs=None, agents=["a000"])
+    schemas = ex.schemas("a000")
+    tools = build_kwargs(req(tools=schemas))["tools"]
+    assert [t["input_schema"] for t in tools] == [s.parameters for s in schemas]
+    assert all(t["strict"] is True for t in tools)
+    # a participant that wants strict mode normalises its own schema
+    assert tool_definition(RAW.normalized())["strict"] is True
+
+
+def test_openai_sends_a_participant_schema_unchanged():
+    raw = RAW.model_copy(deep=True)
+    body = build_body(req(model="hf:m", tools=[raw]))
+    assert body["tools"] == [{"type": "function", "function": {
+        "name": "run", "description": "Run it.", "parameters": RAW.parameters}}]
+    assert "additionalProperties" not in body["tools"][0]["function"]["parameters"]
+    assert raw == RAW
 
 
 def test_openai_body_mapping():

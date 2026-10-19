@@ -128,9 +128,23 @@ Decisions where the contract is silent:
   `reasoning_redacted` (Anthropic `redacted_thinking` blocks; 0 without thinking, null when the
   response blob is missing) come with it. Sessions carry it as pi `thinking` blocks (below).
   `EXPORT_SCHEMA` 3 added these columns too.
+- **Cache writes.** `turns.cache_write_tokens` and `inference.cache_write_tokens` are the
+  usage's prompt tokens written to the provider's prompt cache (Anthropic
+  `cache_creation_input_tokens`; `prompt_tokens` includes them, as it includes the cache reads
+  in `cached_prompt_tokens`). A usage dict leaves the key out when 0, so the cell is 0 wherever
+  the other usage cells are filled and null where they are. Sessions put it in pi
+  `usage.cacheWrite` (and `input` excludes it). `EXPORT_SCHEMA` 4 added the column (appended
+  last in both tables).
 - `EXPORT_SCHEMA` is recorded in `run.json["export_schema"]`; outputs are deterministic for a
   given run directory and code version (no export timestamp), so re-publishing an unchanged run
   uploads nothing.
+- Freshness (`is_current`, which `publish.ensure_export` uses to reuse an export): the same
+  `EXPORT_SCHEMA` and `raw` choice, the sha256 of the log (`run.json["events"]["sha256"]`) and
+  the sha256 of the run's `run.json` (`run.json["run_json"]["sha256"]`). `run.json` can change
+  without the log: `swarmlab programbench fetch-grade` writes a grade into it
+  (`jobs.programbench.write_grade`), and the export copies its score, and the file itself into
+  `raw/`. Any rewrite of `run.json` therefore re-exports, a byte-identical one does not; an
+  export made before this field existed is not current.
 """
 from __future__ import annotations
 
@@ -151,7 +165,7 @@ import pyarrow.parquet as pq
 
 from .world.render import image_label
 
-EXPORT_SCHEMA = "swarmlab-export/3"
+EXPORT_SCHEMA = "swarmlab-export/4"
 INLINE_LIMIT = 64 * 1024
 IMAGE_MARK = b'"type":"image"'  # an image Part in a canonical-JSON request blob
 FULL_BLOBS_LIMIT = 500 * 1024 * 1024
@@ -162,6 +176,15 @@ _KEYS = [("experiment", _S), ("arm", _S), ("seed", _I), ("run", _S), ("round", _
          ("agent", _S), ("seq", _I), ("ts", _F)]
 _USAGE = [("prompt_tokens", _I), ("completion_tokens", _I), ("cached_prompt_tokens", _I),
           ("reasoning_tokens", _I)]
+_CACHE_WRITES = ("cache_write_tokens", _I)  # schema 4, appended last (see _cache_writes)
+
+
+def _cache_writes(usage: dict) -> int | None:
+    """`cache_write_tokens` of a usage dict: left out when 0, so 0 wherever the `Usage` fields
+    are present (`cached_prompt_tokens` is), else None."""
+    if "cache_write_tokens" in usage:
+        return usage["cache_write_tokens"]
+    return 0 if "cached_prompt_tokens" in usage else None
 
 
 def _schema(*cols: tuple[str, pa.DataType]) -> pa.Schema:
@@ -171,7 +194,8 @@ def _schema(*cols: tuple[str, pa.DataType]) -> pa.Schema:
 TABLE_SCHEMAS: dict[str, pa.Schema] = {
     "turns": _schema(("yield_kind", _S), ("calls", _I), *_USAGE, ("cost_usd", _F),
                      ("inference_calls", _I), ("finish_reasons", _S), ("notes", _S),
-                     ("usage", _S), ("error", _S), ("private", _S), ("end_seq", _I)),
+                     ("usage", _S), ("error", _S), ("private", _S), ("end_seq", _I),
+                     _CACHE_WRITES),
     "tool_calls": _schema(("call_id", _S), ("tool", _S), ("args", _S), ("ok", _B),
                           ("pending", _B), ("error", _S), ("result", _S), ("return_seq", _I)),
     "posts": _schema(("post_id", _S), ("provisional_id", _S), ("channel", _S), ("text", _S),
@@ -187,7 +211,7 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
                          ("finish_reason", _S), ("cached", _B), ("attempts", _I),
                          ("request", _S), ("response", _S), ("response_seq", _I),
                          ("refusal_category", _S), ("reasoning", _S), ("reasoning_kind", _S),
-                         ("reasoning_redacted", _I)),
+                         ("reasoning_redacted", _I), _CACHE_WRITES),
     "probes": _schema(("probe", _S), ("ok", _B), ("candidate", _S), ("parsed", _S),
                       ("cost_usd", _F), ("question_hash", _S), ("question", _S),
                       ("raw_hash", _S), ("raw", _S)),
@@ -372,6 +396,7 @@ def build_tables(events: list[dict], meta: dict, blobs: _Blobs) -> dict[str, lis
                        cost_usd=usage.get("cost_usd"), inference_calls=usage.get("inference_calls"),
                        finish_reasons=_j(usage.get("finish_reasons")), notes=_j(usage.get("notes")),
                        usage=_j(usage), error=ev.get("error"), end_seq=ev.get("seq"),
+                       cache_write_tokens=_cache_writes(usage),
                        **{k: usage.get(k) for k, _ in _USAGE})
             rows["turns"].append(row)
         elif t == "tool_called":
@@ -433,7 +458,8 @@ def build_tables(events: list[dict], meta: dict, blobs: _Blobs) -> dict[str, lis
                        refusal_category=ev.get("refusal_category"),
                        **_reasoning_cells(blobs, ev.get("response_hash")),
                        response=blobs.inline(ev.get("response_hash")),
-                       response_seq=ev.get("seq"), **{k: usage.get(k) for k, _ in _USAGE})
+                       response_seq=ev.get("seq"), cache_write_tokens=_cache_writes(usage),
+                       **{k: usage.get(k) for k, _ in _USAGE})
         elif t == "probe":
             parsed = ev.get("parsed") or {}
             cand = parsed.get("candidate") if isinstance(parsed, dict) else None
@@ -566,8 +592,10 @@ def _usage(usage: dict | None, cost: float | None) -> dict:
     u = usage or {}
     prompt = int(u.get("prompt_tokens") or 0)
     cached = int(u.get("cached_prompt_tokens") or 0)
+    writes = int(u.get("cache_write_tokens") or 0)
     out = int(u.get("completion_tokens") or 0)
-    d = {"input": max(0, prompt - cached), "output": out, "cacheRead": cached, "cacheWrite": 0,
+    d = {"input": max(0, prompt - cached - writes), "output": out, "cacheRead": cached,
+         "cacheWrite": writes,
          "totalTokens": prompt + out,
          "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0,
                   "total": float(cost or 0.0)}}
@@ -1021,7 +1049,8 @@ def export_run(run_dir: Path | str, out: Path | str | None = None, *, raw: bool 
     meta_path = run_dir / "run.json"
     if not meta_path.exists():
         raise FileNotFoundError(f"{run_dir} is not a run directory (no run.json)")
-    meta = json.loads(meta_path.read_text())
+    meta_bytes = meta_path.read_bytes()
+    meta = json.loads(meta_bytes)
     out = Path(out) if out is not None else run_dir / "export"
     if out.resolve() == run_dir.resolve():
         raise ValueError("export out dir must differ from the run dir")
@@ -1067,6 +1096,7 @@ def export_run(run_dir: Path | str, out: Path | str | None = None, *, raw: bool 
         "tables": {f: {"rows": counts[f], "path": f"tables/{f}.parquet"} for f in FAMILIES},
         "sessions": sorted(f"sessions/{a}.jsonl" for a in sessions),
         "events": {"n": len(events), "sha256": hashlib.sha256(ev_bytes).hexdigest()},
+        "run_json": {"sha256": hashlib.sha256(meta_bytes).hexdigest()},
         "blobs": blob_info,
         "export_raw": raw,
         "unreadable_blobs": dict(sorted(blobs.unreadable.items())),
@@ -1077,15 +1107,18 @@ def export_run(run_dir: Path | str, out: Path | str | None = None, *, raw: bool 
 
 
 def is_current(run_dir: Path | str, out: Path | str | None = None, *, raw: bool = True) -> bool:
-    """True when `out` holds an export of the run's current log with this EXPORT_SCHEMA, made
-    with the same `raw` choice."""
+    """True when `out` holds an export of the run's current log and current `run.json` (a grade
+    written back changes only the latter) with this EXPORT_SCHEMA, made with the same `raw`
+    choice."""
     run_dir = Path(run_dir)
     out = Path(out) if out is not None else run_dir / "export"
     try:
         doc = json.loads((out / "run.json").read_text())
         sha = hashlib.sha256((run_dir / "events.jsonl").read_bytes()).hexdigest()
+        meta_sha = hashlib.sha256((run_dir / "run.json").read_bytes()).hexdigest()
     except (OSError, ValueError):
         return False
     return (doc.get("export_schema") == EXPORT_SCHEMA and doc.get("events", {}).get("sha256") == sha
+            and (doc.get("run_json") or {}).get("sha256") == meta_sha
             and doc.get("export_raw", True) == raw)
 
