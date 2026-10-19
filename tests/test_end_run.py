@@ -4,16 +4,21 @@ turns have unwound), before the final budget event, snapshot, score and `run_end
 from __future__ import annotations
 
 import asyncio
+import json
 import pickle
 
 import pytest
 
-from swarmlab import Experiment, Run
+from swarmlab import Budget, Experiment, Run
 from swarmlab.budget import HardCeilingReached
 from swarmlab.participants.base import Participant, TurnUsage
+from swarmlab.providers.base import ChatMessage, ChatRequest
+from swarmlab.providers.fake import FakeProvider
 from swarmlab.snapshot import SnapshotStore
 from swarmlab.view import text_observation
 from swarmlab.world.base import Outcome, World, tool
+
+from .helpers import TEST_PRICING
 
 CALLS: list[str] = []   # end_run calls of runs whose world copy the test cannot read back
 
@@ -147,3 +152,66 @@ def test_end_run_is_called_once_per_run(tmp_path):
     run = Experiment(name="end", world=Recording(), participants=[Adder()]).run(
         seed=0, max_rounds=3, commit="round_end", out=tmp_path)
     assert run.end_reason == "max_rounds" and CALLS == ["max_rounds"]
+
+
+# ---- a run that ends at a round boundary without running a round (INTERFACE §8, §13) ----------
+@pytest.mark.parametrize("commit", ["round_end", "async"])
+def test_a_fork_ending_at_its_boundary_refreshes_the_snapshot_with_end_run(tmp_path, commit):
+    # the fork copies round 1's snapshot (ended=None); max_rounds=1 already holds, so the child
+    # runs no round: end_run's state must reach the round-1 snapshot as well as the score
+    parent = Experiment(name="end", world=Recording(), participants=[Adder()]).run(
+        seed=0, max_rounds=2, commit=commit, out=tmp_path)
+    copied = (parent.dir / "snapshots" / "000001.json").read_bytes()
+    child = parent.fork(at_round=1).run(max_rounds=1)
+    assert child.end_reason == "max_rounds" and child.meta["last_round"] == 1
+    final = _final_world(child)
+    assert final["calls"] == ["end_round:1", "end_run:max_rounds:busy=0"]
+    assert child.score == {"total": 1, "ended": "max_rounds", "busy": 0}
+    assert Run.load(child.dir).replay()["score"] == child.score
+    # rewritten in place: same file, same log_seq (round 1's round_committed), no new snapshot
+    # event (the copied one names the same file), no new round
+    store = SnapshotStore(child.dir)
+    assert store.list_rounds() == [1]
+    manifest = store.read(1)
+    assert manifest.log_seq == json.loads(copied)["log_seq"]
+    events = list(child.events_all)
+    assert [e.seq for e in events if e.type == "round_committed"] == [manifest.log_seq]
+    assert [e.round for e in events if e.type == "snapshot"] == [1]
+    assert events[-1].type == "run_ended"
+    # forking the ended child at its last round restores the state after end_run
+    grandchild = Run.load(child.dir).fork(at_round=1).run(max_rounds=2)
+    assert _final_world(grandchild)["calls"] == [
+        "end_round:1", "end_run:max_rounds:busy=0", "end_round:2", "end_run:max_rounds:busy=0"]
+
+
+class PaidCeiling(Participant):
+    """Round 1 pays for one fake model call and adds 1; round 2 hits the hard ceiling."""
+
+    async def turn(self, view, tools):
+        if view.round == 2:
+            raise HardCeilingReached("test ceiling")
+        await tools.infer(ChatRequest(model="fake:reader", max_tokens=8, messages=[
+            ChatMessage(role="user", content=f"Round {view.round}.")]))
+        await tools.call("add", {"n": 1})
+        return TurnUsage(calls=1)
+
+
+@pytest.mark.parametrize("commit", ["round_end", "async"])
+def test_a_resume_whose_soft_budget_already_holds_ends_with_a_refreshed_snapshot(tmp_path, commit):
+    # the hard ceiling leaves round 1's snapshot without end_run (ended=None); the resume's soft
+    # budget is already spent, so it ends at the boundary with soft_budget and no new round
+    run = Experiment(name="end", world=Recording(), participants=[PaidCeiling()],
+                     providers={"fake": FakeProvider(pricing=TEST_PRICING)}).run(
+        seed=0, max_rounds=5, commit=commit, out=tmp_path)
+    assert run.end_reason == "hard_ceiling" and run.meta["last_round"] == 1
+    assert _final_world(run)["ended"] is None
+    spent = run.spend["swarm"]
+    assert spent > 0
+    resumed = run.resume(budget=Budget(soft_usd=spent / 2))
+    assert resumed.end_reason == "soft_budget" and resumed.meta["last_round"] == 1
+    assert _final_world(resumed)["calls"] == ["end_round:1", "end_run:soft_budget:busy=0"]
+    assert resumed.score == {"total": 1, "ended": "soft_budget", "busy": 0}
+    assert Run.load(resumed.dir).replay()["score"] == resumed.score
+    events = list(resumed.events)
+    assert [e["round"] for e in events if e["type"] == "snapshot"] == [1]
+    assert [e["round"] for e in events if e["type"] == "round_committed"] == [1]

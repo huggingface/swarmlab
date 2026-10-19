@@ -70,8 +70,10 @@ Round `r` (phase-commit, `commit == "round_end"`):
    which has a snapshot only when `snapshot_every` gave it one. Then `round_committed`, `run.json`, and the `snapshot` event
    (`manifest_path` is relative to the run dir, `snapshots/<round:06d>.json`).
    `end_run` is called at most once per process, on every end: also before `run_ended` when the
-   end is decided at a round boundary with no round run (resume, fork) and on `hard_ceiling`;
-   on a crash (an exception out of the loop) best effort with reason `crash`.
+   end is decided at a round boundary with no round run (resume, fork), after which that
+   boundary round's snapshot is rewritten in place with the state after the hook (same file and
+   `log_seq`, no new event; `_end_at_boundary`), and on `hard_ceiling`; on a crash (an
+   exception out of the loop) best effort with reason `crash`.
 
 Immediate mode (`commit == "immediate"`) runs turns one at a time in `order`; each `post` and
 world action commits at once inside the executor. After the last turn, `world.end_round(r)` runs;
@@ -1214,6 +1216,37 @@ class Runner:
         if inspect.isawaitable(result):
             await result
 
+    async def _end_at_boundary(self, round: int, reason: str) -> None:
+        """End at the boundary after `round` (committed) without running another round.
+
+        When the world's `end_run` has not run yet (a resumed or forked run whose end condition
+        already holds), it runs now, and then `round`'s snapshot is rewritten in place (same file
+        `snapshots/<round>.json`, same `log_seq`: still that round's `round_committed`) with the
+        state after the hook, so the run's last snapshot and its score agree (§13). The log
+        already has that round's `snapshot` event (copied by fork, kept or re-appended by
+        recovery) naming the same file, so nothing is logged for it (one is appended only if
+        missing): the hook leaves the log unchanged, so a budget-ended run resumed more than
+        once still has the log of a run that never stopped. No round is committed. Round 0 is never
+        snapshotted. When the round that just committed already ran `end_run` (the round loop's
+        ordinary end), this only logs `run_ended`."""
+        if not self._world_ended:
+            await self._end_world_run(reason)
+            if round >= 1:
+                path = self.snapshots.path(round)
+                if path.exists():
+                    log_seq = self.snapshots.read(round).log_seq
+                else:  # defensive: resume and fork both require this snapshot
+                    lc = self.log.last_committed()
+                    log_seq = lc[1] if lc is not None else self.log.next_seq
+                manifest = SnapshotManifest(
+                    run=self.run_id, round=round, log_seq=log_seq,
+                    outcomes_prev=self.outcomes_prev, live=list(self.live_agents),
+                )
+                self.snapshots.write(manifest, self._plugin_blobs())
+                if not any(e.type == "snapshot" and e.round == round for e in self.log):
+                    self._append(SnapshotEvent, round, manifest_path=self._manifest_rel(round))
+        self._end(round, reason)
+
     async def _run_loop(self, start: int) -> None:
         logged = list(self.log)
         self._probe_no_context = {
@@ -1235,8 +1268,7 @@ class Runner:
         reason = self._end_reason(r - 1)
         while True:
             if reason is not None:
-                await self._end_world_run(reason)
-                self._end(r - 1, reason)
+                await self._end_at_boundary(r - 1, reason)
                 return
             try:
                 reason = await self._round(r)  # decided before round r's snapshot (step 7)
@@ -1584,8 +1616,7 @@ class Runner:
         """Every live agent loops over its own turns; each completed turn closes one tick."""
         reason = self._end_reason(start - 1)
         if reason is not None:
-            await self._end_world_run(reason)
-            self._end(start - 1, reason)
+            await self._end_at_boundary(start - 1, reason)
             return
         self._turns_done: dict[str, int] = {}  # completed turns per agent (resume: from the log)
         for e in logged:
