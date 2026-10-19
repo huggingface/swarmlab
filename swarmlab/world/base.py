@@ -54,11 +54,27 @@ run initialisation, before inference: early validation cannot know what a custom
 `apply_role` hook will do.
 
 `Requirements.check` raises one `ValueError` naming every violated field.
+
+Async tools. A `@tool` method may be `async def` (or return any awaitable resolving to an
+`Outcome`), for an action that waits on I/O such as a subprocess. The executor awaits it and only
+then records the action (`action_committed`, the async journal) and returns its feedback, so
+under `commit: async` other agents' turns run, and may commit, while it waits; a tick may even
+close in between, so the action's `action_committed` can land in a later tick than its
+`tool_called`. Rules: `validate` stays synchronous and runs before the tool is called; an async
+tool awaits only I/O, and mutates world state before or after its awaits, on the event-loop
+thread, never from another thread (nothing is locked: between two awaits the tool runs alone).
+When the turn is cancelled while the tool is awaiting (the run ended), the cancellation is raised
+at the tool's await and nothing is recorded: the action never committed. Undoing what the tool
+had already changed before that await is the world's own business (catch `CancelledError` in the
+tool). Under `round_end` the runner awaits the round's actions one at a time in commit order
+(`World.commit`, below). `swarmlab replay` never calls tools (it folds the log and restores
+snapshots), so an async world replays like a synchronous one.
 """
 from __future__ import annotations
 
+import inspect
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -140,7 +156,8 @@ def tool(name: str, description: str | Callable[[Any], str], params: Params | No
 
     `params` maps argument name to a JSON-schema type name ("integer") or a full property schema;
     every argument is required. The decorated method has signature
-    (self, agent: AgentId, **args) -> Outcome.
+    (self, agent: AgentId, **args) -> Outcome; it may be `async def` (module docstring, Async
+    tools).
 
     `description`, `params`, or any single value of a `params` dict may instead be a callable
     taking the world instance (`self`) and returning the same shape, for schemas that depend on
@@ -255,6 +272,20 @@ class Requirements(BaseModel):
         return bound, str(bound)
 
 
+async def _settle(awaitable: Awaitable[Outcome], action_id: ActionId) -> Outcome:
+    out = await awaitable
+    out.action_id = action_id
+    return out
+
+
+async def _call_later(fn: Callable, agent: AgentId, args: dict, action_id: ActionId) -> Outcome:
+    out = fn(agent, **args)
+    if inspect.isawaitable(out):
+        out = await out
+    out.action_id = action_id
+    return out
+
+
 class World(Persistable, Plugin):
     name: str = "world"
     requires: ClassVar[Requirements] = Requirements()  # run settings this world needs
@@ -337,15 +368,32 @@ class World(Persistable, Plugin):
         return Ack(ok=True)
 
     def commit(self, actions: list[tuple[AgentId, ActionId, Action]]) -> list[Outcome]:
-        """Apply actions in the given (seeded) order. Override for conflict semantics."""
+        """Apply actions in the given (seeded) order. Override for conflict semantics.
+
+        A tool may be `async def` (or return any awaitable): see "Async tools" in the module
+        docstring. From the first action whose tool returns an awaitable on, the list holds
+        awaitables in place of outcomes, each resolving to the `Outcome` with `action_id` set; the
+        tools of the later actions are only called when their entry is awaited, so awaiting the
+        entries in order (`swarmlab.medium.registry.settle_outcomes`) applies the actions one
+        after the other in the given order. A world whose tools are all synchronous gets plain
+        outcomes, as before.
+        """
         fns = self._actions()
-        outcomes: list[Outcome] = []
+        outcomes: list[Any] = []
+        deferred = False
         for agent, action_id, action in actions:
             fn = fns.get(action.name)
             if fn is None:
                 out = Outcome(accepted=False, feedback={"error": "unknown action"})
+            elif deferred:
+                outcomes.append(_call_later(fn, agent, action.args, action_id))
+                continue
             else:
                 out = fn(agent, **action.args)
+                if inspect.isawaitable(out):
+                    deferred = True
+                    outcomes.append(_settle(out, action_id))
+                    continue
             out.action_id = action_id
             outcomes.append(out)
         return outcomes
