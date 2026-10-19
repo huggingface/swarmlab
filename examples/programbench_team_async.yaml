@@ -1,0 +1,36 @@
+# ProgramBench, lead + 2 workers under `commit: async` (docs/guide/programbench.md, "Async team").
+# There is no round barrier: each agent loops over its own turns of `steps_per_turn` model calls,
+# and every completed turn closes one tick. The lead delegates on each worker's room and gets the
+# reports from `wait_for_workers`; an idle worker waits (no model call) until an assignment
+# arrives. `rounds_per_agent` caps each agent's turns (so an idle worker's ticks are bounded).
+#
+# This is a real spec: it needs the task image. `backend: local` (the default) is the HF Jobs
+# shape, where swarmlab runs inside the task image (`swarmlab job run` plans it); to run on a
+# machine with Docker, set the world's `backend: docker`. Fake models cannot run it (the
+# commands need the task's workspace); `swarmlab validate` and `swarmlab prompts` work offline.
+name: programbench-team-async
+seeds: [0]
+budget: {hard_usd: 5.0}
+options: {commit: async, rounds_per_agent: 30, max_calls_per_turn: 40}
+roles:
+  lead: {tools: [bash, post, read_board, wait], channels_write: [worker-1, worker-2]}
+  worker: {tools: [bash, post, read_board, wait], channels_read: [worker-1, worker-2]}
+arms:
+  team:
+    world: {type: programbench, params: {task: abishekvashok__cmatrix.5c082c6}}
+    medium:
+      delivery: pull
+      topology:
+        type: rooms
+        params:
+          rooms:
+            lead: [a000, a001, a002]
+            worker-1: [a000, a001]
+            worker-2: [a000, a002]
+    participants:
+      - {type: mini_swe_agent, count: 1, role: lead,
+         params: {model: "anthropic:claude-haiku-5-5", templates: lead, steps_per_turn: 10,
+                  step_limit: 100, wait_tool: true}}
+      - {type: mini_swe_agent, count: 2, role: worker,
+         params: {model: "anthropic:claude-haiku-5-5", templates: worker, steps_per_turn: 10,
+                  step_limit: 100, idle_until_assigned: true}}

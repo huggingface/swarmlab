@@ -37,7 +37,7 @@ Every param is in the spec and its hash. That includes `backend`: a run inside t
 ## The two backends
 
 - **`local`** runs `bash -lc <command>` directly, in its own session, with the output going to a temp file. This is the shape for an HF Job that runs swarmlab inside the task image (Jobs cannot run Docker). The command environment is the inherited one minus anything secret-looking (`ANTHROPIC_*`, `HF_TOKEN`, `*_KEY`, `*_TOKEN`, `*_SECRET`, ...), minus every name the job launcher lists in `SWARMLAB_SECRET_NAMES` (so a key in a variable like `MODEL_AUTH` is dropped too) and minus swarmlab's own virtualenv, plus the baseline variables and, with a known CPU count, `MAKEFLAGS=-j<n>`, `CARGO_BUILD_JOBS`, `OMP_NUM_THREADS` and `GOMAXPROCS`.
-- **`docker`** runs `docker run -d --network none --cpus 20 --memory 60g --memory-swap 60g --user agent --cap-drop SYS_PTRACE <image> sleep 7h` at the first command, then `docker exec -w /workspace -e PAGER=cat ... bash -lc <command>` per call, as mini-swe-agent does. The container is removed at the end of the last round (terminal, or the run's `max_rounds`); a run that stops another way (budget, stop condition, crash) relies on a cleanup hook that runs at interpreter exit.
+- **`docker`** runs `docker run -d --network none --cpus 20 --memory 60g --memory-swap 60g --user agent --cap-drop SYS_PTRACE <image> sleep 7h` at the first command, then `docker exec -w /workspace -e PAGER=cat ... bash -lc <command>` per call, as mini-swe-agent does. The container is removed at the end of the last round or tick (terminal, or the run's `max_rounds`), after every command still running in it is killed; a run that stops another way (budget, stop condition, crash) relies on a cleanup hook that runs at interpreter exit.
 
 Neither backend starts before the first command: `swarmlab prompts`, `replay`, `report` and the viewer never start a container or lock a machine down.
 
@@ -47,8 +47,9 @@ Under lockdown (local backend, `lockdown: true`, swarmlab running as root), the 
 
 - One tool, `bash(command)`, with mini-swe-agent's schema. Its feedback is the baseline's result dict, `{"output", "returncode", "exception_info"}`: stdout and stderr merged, never truncated for the agent (the 5000/5000-character head and tail rendering past 10000 characters is the participant's job). The only cap is `max_output_bytes`.
 - Every call is a fresh `bash -lc` in the workspace, so `cd` and `export` do not persist. The environment carries `PAGER=cat MANPAGER=cat LESS=-R PIP_PROGRESS_BAR=off TQDM_DISABLE=1`.
-- On a timeout the agent sees the output so far, return code -1 and the baseline's `An error occurred while executing the command: ...` text. The process keeps running, as under Docker, where only the waiting client is killed.
+- On a timeout the agent sees the output so far, return code -1 and the baseline's `An error occurred while executing the command: ...` text. The process keeps running, as under Docker, where only the waiting client is killed. The world keeps track of it until it exits; a submission or the run's end kills it.
 - A command whose first non-blank output line is `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`, with return code 0, submits. The run is then terminal and any later `bash` is refused (`submitted`). There is no `submit` tool. At a limit, the workspace is submitted as it is.
+- Submission freezes the workspace: when a command submits, the world kills every other command still running (another agent's, under `commit: async`, or a timed-out one in any mode), so the snapshot that ends the run holds the workspace the submission saw. A killed command returns the usual three keys: its output so far, return code `-9`, and `exception_info` `An error occurred while executing the command: Command '<command>' was killed: a000 submitted the final output (the episode is over)`. The last round or tick kills whatever is still running (`the run ended`) the same way.
 - Before the first command the world sets the baseline's git identity in the workspace repo (not a step).
 - The task text (`World.description()`, what an `llm` participant sees) is the baseline's system template followed by its instance template, with the same machine details filled in. One sentence is added at the end (below).
 
@@ -83,7 +84,7 @@ arms:
 
 The `solo` role leaves the agent `bash` (and `end_turn`, which is always offered) and hides the board's `read_board` and `post`, as in the baseline.
 
-The world needs `commit: immediate`, because a coding agent needs each command's output before its next call, so `validate` refuses `round_end`. At run start, a one-round run must also allow at least `step_limit` tool calls in its turn (`max_calls_per_turn >= 1000`), otherwise the default 20-call cap would end the episode long before the benchmark's limit. Runs with several rounds of k calls are a legitimate variation and are not checked. There the participant enforces the step limit.
+The world needs `commit: immediate` or `commit: async`, because a coding agent needs each command's output before its next call, so `validate` refuses `round_end`. The official solo shape is `immediate`, one round, one turn; `async` is for teams ([Async team](#async-team)). At run start, a one-round run must also allow at least `step_limit` tool calls in its turn (`max_calls_per_turn >= 1000`), otherwise the default 20-call cap would end the episode long before the benchmark's limit. Runs with several rounds of k calls are a legitimate variation and are not checked. There the participant enforces the step limit.
 
 The `llm` participant is swarmlab's own loop and does not reproduce the baseline's observation template or step warnings. The faithful participant is mini-swe-agent 2.4.6 itself (next section). `swarmlab job run` without vLLM and `swarmlab programbench grade` come in follow-up PRs.
 
@@ -109,8 +110,8 @@ The participant does not install mini-swe-agent: its agent loop, exceptions and 
 | `temperature` | null | null leaves the provider's default, as the baseline does |
 | `extra` | `{}` | provider body fields, as for `llm` |
 | `templates` | `solo` | `solo`, `lead`, `worker`, or `file:<path>` (a YAML mapping with `system_template` and `instance_template`) |
-| `idle_until_assigned` | false | a worker: no model call until something is delivered; its report to `lead_channel` ends the assignment |
-| `wait_tool` | false | a lead: offer `wait_for_workers`, which ends the turn after the step (not with `templates: solo`) |
+| `idle_until_assigned` | false | a worker: no model call until something is delivered; its report to `lead_channel` ends the assignment. Under `commit: async` it waits for the delivery with the core `wait` tool (its role must list `wait`) |
+| `wait_tool` | false | a lead: offer `wait_for_workers`, which ends the turn after the step; under `commit: async` it waits for the reports and returns them instead (its role must list `wait`). Not with `templates: solo` |
 | `lead_channel` | `lead` | where workers post reports |
 | `worker_channels` | null | the lead's channels to its workers; null: the agent's `post` channels other than `lead_channel` |
 
@@ -145,7 +146,7 @@ How the transcript matches the baseline:
 
 ## Swarm shape
 
-The lead/worker scaffold of arXiv 2610.17471 with this participant: a lead with the official task text and delegation instructions, workers that see only their assignments, a shared workspace, and k steps per turn:
+The lead/worker scaffold of arXiv 2610.17471 with this participant: a lead with the official task text and delegation instructions, workers that see only their assignments, a shared workspace, and k steps per turn. This section is the lockstep variant (`commit: immediate`, rounds, the `fixed` scheduler): every agent takes one turn per round, so a fast agent waits for the slowest one every round. The [async team](#async-team) below runs the same team with no round barrier.
 
 ```yaml
 name: programbench-team
@@ -186,6 +187,51 @@ arms:
 - Each agent has its own step limit and its own clock (its turns only); the world's 6 h clock is shared, and past it every command is refused, which ends each agent's episode (`TimeExceeded`).
 
 Check a spec without spending: `swarmlab validate <spec>` and `swarmlab prompts <spec>` show the exact system and first user message of the lead and of a worker.
+
+## Async team
+
+The same team under `commit: async` (`examples/programbench_team_async.yaml`): there are no rounds and no barrier, every agent works at its own pace, and messages arrive while an agent works, not at the next round.
+
+```yaml
+name: programbench-team-async
+seeds: [0]
+budget: {hard_usd: 5.0}
+options: {commit: async, rounds_per_agent: 30, max_calls_per_turn: 40}
+roles:
+  lead: {tools: [bash, post, read_board, wait], channels_write: [worker-1, worker-2]}
+  worker: {tools: [bash, post, read_board, wait], channels_read: [worker-1, worker-2]}
+arms:
+  team:
+    world: {type: programbench, params: {task: abishekvashok__cmatrix.5c082c6}}
+    medium:
+      delivery: pull
+      topology:
+        type: rooms
+        params:
+          rooms:
+            lead: [a000, a001, a002]
+            worker-1: [a000, a001]
+            worker-2: [a000, a002]
+    participants:
+      - {type: mini_swe_agent, count: 1, role: lead,
+         params: {model: "anthropic:claude-haiku-5-5", templates: lead, steps_per_turn: 10,
+                  step_limit: 100, wait_tool: true}}
+      - {type: mini_swe_agent, count: 2, role: worker,
+         params: {model: "anthropic:claude-haiku-5-5", templates: worker, steps_per_turn: 10,
+                  step_limit: 100, idle_until_assigned: true}}
+```
+
+The world's `backend` is left at `local`, the HF Jobs shape (`swarmlab job run` plans it); set `backend: docker` to run it on a machine with Docker. It needs the task image either way, so fake models cannot run it; `swarmlab validate` and `swarmlab prompts` work offline.
+
+- **Ticks.** Each agent loops over its own turns, all at once; every completed turn of any agent closes one tick, which is what events, snapshots and `max_rounds` count. `rounds_per_agent: 30` caps every agent at 30 turns (so at most 90 ticks). There is no scheduler: `commit: async` refuses one.
+- **`steps_per_turn` is the tick cadence.** A turn is at most 10 model calls, so each agent's progress is logged and can be snapshotted at least every 10 steps. It no longer makes anyone wait: a worker's 10 steps and the lead's 10 steps run at the same time, and their commands run at the same time in the shared workspace.
+- **The `wait` primitive.** Both roles list the core `wait` tool (offered only under async). The participant uses it; its model never sees it. An idle worker calls it itself, with no model call: its turn parks until the lead posts on its room, the post becomes its assignment, and it works up to 10 steps per turn until it posts its report on `lead`, then waits again. The lead's `wait_for_workers` is one `wait`: it returns the reports as its tool result (rendered as a `read_board` result) and the lead's turn goes on. The lead's prompt says so ("it returns them as its result"); the worker's prompt says that between assignments it waits.
+- **The deadlock rule.** A `wait` returns at once, empty, when every other running agent is waiting or finished, since nobody could post. The lead then reads `no worker can report: every worker is idle or finished ...` and goes on. An idle worker's turn ends with the note `idle` and its next turn waits again; such a turn costs no model call but closes a tick, so a worker that is never given work ends at its `rounds_per_agent` cap (or when the run ends).
+- **The submission freeze.** When the lead's submission command returns, the world kills every command still running (the workers' included) and refuses new ones. The run ends at the tick the lead's turn closes, so its last turn is in the log; the other agents' turns still in flight are then cancelled, and their commits stand.
+- **The final snapshot.** The tick that ends the run is always snapshotted, whatever `snapshot_every`, so grading reads the frozen workspace. Snapshots of earlier ticks may catch a file another agent's command is writing; resume and fork lose the turns that were in flight anyway.
+- **Clocks.** Each agent's own 6 h clock (the participant's `wall_limit_s`) is plain wall time inside its turns, including the time it spends in `wait`. The world's shared clock (the world's `wall_limit_s`, from the first tick) is the real limit: past it every command is refused, which ends every agent's episode (`TimeExceeded`).
+- **Step limits.** `step_limit: 100` is per agent (each participant's own limit, at most 300 model calls for the team). The world's `step_limit` is only checked for a one-round (or one-tick) run.
+- The solo official shape stays `commit: immediate`, one round, one turn.
 
 ## Snapshots, resume and the viewer
 
@@ -242,7 +288,7 @@ swarmlab programbench grade runs/<run_id> --launch [--wait]  # submits; --wait p
 swarmlab programbench fetch-grade runs/<run_id>              # later: download grade.json, write the score
 ```
 
-`grade` writes the run's last committed snapshot workspace to `runs/<run_id>/artifacts/submission.tar.gz`. If that snapshot holds no workspace (no command ever ran), it writes an empty `artifacts/submission.untouched` marker and refuses, since there is nothing of the agent's to grade. It also refuses when the last snapshot is older than the run's last round (`snapshot_every` above 1 skipped it; no extra snapshot is taken at the end), naming both rounds: the final workspace was never saved. Use the solo shape (`max_rounds: 1`) or `snapshot_every: 1`. It then plans a second job:
+`grade` writes the run's last committed snapshot workspace to `runs/<run_id>/artifacts/submission.tar.gz`. If that snapshot holds no workspace (no command ever ran), it writes an empty `artifacts/submission.untouched` marker and refuses, since there is nothing of the agent's to grade. It also refuses when the last snapshot is older than the run's last round, naming both rounds: the final workspace was never saved. The round (or tick) that ends a run is always snapshotted, whatever `snapshot_every`, so this happens only to a run that did not end normally (a hard ceiling or a crash discards the round in flight); resume it to finish it. It then plans a second job:
 
 - image: the task's clean `task_cleanroom_v6` image, which is also what the official evaluator uses;
 - flavor `cpu-upgrade` by default. pytest runs with as many workers as the job's real CPU count, read from the cgroup;

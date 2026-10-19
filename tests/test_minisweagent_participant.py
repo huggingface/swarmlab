@@ -1060,3 +1060,50 @@ def test_async_wait_for_workers_says_so_when_no_worker_can_report(tmp_path):
     assert [m["content"] for m in wait] == [WAIT_STALLED]   # the idle worker is waiting too
     assert len(turns(run, "a000")) == 1
     assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+
+
+EXAMPLE_ASYNC = Path(__file__).resolve().parents[1] / "examples" / "programbench_team_async.yaml"
+
+
+def test_guide_async_team_spec_is_the_example_and_validates(tmp_path):
+    from typer.testing import CliRunner
+
+    from swarmlab.cli import app
+    from swarmlab.prompts_cmd import render_prompts
+
+    spec = _guide_yaml("programbench-team-async")
+    assert spec == yaml.safe_load(EXAMPLE_ASYNC.read_text())
+    res = CliRunner().invoke(app, ["validate", str(EXAMPLE_ASYNC)])
+    assert res.exit_code == 0, res.output
+    exp = Experiment.from_yaml(EXAMPLE_ASYNC, "team")
+    assert exp.options["commit"] == "async" and "scheduler" not in exp.options
+    lead_row, worker_row = render_prompts(exp)
+    assert lead_row["turn_based"] and lead_row["tools"] == [
+        "bash", "read_board", "post", "end_turn", "wait_for_workers"]
+    assert "it returns them as its result" in lead_row["user"]
+    assert "`worker-1`, `worker-2`" in lead_row["user"]
+    assert "wait" not in worker_row["tools"]
+    assert "When you have no assignment, you wait until the lead sends one." in worker_row["user"]
+
+
+def test_guide_async_team_spec_runs_end_to_end_with_fake_models(tmp_path):
+    spec = _guide_yaml("programbench-team-async")
+    arm = spec["arms"]["team"]
+    arm["world"]["params"].update(workspace=str(tmp_path / "ws"), user=None, lockdown=False,
+                                  check_task=False)
+    arm["participants"][0]["params"]["model"] = fake("team_lead")
+    arm["participants"][1]["params"]["model"] = fake("team_worker")
+    spec["providers"] = {"fake": {"type": "fake", "params": {"yields": [0, 20]}}}
+    path = tmp_path / "team.yaml"
+    path.write_text(yaml.safe_dump(spec))
+    run = Experiment.from_yaml(path, "team").run(seed=0, out=tmp_path / "runs")
+    assert run.meta["end_reason"] == "terminal" and run.score["submitted"]
+    posts = sorted((e["agent"], e["channel"]) for e in run.events if e["type"] == "post")
+    assert posts == [("a000", "worker-1"), ("a000", "worker-2"), ("a001", "lead"),
+                     ("a002", "lead")]
+    assert state(run, "a000")["messages"][-1]["extra"]["exit_status"] == "Submitted"
+    store = SnapshotStore(run.dir)
+    assert store.latest().round == run.meta["last_round"]
+    assert pb.workspace_tar_of(store.load(store.latest())["world"]) == \
+        pb.workspace_tar(tmp_path / "ws")[0]
+    assert Run.load(run.dir).replay()["score"] == run.score

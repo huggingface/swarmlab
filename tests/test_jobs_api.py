@@ -293,3 +293,22 @@ def test_api_mode_parallel_schedules_runs_and_refuses_programbench(tmp_path):
     with pytest.raises(SpecError, match="--parallel 2 with a programbench run"):
         plan(write(tmp_path, solo_doc()), parallel=2)
     assert plan(write(tmp_path, solo_doc()), parallel=1).timeout_s == 7 * 3600
+
+
+EXAMPLE_ASYNC = REPO / "examples" / "programbench_team_async.yaml"
+
+
+def test_async_programbench_team_example_plans_one_api_job(tmp_path):
+    p = plan(EXAMPLE_ASYNC)
+    assert p.mode == "api" and p.image == IMAGE and p.flavor == "cpu-upgrade"
+    assert [r for r, _ in p.runs] == ["team"]                     # one run per job holds
+    assert p.timeout_s == 7 * 3600                                # the 6 h wall limit + 1 h
+    detail = p.estimate_detail["arms"]["team"]
+    # rounds_per_agent 30 x 3 agents resolves to 90 ticks, bounded by the world's wall limit
+    assert (detail["agents"], detail["rounds"], detail["unit"]) == (3, 90, "tick")
+    text = jl.describe(p)
+    assert "team: N=3, up to 90 ticks (async), bounded by the world's wall limit 6h/run" in text
+    assert "an upper bound: the wall limit" in text
+    # the round-based solo arm prints as before
+    solo = jl.describe(plan(write(tmp_path, solo_doc())))
+    assert "solo: N=1, bounded by the world's wall limit 6h/run" in solo
