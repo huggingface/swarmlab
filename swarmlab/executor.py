@@ -109,7 +109,11 @@ Decisions where the contract is silent:
   Offered and allowed only with a hub (`waits`, async) and when the agent's role lists `wait`
   explicitly (`_wait_listed`); otherwise `not_allowed`. Parked turns await the hub's event
   through `_suspend`, so `cancel()` releases them with `CancelledError`. `_post` notifies the
-  hub after every committed post.
+  hub after every committed post. A parked turn gives its concurrency permit back to the hub
+  (`WaitHub.release`) before it first parks and reacquires it (`WaitHub.acquire`, also through
+  `_suspend`) before it returns, so an agent that would post is never kept from starting by a
+  waiter holding the slot; a turn cancelled while parked or reacquiring holds no permit, and
+  the runner's release after it is a no-op. `waited_s` includes the reacquisition.
 - Concurrency: for a synchronous world tool (and every board, status and registry tool) `call`
   never suspends, so under asyncio each such call is atomic. During round_end turns it only reads
   shared world state and touches the calling agent's own board inbox (`board.read`), so
@@ -213,20 +217,30 @@ WAIT_LIMIT = 50  # posts a `wait` returns at most (read_board's default limit)
 
 
 class WaitHub:
-    """`commit: async`: wakes the turns parked in `wait` (module docstring, Wait).
+    """`commit: async`: wakes the turns parked in `wait` and owns the turns' concurrency permits
+    (module docstring, Wait).
 
     One per async run, shared by every turn's executor. `running` holds the agents whose turn loop
-    is live (the runner registers every live agent before any loop starts and removes an agent when
-    its loop ends), `waiting` the agents parked in `wait` right now. `notify()` wakes every parked
-    `wait` to re-check: the executors call it after each committed post, the runner when a tick
-    opens (a delayed delivery may have become eligible) and when an agent's loop ends (the waiters
-    may now be the only agents left). No polling: a parked `wait` awaits an `asyncio.Event` that
-    `notify()` sets and replaces."""
+    is live (the runner registers exactly the agents it starts a loop for, after the first tick's
+    kills, and removes an agent when its loop ends, however it ends), `waiting` the agents parked
+    in `wait` right now. `notify()` wakes every parked `wait` to re-check: the executors call it
+    after each committed post, the runner when a tick opens (a delayed delivery may have become
+    eligible) and when an agent's loop ends (the waiters may now be the only agents left). No
+    polling: a parked `wait` awaits an `asyncio.Event` that `notify()` sets and replaces.
 
-    def __init__(self) -> None:
+    Permits: `Semaphore(concurrency)` bounds the turns that run at once (None: unbounded). The
+    agent loop takes its permit with `acquire(agent)` before a turn and gives it back with
+    `release(agent)` after; a parked `wait` releases it and reacquires it before returning, so a
+    waiter never keeps another agent (a potential poster) from starting. `release` is a no-op
+    when the agent holds no permit (a turn cancelled while parked or while reacquiring), so a
+    permit is never released twice."""
+
+    def __init__(self, concurrency: int | None = None) -> None:
         self.running: set[AgentId] = set()
         self.waiting: set[AgentId] = set()
         self._event = asyncio.Event()
+        self._sem = None if concurrency is None else asyncio.Semaphore(max(1, concurrency))
+        self._held: set[AgentId] = set()
 
     @property
     def event(self) -> asyncio.Event:
@@ -242,11 +256,29 @@ class WaitHub:
     def finished(self, agent: AgentId) -> None:
         self.running.discard(agent)
         self.waiting.discard(agent)
+        self.release(agent)
         self.notify()
 
     def stalled(self, agent: AgentId) -> bool:
         """True when no agent but `agent` could post: every other running agent is waiting."""
         return all(a in self.waiting for a in self.running if a != agent)
+
+    async def acquire(self, agent: AgentId) -> None:
+        """Take `agent`'s turn permit (waits while `concurrency` turns hold one)."""
+        if self._sem is not None:
+            await self._sem.acquire()
+        self._held.add(agent)  # no await in between: a cancelled acquire never marks it held
+
+    def release(self, agent: AgentId) -> None:
+        """Give `agent`'s permit back; a no-op when it holds none."""
+        if agent in self._held:
+            self._held.discard(agent)
+            if self._sem is not None:
+                self._sem.release()
+
+    def free_permits(self) -> int | None:
+        """Permits not held right now (None: unbounded); `concurrency` once every loop ended."""
+        return None if self._sem is None else self._sem._value
 
 
 def board_schemas(board: Board) -> list[ToolSchema]:
@@ -695,11 +727,15 @@ class RoundExecutor:
         start = loop.time()
         deadline = None if timeout is None else start + float(timeout)
         timed_out = False
+        released = False  # the turn's permit, given up while parked (WaitHub, Permits)
         while not self._unread(agent):
             remaining = None if deadline is None else deadline - loop.time()
             if hub.stalled(agent) or (remaining is not None and remaining <= 0):
                 timed_out = True
                 break
+            if not released:
+                hub.release(agent)
+                released = True
             hub.waiting.add(agent)
             try:
                 async with asyncio.timeout(remaining):
@@ -709,6 +745,8 @@ class RoundExecutor:
                 break
             finally:
                 hub.waiting.discard(agent)
+        if released:  # not on a cancellation: the unwinding turn needs no permit
+            await self._suspend(hub.acquire(agent))
         posts: list[dict] = []
         if not timed_out:  # the same read as `read_board()`: marks read, logs `read`
             posts = self._read_readable(agent, call_id, WAIT_LIMIT).result["items"]

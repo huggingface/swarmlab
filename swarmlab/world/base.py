@@ -64,9 +64,13 @@ close in between, so the action's `action_committed` can land in a later tick th
 tool awaits only I/O, and mutates world state before or after its awaits, on the event-loop
 thread, never from another thread (nothing is locked: between two awaits the tool runs alone).
 When the turn is cancelled while the tool is awaiting (the run ended), the cancellation is raised
-at the tool's await and nothing is recorded: the action never committed. Undoing what the tool
-had already changed before that await is the world's own business (catch `CancelledError` in the
-tool). Under `round_end` the runner awaits the round's actions one at a time in commit order
+at the tool's await and nothing is recorded: the action never committed. So a tool that changed
+world state before an await must undo that change when the await raises `CancelledError` (in a
+`try/finally` or `except CancelledError` that re-raises; the undo may itself await, e.g. to reap a
+subprocess). The runner guarantees that undo has completed before the final snapshot: at the tick
+that ends the run it cancels the in-flight turns and awaits their unwinding before the final
+`budget` event, the snapshot, run.json's score and `run_ended` are written, so the final state,
+score and snapshot agree (and replay is exact). Under `round_end` the runner awaits the round's actions one at a time in commit order
 (`World.commit`, below). `swarmlab replay` never calls tools (it folds the log and restores
 snapshots), so an async world replays like a synchronous one.
 """
