@@ -101,7 +101,8 @@ is consistent):
    `delivery`, `registry`, `claim`, `action_committed`, with `round = t`. They include other
    agents' commits from turns still in flight, and none of A's commits made in earlier ticks
    (those were logged there): an action's `action_committed` is in the tick it committed in,
-   its `tool_called` in the tick its turn ended. Every event's `round` is the round of the next
+   its `tool_called` in the tick its turn ended (an async world tool, swarmlab/world/base.py,
+   commits when its await completes, possibly ticks after the call). Every event's `round` is the round of the next
    `round_committed` in the log, which is what recovery, fork and replay rely on, and `seq`
    increases with the true commit order.
 3. `outcomes_prev[A]` becomes A's own outcomes of the turn (its next `View.outcomes`);
@@ -312,7 +313,7 @@ from .interventions import (
     fire_interventions,
     replay_world_op,
 )
-from .medium.registry import Registry, commit_world
+from .medium.registry import Registry, acommit_world
 from .medium.topology import Gossip
 from .metrics.base import METRICS_REV, Metric
 from .metrics.base import get as get_metric
@@ -1425,8 +1426,8 @@ class Runner:
             reg = (self.registry.commit(r, [op for a in order for op in ex.buffered_registry(a)])
                    if self.registry is not None else [])  # M3b: registry before world actions
             actions = [x for a in order for x in ex.buffered_actions(a)]
-            outcomes, claims = commit_world(self.world, actions, registry=self.registry,
-                                            policy=self.board.claim_policy, round=r)
+            outcomes, claims = await acommit_world(self.world, actions, registry=self.registry,
+                                                   policy=self.board.claim_policy, round=r)
             applied = [(a, aid, act, out) for (a, aid, act), out in zip(actions, outcomes, strict=True)]
         else:
             posts, deliveries = ex.committed.posts, ex.committed.deliveries

@@ -100,9 +100,20 @@ Decisions where the contract is silent:
   `asyncio.CancelledError`. Without `on_commit` (every other mode) nothing changes.
   `turn_based=True` (async) describes `end_turn` as "Finish your turn." instead of "Finish your
   turn for this round.".
-- Concurrency: `call` contains no `await`, so under asyncio each call is atomic. During round_end
-  turns it only reads shared world state and touches the calling agent's own board inbox
-  (`board.read`), so concurrent turns cannot observe each other.
+- Concurrency: for a synchronous world tool (and every board, status and registry tool) `call`
+  never suspends, so under asyncio each such call is atomic. During round_end turns it only reads
+  shared world state and touches the calling agent's own board inbox (`board.read`), so
+  concurrent turns cannot observe each other.
+- Async world tools (swarmlab/world/base.py, Async tools): under immediate commit (and so under
+  async) `_world_action` validates synchronously, then awaits the tool through `acommit_world`;
+  only when it completes are the claim and the action journaled (`on_commit`), appended to
+  `committed` and returned, so the `action_committed` follows completion order across agents and
+  may land in a later tick than its `tool_called`. The action id (`x{round}...`) is taken before
+  the await, from the tick the call was made in. A cancellation while awaiting (the run ended)
+  propagates and records nothing: `cancel()` cancels a turn suspended in a call at once (before
+  any other task runs), so the tool's pending await raises `CancelledError`; if the tool swallows
+  that and completes anyway, its result is dropped the same way. Under round_end the action is buffered as usual and the
+  runner awaits the tools at commit (`acommit_world`).
 """
 from __future__ import annotations
 
@@ -130,8 +141,8 @@ from .medium.registry import (
     Registry,
     RegistryOp,
     RegistryOutcome,
+    acommit_world,
     check_op_args,
-    commit_world,
 )
 from .providers.base import ChatRequest, ChatResponse, Usage
 from .roles import Role
@@ -280,6 +291,7 @@ class RoundExecutor:
         self.hard_ceiling = False
         self.on_commit = on_commit  # async commit: the runner's journal (module docstring)
         self.cancelled = False
+        self._suspended: set[asyncio.Task] = set()  # turns awaiting inside a call (cancel())
         self.turn_based = turn_based  # async: `end_turn` is described per turn, not per round
         self._state: dict[AgentId, _AgentState] = {}
         self.committed = Committed()
@@ -427,8 +439,22 @@ class RoundExecutor:
 
     def cancel(self) -> None:
         """Async commit: the run ended while this turn was in flight. Every later `call` or
-        `infer` raises `asyncio.CancelledError` (nothing is applied, logged or sent)."""
+        `infer` raises `asyncio.CancelledError` (nothing is applied, logged or sent), and a turn
+        suspended inside a call (an async world tool awaiting) is cancelled at once, so the tool's
+        await raises before the tool can complete."""
         self.cancelled = True
+        for task in list(self._suspended):
+            task.cancel()
+
+    async def _suspend(self, awaitable: Any) -> Any:
+        """Await `awaitable` from inside a call, cancellable by `cancel()`."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._suspended.add(task)
+        try:
+            return await awaitable
+        finally:
+            self._suspended.discard(task)
 
     def _journal(self, kind: str, item: Any) -> None:
         if self.on_commit is not None:
@@ -461,7 +487,7 @@ class RoundExecutor:
         elif name in STATUS_TOOLS and name in self._world_tools:
             res = self._status(agent, call_id, name, args)
         elif name in self._world_tools:
-            res = self._world_action(agent, call_id, name, args)
+            res = await self._world_action(agent, call_id, name, args)
         else:
             res = self._err(call_id, "not_allowed")
         return self._ret(agent, res)
@@ -595,7 +621,7 @@ class RoundExecutor:
             return self._err(call_id, "not_allowed")
         return ToolResult(call_id=call_id, ok=True, result=dict(value))
 
-    def _world_action(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
+    async def _world_action(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
         action = Action(name=name, args=args)
         ack = (self.world.validate(agent, action, pending=self.pending_actions(agent))
                if self._validate_pending else self.world.validate(agent, action))
@@ -607,8 +633,11 @@ class RoundExecutor:
         if self.commit_mode == "round_end":
             st.actions.append((agent, action_id, action))
             return ToolResult(call_id=call_id, ok=True, result={"id": action_id}, pending=True)
-        outs, claims = commit_world(self.world, [(agent, action_id, action)], registry=self.registry,
-                                    policy=self.claim_policy, round=self.round)
+        outs, claims = await self._suspend(acommit_world(
+            self.world, [(agent, action_id, action)], registry=self.registry,
+            policy=self.claim_policy, round=self.round))
+        if self.cancelled:  # the run ended while an async tool awaited and the tool finished anyway
+            raise asyncio.CancelledError()
         outcome = outs[0]
         outcome.action_id = action_id
         self.committed.claims.extend(claims)

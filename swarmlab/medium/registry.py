@@ -65,6 +65,7 @@ only when the registry is on, so other runs' manifests are unchanged.
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from collections.abc import Sequence
 from typing import Any, ClassVar
@@ -306,7 +307,8 @@ def commit_world(world: Any, actions: list[tuple[AgentId, ActionId, Any]], *, re
 
     Without a registry this is exactly `world.commit(actions)`. Outcomes are in action order;
     rejected actions never reach the world. A claim record is the `claim` event's fields plus
-    `agent`.
+    `agent`. An outcome may be an awaitable when the world has async tools; `acommit_world`
+    awaits them.
     """
     if registry is None:
         return world.commit(actions), []
@@ -334,3 +336,30 @@ def commit_world(world: Any, actions: list[tuple[AgentId, ActionId, Any]], *, re
     for i, out in zip(passed, world.commit([actions[i] for i in passed]), strict=True):
         outcomes[i] = out
     return outcomes, claims
+
+
+async def settle_outcomes(outcomes: list[Any]) -> list[Any]:
+    """Await, in order, the entries of `outcomes` that are awaitables (a world's async tools,
+    `World.commit`), replacing each by its `Outcome`. If one raises (or the await is cancelled),
+    the entries not yet awaited are closed without running, so no later action is half-applied by
+    the caller, and the exception propagates."""
+    for i, out in enumerate(outcomes):
+        if inspect.isawaitable(out):
+            try:
+                outcomes[i] = await out
+            except BaseException:
+                for rest in outcomes[i + 1:]:
+                    if inspect.iscoroutine(rest):
+                        rest.close()
+                raise
+    return outcomes
+
+
+async def acommit_world(world: Any, actions: list[tuple[AgentId, ActionId, Any]], *,
+                        registry: Registry | None, policy: ClaimPolicy | None,
+                        round: int) -> tuple[list[Any], list[dict]]:
+    """`commit_world`, then `settle_outcomes`: what the executor and the runner call, so a world
+    tool may return an awaitable (swarmlab/world/base.py, Async tools). For a world whose tools are
+    all synchronous it never suspends, and returns exactly what `commit_world` returns."""
+    outcomes, claims = commit_world(world, actions, registry=registry, policy=policy, round=round)
+    return await settle_outcomes(outcomes), claims

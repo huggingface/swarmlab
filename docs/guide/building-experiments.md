@@ -129,6 +129,15 @@ To use it from YAML, save it as `myworld.py` next to the spec and write `world: 
   @tool("choose_site", "Hold a site", {"site": lambda self: {"type": "string", "enum": self.sites}})
   def choose_site(self, agent, site): ...
   ```
+- A tool that waits on I/O (a subprocess, a network call) can be `async def`: the executor awaits it, and under `commit: async` the other agents keep acting meanwhile instead of the whole event loop freezing. Await only I/O and change world state before or after the await, never from another thread; if the run ends while the tool awaits, the await raises `CancelledError` and the action is not recorded, so clean up what you started there ([INTERFACE §8](../INTERFACE.md#8-world), Async tools):
+
+  ```python
+  @tool("bash", "Run a shell command", {"cmd": "string"})
+  async def bash(self, agent, cmd):
+      proc = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE)
+      out, _ = await proc.communicate()
+      return Outcome(accepted=True, feedback={"stdout": out.decode()[-4000:]})
+  ```
 - Declare the run settings the world needs, and a spec that breaks them fails at construction (`validate`, `run`, `prompts`, `estimate`) instead of producing meaningless numbers. Checks that depend on the participants (what a model or custom agent can read, after roles apply) go in a `check_experiment(experiment)` override (calling `super()`): the runner calls it at run initialisation on the bound, role-applied participants, before any inference, so `validate` and `estimate` may accept a spec that it then refuses ([INTERFACE §8](../INTERFACE.md#8-world)):
 
   ```python
