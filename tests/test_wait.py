@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -183,3 +184,147 @@ def test_llm_agent_received_memory_ingests_wait_posts():
             "content": "go"}
     agent._note_read("wait", {"posts": [item], "timed_out": False, "waited_s": 0.0})
     assert [m["content"] for m in agent.received] == ["go"]
+
+
+# ---- permits: a parked wait gives its concurrency slot back (WaitHub, Permits) ----------------
+
+HUBS: list[WaitHub] = []
+
+
+class _Hub(WaitHub):
+    def __init__(self, *args, **kw) -> None:
+        super().__init__(*args, **kw)
+        HUBS.append(self)
+
+
+def _run(exp: Experiment, monkeypatch, deadline_s: float = 30.0, **kw):
+    """`exp.run(**kw)` in a thread, failing (not hanging) when it is not done in `deadline_s`;
+    records the run's WaitHub in HUBS."""
+    import swarmlab.runner
+
+    HUBS.clear()
+    monkeypatch.setattr(swarmlab.runner, "WaitHub", _Hub)
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(exp.run(**kw)), daemon=True)
+    t.start()
+    t.join(deadline_s)
+    assert not t.is_alive(), "the run hung"
+    assert out, "the run raised"
+    return out[0]
+
+
+class Chatter(Participant):
+    """Posts "n" every turn, after a few loop steps."""
+
+    async def turn(self, view, tools):
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await tools.call("post", {"text": f"{view.turn}"})
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=2)
+
+
+def test_a_parked_wait_lets_the_poster_take_the_only_slot(tmp_path, monkeypatch):
+    RESULTS.clear()
+    exp = _exp([Waiter(), Lead()], ["worker", "lead"], concurrency=1, rounds_per_agent=1)
+    run = _run(exp, monkeypatch, seed=0, out=tmp_path)
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 2
+    _, ok, res, _ = RESULTS["a000"][0]
+    assert ok and res["timed_out"] is False and [p["content"] for p in res["posts"]] == ["go"]
+    assert HUBS[0].free_permits() == 1 and HUBS[0].running == set()
+    assert Run.load(run.dir).replay()["last_round"] == 2
+
+
+def test_waiters_holding_every_slot_let_a_queued_poster_in(tmp_path, monkeypatch):
+    RESULTS.clear()
+    exp = _exp([Waiter(), Waiter(), Lead()], ["worker", "worker", "lead"], concurrency=2,
+               rounds_per_agent=1)
+    run = _run(exp, monkeypatch, seed=0, out=tmp_path)
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 3
+    for a in ("a000", "a001"):
+        _, ok, res, _ = RESULTS[a][0]
+        assert ok and res["timed_out"] is False and [p["content"] for p in res["posts"]] == ["go"]
+    assert HUBS[0].free_permits() == 2
+    assert run.score == {"total": 0}
+
+
+def test_a_wait_cancelled_at_run_end_with_its_permit_released_leaks_nothing(tmp_path, monkeypatch):
+    RESULTS.clear()
+    exp = _exp([Lead(post=False), Waiter()], ["lead", "worker"], concurrency=1)
+    run = _run(exp, monkeypatch, seed=0, max_rounds=3, out=tmp_path)
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 3
+    assert "a001" not in RESULTS  # parked (its permit given up) when the run ended
+    assert not any(e.get("agent") == "a001" for e in _events(run.dir)
+                   if e["type"] in ("turn_started", "tool_called", "turn_ended"))
+    assert HUBS[0].free_permits() == 1 and HUBS[0].running == set()
+    assert Run.load(run.dir).replay()["last_round"] == 3
+
+
+def test_many_waits_leave_every_permit_free(tmp_path, monkeypatch):
+    RESULTS.clear()
+    exp = _exp([Chatter(), Waiter(), Waiter()], ["lead", "worker", "worker"], concurrency=1)
+    run = _run(exp, monkeypatch, seed=0, max_rounds=30, out=tmp_path)
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 30
+    waits = [r for a in ("a001", "a002") for r in RESULTS.get(a, []) if r[0] == "wait"]
+    assert len(waits) >= 10 and any(not r[2]["timed_out"] for r in waits)
+    assert HUBS[0].free_permits() == 1 and HUBS[0].running == set()
+
+
+def test_hub_release_is_idempotent_and_cancelled_acquire_holds_nothing():
+    async def go():
+        hub = WaitHub(1)
+        await hub.acquire("a")
+        hub.release("a")
+        hub.release("a")  # not held any more: no second release
+        assert hub.free_permits() == 1
+        await hub.acquire("a")
+        blocked = asyncio.create_task(hub.acquire("b"))
+        await asyncio.sleep(0)
+        blocked.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await blocked
+        hub.release("b")  # cancelled while acquiring: holds nothing
+        hub.finished("a")  # a loop that ends gives its permit back
+        assert hub.free_permits() == 1
+        assert WaitHub().free_permits() is None  # unbounded
+
+    asyncio.run(go())
+
+
+# ---- hub membership follows the agent loops --------------------------------------------------
+
+class KillTotal(SyncTotal):
+    """`killed_at(r)` returns `kills[r]`."""
+
+    def __init__(self, kills: dict[int, list[str]]) -> None:
+        self.kills = kills
+
+    def killed_at(self, round):
+        return list(self.kills.get(round, []))
+
+
+def test_an_agent_killed_when_the_first_tick_opens_is_not_a_poster(tmp_path, monkeypatch):
+    RESULTS.clear()
+    exp = Experiment(name="kill1", world=KillTotal({1: ["a001"]}),
+                     participants=[assign(Waiter(), "worker"), assign(Lead(), "lead")],
+                     roles=ROLES, options={"commit": "async", "rounds_per_agent": 1})
+    run = _run(exp, monkeypatch, seed=0, out=tmp_path)
+    _, ok, res, _ = RESULTS["a000"][0]
+    assert ok and res["timed_out"] is True and res["waited_s"] < 1
+    assert HUBS[0].running == set()
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 1
+
+
+def test_a_later_kill_of_the_only_other_agent_releases_a_waiter(tmp_path, monkeypatch):
+    RESULTS.clear()
+    exp = Experiment(name="kill2", world=KillTotal({2: ["a001"]}),
+                     participants=[assign(Waiter(), "worker"), assign(Lead(post=False), "lead")],
+                     roles=ROLES, options={"commit": "async"})
+    run = _run(exp, monkeypatch, seed=0, max_rounds=3, out=tmp_path)
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 3
+    first = RESULTS["a000"][0][2]
+    assert first["timed_out"] is True and first["posts"] == []
+    starts = [e for e in _events(run.dir) if e["type"] == "round_started"]
+    assert [e["order"] for e in starts] == [["a001"], ["a000"], ["a000"]]
+    assert HUBS[0].running == set() and HUBS[0].free_permits() == 32
+    assert Run.load(run.dir).replay()["last_round"] == 3
