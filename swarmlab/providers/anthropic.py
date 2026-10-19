@@ -66,6 +66,13 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   jittered backoff as the OpenAI-compatible adapter; exhausted retries raise
   `ProviderError(status=..., attempts=...)` chained to the last SDK error. Other
   `APIStatusError`s (4xx) propagate unchanged at once.
+- Pricing: `default_pricing` is the catalog's `ANTHROPIC_MODELS` table. For a model with a
+  prompt-length tier (`catalog.ANTHROPIC_LONG_PROMPT`: Haiku 5.5 over 100,000 prompt tokens),
+  `cost` prices a request whose `usage.prompt_tokens` (cache reads and writes included, as the
+  API counts it) is over the threshold entirely at the long row, and `max_cost` does the same with
+  the estimated prompt tokens. The tier applies only while the model's row is the built-in one
+  (a `pricing:` override for that model replaces both). Both hand the tier row to `base.usage_cost` /
+  `base.max_request_cost` together with the cache-write factor (next bullet).
 - Prompt caching (provider params `prompt_cache`, `cache_ttl`; docs/INTERFACE-M1b.md §1
   amendment). `prompt_cache="prefix"` (the default; `True` means the same) sends two cache
   breakpoints: an explicit `cache_control` marker on the system text (`system` then goes as one
@@ -133,10 +140,13 @@ from .base import (
     Refusal,
     Usage,
     check_tool_choice,
+    max_request_cost,
     model_id,
     parse_json_args,
     text_of,
+    usage_cost,
 )
+from .catalog import ANTHROPIC_LONG_PROMPT, ANTHROPIC_MODELS
 
 THINKING_BUDGET_MODELS = frozenset({"claude-haiku-4-5"})
 PROMPT_CACHE_MODES = ("none", "auto", "prefix")
@@ -390,7 +400,7 @@ def parse_refusal(message: Any) -> Refusal | None:
 class AnthropicProvider(Provider):
     entry_point: ClassVar[str | None] = "anthropic"
     name = "anthropic"
-    default_pricing: ClassVar[dict[str, PricingRow]] = {"claude-haiku-4-5": (1.00, 5.00, 0.10)}
+    default_pricing: ClassVar[dict[str, PricingRow]] = dict(ANTHROPIC_MODELS)
 
     def __init__(self, pricing: dict | None = None, concurrency: int = 8,
                  timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES,
@@ -408,12 +418,32 @@ class AnthropicProvider(Provider):
         self._client: Any = None
         self._client_loop: Any = None
 
+    # ---- pricing (prompt-length tiers) ---------------------------------------------------------
+    def _row_for(self, model: str, prompt_tokens: int) -> PricingRow:
+        row = self.model_pricing(model)
+        mid = model.split(":", 1)[1] if model.startswith(f"{self.name}:") else model
+        tier = ANTHROPIC_LONG_PROMPT.get(mid)
+        if tier is not None and row == ANTHROPIC_MODELS.get(mid) and prompt_tokens > tier[0]:
+            return tier[1]
+        return row
+
     def _cache_settings(self, request: ChatRequest) -> CacheSettings:
         return cache_settings(request, self.prompt_cache, self.cache_ttl)
 
     def max_write_factor(self, request: ChatRequest) -> float:
         """The largest write factor among the TTLs `request` sends; 1.0 when it sends none."""
         return self._cache_settings(request).write_factor
+
+    def max_cost(self, request: ChatRequest) -> float:
+        # the prompt-length tier row for the estimated prompt, every token possibly a cache write
+        prompt = self.estimate_prompt_tokens(request)
+        return max_request_cost(request, prompt, self._row_for(model_id(request), prompt),
+                                self.max_write_factor(request))
+
+    def cost(self, request: ChatRequest, usage: Usage, write_factor: float | None = None) -> float:
+        # the prompt-length tier row (long prompts) with the cache-write premium (base.usage_cost)
+        factor = self.write_factor if write_factor is None else write_factor
+        return usage_cost(usage, self._row_for(model_id(request), usage.prompt_tokens), factor)
 
     def _get_client(self) -> Any:
         loop = asyncio.get_running_loop()

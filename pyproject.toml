@@ -18,6 +18,7 @@ dependencies = [
 anthropic = ["anthropic>=1.11"]  # top-level cache_control kwarg (prompt caching)
 hub = ["datasets>=3", "huggingface_hub>=0.25"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10"]
+programbench = ["programbench==1.2.5"]
 
 [project.scripts]
 swarmlab = "swarmlab.cli:app"
@@ -28,6 +29,7 @@ coloring = "swarmlab.world.coloring:ColoringGrid"
 hidden_sites = "swarmlab.world.hidden_sites:HiddenSites"
 cascade = "swarmlab.world.cascade:CascadeWorld"
 minesweeper = "swarmlab.world.minesweeper:Minesweeper"
+programbench = "swarmlab.world.programbench:ProgramBench"
 
 [project.entry-points."swarmlab.claim_policies"]
 advisory = "swarmlab.medium.registry:Advisory"
@@ -114,6 +116,7 @@ hidden_chooser = "swarmlab.world.hidden_sites:fake_chooser"
 cascade_herder = "swarmlab.world.cascade:fake_herder"
 minesweeper_random = "swarmlab.world.minesweeper:fake_random"
 minesweeper_allocator = "swarmlab.world.minesweeper:fake_allocator"
+programbench_echo = "swarmlab.world.programbench:fake_echo"
 
 [build-system]
 requires = ["hatchling"]

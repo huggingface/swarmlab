@@ -1,12 +1,12 @@
 # Real models and budgets
 
-Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, prompt caching, self-hosting with HF Jobs (vLLM serve profiles), refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
+Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, prompt caching, self-hosting with HF Jobs (vLLM serve profiles), API models in HF Jobs, refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
 
 ## Switching to real models
 
 - **Model ids** are `provider:model[:served_by]`: `anthropic:claude-haiku-4-5`, `hf:Qwen/Qwen3.5-9B:deepinfra` (the HF router, pinned to DeepInfra; without `:served_by` the router picks), `openai:<model>`, `vllm:<model>` (with a `providers:` base url). Put it in `model:` of each `llm` participant group.
 - **Keys** come from the environment: `ANTHROPIC_API_KEY` (or `ANTHROPIC_KEY`), `HF_TOKEN`, `OPENAI_API_KEY`. `swarmlab doctor demo.yaml` checks the keys and extras that spec needs and that the endpoints answer.
-- **Prices** are never typed by hand. `swarmlab models [--provider hf|anthropic] [--tools] [--search qwen]` lists models, who serves them, tool support and USD per million tokens. `hf` prices come from the router listing (cached 24 h in `~/.cache/swarmlab/catalog.json`); a bare `hf:Org/Model` is priced at its most expensive listed provider. The price used is written into the run spec. To override, or for a model the catalog does not price, add `providers: {hf: {type: openai_compat, params: {name: hf, pricing: {"Org/Model:prov": [in, out, cached]}}}}`.
+- **Prices** are never typed by hand. Claude Haiku 5.5 (`anthropic:claude-haiku-5-5`) is $0.10 / $0.50 / $0.01 per million prompt / completion / cached tokens, but a request whose prompt is over 100,000 tokens is priced at $0.50 / $2.50 / $0.05 for the whole request. The provider bills that tier; `estimate` and `swarmlab models` show the base row, so a long-context run (a ProgramBench episode) costs more than they suggest. `swarmlab models [--provider hf|anthropic] [--tools] [--search qwen]` lists models, who serves them, tool support and USD per million tokens. `hf` prices come from the router listing (cached 24 h in `~/.cache/swarmlab/catalog.json`); a bare `hf:Org/Model` is priced at its most expensive listed provider. The price used is written into the run spec. To override, or for a model the catalog does not price, add `providers: {hf: {type: openai_compat, params: {name: hf, pricing: {"Org/Model:prov": [in, out, cached]}}}}`.
 - **Timeouts**: each provider call attempt is cut off after `timeout_s` (default 90 s) and timeouts, connection errors, 429 and 5xx are retried up to `max_retries` times (default 2) with jittered 1/2/4 s backoff; the budget reservation is held across retries. A phase-commit round waits for its slowest call, so tighten these for slow-tailed routers: `providers: {hf: {type: openai_compat, params: {name: hf, timeout_s: 60, max_retries: 3}}}` (`type: anthropic` takes the same two params).
 - Each `inference_response` event records `attempts`; a call that still fails after its retries raises `ProviderError`.
 - **Preflight before spending**: `swarmlab preflight spec.yaml --arm A` sends ONE real request per LLM participant group through the real provider, with the arm's exact `model`, `max_tokens`, `temperature` and `extra`, its system prompt, the tools a run offers (world tools plus `post`, `read_board`, `end_turn`) and a one-line user message. It prints the worst case of those requests first (nothing is sent above `--max-usd`, default $0.05), then per group the model, latency, finish reason, whether a tool call parsed, reasoning tokens if the provider reports them, and on failure the provider's HTTP error text; exit 1 if any group fails or parses no tool call. A provider that rejects a body field otherwise shows up only as a run in which every turn errored.
@@ -56,6 +56,10 @@ All six were validated under **vLLM 0.27.1**, BF16, TP=1 (`swarmlab/jobs/profile
 swarmlab job run spec.yaml --model ibm-granite/granite-4.1-3b --flavor a10g-small \
   --vllm-version 0.27.1 --max-model-len 32768            # prints only; add --launch to submit
 ```
+
+### API models in HF Jobs (no vLLM)
+
+`swarmlab job run SPEC` without `--model`, for a spec whose arms call API models (no `vllm:` model), plans a CPU job with no vLLM. It runs on `cpu-upgrade` by default with the uv image, or with the task image for a [ProgramBench](programbench.md#running-in-hf-jobs) world. The model's key variable is passed by name (`--secrets ANTHROPIC_API_KEY`, or `ANTHROPIC_KEY` when only that one is set in your shell) next to `HF_TOKEN`. `--launch` refuses while one is unset. The printout says `mode: api (no vLLM)` and lists the secret names. Model calls are billed by the provider on top of the job's compute, and each run's budget caps them.
 
 ## Refusals
 
