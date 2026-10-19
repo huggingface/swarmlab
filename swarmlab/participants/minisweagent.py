@@ -32,7 +32,11 @@ Two shapes
 - Swarm: `steps_per_turn=k` runs at most k steps (model calls) per turn; the episode continues at
   the agent's next turn from its stored messages. Typically a lead with the `lead` templates and
   workers with the `worker` templates and `idle_until_assigned` (docs/guide/programbench.md,
-  "Swarm shape").
+  "Swarm shape"). Under `commit: immediate` (lockstep rounds, the `fixed` scheduler) or
+  `commit: async` (every agent loops over its own turns; k is then the tick cadence: each turn of
+  k steps closes one tick). Under async the idle worker and `wait_for_workers` use the core
+  `wait` tool (below), so the role of such an agent must list `wait` in its tools: the first turn
+  raises a `ValueError` naming the fix when `view.tools` lacks it.
 
 A finished agent (last message `exit`) never calls the model again: later turns return at once.
 
@@ -56,13 +60,22 @@ The turn
    `read_board`) the items of one `read_board` call the participant makes itself. Something new
    is its assignment: it runs its steps. Its assignment ends when it posts to `lead_channel` (its
    report; the turn ends after that step) and it is idle again until the next delivery. The
-   conversation is kept across assignments, as a resumed worker in the paper.
+   conversation is kept across assignments, as a resumed worker in the paper. Under `commit:
+   async` (`view.turn` set) the participant calls the core `wait` instead of `read_board`, still
+   with no model call: the turn parks until a post reaches the worker, and the posts `wait`
+   returns (marked read) are the assignment, inserted as in 4. When `wait` returns `timed_out`
+   with no posts (the deadlock rule: every other running agent is waiting or finished, so nobody
+   can post), the turn ends with the note `idle`; the runner then starts the worker's next turn,
+   which waits again. Such idle turns cost no model call but each closes a tick, so a worker
+   that is never assigned work ends by its per-agent cap (`options.rounds_per_agent`), or when
+   the run ends.
 6. Steps in a worker thread (the bridge, below): up to `steps_per_turn`, handling
    `InterruptAgentFlow` exactly as `run()`: a `FormatError` adds its cost and messages (and the
    `RepeatedFormatError` exit at the limit), any other (`Submitted`, `LimitsExceeded`,
    `TimeExceeded`) appends its exit message. With the other templates the turn also ends after
    a step in which the model called `end_turn`, `wait_for_workers`, or a call was refused
-   `turn_ended`; with `solo` none of these is offered.
+   `turn_ended`; with `solo` none of these is offered (under `commit: async`
+   `wait_for_workers` does not end the turn).
 
 Model adapter
 -------------
@@ -92,8 +105,14 @@ not actions: the adapter runs them itself (`post`, `read_board`, `end_turn` thro
 `wait_for_workers` is answered without a call: it posts nothing and ends the turn after the
 step) and records each result as a `tool` message, the JSON of `{"ok", "result", "error"}` (the
 `llm` participant's format; `wait_for_workers` gets `waiting for workers; their reports arrive at
-your next turn`). All calls of a reply run in the order the model issued them, and their tool
-messages follow in that order.
+your next turn`). Under `commit: async` `wait_for_workers` is one call of the core `wait` (one
+tool call against `max_calls_per_turn`) and does not end the turn: its tool message is the
+posts it returned, rendered as a `read_board` result (`{"ok": true, "result": {"items": [...]},
+"error": null}`), so the lead reads the reports inline; when `wait` timed out with no posts (no
+worker can report) the message is `WAIT_STALLED`. Its description differs per mode
+(`WAIT_SCHEMA` / `WAIT_SCHEMA_ASYNC`, chosen by `view.turn`). The core `wait` itself is never
+offered to the model (it is the participant's own). All calls of a reply run in the order the
+model issued them, and their tool messages follow in that order.
 
 Environment adapter
 -------------------
@@ -134,8 +153,8 @@ request was dispatched, as for any cancelled participant, or `tools.call`), refu
 and waits until the step thread has returned before it repairs the transcript as above, saves the
 state and re-raises. So nothing is appended to the saved messages afterwards. The cancelled step's
 model call is counted in `n_calls` (mini-swe-agent counts it before the call) and has no message. A
-command the world already started is not interrupted: the world runs a command synchronously, so a
-cancellation lands between commands.
+command in flight is killed by the world when its `bash` is cancelled (swarmlab/world/programbench.py,
+Cancellation) and gets the "not executed" observation; a parked `wait` is released the same way.
 
 Templates
 ---------
@@ -148,7 +167,10 @@ uname), `programbench_rules` (the `<RULES>` block of the system text),
 submission bullet), `resource_sentence` (the last paragraph of `view.description` when it starts
 with `This machine has`, else empty), `lead_channel`, `worker_channels` (the `worker_channels`
 param, or the channels of this agent's `post` tool other than `lead_channel`: for a lead one per
-worker, for a worker its own), `wait_tool`, `agent`, `role` and `tools` (names offered). `solo`
+worker, for a worker its own), `wait_tool`, `turn_based` (`commit: async`: the lead's
+`wait_for_workers` bullet says the tool returns the reports, the worker's text says it waits
+between assignments; the round-based text is unchanged), `agent`, `role` and `tools` (names
+offered). `solo`
 is the official text plus the resource sentence, byte for byte what the baseline renders plus
 that sentence; `lead` adds delegation instructions; `worker` has the environment rules and its
 role, not the task statement. A role's `prompt_append` is added to the system message, its
@@ -163,7 +185,9 @@ from this state, with `_start_time = time.time() - elapsed_s`, so the wall limit
 in a new process (time between processes is not counted). The clock runs only inside the agent's
 own turns: in the solo shape that is the whole episode; in the swarm shape each agent counts its
 own working time, and the world's clock still refuses commands after its wall limit
-(`wall_limit` -> `TimeExceeded`).
+(`wall_limit` -> `TimeExceeded`). Under `commit: async` the clock is plain wall time within the
+agent's turns, which includes the time parked in `wait` (`wait_for_workers` runs inside a step;
+an idle worker's own wait is added to `elapsed_s`, also before its first assignment).
 
 `turn()` returns an `LLMTurnUsage`: `calls` (tool calls made, the participant's own `read_board`
 included), tokens and cost summed from the turn's responses (the runner overwrites them with the
@@ -222,6 +246,16 @@ WAIT_SCHEMA = ToolSchema(
     parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
 WAIT_RESULT = "waiting for workers; their reports arrive at your next turn"
+# commit: async: `wait_for_workers` is the core `wait` tool, which returns the reports
+WAIT_SCHEMA_ASYNC = WAIT_SCHEMA.model_copy(update={
+    "description": "Wait until your workers report: returns the messages posted to you since "
+                   "you last read them (their reports), or says at once that no worker can "
+                   "report. Takes no arguments; posts nothing."})
+WAIT_STALLED = ("no worker can report: every worker is idle or finished, so nothing will arrive "
+                "while you wait. Assign work or continue yourself.")
+WAIT_NOT_LISTED = ("the mini_swe_agent participant with {flag} under commit: async waits with the "
+                   "core `wait` tool, which agent {agent} is not offered: list `wait` in its "
+                   "role's tools (roles: {{<role>: {{tools: [bash, post, read_board, wait]}}}})")
 NOT_EXECUTED = {"output": "", "returncode": -1, "exception_info": "action was not executed"}
 REFUSED_PREFIX = "swarmlab refused the command: "
 # swarmlab finish reasons (Anthropic's stop reasons, OpenAI's) in OpenAI's words, as litellm
@@ -399,6 +433,7 @@ class _Turn:
     loop: asyncio.AbstractEventLoop | None
     tools: AgentTools | None
     offered: list[ToolSchema]
+    turn_based: bool = False  # commit: async (`view.turn` set)
     abort: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     task: asyncio.Task | None = None  # the bridge operation running on the loop, if any
@@ -726,9 +761,11 @@ class MiniSweAgent(Participant):
         if self.templates == "solo":
             return ([OFFICIAL_BASH.model_copy(deep=True)]
                     if any(t.name == "bash" for t in view.tools) else [])
-        tools = list(view.tools)
+        # the core `wait` is the participant's own (idle worker, `wait_for_workers`), never the
+        # model's
+        tools = [t for t in view.tools if t.name != "wait"]
         if self.wait_tool and all(t.name != WAIT_TOOL for t in tools):
-            tools.append(WAIT_SCHEMA)
+            tools.append(WAIT_SCHEMA_ASYNC if view.turn is not None else WAIT_SCHEMA)
         return tools
 
     def template_vars(self, view: View, offered: list[ToolSchema]) -> dict:
@@ -741,7 +778,8 @@ class MiniSweAgent(Participant):
                 "programbench_command_rules": command_rules(instance),
                 "resource_sentence": resource_sentence_of(view.description),
                 "lead_channel": self.lead_channel, "worker_channels": channels,
-                "wait_tool": self.wait_tool, "agent": str(getattr(self, "agent", "")),
+                "wait_tool": self.wait_tool, "turn_based": view.turn is not None,
+                "agent": str(getattr(self, "agent", "")),
                 "role": getattr(self, "_role_name", None) or "",
                 "tools": [t.name for t in offered]}
 
@@ -760,6 +798,8 @@ class MiniSweAgent(Participant):
         agent.extra_template_vars |= self.template_vars(view, turn.offered)
         if not self.messages:
             agent.add_messages(*self._first_messages(agent))
+            if self.elapsed_s:  # async: an idle worker's waits before its first assignment
+                agent._start_time = time.time() - self.elapsed_s
         else:
             agent.messages = self.messages
             agent.n_calls = self.n_calls
@@ -799,25 +839,48 @@ class MiniSweAgent(Participant):
                        and (upto is None or _delivery_key(i) > list(upto))), key=_delivery_key)
 
     # ---- the turn ------------------------------------------------------------------------------
+    def _check_wait(self, view: View) -> None:
+        """Under `commit: async` the idle worker and `wait_for_workers` need the core `wait`."""
+        flags = [f for f in ("idle_until_assigned", "wait_tool") if getattr(self, f)]
+        if view.turn is not None and flags and all(t.name != "wait" for t in view.tools):
+            raise ValueError(WAIT_NOT_LISTED.format(flag=" and ".join(flags), agent=view.agent))
+
+    async def _await_assignment(self, view: View, tools: AgentTools,
+                                usage: LLMTurnUsage) -> list[dict]:
+        """An idle worker's own board check, with no model call: under `commit: async` one
+        `wait` (parked until a post arrives, or `timed_out` at once when nobody can post), its
+        time on the agent's clock; otherwise one `read_board` when the agent has it."""
+        if view.turn is not None:
+            t0 = time.time()
+            res = await tools.call("wait", {})
+            usage.calls += 1
+            self.elapsed_s += time.time() - t0
+            items = (res.result or {}).get("posts") if res.ok else None
+        elif any(t.name == "read_board" for t in view.tools):
+            res = await tools.call("read_board", {})
+            usage.calls += 1
+            items = (res.result or {}).get("items") if res.ok else None
+        else:
+            return []
+        return self._new_deliveries(list(items or []))
+
     async def turn(self, view: View, tools: AgentTools) -> LLMTurnUsage:
         usage = LLMTurnUsage()
         if self.finished:
             usage.notes.append("finished")
             return usage
+        self._check_wait(view)
         msa = load_minisweagent()
         new = self._new_deliveries(list(view.pushed))
         if self.idle_until_assigned and not self.assigned:
-            if not new and any(t.name == "read_board" for t in view.tools):
-                res = await tools.call("read_board", {})
-                usage.calls += 1
-                if res.ok:
-                    new = self._new_deliveries(list((res.result or {}).get("items") or []))
+            if not new:
+                new = await self._await_assignment(view, tools, usage)
             if not new:
                 usage.notes.append("idle")
                 return usage
             self.assigned = True
         turn = _Turn(usage=usage, loop=asyncio.get_running_loop(), tools=tools,
-                     offered=self.offered_tools(view))
+                     offered=self.offered_tools(view), turn_based=view.turn is not None)
         agent = self._build(view, turn, msa)
         if new:
             agent.add_messages({"role": "user", "content": render_delivered(
@@ -894,9 +957,20 @@ class MiniSweAgent(Participant):
         if set(call.args) == {"_raw"}:
             return message(json.dumps({"ok": False, "result": {}, "error": (
                 "arguments are not a JSON object; nothing was executed")}, sort_keys=True))
-        if call.name == WAIT_TOOL:
+        if call.name == WAIT_TOOL and not turn.turn_based:
             turn.end = True
             return message(WAIT_RESULT)
+        if call.name == WAIT_TOOL:  # async: the core `wait`; the reports are its result
+            res = turn.run(turn.tools.call("wait", {}))
+            turn.usage.calls += 1
+            result = res.result or {}
+            if res.ok and result.get("timed_out") and not result.get("posts"):
+                return message(WAIT_STALLED)
+            if res.ok:  # rendered as a `read_board` result
+                return message(json.dumps({"ok": True, "result": {"items": result.get("posts")},
+                                           "error": None}, sort_keys=True))
+            return message(json.dumps({"ok": False, "result": res.result, "error": res.error},
+                                      sort_keys=True))
         res = turn.run(turn.tools.call(call.name, call.args))
         turn.usage.calls += 1
         if call.name == "end_turn" and res.ok:

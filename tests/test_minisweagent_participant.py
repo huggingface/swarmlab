@@ -843,3 +843,220 @@ def test_render_delivered_drops_the_round_when_turn_based():
         'Delivered to you:\n- p1 (round 3): hi\n- p2 (round 4): {"k": 1}'
     assert render_delivered(items, turn_based=True) == \
         'Delivered to you:\n- p1: hi\n- p2: {"k": 1}'
+
+
+# ---- commit: async: the idle worker and wait_for_workers on the core `wait` ------------------------
+
+def _channel_of(request) -> str:
+    """The worker's own channel, from its instance message ("on channel `worker-1`")."""
+    for m in request.messages:
+        found = re.search(r"on channel `([^`]+)`", str(m.content))
+        if found:
+            return found.group(1)
+    return "main"
+
+
+def team_worker(request, rng):
+    """Write `<channel>.txt` (plus compile.sh for worker-1), then report `<channel>: done`."""
+    ch = _channel_of(request)
+    if "bash" not in _names(request):
+        cmd = f"echo {ch} > {ch}.txt" + (f" && {pb.FAKE_COMPILE}" if ch == "worker-1" else "")
+        return _response(request, rng, [("bash", {"command": cmd})])
+    return _response(request, rng, [("post", {"channel": "lead", "text": f"{ch}: done"})])
+
+
+def team_lead(request, rng):
+    """Assign both workers and wait; wait again until both reports are in; then submit."""
+    if "post" not in _names(request):
+        return _response(request, rng, [
+            ("post", {"channel": "worker-1", "text": "Write worker-1.txt and compile.sh."}),
+            ("post", {"channel": "worker-2", "text": "Write worker-2.txt."}),
+            ("wait_for_workers", {})])
+    tools = " ".join(str(m.content) for m in request.messages if m.role == "tool")
+    if "worker-1: done" in tools and "worker-2: done" in tools:
+        return _response(request, rng, [("bash", {"command": SUBMIT})])
+    return _response(request, rng, [("wait_for_workers", {})])
+
+
+class LatePoster(Participant):
+    """First turn: sleeps `delay_s`, then posts `text` on `channel`; every turn ends at once."""
+
+    def __init__(self, text: str, channel: str, delay_s: float = 0.3) -> None:
+        self.text, self.channel, self.delay_s = text, channel, delay_s
+        self.turns = 0
+
+    async def turn(self, view, tools) -> TurnUsage:
+        self.turns += 1
+        if self.turns == 1:
+            await asyncio.sleep(self.delay_s)
+            await tools.call("post", {"channel": self.channel, "text": self.text})
+        await tools.call("end_turn", {})
+        return TurnUsage()
+
+
+ASYNC_ROLES = {"lead": Role(name="lead", tools=["bash", "post", "read_board", "wait"]),
+               "worker": Role(name="worker", tools=["bash", "post", "read_board", "wait"])}
+
+
+def _async_team(tmp_path, participants, roles, *, channels=("main", "lead"), providers=None,
+                topology="broadcast", role_defs=None, **options) -> Run:
+    parts = [assign(p, r) for p, r in zip(participants, roles, strict=True)]
+    exp = Experiment(name="msa-async", world=world(tmp_path), participants=parts,
+                     roles={r: (role_defs or ASYNC_ROLES)[r] for r in set(roles)},
+                     medium=Board(delivery="pull", channels=list(channels), topology=topology),
+                     providers=providers or {},
+                     options={"commit": "async", "max_calls_per_turn": 20, **options})
+    return exp.run(seed=0, out=tmp_path / "runs")
+
+
+def _tool_results(run: Run, agent: str, tool: str) -> list[dict]:
+    calls = {e["call_id"] for e in run.events
+             if e["type"] == "tool_called" and e["agent"] == agent and e["tool"] == tool}
+    return [e["result"]["result"] for e in run.events if e["type"] == "tool_returned"
+            and e["call_id"] in calls]
+
+
+def test_async_idle_worker_waits_with_no_model_call_until_the_post(tmp_path):
+    run = _async_team(tmp_path, [LatePoster("build it", "main", delay_s=0.3),
+                                 MiniSweAgent(model=fake("worker"), steps_per_turn=10,
+                                              templates="worker", idle_until_assigned=True)],
+                      ["lead", "worker"], rounds_per_agent=2)
+    assert run.meta["end_reason"] == "max_rounds"
+    ended = turns(run, "a001")
+    assert [e["usage"]["notes"] for e in ended] == [[], ["idle"]]
+    assert [e["usage"].get("inference_calls", 0) for e in ended] == [2, 0]
+    called = [e["tool"] for e in run.events if e["type"] == "tool_called" and e["agent"] == "a001"]
+    assert called == ["wait", "bash", "post", "wait"]
+    first, second = _tool_results(run, "a001", "wait")
+    assert first["waited_s"] >= 0.2 and not first["timed_out"]
+    assert [p["content"] for p in first["posts"]] == ["build it"]
+    assert second == {"posts": [], "timed_out": True, "waited_s": second["waited_s"]}
+    st = state(run, "a001")
+    assert re.fullmatch(r"Delivered to you:\n- \S+: build it", st["messages"][2]["content"])
+    assert "When you have no assignment, you wait until the lead sends one." in \
+        st["messages"][1]["content"]
+    assert st["assigned"] is False and st["elapsed_s"] >= 0.2   # the wait is on its clock
+
+
+def test_async_offered_tools_hide_wait_and_describe_wait_for_workers_per_mode():
+    from swarmlab.executor import WAIT_SCHEMA as CORE_WAIT
+    from swarmlab.participants.minisweagent import WAIT_SCHEMA, WAIT_SCHEMA_ASYNC
+
+    p = MiniSweAgent(model="fake:x", templates="lead", wait_tool=True)
+    view = _view(tools=[*_view().tools, CORE_WAIT])
+    async_view = view.model_copy(update={"turn": 1})
+    assert [t.name for t in p.offered_tools(view)] == ["bash", "end_turn", "wait_for_workers"]
+    assert p.offered_tools(view)[-1] == WAIT_SCHEMA
+    assert p.offered_tools(async_view)[-1] == WAIT_SCHEMA_ASYNC
+    assert "turn ends" in WAIT_SCHEMA.description
+    assert "returns the messages posted to you" in WAIT_SCHEMA_ASYNC.description
+    p.bind("a000", random.Random(0))
+    lead_view = _view(tools=[_post_tool(["worker-1"])])
+    lockstep = p.turn_message(lead_view).content
+    assert "your turn ends after that step" in lockstep
+    turn_based = p.turn_message(lead_view.model_copy(update={"turn": 1})).content
+    assert "it returns them as its result" in turn_based and "turn ends" not in turn_based
+
+
+def test_async_team_end_to_end_wait_for_workers_returns_the_reports(tmp_path):
+    from typer.testing import CliRunner
+
+    from swarmlab.cli import app
+    from swarmlab.providers.fake import FakeProvider
+
+    lead_p = MiniSweAgent(model=fake("team_lead"), templates="lead", steps_per_turn=10,
+                          wait_tool=True, worker_channels=["worker-1", "worker-2"])
+    run = _async_team(tmp_path, [lead_p,
+                                 MiniSweAgent(model=fake("team_worker"), templates="worker",
+                                              steps_per_turn=10, idle_until_assigned=True,
+                                              worker_channels=["worker-1"]),
+                                 MiniSweAgent(model=fake("team_worker"), templates="worker",
+                                              steps_per_turn=10, idle_until_assigned=True,
+                                              worker_channels=["worker-2"])],
+                      ["lead", "worker", "worker"],
+                      channels=("lead", "worker-1", "worker-2"), rounds_per_agent=5,
+                      # the guide's channels: a room per worker shared with the lead, and `lead`
+                      topology={"type": "rooms", "params": {"rooms": {
+                          "lead": ["a000", "a001", "a002"], "worker-1": ["a000", "a001"],
+                          "worker-2": ["a000", "a002"]}}},
+                      role_defs={"lead": Role(name="lead", tools=["bash", "post", "read_board",
+                                                                  "wait"],
+                                              channels_write=["worker-1", "worker-2"]),
+                                 "worker": Role(name="worker", tools=["bash", "post",
+                                                                      "read_board", "wait"],
+                                                channels_read=["worker-1", "worker-2"])},
+                      providers={"fake": FakeProvider(yields=[0, 20])}, snapshot_every=1000)
+    assert run.meta["end_reason"] == "terminal"
+    lead_turns = turns(run, "a000")
+    assert len(lead_turns) == 1                       # wait_for_workers did not end the turn
+    st = state(run, "a000")
+    assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
+    waits = [m for m in tools_of(st) if m.get("extra", {}).get("tool") == "wait_for_workers"]
+    reports = [i["content"] for m in waits if m["content"].startswith("{")
+               for i in json.loads(m["content"])["result"]["items"]]
+    assert sorted(reports) == ["worker-1: done", "worker-2: done"]
+    assert all(m["content"] != WAIT_RESULT for m in waits)
+    called = [e["tool"] for e in run.events if e["type"] == "tool_called" and e["agent"] == "a000"]
+    assert "read_board" not in called and called.count("wait") == len(waits)
+    # the workers did the work in the shared workspace, each from its own assignment
+    ws = tmp_path / "ws"
+    assert (ws / "worker-1.txt").read_text() == "worker-1\n"
+    assert (ws / "worker-2.txt").read_text() == "worker-2\n"
+    for w in ("a001", "a002"):
+        wst = state(run, w)
+        assert wst["messages"][2]["content"].startswith("Delivered to you:\n- ")
+        assert "(round" not in wst["messages"][2]["content"]
+    # the final tick is snapshotted (snapshot_every 1000) and holds the frozen workspace
+    store = SnapshotStore(run.dir)
+    latest = store.latest()
+    assert latest.round == run.meta["last_round"]
+    assert pb.workspace_tar_of(store.load(latest)["world"]) == pb.workspace_tar(ws)[0]
+    assert Run.load(run.dir).replay()["score"] == run.score
+    res = CliRunner().invoke(app, ["report", str(run.dir), "--include-fake"])
+    assert res.exit_code == 0, res.output
+
+
+def test_async_never_assigned_worker_ends_by_its_per_agent_cap(tmp_path):
+    run = _async_team(tmp_path, [MiniSweAgent(model=fake("forever"), steps_per_turn=1,
+                                              templates="lead"),
+                                 MiniSweAgent(model=fake("worker"), steps_per_turn=10,
+                                              templates="worker", idle_until_assigned=True)],
+                      ["lead", "worker"], rounds_per_agent=3)
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 6
+    ended = turns(run, "a001")
+    assert [e["usage"]["notes"] for e in ended] == [["idle"]] * 3     # bounded: 3 ticks
+    assert inference_rounds(run, "a001") == []
+    results = _tool_results(run, "a001", "wait")
+    assert len(results) == 3 and all(r["timed_out"] and r["posts"] == [] for r in results)
+
+
+def test_async_role_without_wait_is_a_clear_error(tmp_path):
+    roles = {"lead": Role(name="lead", tools=["post"]),
+             "worker": Role(name="worker", tools=["bash", "post", "read_board"])}
+    parts = [assign(LatePoster("x", "main", 0), "lead"),
+             assign(MiniSweAgent(model=fake("worker"), templates="worker",
+                                 idle_until_assigned=True, steps_per_turn=10), "worker")]
+    exp = Experiment(name="msa-async", world=world(tmp_path), participants=parts, roles=roles,
+                     medium=Board(delivery="pull", channels=["main", "lead"]),
+                     options={"commit": "async", "max_calls_per_turn": 20,
+                              "rounds_per_agent": 1})
+    run = exp.run(seed=0, out=tmp_path / "runs")
+    (ended,) = turns(run, "a001")
+    assert ended["yield_kind"] == "error"
+    assert "list `wait` in its role's tools" in ended["error"]
+
+
+def test_async_wait_for_workers_says_so_when_no_worker_can_report(tmp_path):
+    from swarmlab.participants.minisweagent import WAIT_STALLED
+
+    run = _async_team(tmp_path, [MiniSweAgent(model=fake("waiting_lead"), templates="lead",
+                                              steps_per_turn=10, wait_tool=True),
+                                 MiniSweAgent(model=fake("worker"), steps_per_turn=10,
+                                              templates="worker", idle_until_assigned=True)],
+                      ["lead", "worker"], rounds_per_agent=3)
+    assert run.meta["end_reason"] == "terminal"
+    st = state(run, "a000")
+    wait = [m for m in tools_of(st) if m.get("extra", {}).get("tool") == "wait_for_workers"]
+    assert [m["content"] for m in wait] == [WAIT_STALLED]   # the idle worker is waiting too
+    assert len(turns(run, "a000")) == 1
+    assert st["messages"][-1]["extra"]["exit_status"] == "Submitted"
