@@ -12,6 +12,7 @@ from swarmlab.events import logical_view, parse_event
 from swarmlab.ids import ActionId, AgentId
 from swarmlab.medium.registry import settle_outcomes
 from swarmlab.participants.base import Participant, TurnUsage
+from swarmlab.snapshot import SnapshotStore
 from swarmlab.view import text_observation
 from swarmlab.world.base import Action, Outcome, World, tool
 
@@ -148,3 +149,45 @@ def test_cancellation_while_an_async_tool_awaits_records_nothing(tmp_path):
                    if e["type"] in ("turn_started", "tool_called", "tool_returned", "turn_ended"))
     assert run.score == {"total": 3}  # a000's add never applied
     assert Run.load(run.dir).replay()["score"] == {"total": 3}
+
+
+class BusyTotal(SyncTotal):
+    """`hold` marks the world busy, awaits forever (cancelled at run end) and, unwinding, awaits
+    once more (async cleanup) before it undoes the mark: the contract for state changed before an
+    await."""
+
+    def reset(self, rng, agents):
+        super().reset(rng, agents)
+        self.busy = 0
+
+    @tool("hold", "Hold the world busy", {})
+    async def hold(self, agent) -> Outcome:
+        self.busy += 1
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            self.busy -= 1
+        return Outcome(accepted=True, feedback={})
+
+    def score(self):
+        return {"total": self.total, "busy": self.busy}
+
+
+class Holder(Participant):
+    async def turn(self, view, tools):
+        await tools.call("hold", {})
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=2)
+
+
+def test_a_cancelled_tool_has_undone_its_change_before_the_final_snapshot(tmp_path):
+    exp = Experiment(name="busy", world=BusyTotal(), participants=[Holder(), Adder()])
+    run = exp.run(seed=0, max_rounds=1, commit="async", out=tmp_path)
+    assert run.meta["end_reason"] == "max_rounds" and run.meta["last_round"] == 1
+    assert run.score == {"total": 1, "busy": 0}
+    store = SnapshotStore(run.dir)
+    world = BusyTotal()
+    world.restore(store.load(store.latest())["world"])
+    assert world.busy == 0  # the snapshot was written after the hold unwound
+    assert Run.load(run.dir).replay()["score"] == {"total": 1, "busy": 0}
