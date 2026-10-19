@@ -1174,3 +1174,20 @@ def test_guide_async_team_spec_runs_end_to_end_with_fake_models(tmp_path):
     assert pb.workspace_tar_of(store.load(store.latest())["world"]) == \
         pb.workspace_tar(tmp_path / "ws")[0]
     assert Run.load(run.dir).replay()["score"] == run.score
+
+
+def test_guidance_is_appended_to_the_team_templates_and_refused_for_solo(tmp_path):
+    """`guidance` is a paragraph after the team text (lead and worker), before the resource
+    sentence; the solo template is the official text and takes none."""
+    for templates in ("lead", "worker"):
+        p = MiniSweAgent(model="fake:x", templates=templates, guidance="Delegate the implementation.")
+        view = _view(tools=[_post_tool(["lead", "worker-1"])])
+        text = p.turn_message(view).content
+        assert "Delegate the implementation." in text
+        assert text.index("Delegate the implementation.") > text.index("## Working with a team") \
+            if templates == "lead" else True
+    assert MiniSweAgent(model="fake:x", templates="lead").guidance is None
+    with pytest.raises(ValueError, match="guidance needs the lead"):
+        MiniSweAgent(model="fake:x", templates="solo", guidance="x")
+    with pytest.raises(ValueError, match="non-empty string"):
+        MiniSweAgent(model="fake:x", templates="lead", guidance="  ")

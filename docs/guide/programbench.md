@@ -114,6 +114,7 @@ The participant does not install mini-swe-agent: its agent loop, exceptions and 
 | `wait_tool` | false | a lead: offer `wait_for_workers`, which ends the turn after the step; under `commit: async` it waits for the reports and returns them instead (its role must list `wait`). Not with `templates: solo` |
 | `lead_channel` | `lead` | where workers post reports |
 | `worker_channels` | null | the lead's channels to its workers; null: the agent's `post` channels other than `lead_channel` |
+| `guidance` | null | a paragraph appended to the lead or worker instance text (the paper's "guidance" to the team, e.g. "Delegate the implementation to your workers"); not with `solo` |
 
 Params are in the spec only when they differ from these defaults.
 

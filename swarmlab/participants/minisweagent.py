@@ -2,7 +2,7 @@
 
 `MiniSweAgent(model, steps_per_turn=None, step_limit=1000, wall_limit_s=21600, max_tokens=8192,
 temperature=None, extra=None, templates="solo", idle_until_assigned=False, wait_tool=False,
-lead_channel="lead", worker_channels=None)`, entry point `mini_swe_agent`. No extra is needed:
+lead_channel="lead", worker_channels=None, guidance=None)`, entry point `mini_swe_agent`. No extra is needed:
 mini-swe-agent's agent loop, exceptions and tool-call helpers are a vendored copy of 2.4.6 in
 `swarmlab/vendor/minisweagent/` (MIT; its README lists the files, their wheel hashes and the
 changes, which are import paths only).
@@ -167,7 +167,7 @@ uname), `programbench_rules` (the `<RULES>` block of the system text),
 submission bullet), `resource_sentence` (the last paragraph of `view.description` when it starts
 with `This machine has`, else empty), `lead_channel`, `worker_channels` (the `worker_channels`
 param, or the channels of this agent's `post` tool other than `lead_channel`: for a lead one per
-worker, for a worker its own), `wait_tool`, `turn_based` (`commit: async`: the lead's
+worker, for a worker its own), `wait_tool`, `guidance` (the param, or empty; both templates append it as a paragraph before the resource sentence), `turn_based` (`commit: async`: the lead's
 `wait_for_workers` bullet says the tool returns the reports, the worker's text says it waits
 between assignments; the round-based text is unchanged), `agent`, `role` and `tools` (names
 offered). `solo`
@@ -644,7 +644,7 @@ def _arguments(args: dict) -> str:
 _DEFAULTS: dict[str, Any] = {
     "steps_per_turn": None, "step_limit": 1000, "wall_limit_s": 21600, "max_tokens": 8192,
     "temperature": None, "extra": None, "templates": "solo", "idle_until_assigned": False,
-    "wait_tool": False, "lead_channel": "lead", "worker_channels": None,
+    "wait_tool": False, "lead_channel": "lead", "worker_channels": None, "guidance": None,
 }
 
 
@@ -675,6 +675,7 @@ class MiniSweAgent(Participant):
         wait_tool: bool = False,
         lead_channel: str = "lead",
         worker_channels: list[str] | None = None,
+        guidance: str | None = None,
     ) -> None:
         from ..providers.base import split_model
 
@@ -695,6 +696,11 @@ class MiniSweAgent(Participant):
         if wait_tool and templates == "solo":
             raise ValueError("wait_tool needs the lead (or a file:) templates: the solo template "
                              "offers only bash")
+        if guidance is not None and (not isinstance(guidance, str) or not guidance.strip()):
+            raise ValueError(f"guidance must be a non-empty string or null, got {guidance!r}")
+        if guidance is not None and templates == "solo":
+            raise ValueError("guidance needs the lead, worker or a file: templates: the solo "
+                             "template is the official text and takes no additions")
         if not isinstance(lead_channel, str) or not lead_channel:
             raise ValueError(f"lead_channel must be a channel name, got {lead_channel!r}")
         if worker_channels is not None and (isinstance(worker_channels, str) or not all(
@@ -719,6 +725,7 @@ class MiniSweAgent(Participant):
         self.wait_tool = wait_tool
         self.lead_channel = lead_channel
         self.worker_channels = list(worker_channels) if worker_channels is not None else None
+        self.guidance = guidance
         # ---- episode state (plain data, snapshotted by Persistable) ----
         self.messages: list[dict] = []
         self.n_calls = 0
@@ -783,6 +790,7 @@ class MiniSweAgent(Participant):
                 "resource_sentence": resource_sentence_of(view.description),
                 "lead_channel": self.lead_channel, "worker_channels": channels,
                 "wait_tool": self.wait_tool, "turn_based": view.turn is not None,
+                "guidance": self.guidance or "",
                 "agent": str(getattr(self, "agent", "")),
                 "role": getattr(self, "_role_name", None) or "",
                 "tools": [t.name for t in offered]}

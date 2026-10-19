@@ -16,6 +16,10 @@ instance_template: |-
   Never run `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`: only the lead submits, and a submission ends the work of the whole team.
 
   {{ programbench_command_rules }}
+  {%- if guidance %}
+
+  {{ guidance }}
+  {%- endif %}
   {%- if resource_sentence %}
 
   {{ resource_sentence }}

@@ -17,6 +17,10 @@ instance_template: |-
   - Call `wait_for_workers` to pause until reports arrive: your turn ends after that step, and the reports are there at your next turn.
   {%- endif %}
   - You are responsible for the result: integrate the workers' work yourself, make sure `./compile.sh` builds `./executable`, and submit as described above. Only you submit; workers never do.
+  {%- if guidance %}
+
+  {{ guidance }}
+  {%- endif %}
   {%- if resource_sentence %}
 
   {{ resource_sentence }}
