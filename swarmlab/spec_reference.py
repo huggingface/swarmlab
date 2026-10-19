@@ -120,7 +120,7 @@ DESCRIPTIONS: dict[type[BaseModel], dict[str, str]] = {
                    "loops over its own turns at once, no rounds; a round is then a tick, one "
                    "completed turn; no scheduler, probes or interventions)"),
         "max_calls_per_turn": "tool calls an agent may make per turn",
-        "snapshot_every": "write a snapshot every N rounds",
+        "snapshot_every": "write a snapshot every N rounds (the round that ends the run is always snapshotted)",
         "concurrency": "concurrent turns",
         "repeat": "paired-run repeat index (0: a plain run)",
         "scheduler": "turn order per round, e.g. `seeded_shuffle` (default, every live agent in a "
