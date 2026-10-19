@@ -170,15 +170,23 @@ END_TURN_SCHEMA = ToolSchema(
 )
 
 
-def board_schemas(board: Board) -> list[ToolSchema]:
-    return [
+def board_schemas(board: Board, agent: AgentId | None = None) -> list[ToolSchema]:
+    topo = board.topology
+    if getattr(topo, "dynamic_channels", False):
+        from .medium.topology import CHANNEL_NAME_PATTERN
+
+        chan: dict = {"type": "string", "pattern": CHANNEL_NAME_PATTERN}
+    else:
+        chan = {"type": "string", "enum": list(board.channels)}
+    extra = topo.post_properties(agent) if agent is not None else {}
+    out = [
         ToolSchema(
             name="read_board",
             description="Read unread messages delivered to your inbox (oldest first).",
             parameters={
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string", "enum": list(board.channels)},
+                    "channel": dict(chan),
                     "limit": {"type": "integer"},
                 },
                 "required": [],
@@ -191,14 +199,16 @@ def board_schemas(board: Board) -> list[ToolSchema]:
             parameters={
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string", "enum": list(board.channels)},
+                    "channel": dict(chan),
+                    **extra,
                     "text": {"type": "string"},
                 },
-                "required": ["text"],
+                "required": ["text", *[k for k in topo.post_required() if k in extra]],
                 "additionalProperties": False,
             },
         ),
     ]
+    return out
 
 
 @dataclass
@@ -376,26 +386,46 @@ class RoundExecutor:
         return self.max_calls
 
     def _board_schemas(self, agent: AgentId) -> list[ToolSchema]:
-        out = board_schemas(self.board)
+        out = board_schemas(self.board, agent)
         role = self.roles.get(agent)
+        dynamic = getattr(self.board.topology, "dynamic_channels", False)
         if role is not None:
             read, write = self._channels(agent, "read"), self._channels(agent, "write")
             for s in out:
                 props = s.parameters["properties"]
-                props["channel"] = {**props["channel"], "enum": read if s.name == "read_board" else write}
+                if not dynamic:
+                    props["channel"] = {**props["channel"],
+                                        "enum": read if s.name == "read_board" else write}
                 if s.name == "post" and role.post_fields:
                     props["fields"] = _obj({k: {"type": "string", "enum": list(v)}
                                             for k, v in role.post_fields.items()}, [])
         if self.board.topology.default_channel(agent) is None:  # `_post` rejects a bare post
             for s in out:
                 if s.name == "post":
-                    s.parameters["required"] = ["channel", "text"]
+                    s.parameters["required"] = ["channel", *s.parameters["required"]]
         return out
 
     def schemas(self, agent: AgentId) -> list[ToolSchema]:
         reg = registry_schemas() if self.registry is not None else []
-        out = [*self._world_tools.values(), *self._board_schemas(agent), *reg, END_TURN_SCHEMA]
+        topo = self.board.topology.tool_schemas(agent)
+        out = [*self._world_tools.values(), *self._board_schemas(agent), *topo, *reg, END_TURN_SCHEMA]
         return [s.normalized() for s in out if self._allowed(agent, s.name)]
+
+    def _topology_tool_names(self, agent: AgentId) -> set[str]:
+        return {s.name for s in self.board.topology.tool_schemas(agent)}
+
+    def _topology_call(self, agent: AgentId, call_id: CallId, name: str, args: dict) -> ToolResult:
+        ok, value = self.board.topology.call_tool(agent, name, args, self.round)
+        if not ok:
+            return self._err(call_id, str(value))
+        self._sync_dynamic_channels()
+        return ToolResult(call_id=call_id, ok=True, result=dict(value))
+
+    def _sync_dynamic_channels(self) -> None:
+        """Add channels a dynamic topology created to the board (`Board.add_channel`)."""
+        if getattr(self.board.topology, "dynamic_channels", False):
+            for ch in self.board.topology.channels():
+                self.board.add_channel(ch)
 
     def pushable(self, agent: AgentId, limit: int) -> list[Delivery]:
         """Push-delivery items for `agent` this round: `board.pushable` minus unreadable channels."""
@@ -427,6 +457,8 @@ class RoundExecutor:
             res = self._post(agent, call_id, args)
         elif name in REGISTRY_TOOLS and self.registry is not None:
             res = self._registry(agent, call_id, name, args)
+        elif name in self._topology_tool_names(agent):
+            res = self._topology_call(agent, call_id, name, args)
         elif name in STATUS_TOOLS and name in self._world_tools:
             res = self._status(agent, call_id, name, args)
         elif name in self._world_tools:
@@ -514,7 +546,9 @@ class RoundExecutor:
         ]})
 
     def _post(self, agent: AgentId, call_id: CallId, args: dict) -> ToolResult:
-        extra = set(args) - {"channel", "text", "fields"}
+        topo = self.board.topology
+        topo_keys = set(topo.post_properties(agent))
+        extra = set(args) - {"channel", "text", "fields"} - topo_keys
         channel = args.get("channel")
         if channel is None:
             channel = self.board.topology.default_channel(agent)
@@ -525,8 +559,14 @@ class RoundExecutor:
         fields = args.get("fields") or {}
         if extra or not isinstance(text, str) or not isinstance(fields, dict):
             return self._err(call_id, "bad args: post(channel?, text: str, fields?: object)")
-        if channel not in self.board.channels:
+        topo_args = {k: args[k] for k in topo_keys if k in args}
+        if channel not in self.board.channels and not getattr(topo, "dynamic_channels", False):
             return self._err(call_id, f"unknown channel {channel!r}")
+        problem = topo.check_post(agent, channel, topo_args)
+        if problem is not None:
+            return self._err(call_id, f"bad args: {problem}")
+        self._sync_dynamic_channels()
+        fields = {**fields, **topo_args}
         role = self.roles.get(agent)
         if role is not None:  # M3c: channel and typed-field permissions
             if channel not in self._channels(agent, "write"):

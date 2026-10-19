@@ -174,6 +174,7 @@ class Board(Persistable, Plugin):
         self.claim_policy = build_claim_policy(claim_policy)
         if not self.registry and self.claim_policy.type_name() != "advisory":
             raise ValueError("a claim policy other than 'advisory' needs `registry: true`")
+        self._dynamic: list[str] = []  # channels a dynamic topology created during the run
         self._buffer: list[Post] = []
         self._inboxes: dict[AgentId, list[Delivery]] = {}
         self._post_channel: dict[PostId, str] = {}
@@ -195,7 +196,7 @@ class Board(Persistable, Plugin):
                 "delivery": self.delivery,
                 "push_limit": self.push_limit,
                 "policies": [p.spec() for p in self.policies],
-                "channels": list(self.channels),
+                "channels": [c for c in self.channels if c not in self._dynamic],
                 **({"registry": True} if self.registry else {}),
                 **({"push_consume": True} if getattr(self, "push_consume", False) else {}),
                 **({"claim_policy": self.claim_policy.spec()}
@@ -210,6 +211,13 @@ class Board(Persistable, Plugin):
         return cls(**params)
 
     # -- writes ----------------------------------------------------------------------------
+
+    def add_channel(self, channel: str) -> None:
+        """Add a channel created during the run by a topology with `dynamic_channels` (not part of
+        the board's spec; rebuilt from the topology's snapshot on restore)."""
+        if channel not in self.channels:
+            self.channels.append(channel)
+            self._dynamic.append(channel)
 
     def _check_channel(self, channel: str) -> None:
         if channel not in self.channels:
@@ -402,6 +410,9 @@ class Board(Persistable, Plugin):
         topo_spec, topo_state = state["topology"]
         if topo_spec == self.topology.spec():
             self.topology.restore(topo_state)
+        if getattr(self.topology, "dynamic_channels", False):
+            for ch in self.topology.channels():
+                self.add_channel(ch)
         for policy, (pol_spec, pol_state) in zip(self.policies, state["policies"]):
             if pol_spec == policy.spec():
                 policy.restore(pol_state)
