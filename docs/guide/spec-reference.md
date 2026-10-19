@@ -46,7 +46,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
   - `arms.NAME.roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations for this arm, merged over the top-level `roles`
     - `arms.NAME.roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
     - `arms.NAME.roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
-    - `arms.NAME.roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
+    - `arms.NAME.roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all but `wait`, which is offered only when listed and only under `commit: async`)
     - `arms.NAME.roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
     - `arms.NAME.roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
     - `arms.NAME.roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`
@@ -79,7 +79,7 @@ Every key of an experiment YAML, generated from the pydantic models (`swarmlab s
 - `roles`: `{NAME: {prompt_append, system_prompt, tools, channels_read, channels_write, registry, may_act, model, budget, post_fields}}` (optional): role declarations by name, for every arm (an arm's `roles` is merged per name)
   - `roles.NAME.prompt_append`: `str | null` (optional): text appended to the system prompt
   - `roles.NAME.system_prompt`: `str | null` (optional): replaces the system prompt
-  - `roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all)
+  - `roles.NAME.tools`: `[str, ...] | null` (optional): allowlist of tool names (null: all but `wait`, which is offered only when listed and only under `commit: async`)
   - `roles.NAME.channels_read`: `[str, ...] | null` (optional): channels the role reads (null: all)
   - `roles.NAME.channels_write`: `[str, ...] | null` (optional): channels the role writes (null: all)
   - `roles.NAME.registry`: `none | read | write` (default `write`): registry access: `none`, `read`, `write`

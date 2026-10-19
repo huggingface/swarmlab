@@ -10,6 +10,7 @@ class Role(BaseModel):
     prompt_append: str | None = None          # appended after the task section of the system prompt
     system_prompt: str | None = None          # full override (rarely)
     tools: list[str] | None = None            # allowlist of tool names; None = all tools the medium/world expose
+                                              # (`wait`, async only, is offered only when listed: INTERFACE §9)
     channels_read: list[str] | None = None    # board channels this role may read; None = all
     channels_write: list[str] | None = None   # board channels this role may post to; None = all
     registry: Literal["none", "read", "write"] = "write"
