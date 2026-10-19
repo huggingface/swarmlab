@@ -191,3 +191,36 @@ def test_a_cancelled_tool_has_undone_its_change_before_the_final_snapshot(tmp_pa
     world.restore(store.load(store.latest())["world"])
     assert world.busy == 0  # the snapshot was written after the hold unwound
     assert Run.load(run.dir).replay()["score"] == {"total": 1, "busy": 0}
+
+
+async def test_executor_cancel_cancels_a_suspended_tool_once():
+    """`RoundExecutor.cancel()` called again (a hard ceiling, then the run's settlement) does not
+    cancel a suspended call a second time: that would interrupt the tool's awaiting cleanup."""
+    from swarmlab.executor import RoundExecutor
+
+    ex = RoundExecutor.__new__(RoundExecutor)  # only the cancellation state is exercised
+    ex.cancelled, ex._suspended = False, set()
+    log: list[str] = []
+
+    async def tool_call() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            try:
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+                log.append("cleaned")
+            except asyncio.CancelledError:
+                log.append("interrupted")
+            raise
+
+    task = asyncio.create_task(ex._suspend(tool_call()))
+    await asyncio.sleep(0)
+    ex.cancel()
+    await asyncio.sleep(0)       # the tool is now inside its cleanup
+    ex.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert log == ["cleaned"] and ex.cancelled

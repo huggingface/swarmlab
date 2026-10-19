@@ -470,13 +470,17 @@ class _Turn:
                 self.task = None
 
     def cancel(self) -> None:
-        """On the loop: refuse further bridge operations and cancel the running one. Its
-        `CancelledError` reaches `tools.infer`/`tools.call` (the gate releases the reservation);
-        the step thread then gets `_Aborted` once that task has finished."""
+        """On the loop: refuse further bridge operations and cancel the running one, at most
+        once. Its `CancelledError` reaches `tools.infer`/`tools.call` (the gate releases the
+        reservation); the step thread then gets `_Aborted` once that task has finished. A task
+        that already has a cancellation pending (the executor's `cancel()` reached it first, or
+        an earlier call here) is not cancelled again: a second `CancelledError` would interrupt
+        an async world tool's cancellation cleanup, which may await (world/base.py, Async
+        tools); the caller waits for the task to finish instead (`MiniSweAgent._settle`)."""
         with self.lock:
             self.abort.set()
             task = self.task
-        if task is not None:
+        if task is not None and not task.done() and not task.cancelling():
             task.cancel()
 
 
@@ -906,9 +910,12 @@ class MiniSweAgent(Participant):
 
     @staticmethod
     async def _settle(turn: _Turn, worker: asyncio.Future) -> None:
-        """The turn was cancelled: cancel the bridge operation and wait until the step thread
-        has returned (so nothing touches the messages afterwards). A repeated cancellation while
-        waiting cancels again and keeps waiting; the caller re-raises the cancellation."""
+        """The turn was cancelled: cancel the bridge operation (once: `_Turn.cancel`) and wait
+        until the step thread has returned (so nothing touches the messages afterwards). The
+        step thread returns only once the bridge task has finished, the cancelled world tool's
+        cleanup included, so the participant's state is saved after that cleanup. A repeated
+        cancellation while waiting keeps waiting (it does not cancel the bridge task again); the
+        caller re-raises the cancellation."""
         turn.cancel()
         while not worker.done():
             try:

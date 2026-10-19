@@ -537,10 +537,13 @@ class RoundExecutor:
         """Async commit: the run ended while this turn was in flight. Every later `call` or
         `infer` raises `asyncio.CancelledError` (nothing is applied, logged or sent), and a turn
         suspended inside a call (an async world tool awaiting) is cancelled at once, so the tool's
-        await raises before the tool can complete."""
+        await raises before the tool can complete. Each such task is cancelled at most once (not
+        when a cancellation is already pending on it), however often this is called: a second
+        `CancelledError` would interrupt the tool's cancellation cleanup, which may await."""
         self.cancelled = True
         for task in list(self._suspended):
-            task.cancel()
+            if not task.done() and not task.cancelling():
+                task.cancel()
 
     async def _suspend(self, awaitable: Any) -> Any:
         """Await `awaitable` from inside a call, cancellable by `cancel()`."""

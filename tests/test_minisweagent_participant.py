@@ -45,6 +45,8 @@ from swarmlab.spec import Budget
 from swarmlab.tools import ToolResult
 from swarmlab.view import View, text_observation
 from swarmlab.world import programbench as pb
+from swarmlab.world.base import Outcome, World
+from swarmlab.world.base import tool as world_tool
 from swarmlab.world.programbench import SUBMIT_MARKER, ProgramBench, prompt_parts
 
 TASK = "abishekvashok__cmatrix.5c082c6"
@@ -672,6 +674,71 @@ async def test_a_cancelled_turn_cancels_and_settles_the_bridge(block):
         assert saved[4]["content"].startswith("<exception>action was not executed</exception>")
         assert tools.returned == ["infer", "bash"]
     assert not p.finished
+
+
+class _CleanupWorld(World):
+    """An async `bash` that never completes on its own; its cancellation cleanup awaits."""
+
+    started: asyncio.Event | None = None  # set per test
+
+    def reset(self, rng, agents):
+        self.busy = 0
+        self.cleaned = False
+        self.cleanup_interrupted = False
+
+    def observe(self, agent):
+        return text_observation("offline cancellation test")
+
+    @world_tool("bash", "Stub command", {"command": "string"})
+    async def bash(self, agent, command):
+        self.busy += 1
+        type(self).started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            try:
+                await asyncio.sleep(0)    # the undo awaits (INTERFACE §8, Async tools)
+                await asyncio.sleep(0)
+                self.busy -= 1
+                self.cleaned = True
+            except asyncio.CancelledError:
+                self.cleanup_interrupted = True
+                raise
+        return Outcome(accepted=True)
+
+    def score(self):
+        return {"busy": self.busy, "cleaned": self.cleaned,
+                "cleanup_interrupted": self.cleanup_interrupted}
+
+
+class _FinishTick(Participant):
+    """Ends its turn once the other agent's command is running: that tick ends the run."""
+
+    async def turn(self, view, tools):
+        await _CleanupWorld.started.wait()
+        await tools.call("end_turn", {})
+        return TurnUsage(calls=1)
+
+
+def test_run_end_cancels_the_bridge_once_and_awaits_the_tools_cleanup(tmp_path):
+    """The final tick cancels the executor's pending bridge operation, then the participant's
+    loop; the participant must not cancel the bridge task a second time (that interrupted the
+    tool's awaiting cleanup) and must wait for it before its state is saved."""
+    _CleanupWorld.started = asyncio.Event()
+    run = Experiment(name="double-cancel", world=_CleanupWorld(),
+                     participants=[MiniSweAgent(model="fake:programbench_echo"), _FinishTick()],
+                     ).run(seed=0, max_rounds=1, commit="async", out=tmp_path / "runs")
+    assert run.meta["end_reason"] == "max_rounds"
+    assert run.score == {"busy": 0, "cleaned": True, "cleanup_interrupted": False}
+    store = SnapshotStore(run.dir)
+    latest = store.latest()
+    assert latest.round == run.meta["last_round"] == 1
+    final = pickle.loads(store.load(latest)["world"])
+    assert (final["busy"], final["cleaned"], final["cleanup_interrupted"]) == (0, True, False)
+    assert Run.load(run.dir).replay()["score"] == run.score
+    # the cancelled turn committed nothing and left no turn events; the closing turn is a001's
+    assert not [e for e in run.events if e["type"] == "action_committed"]
+    assert [e["agent"] for e in run.events if e["type"] == "turn_ended"] == ["a001"]
 
 
 # ---- templates ------------------------------------------------------------------------------------
