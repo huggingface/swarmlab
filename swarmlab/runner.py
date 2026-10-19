@@ -178,7 +178,8 @@ Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
   exception does not prevent this (the executor flags it).
 - `turn_ended.usage` is the participant's `TurnUsage` updated with the executor's nominal
   inference totals (`prompt_tokens`, `completion_tokens`, `cached_prompt_tokens`,
-  `reasoning_tokens`, `cost_usd`, `inference_calls`) when the agent made swarm inference calls.
+  `reasoning_tokens`, `cache_write_tokens` when non-zero, `cost_usd`, `inference_calls`) when the
+  agent made swarm inference calls.
 - `replay()` builds a gate but never calls it; it raises `ReplayMismatch` if the gate's
   `provider_calls` is non-zero and reports it as `provider_calls`.
 - `fork()` also copies the parent's cache entries for rounds <= the fork round and the request and
@@ -188,7 +189,9 @@ Budget and inference (M1b, docs/INTERFACE-M1b.md §2-§3):
 `run.json` (rewritten atomically after every commit): run_id, experiment, arm, spec, spec_hash,
 git_commit, dirty, parent_run, fork_round, restored (what a fork restored), status
 ("running" | "ended"), end_reason, last_round (last committed round), score (`world.score()`
-after the last commit), metrics_rev (the metric-semantics revision the run logs with,
+after the last commit; the one exception: `swarmlab programbench grade` writes an external
+grader's keys into `score` after the run and keeps the runner's own value as `score_world`,
+which `replay` then checks instead, swarmlab/jobs/programbench.py), metrics_rev (the metric-semantics revision the run logs with,
 `swarmlab.metrics.base.METRICS_REV` for new runs; absent in older run.json files, which are
 revision 1: replay, resume and report then fold with `Metric.use_rev(1)`), import_dir (only
 when the experiment came from a YAML: its directory, put on `sys.path` by `Run.experiment`),
@@ -1146,9 +1149,10 @@ class Runner:
             if world_ok:
                 self.world.restore(self.snapshots.load(manifest)["world"])
                 score = _jsonable(self.world.score())
-                if score != meta.get("score"):
+                recorded = meta.get("score_world", meta.get("score"))  # graded: the world's own
+                if score != recorded:
                     raise ReplayMismatch(
-                        f"score after round {manifest.round}: run.json has {meta.get('score')}, "
+                        f"score after round {manifest.round}: run.json has {recorded}, "
                         f"replay gives {score}"
                     )
         return {"last_round": last_committed, "metrics_checked": checked, "score": score,

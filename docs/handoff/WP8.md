@@ -26,7 +26,10 @@ runner live in the same job, and results leave the job through an HF bucket.
 
 ## How it works
 
-`swarmlab job run SPEC --model M` (prints only) and `... --launch` (submits):
+`swarmlab job run SPEC --model M` (prints only) and `... --launch` (submits). (Later addition:
+without `--model`, when no arm calls a `vllm:` model, `job run` plans an API-model job with no
+vLLM; see `swarmlab/jobs/launch.py` "API mode" and docs/guide/programbench.md. The steps below
+are the vLLM mode, unchanged.)
 
 1. **Plan.** Every model the chosen arms call (participants' `model`, probes' `coder_model`) must
    be `vllm:M`; scripted arms are allowed, an arm set that calls no model is refused, and any

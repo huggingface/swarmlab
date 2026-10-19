@@ -330,6 +330,20 @@ def render_system_prompt(template: str | None, *, agent: str, role: str, descrip
     return out
 
 
+def render_delivered(items: list[dict], *, turn_based: bool = False) -> str:
+    """Delivered board items as text: `Delivered to you:` and a line per item,
+    `- <post_id> (round <eligible_round>): <content>` (non-string content as JSON). With
+    `turn_based` (`commit: async`, `view.turn` set) the ` (round <eligible_round>)` is left out."""
+    lines = ["Delivered to you:"]
+    for item in items:
+        content = item.get("content")
+        if not isinstance(content, str):
+            content = json.dumps(content, sort_keys=True)
+        when = "" if turn_based else f" (round {item.get('eligible_round')})"
+        lines.append(f"- {item.get('post_id')}{when}: {content}")
+    return "\n".join(lines)
+
+
 def json_protocol_text(tools: list[ToolSchema]) -> str:
     schemas = "\n".join(f"- {t.name}: {json.dumps(t.parameters, sort_keys=True)}" for t in tools)
     return JSON_PROTOCOL_TEXT.format(schemas=schemas)
@@ -853,14 +867,8 @@ class LLMAgent(Participant):
                 lines.append(f"- {o.get('tool')} {o.get('action_id')}: {verdict} {fb}")
             parts.append(Part(type="text", text="\n".join(lines)))
         if view.pushed:
-            lines = ["Delivered to you:"]
-            for item in view.pushed:
-                content = item.get("content")
-                if not isinstance(content, str):
-                    content = json.dumps(content, sort_keys=True)
-                when = "" if turn_based else f" (round {item.get('eligible_round')})"
-                lines.append(f"- {item.get('post_id')}{when}: {content}")
-            parts.append(Part(type="text", text="\n".join(lines)))
+            parts.append(Part(type="text", text=render_delivered(view.pushed,
+                                                                 turn_based=turn_based)))
         return ChatMessage(role="user", content=parts)
 
     def turn_message(self, view: View) -> ChatMessage:

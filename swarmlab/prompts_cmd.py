@@ -17,7 +17,9 @@ Decisions:
   (dynamics, schedules) are what agents see in round 1; no outcomes, and nothing pushed (pushed
   items exist only from round 2). Later rounds are not previewed. Evaluator-only `private` data is stripped as in a run; it is not shown.
 - The tools are the executor's schemas for that agent (`RoundExecutor.schemas`), i.e. what the
-  provider receives under the native protocol.
+  provider receives under the native protocol, unless the participant has an
+  `offered_tools(view)` method choosing what it sends (`mini_swe_agent`'s solo template offers
+  only `bash`); then they are its result.
 - A participant without these rendering methods (scripted participants) is listed with
   `system: null` and a note; nothing else of it is rendered.
 - Image parts of the user message render as `[image: PNG <w>×<h>]` (M5) in the text output (the
@@ -101,6 +103,11 @@ def group_views(exp: Experiment, seed: int = 0) -> list[tuple[int, int, Any, Any
     return out
 
 
+def _offered(p: Any, view: View) -> list:
+    offered = getattr(p, "offered_tools", None)
+    return offered(view) if callable(offered) else view.tools
+
+
 def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
     """One dict per participant group: agent, type, count, model, system, user, tools."""
     agents = [agent_id(i) for i in range(len(exp.participants))]
@@ -114,7 +121,7 @@ def render_prompts(exp: Experiment, seed: int = 0) -> list[dict]:
             "type": spec["type"], "count": count, "model": participant_model(p),
             "role": names[first],
             "tool_protocol": getattr(p, "tool_protocol", None),
-            "tools": [t.name for t in view.tools], "system": None, "user": None,
+            "tools": [t.name for t in _offered(p, view)], "system": None, "user": None,
             "user_parts": None, "note": None,
         }
         render = getattr(p, "_render_system", None)
