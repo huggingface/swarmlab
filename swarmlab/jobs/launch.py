@@ -1,7 +1,15 @@
-"""Build (and on request submit) an HF Job that serves a model with vLLM and runs a spec against it.
+"""Build (and on request submit) an HF Job that runs a spec: next to a vLLM server, or against API models.
 
-HF Jobs have no inbound networking, so the model server and the swarmlab runner share one job
-(DESIGN.md §12: "one job hosts a wave of runs and vLLM when self-hosting"). The pieces:
+Two modes (`JobPlan.mode`), chosen by `plan_job` from the spec:
+
+- `vllm` (`--model` given, or some model-backed participant or probe coder of the chosen arms
+  calls a `vllm:` model): the job serves the model with vLLM and the runs call it. HF Jobs have
+  no inbound networking, so the model server and the swarmlab runner share one job (DESIGN.md
+  §12: "one job hosts a wave of runs and vLLM when self-hosting"). Everything below up to "API
+  mode" describes this mode, which is unchanged.
+- `api` (no `--model` and no `vllm:` model in the chosen arms): no vLLM at all; see "API mode".
+
+The pieces:
 
 - `plan_job(spec, model=..., flavor=..., ...) -> JobPlan` (pure, no I/O beyond reading the spec
   and asking git for the commit): validates that every model-backed participant (and probe coder)
@@ -51,6 +59,44 @@ run, `rounds * per_round_s(N)` with `per_round_s(N) = 30 + 2 * N` seconds (a gue
 router-served Qwen phase-1 runs took ~1 min per round at N=16; a local server should not be
 slower). `--per-round` overrides it. The default timeout is 1.5x the estimate, rounded up to
 10 minutes.
+
+API mode
+--------
+`plan_job(spec)` without `model` when no chosen arm calls a `vllm:` model. The plan has no vLLM
+pieces (no providers override, no `VLLM_*` env, no serve argv, no profile; `vllm_serve_argv` is
+None in plan.json) and `describe` prints `mode: api`. The job spec is the chosen arms of the
+spec as given (its own `providers:` kept).
+
+- Image: `image=` (`--image`), else the task image `programbench/<task>:task_cleanroom_v6` when the
+  first chosen arm's world is `programbench`, else `DEFAULT_IMAGE`. A programbench arm whose world
+  `backend` is not `local` is refused (a job cannot run Docker; the spec is not rewritten), and so
+  are chosen arms naming different programbench tasks (one job runs one image) and a plan with
+  more than one programbench run (the task workspace is the image's `/workspace`, which nothing
+  resets between runs: one job per arm x seed).
+- Flavor: `cpu-upgrade` by default (`vllm` mode keeps `a100-large`).
+- Timeout and estimate: a programbench run counts its world's `wall_limit_s` (the 6 h limit),
+  plus `API_SLACK_S` (1 h: setup, the final snapshot, the sync), so the official limit gives 7 h;
+  other arms use the per-round estimate as in vllm mode (1.5x, rounded up to 10 minutes).
+- Secrets (`JobPlan.secrets`, names only, in plan.json and the job's job.json): `HF_TOKEN` (the
+  bootstrap's bucket access), plus each model's key variable: the Anthropic provider's
+  `ANTHROPIC_API_KEY`, or `ANTHROPIC_KEY` when only that one is set here (the provider reads
+  either), and an OpenAI-compatible provider's `api_key_env`. Each is passed as
+  `hf jobs run --secrets NAME`, so the hf CLI reads the value from the launching environment; no
+  value is ever on the command line, in the plan or in the stage dir. A name unset here is listed
+  in `missing_secrets`; `describe` warns and `submit` refuses.
+- Extras (`JobPlan.extras`): the wheel is installed as `swarmlab[<extras>]`: `anthropic` when an
+  arm calls an Anthropic model, `programbench` for a programbench world (its run-start task check).
+  The `mini_swe_agent` participant needs no extra: its agent loop is vendored.
+- No volume: the hidden ProgramBench tests must never be in the agent's container (they are
+  mounted only in the grade job, `swarmlab/jobs/programbench.py`).
+- The entry (`job_entry`) installs uv first when the image lacks it (the task image has Python
+  3.10, pip and curl, no uv): `curl -LsSf https://astral.sh/uv/install.sh` into
+  `/opt/swarmlab/uv`, without touching PATH or shell profiles, then fetches the stage dir with
+  that uv and passes it to bootstrap.sh as `SWARMLAB_UV`. bootstrap.sh installs a managed Python
+  3.12 next to it (`uv python install 3.12` into `/opt/swarmlab/python`), creates the venv and
+  skips everything vLLM; `SWARMLAB_MODE=api` selects that branch.
+- The job runs as root; the programbench world's lockdown happens at the first `bash` command
+  (world code, not the bootstrap), and keeps the Hub hosts the bucket sync needs.
 """
 from __future__ import annotations
 
@@ -58,13 +104,14 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from importlib.resources import files
 from pathlib import Path
@@ -83,12 +130,17 @@ DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 DEFAULT_PORT = 8000
 DEFAULT_SYNC_EVERY_S = 300
 DEFAULT_SETUP_S = 600
+VLLM_FLAVOR = "a100-large"
+API_FLAVOR = "cpu-upgrade"
+API_SLACK_S = 3600          # a programbench job's timeout: wall_limit_s + this
+UV_INSTALLER = "https://astral.sh/uv/install.sh"
+UV_LOCAL = "/opt/swarmlab/uv"
 DEFAULT_CONCURRENCY = 64
 DEFAULT_REQUEST_TIMEOUT_S = 600.0
 STAGE_LOCAL = "/opt/swarmlab/stage"
 # `hf jobs hardware`, 2026-10-06 (USD per hour); unknown flavors print "?"
 FLAVOR_USD_PER_HOUR = {
-    "cpu-basic": 0.01, "cpu-upgrade": 0.03, "t4-small": 0.40, "t4-medium": 0.60,
+    "cpu-basic": 0.01, "cpu-upgrade": 0.03, "cpu-xl": 1.00, "cpu-performance": 1.90, "t4-small": 0.40, "t4-medium": 0.60,
     "l4x1": 0.80, "l4x4": 3.80, "a10g-small": 1.00, "a10g-large": 1.50, "a10g-largex2": 3.00,
     "a10g-largex4": 5.00, "l40sx1": 1.80, "l40sx4": 8.30, "a100-large": 2.50, "a100x4": 10.00,
     "a100x8": 20.00, "h200": 5.00, "h200x2": 10.00, "rtx-pro-6000": 2.75,
@@ -96,7 +148,7 @@ FLAVOR_USD_PER_HOUR = {
 # memory of ONE GPU in the flavor (GB); the profiles run TP=1, so a multi-GPU flavor does not add
 # memory for the model. Unknown flavors get no size note.
 FLAVOR_GPU_GB = {
-    "cpu-basic": 0, "cpu-upgrade": 0, "t4-small": 16, "t4-medium": 16,
+    "cpu-basic": 0, "cpu-upgrade": 0, "cpu-xl": 0, "cpu-performance": 0, "t4-small": 16, "t4-medium": 16,
     "l4x1": 24, "l4x4": 24, "a10g-small": 24, "a10g-large": 24, "a10g-largex2": 24,
     "a10g-largex4": 24, "l40sx1": 48, "l40sx4": 48, "a100-large": 80, "a100x4": 80,
     "a100x8": 80, "h200": 141, "h200x2": 141, "rtx-pro-6000": 96,
@@ -182,16 +234,18 @@ def vllm_provider(model: str, port: int = DEFAULT_PORT, concurrency: int = DEFAU
         "timeout_s": float(timeout_s), "self_hosted": True}}
 
 
-def job_spec_doc(doc: dict, model: str, arms: Sequence[str] | None = None,
+def job_spec_doc(doc: dict, model: str | None, arms: Sequence[str] | None = None,
                  **provider_kw: Any) -> dict:
-    """The spec the job runs: the in-job vllm provider, and only the chosen `arms` (when given).
+    """The spec the job runs: the in-job vllm provider (unless `model` is None: API mode), and
+    only the chosen `arms` (when given).
 
     Arms the job does not run are dropped: they may call other models, which the job does not
     serve or price, and the job validates every arm of its spec before it starts."""
     out = copy.deepcopy(doc)
     if arms is not None:
         out["arms"] = {a: out["arms"][a] for a in out["arms"] if a in set(arms)}
-    out["providers"] = {**out.get("providers", {}), "vllm": vllm_provider(model, **provider_kw)}
+    if model is not None:
+        out["providers"] = {**out.get("providers", {}), "vllm": vllm_provider(model, **provider_kw)}
     return out
 
 
@@ -205,7 +259,7 @@ class JobPlan:
     spec_path: str
     name: str
     tag: str
-    model: str
+    model: str | None          # the model vLLM serves; None in API mode
     flavor: str
     image: str
     bucket: str
@@ -229,6 +283,11 @@ class JobPlan:
     probe_extra: dict[str, Any] = field(default_factory=dict)
     probe_extra_source: str = "default"   # "--probe-extra" | "profile" | "default" | "none"
     port: int = DEFAULT_PORT   # vLLM's port; the job spec's provider URL points at it
+    mode: str = "vllm"         # "vllm" | "api" (module docstring)
+    secrets: list[str] = field(default_factory=lambda: ["HF_TOKEN"])  # names, never values
+    missing_secrets: list[str] = field(default_factory=list)          # unset where planned
+    extras: list[str] = field(default_factory=list)   # swarmlab extras installed in the job
+    programbench: dict[str, Any] | None = None        # {"task", "image", "wall_limit_s", ...}
 
     @property
     def stage_remote(self) -> str:
@@ -247,26 +306,21 @@ class JobPlan:
         return FLAVOR_USD_PER_HOUR.get(self.flavor)
 
     @property
-    def vllm_serve_argv(self) -> list[str]:
-        return serve_argv(self)
+    def vllm_serve_argv(self) -> list[str] | None:
+        return serve_argv(self) if self.mode == "vllm" else None
 
     @property
-    def vllm_serve_command(self) -> str:
-        return serve_command(self)
+    def vllm_serve_command(self) -> str | None:
+        return serve_command(self) if self.mode == "vllm" else None
 
     def env(self) -> dict[str, str]:
+        if self.mode == "api":
+            return {**self._common_env(), "SWARMLAB_MODE": "api",
+                    "SWARMLAB_SECRET_NAMES": " ".join(self.secrets),
+                    "SWARMLAB_EXTRAS": ",".join(self.extras)}   # HF_HOME: root-only default
         env = {
-            "SWARMLAB_TAG": self.tag,
-            "SWARMLAB_STAGE": self.stage_remote,
-            "SWARMLAB_RUNS_REMOTE": self.runs_remote,
-            "SWARMLAB_RUNS": " ".join(f"{a}:{s}" for a, s in self.runs),
-            "SWARMLAB_GIT_COMMIT": self.commit,
-            "SWARMLAB_GIT_DIRTY": "1" if self.dirty else "0",
-            "SWARMLAB_JOB_SPEC_SHA256": self.job_spec_sha256,
-            "SWARMLAB_FLAVOR": self.flavor,
-            "SWARMLAB_IMAGE": self.image,
-            "SWARMLAB_SYNC_EVERY": str(self.sync_every_s),
-            "VLLM_MODEL": self.model,
+            **self._common_env(),
+            "VLLM_MODEL": self.model or "",
             "VLLM_PORT": str(self.port),
             "VLLM_VERSION": self.vllm_version,
             "VLLM_MAX_MODEL_LEN": str(self.max_model_len),
@@ -284,6 +338,20 @@ class JobPlan:
             env["VLLM_REVISION"] = self.revision
         return env
 
+    def _common_env(self) -> dict[str, str]:
+        return {
+            "SWARMLAB_TAG": self.tag,
+            "SWARMLAB_STAGE": self.stage_remote,
+            "SWARMLAB_RUNS_REMOTE": self.runs_remote,
+            "SWARMLAB_RUNS": " ".join(f"{a}:{s}" for a, s in self.runs),
+            "SWARMLAB_GIT_COMMIT": self.commit,
+            "SWARMLAB_GIT_DIRTY": "1" if self.dirty else "0",
+            "SWARMLAB_JOB_SPEC_SHA256": self.job_spec_sha256,
+            "SWARMLAB_FLAVOR": self.flavor,
+            "SWARMLAB_IMAGE": self.image,
+            "SWARMLAB_SYNC_EVERY": str(self.sync_every_s),
+        }
+
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d.pop("job_spec_yaml")
@@ -300,13 +368,13 @@ class JobPlan:
 def plan_job(
     spec: Path | str,
     *,
-    model: str,
-    flavor: str = "a100-large",
+    model: str | None = None,
+    flavor: str | None = None,
     arms: Sequence[str] | None = None,
     seeds: Sequence[int] | None = None,
     timeout: str | int | None = None,
     bucket: str = DEFAULT_BUCKET,
-    image: str = DEFAULT_IMAGE,
+    image: str | None = None,
     vllm_version: str = DEFAULT_VLLM_VERSION,
     vllm_flags: str | None = None,
     profile: str | None = "auto",
@@ -324,7 +392,11 @@ def plan_job(
     tag: str | None = None,
     now: float | None = None,
     git: Callable[[], tuple[str, bool]] | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> JobPlan:
+    """The job for `spec`: vLLM mode when `model` is given or an arm calls a `vllm:` model, else
+    API mode (module docstring). `environ` (default `os.environ`) is where API mode looks for
+    the secrets' values (only whether they are set)."""
     spec = Path(spec)
     doc = load_experiment_yaml(spec)
     chosen = list(arms) if arms else list(doc["arms"])
@@ -332,11 +404,70 @@ def plan_job(
     if unknown:
         raise SpecError(f"{spec}: unknown arm(s) {unknown}; available: {list(doc['arms'])}")
     seed_list = list(seeds) if seeds else experiment_seeds(doc)
-    check_vllm_models(doc, chosen, model)
     if not bucket.startswith("hf://buckets/"):
         raise SpecError(f"--bucket must look like hf://buckets/<namespace>/<name>, got {bucket!r}")
     bucket = bucket.rstrip("/")
+    api = model is None and not any(m.startswith("vllm:") for a in chosen
+                                    for m in arm_models(doc, a))
+    if not api and model is None:
+        raise SpecError("the chosen arms call vllm: models; pass --model <the HF model id vLLM "
+                        "serves>")
+    commit, dirty = (git or checkout_identity)()
+    if tag is None:
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(time.time() if now is None else now))
+        tag = f"{slug(doc['name'])}-{commit[:7]}-{stamp}"
+    runs = [(a, int(s)) for a in chosen for s in seed_list]
+    common: dict[str, Any] = {
+        "spec_path": str(spec), "name": doc["name"], "tag": tag, "bucket": bucket,
+        "commit": commit, "dirty": dirty, "runs": runs, "vllm_version": vllm_version,
+        "max_model_len": max_model_len, "gpu_memory_utilization": gpu_memory_utilization,
+        "revision": revision, "sync_every_s": sync_every_s, "orig_spec_yaml": spec.read_text(),
+        "port": port}
+    if api:
+        plan = _plan_api(doc, chosen, len(seed_list), flavor=flavor, image=image,
+                         timeout=timeout, per_round_s=per_round_s, setup_s=setup_s,
+                         environ=os.environ if environ is None else environ, common=common)
+    else:
+        assert model is not None
+        plan = _plan_vllm(doc, chosen, len(seed_list), model=model, flavor=flavor or VLLM_FLAVOR,
+                          image=image or DEFAULT_IMAGE, timeout=timeout, vllm_flags=vllm_flags,
+                          profile=profile, vllm_flags_append=vllm_flags_append,
+                          probe_extra=probe_extra, concurrency=concurrency,
+                          request_timeout_s=request_timeout_s, per_round_s=per_round_s,
+                          setup_s=setup_s, common=common)
+    if dirty:
+        plan.notes.append("the checkout has uncommitted changes: the wheel will not match the "
+                          "commit")
+    return plan
 
+
+def _estimate(doc: dict, chosen: Sequence[str], n_seeds: int, per_round_s: float | None,
+              setup_s: int, wall_s: Mapping[str, float] | None = None) -> tuple[int, dict]:
+    """(total seconds, per-arm detail): rounds x per-round guess per run, or the world's wall
+    limit for the arms in `wall_s` (programbench)."""
+    per_arm = {}
+    total = setup_s
+    for a in chosen:
+        n = arm_agents(doc, a)
+        if wall_s and a in wall_s:
+            per_arm[a] = {"agents": n, "wall_limit_s": wall_s[a], "per_run_s": int(wall_s[a]),
+                          "runs": n_seeds}
+        else:
+            rounds = arm_rounds(doc, a)
+            pr = per_round_s if per_round_s is not None else per_round_guess(n)
+            per_arm[a] = {"agents": n, "rounds": rounds, "per_round_s": pr,
+                          "per_run_s": int(rounds * pr), "runs": n_seeds}
+        total += per_arm[a]["per_run_s"] * n_seeds
+    return total, per_arm
+
+
+def _plan_vllm(doc: dict, chosen: list[str], n_seeds: int, *, model: str, flavor: str,
+               image: str, timeout: str | int | None, vllm_flags: str | None,
+               profile: str | None, vllm_flags_append: str | None,
+               probe_extra: dict[str, Any] | None, concurrency: int, request_timeout_s: float,
+               per_round_s: float | None, setup_s: int, common: dict[str, Any]) -> JobPlan:
+    check_vllm_models(doc, chosen, model)
+    max_model_len, vllm_version = common["max_model_len"], common["vllm_version"]
     resolved = resolve_flags(model, vllm_flags=vllm_flags, profile=profile,
                              append=vllm_flags_append, probe_extra=probe_extra)
     notes = []
@@ -365,44 +496,138 @@ def plan_job(
                      "will not be parsed and agent turns will be prose")
     if "vllm" in doc.get("providers", {}):
         notes.append("the spec's own providers.vllm is replaced by the in-job server override")
-    job_doc = job_spec_doc(doc, model, arms=chosen, port=port, concurrency=concurrency,
+    job_doc = job_spec_doc(doc, model, arms=chosen, port=common["port"], concurrency=concurrency,
                            timeout_s=request_timeout_s)
     job_yaml = dump_yaml(job_doc)
-    _check_job_spec(job_yaml, chosen)
-
-    commit, dirty = (git or checkout_identity)()
-    if tag is None:
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(time.time() if now is None else now))
-        tag = f"{slug(doc['name'])}-{commit[:7]}-{stamp}"
-
-    runs = [(a, int(s)) for a in chosen for s in seed_list]
-    per_arm = {}
-    total = setup_s
-    for a in chosen:
-        n = arm_agents(doc, a)
-        rounds = arm_rounds(doc, a)
-        pr = per_round_s if per_round_s is not None else per_round_guess(n)
-        per_arm[a] = {"agents": n, "rounds": rounds, "per_round_s": pr,
-                      "per_run_s": int(rounds * pr), "runs": len(seed_list)}
-        total += int(rounds * pr) * len(seed_list)
+    pb = [a for a, e in _check_job_spec(job_yaml, chosen).items()
+          if getattr(e.world, "name", None) == "programbench"]
+    if pb:
+        raise SpecError(f"arm(s) {pb}: a programbench world runs in an API-model job inside its "
+                        "task image (no vLLM there); call an API model instead of vllm:")
+    total, per_arm = _estimate(doc, chosen, n_seeds, per_round_s, setup_s)
     timeout_s = (parse_duration(timeout) if timeout is not None
                  else math.ceil(total * 1.5 / 600.0) * 600)
     if timeout_s < total:
         notes.append(f"timeout {fmt_duration(timeout_s)} is below the {total // 60} min estimate; "
                      "the job may be cut (runs synced so far stay in the bucket, resumable)")
-    if dirty:
-        notes.append("the checkout has uncommitted changes: the wheel will not match the commit")
     return JobPlan(
-        spec_path=str(spec), name=doc["name"], tag=tag, model=model, flavor=flavor, image=image,
-        bucket=bucket, commit=commit, dirty=dirty, runs=runs, timeout_s=timeout_s,
+        **common, model=model, flavor=flavor, image=image, timeout_s=timeout_s,
         estimate_s=total, estimate_detail={"setup_s": setup_s, "arms": per_arm},
-        vllm_version=vllm_version, vllm_flags=resolved.flags, max_model_len=max_model_len,
-        gpu_memory_utilization=gpu_memory_utilization, revision=revision,
-        sync_every_s=sync_every_s, job_spec_yaml=job_yaml, orig_spec_yaml=spec.read_text(),
-        notes=notes, vllm_flags_source=resolved.source, vllm_profile=resolved.profile,
-        probe_extra=resolved.probe_extra, probe_extra_source=resolved.probe_extra_source,
-        port=port,
-    )
+        vllm_flags=resolved.flags, job_spec_yaml=job_yaml, notes=notes,
+        vllm_flags_source=resolved.source, vllm_profile=resolved.profile,
+        probe_extra=resolved.probe_extra, probe_extra_source=resolved.probe_extra_source)
+
+
+def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
+              image: str | None, timeout: str | int | None, per_round_s: float | None,
+              setup_s: int, environ: Mapping[str, str], common: dict[str, Any]) -> JobPlan:
+    job_yaml = dump_yaml(job_spec_doc(doc, None, arms=chosen))
+    exps = _check_job_spec(job_yaml, chosen)
+    notes: list[str] = []
+    pb = programbench_arms(exps)
+    facts = None
+    if pb:
+        tasks = sorted({w.task for w in pb.values()})
+        if len(tasks) > 1:
+            raise SpecError(f"the chosen arms name different programbench tasks {tasks}: one "
+                            "job runs one task image; launch one job per task (--arm)")
+        runs_pb = [r for r in common["runs"] if r[0] in pb]
+        if len(runs_pb) > 1:
+            raise SpecError(
+                f"{len(runs_pb)} programbench runs in one job "
+                f"({', '.join(f'{a}:{s}' for a, s in runs_pb)}): a run works in the image's "
+                "own /workspace, which nothing resets between runs, so one job runs one arm x "
+                "seed; narrow it with --arm and --seeds")
+        first = pb[next(iter(pb))]
+        facts = {"task": tasks[0], "image": first.image, "wall_limit_s": first.wall_limit_s,
+                 "lockdown": first.lockdown, "pin_hosts": list(first.pin_hosts),
+                 "user": first.user}
+        if not first.lockdown:
+            notes.append("the programbench world has lockdown: false: the agent keeps the job's "
+                         "network and sudo")
+        elif first.user is None:
+            notes.append("the programbench world has user: null: the agent's commands run as "
+                         "root (the job's user)")
+    first_arm = chosen[0]
+    default_image = pb[first_arm].image if first_arm in pb else DEFAULT_IMAGE
+    image = image or default_image
+    if pb and image != facts["image"]:
+        notes.append(f"--image {image} is not the task image {facts['image']}")
+    flavor = flavor or API_FLAVOR
+    wall = {a: float(w.wall_limit_s) for a, w in pb.items()}
+    total, per_arm = _estimate(doc, chosen, n_seeds, per_round_s, setup_s, wall)
+    if timeout is not None:
+        timeout_s = parse_duration(timeout)
+    elif wall:  # the wall limit + 1 h (setup, final snapshot, sync); other runs at 1.5x
+        other = total - setup_s - sum(int(wall[a]) * n_seeds for a in wall)
+        timeout_s = math.ceil((sum(wall[a] * n_seeds for a in wall) + API_SLACK_S
+                               + 1.5 * other) / 600.0) * 600
+    else:
+        timeout_s = math.ceil(total * 1.5 / 600.0) * 600
+    if timeout_s < total:
+        notes.append(f"timeout {fmt_duration(timeout_s)} is below the {total // 60} min estimate; "
+                     "the job may be cut (runs synced so far stay in the bucket, resumable)")
+    secrets, missing = job_secrets(exps, environ)
+    if missing:
+        notes.append(f"{', '.join(missing)} not set in this environment: the job reads each "
+                     "secret from here (hf jobs run --secrets NAME); --launch refuses until set")
+    extras = sorted(({"anthropic"} if any(_is_anthropic(p) for p in _providers(exps)) else set())
+                    | ({"programbench"} if pb else set()))
+    return JobPlan(
+        **common, model=None, flavor=flavor, image=image, timeout_s=timeout_s, estimate_s=total,
+        estimate_detail={"setup_s": setup_s, "arms": per_arm}, vllm_flags="",
+        job_spec_yaml=job_yaml, notes=notes, vllm_flags_source="none", vllm_profile=None,
+        probe_extra={}, probe_extra_source="none", mode="api", secrets=secrets,
+        missing_secrets=missing, extras=extras, programbench=facts)
+
+
+def programbench_arms(exps: Mapping[str, Any]) -> dict[str, Any]:
+    """{arm: ProgramBench world} for the arms whose world is programbench; SpecError for one
+    whose `backend` is not `local` (a job cannot run Docker; the spec is not rewritten)."""
+    from ..world.programbench import ProgramBench
+
+    out = {a: e.world for a, e in exps.items() if isinstance(e.world, ProgramBench)}
+    bad = [a for a, w in out.items() if w.backend != "local"]
+    if bad:
+        raise SpecError(f"arm(s) {bad}: the programbench world's backend is "
+                        f"{out[bad[0]].backend!r}, but a job cannot run Docker; set "
+                        "world.params.backend: local (the job runs inside the task image)")
+    return out
+
+
+def _models(exp: Any) -> list[str]:
+    from ..experiment import participant_model
+
+    models = [participant_model(p) for p in exp.participants]
+    models += [p.coder_model() for p in exp.probes]
+    models += [r.model for r in exp.roles.values()]  # role model overrides
+    return [m for m in models if m is not None]
+
+
+def _providers(exps: Mapping[str, Any]) -> list[Any]:
+    return [e.provider_for(m)[0] for e in exps.values() for m in _models(e)]
+
+
+def _is_anthropic(provider: Any) -> bool:
+    from ..providers.anthropic import AnthropicProvider
+
+    return isinstance(provider, AnthropicProvider)
+
+
+def job_secrets(exps: Mapping[str, Any], environ: Mapping[str, str]) -> tuple[list[str], list[str]]:
+    """(secret names the job needs, those unset in `environ`): HF_TOKEN, then each model's key
+    variable (Anthropic: ANTHROPIC_API_KEY, or ANTHROPIC_KEY when only that is set here;
+    OpenAI-compatible: its `api_key_env`), in first-seen order."""
+    names = ["HF_TOKEN"]
+    for p in _providers(exps):
+        if _is_anthropic(p):
+            name = ("ANTHROPIC_KEY" if not environ.get("ANTHROPIC_API_KEY")
+                    and environ.get("ANTHROPIC_KEY") else "ANTHROPIC_API_KEY")
+        else:
+            name = getattr(p, "api_key_env", None)
+        if name and name not in names:
+            names.append(name)
+    return names, [n for n in names if not environ.get(n)]
 
 
 def checkout_identity() -> tuple[str, bool]:
@@ -417,28 +642,39 @@ def checkout_identity() -> tuple[str, bool]:
             os.environ["SWARMLAB_GIT_COMMIT"] = saved
 
 
-def _check_job_spec(job_yaml: str, arms: Sequence[str]) -> None:
-    """Every chosen arm of the job spec must build (offline: the vllm provider is fully priced)."""
+def _check_job_spec(job_yaml: str, arms: Sequence[str]) -> dict[str, Any]:
+    """Every chosen arm of the job spec must build (offline: the vllm provider is fully priced);
+    returns {arm: Experiment}."""
     from ..experiment import Experiment
 
+    out = {}
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "spec.yaml"
         path.write_text(job_yaml)
         for a in arms:
             try:
-                Experiment.from_yaml(path, a)
+                out[a] = Experiment.from_yaml(path, a)
             except SpecError:
                 raise
             except (ValueError, TypeError, ImportError, AttributeError) as e:
                 raise SpecError(f"job spec, arm {a!r}: {type(e).__name__}: {e}") from e
+    return out
 
 
 # ---- the command ------------------------------------------------------------------------------
-def job_entry(plan: JobPlan) -> str:
-    """The shell line the job runs: fetch the stage dir, then the bootstrap script."""
-    return (f"mkdir -p {STAGE_LOCAL} && uv tool run --from 'huggingface_hub>=1.32' "
-            f"hf buckets sync \"$SWARMLAB_STAGE\" {STAGE_LOCAL} && "
-            f"exec bash {STAGE_LOCAL}/bootstrap.sh")
+def job_entry(plan: Any) -> str:
+    """The shell line the job runs: fetch the stage dir, then the bootstrap script. In vllm mode
+    the uv image's uv fetches it; otherwise (API mode, grade jobs) uv is installed first when the
+    image has none (into UV_LOCAL, PATH and shell profiles untouched) and handed to bootstrap.sh
+    as SWARMLAB_UV."""
+    if plan.mode == "vllm":
+        return (f"mkdir -p {STAGE_LOCAL} && uv tool run --from 'huggingface_hub>=1.32' "
+                f"hf buckets sync \"$SWARMLAB_STAGE\" {STAGE_LOCAL} && "
+                f"exec bash {STAGE_LOCAL}/bootstrap.sh")
+    return (f"mkdir -p {STAGE_LOCAL} && UV=$(command -v uv) || {{ curl -LsSf {UV_INSTALLER} | "
+            f"env UV_INSTALL_DIR={UV_LOCAL} UV_NO_MODIFY_PATH=1 sh && UV={UV_LOCAL}/uv; }} && "
+            f"\"$UV\" tool run --from 'huggingface_hub>=1.32' hf buckets sync \"$SWARMLAB_STAGE\" "
+            f"{STAGE_LOCAL} && SWARMLAB_UV=\"$UV\" exec bash {STAGE_LOCAL}/bootstrap.sh")
 
 
 def launcher_flags(plan: JobPlan) -> list[str]:
@@ -463,11 +699,18 @@ def serve_command(plan: JobPlan) -> str:
     return shlex.join(serve_argv(plan))
 
 
-def hf_command(plan: JobPlan, hf: str = "hf") -> list[str]:
+def hf_command(plan: Any, hf: str = "hf") -> list[str]:
+    """The exact `hf jobs run` argv of a plan (a `JobPlan`, or a grade plan with the same
+    attributes): secrets by name only (`--secrets NAME`: the hf CLI reads the value from the
+    launching environment), then volumes (`-v`, none for an agent job), then the env."""
     cmd = [hf, "jobs", "run", "--detach", "--flavor", plan.flavor,
-           "--timeout", fmt_duration(plan.timeout_s), "--secrets", "HF_TOKEN",
-           "--name", f"swarmlab-{plan.tag}"[:80],
-           "--label", "experiment=swarmlab", "--label", f"swarmlab_tag={plan.tag}"]
+           "--timeout", fmt_duration(plan.timeout_s)]
+    for name in plan.secrets:
+        cmd += ["--secrets", name]
+    cmd += ["--name", f"swarmlab-{plan.tag}"[:80],
+            "--label", "experiment=swarmlab", "--label", f"swarmlab_tag={plan.tag}"]
+    for vol in getattr(plan, "volumes", ()):
+        cmd += ["-v", vol]
     for k, v in plan.env().items():
         cmd += ["-e", f"{k}={v}"]
     return [*cmd, plan.image, "bash", "-c", job_entry(plan)]
@@ -480,22 +723,43 @@ def describe(plan: JobPlan) -> str:
     lines = ["hf jobs command:", "  " + shlex.join(hf_command(plan)), "",
              f"tag {plan.tag}  commit {plan.commit[:12]}{' (dirty)' if plan.dirty else ''}",
              f"stage {plan.stage_remote}/   runs -> {plan.runs_remote}/",
-             f"runs ({len(plan.runs)}): " + ", ".join(f"{a}:s{s}" for a, s in plan.runs),
-             (f"vllm {plan.vllm_version}: profile {plan.vllm_profile or 'none'}, "
-              f"flags from {plan.vllm_flags_source}"),
-             f"  flags: {plan.vllm_flags}",
-             f"  launcher adds: {shlex.join(launcher_flags(plan))}",
-             (f"  probe extra: {json.dumps(plan.probe_extra, sort_keys=True)} "
-              f"(from {plan.probe_extra_source})")]
+             f"runs ({len(plan.runs)}): " + ", ".join(f"{a}:s{s}" for a, s in plan.runs)]
+    if plan.mode == "vllm":
+        lines += [(f"vllm {plan.vllm_version}: profile {plan.vllm_profile or 'none'}, "
+                   f"flags from {plan.vllm_flags_source}"),
+                  f"  flags: {plan.vllm_flags}",
+                  f"  launcher adds: {shlex.join(launcher_flags(plan))}",
+                  (f"  probe extra: {json.dumps(plan.probe_extra, sort_keys=True)} "
+                   f"(from {plan.probe_extra_source})")]
+    else:
+        lines += [(f"mode: api (no vLLM): image {plan.image}, flavor {plan.flavor}, "
+                   f"wheel extras [{','.join(plan.extras)}]"),
+                  ("  secrets (names; the hf CLI reads each value from this environment): "
+                   f"{' '.join(plan.secrets)}")]
+        pb = plan.programbench
+        if pb:
+            lines.append(f"  programbench task {pb['task']} (backend local): the world locks the "
+                         f"job down at its first command (DNS blackholed, sudo removed; pinned: "
+                         f"{', '.join(pb['pin_hosts'])})" if pb["lockdown"] else
+                         f"  programbench task {pb['task']} (backend local, lockdown off)")
     for a, d in plan.estimate_detail["arms"].items():
-        lines.append(f"  {a}: N={d['agents']} x {d['rounds']} rounds x ~{d['per_round_s']:g} s/round"
-                     f" = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
+        if "wall_limit_s" in d:
+            lines.append(f"  {a}: N={d['agents']}, bounded by the world's wall limit "
+                         f"{fmt_duration(int(d['wall_limit_s']))}/run x {d['runs']} seed(s)")
+        else:
+            lines.append(f"  {a}: N={d['agents']} x {d['rounds']} rounds x ~{d['per_round_s']:g}"
+                         f" s/round = ~{d['per_run_s'] / 60:.0f} min/run x {d['runs']} seed(s)")
     cost = (f"~${rate * est_h:.2f} expected, ${rate * plan.timeout_s / 3600:.2f} worst case "
             f"(${rate:.2f}/h x timeout)" if rate is not None else "rate unknown for this flavor")
+    bounded = any("wall_limit_s" in d for d in plan.estimate_detail["arms"].values())
     lines.append(f"estimate: ~{plan.estimate_s / 60:.0f} min wall (incl. "
-                 f"{plan.estimate_detail['setup_s'] // 60} min setup); timeout "
+                 f"{plan.estimate_detail['setup_s'] // 60} min setup"
+                 f"{'; an upper bound: the wall limit' if bounded else ''}); timeout "
                  f"{fmt_duration(plan.timeout_s)}; flavor {plan.flavor}: {cost}")
-    lines.append("model calls are self-hosted: the ledger shows $0, the cost is the job's compute")
+    lines.append("model calls are self-hosted: the ledger shows $0, the cost is the job's compute"
+                 if plan.mode == "vllm" else
+                 "model calls are billed by their providers on top (each run's budget caps them); "
+                 "the cost above is the job's compute")
     lines += [f"note: {n}" for n in plan.notes]
     return "\n".join(lines)
 
@@ -543,12 +807,20 @@ def run_cli(args: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True, check=False)
 
 
-def submit(plan: JobPlan, *, hf: str = "hf", runner: Runner = run_cli,
+def submit(plan: Any, *, hf: str = "hf", runner: Runner = run_cli,
            build: Callable[[Path], Path] | None = build_wheel,
-           ledger: Path | str | None = None) -> dict[str, Any]:
-    """Stage, upload, submit. Returns `{"job_id", "url", "tag", ...}`; raises on failure."""
+           ledger: Path | str | None = None,
+           stage_fn: Callable[..., Path] | None = None) -> dict[str, Any]:
+    """Stage, upload, submit. Returns `{"job_id", "url", "tag", ...}`; raises on failure
+    (before anything is uploaded when a secret the job needs is unset here). `plan` is a
+    `JobPlan`, or a grade plan (`swarmlab/jobs/programbench.py`) with its own `stage_fn`."""
+    stage_fn = stage_fn or stage
+    if plan.missing_secrets:
+        raise SpecError(f"not launching: {', '.join(plan.missing_secrets)} not set in this "
+                        "environment (the job reads each secret from here via hf jobs run "
+                        "--secrets NAME)")
     with tempfile.TemporaryDirectory() as tmp:
-        d = stage(plan, Path(tmp) / plan.tag, build=build)
+        d = stage_fn(plan, Path(tmp) / plan.tag, build=build)
         p = runner([hf, "buckets", "sync", str(d), plan.stage_remote])
         if p.returncode != 0:
             raise RuntimeError(f"upload of the stage dir failed: {(p.stdout + p.stderr)[-500:]}")
@@ -564,9 +836,11 @@ def submit(plan: JobPlan, *, hf: str = "hf", runner: Runner = run_cli,
     row = {"kind": "launch", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "job_id": job_id, "url": f"https://huggingface.co/jobs/{_namespace(plan)}/{job_id}",
            "tag": plan.tag, "flavor": plan.flavor, "timeout_s": plan.timeout_s,
-           "estimate_s": plan.estimate_s, "rate_usd_per_hour": plan.rate_usd_per_hour,
-           "commit": plan.commit, "runs": [f"{a}:{s}" for a, s in plan.runs],
-           "stage_remote": plan.stage_remote, "runs_remote": plan.runs_remote}
+           "estimate_s": getattr(plan, "estimate_s", None),
+           "rate_usd_per_hour": plan.rate_usd_per_hour,
+           "commit": plan.commit, "runs": [f"{a}:{s}" for a, s in getattr(plan, "runs", [])],
+           "stage_remote": plan.stage_remote, "runs_remote": getattr(plan, "runs_remote", None),
+           "mode": plan.mode, "secrets": list(plan.secrets)}
     with tempfile.TemporaryDirectory() as tmp:
         f = Path(tmp) / "launch.json"
         f.write_text(json.dumps(row, indent=1))
@@ -579,7 +853,7 @@ def submit(plan: JobPlan, *, hf: str = "hf", runner: Runner = run_cli,
     return row
 
 
-def _namespace(plan: JobPlan) -> str:
+def _namespace(plan: Any) -> str:
     return plan.bucket.removeprefix("hf://buckets/").split("/", 1)[0]
 
 

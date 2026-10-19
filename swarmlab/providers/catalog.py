@@ -6,8 +6,14 @@ Sources:
   Each model lists its inference providers (`served_by`) with `status`, `context_length`,
   `supports_tools` and `pricing: {"input", "output"}` in USD per million tokens. One
   `CatalogEntry` per (model, served_by); a provider without `pricing` gets `input=output=None`.
-- `anthropic`: the static table `ANTHROPIC_MODELS` below. Only models documented in `docs/` are
-  listed (today: Claude Haiku 4.5 at 1.00 / 5.00 / 0.10 USD per M prompt / completion / cached).
+- `anthropic`: the static table `ANTHROPIC_MODELS` below, from Anthropic's pricing page
+  (https://platform.claude.com/docs/en/about-claude/pricing, read 2026-10-15): Claude Haiku 4.5 at
+  1.00 / 5.00 / 0.10 and Claude Haiku 5.5 at 0.10 / 0.50 / 0.01 USD per M prompt / completion /
+  cached prompt tokens. Haiku 5.5 is priced by prompt length: a request whose prompt (every input
+  token, cache reads and writes included) is over 100,000 tokens pays 0.50 / 2.50 / 0.05 for the
+  whole request (`ANTHROPIC_LONG_PROMPT`; `AnthropicProvider.cost` and `max_cost` apply it, the
+  catalog listing shows the base row). Cache writes (1.25x input for 5 min) are not modelled:
+  swarmlab sends no `cache_control`.
 
 Decisions where the contract is silent:
 
@@ -38,6 +44,11 @@ TTL_S = 24 * 3600
 # Static Anthropic table: model id -> (USD per M prompt, completion, cached prompt).
 ANTHROPIC_MODELS: dict[str, tuple[float, float, float]] = {
     "claude-haiku-4-5": (1.00, 5.00, 0.10),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+}
+# Prompt-length tiers: model id -> (prompt tokens above which, the row for the whole request).
+ANTHROPIC_LONG_PROMPT: dict[str, tuple[int, tuple[float, float, float]]] = {
+    "claude-haiku-5-5": (100_000, (0.50, 2.50, 0.05)),
 }
 
 

@@ -68,6 +68,12 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   jittered backoff as the OpenAI-compatible adapter; exhausted retries raise
   `ProviderError(status=..., attempts=...)` chained to the last SDK error. Other
   `APIStatusError`s (4xx) propagate unchanged at once.
+- Pricing: `default_pricing` is the catalog's `ANTHROPIC_MODELS` table. For a model with a
+  prompt-length tier (`catalog.ANTHROPIC_LONG_PROMPT`: Haiku 5.5 over 100,000 prompt tokens),
+  `cost` prices a request whose `usage.prompt_tokens` (cache reads and writes included, as the
+  API counts it) is over the threshold entirely at the long row, and `max_cost` does the same with
+  the estimated prompt tokens. The tier applies only while the model's row is the built-in one
+  (a `pricing:` override for that model replaces both).
 - API key: `ANTHROPIC_API_KEY`, else `ANTHROPIC_KEY`; with neither set the SDK's own credential
   resolution applies. The client is created per event loop (the runner uses `asyncio.run` per
   live/resume call). Tests replace `_client` with a stub; a stub set that way is always used.
@@ -96,6 +102,7 @@ from .base import (
     parse_json_args,
     text_of,
 )
+from .catalog import ANTHROPIC_LONG_PROMPT, ANTHROPIC_MODELS
 
 THINKING_BUDGET_MODELS = frozenset({"claude-haiku-4-5"})
 
@@ -246,13 +253,34 @@ def parse_refusal(message: Any) -> Refusal | None:
 class AnthropicProvider(Provider):
     entry_point: ClassVar[str | None] = "anthropic"
     name = "anthropic"
-    default_pricing: ClassVar[dict[str, PricingRow]] = {"claude-haiku-4-5": (1.00, 5.00, 0.10)}
+    default_pricing: ClassVar[dict[str, PricingRow]] = dict(ANTHROPIC_MODELS)
 
     def __init__(self, pricing: dict | None = None, concurrency: int = 8,
                  timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES) -> None:
         self._setup(pricing, concurrency, timeout_s, max_retries)
         self._client: Any = None
         self._client_loop: Any = None
+
+    # ---- pricing (prompt-length tiers) ---------------------------------------------------------
+    def _row_for(self, model: str, prompt_tokens: int) -> PricingRow:
+        row = self.model_pricing(model)
+        mid = model.split(":", 1)[1] if model.startswith(f"{self.name}:") else model
+        tier = ANTHROPIC_LONG_PROMPT.get(mid)
+        if tier is not None and row == ANTHROPIC_MODELS.get(mid) and prompt_tokens > tier[0]:
+            return tier[1]
+        return row
+
+    def max_cost(self, request: ChatRequest) -> float:
+        prompt = self.estimate_prompt_tokens(request)
+        p_in, p_out, _ = self._row_for(model_id(request), prompt)
+        out_tokens = request.max_tokens + (request.thinking_budget or 0)
+        return (prompt * p_in + out_tokens * p_out) / 1e6
+
+    def cost(self, request: ChatRequest, usage: Usage) -> float:
+        p_in, p_out, p_cached = self._row_for(model_id(request), usage.prompt_tokens)
+        cached = min(usage.cached_prompt_tokens, usage.prompt_tokens)
+        return ((usage.prompt_tokens - cached) * p_in + cached * p_cached
+                + usage.completion_tokens * p_out) / 1e6
 
     def _get_client(self) -> Any:
         loop = asyncio.get_running_loop()
