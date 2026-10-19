@@ -242,7 +242,10 @@ def test_description_is_the_baseline_text_with_uname(tmp_path):
     assert w.description() == f"{s}\n\n{i}"
 
 
-def test_templates_are_the_installed_mini_swe_agent_config():
+def test_templates_are_the_installed_mini_swe_agent_config(monkeypatch):
+    # A cross-check against the real package, which swarmlab does not install (the participant
+    # uses a vendored copy): it runs when a developer has mini-swe-agent 2.4.6 installed.
+    monkeypatch.setenv("MSWEA_SILENT_STARTUP", "1")
     minisweagent = pytest.importorskip("minisweagent")
     import yaml
 

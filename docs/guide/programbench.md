@@ -10,7 +10,7 @@ The world reproduces the official harness's environment (mini-swe-agent 2.4.6 wi
 pip install "swarmlab[programbench]"
 ```
 
-The extra pins `programbench==1.2.5` (task metadata now; the grader in a later step). Building the world, replaying a run, the viewer and reports work without it; only the run-start task check (`check_task`) imports `programbench`. mini-swe-agent, the faithful solo participant, comes with that participant's own extra in a later PR; the world's task text is already copied from its 2.4.6 release.
+The extra pins `programbench==1.2.5` (task metadata now; the grader in a later step). Building the world, replaying a run, the viewer and reports work without it; only the run-start task check (`check_task`) imports `programbench`. mini-swe-agent, the faithful participant, comes with its own extra (see [Faithful participant](#faithful-participant)); the world's task text is copied from its 2.4.6 release.
 
 ## Parameters
 
@@ -85,7 +85,107 @@ The `solo` role leaves the agent `bash` (and `end_turn`, which is always offered
 
 The world needs `commit: immediate`, because a coding agent needs each command's output before its next call, so `validate` refuses `round_end`. At run start, a one-round run must also allow at least `step_limit` tool calls in its turn (`max_calls_per_turn >= 1000`), otherwise the default 20-call cap would end the episode long before the benchmark's limit. Runs with several rounds of k calls are a legitimate variation and are not checked. There the participant enforces the step limit.
 
-The `llm` participant is swarmlab's own loop and does not reproduce the baseline's observation template or step warnings. The faithful solo participant (mini-swe-agent 2.4.6 itself) comes in a follow-up PR. Running in a job and grading are described [below](#running-in-hf-jobs).
+The `llm` participant is swarmlab's own loop and does not reproduce the baseline's observation template or step warnings. The faithful participant is mini-swe-agent 2.4.6 itself (next section). `swarmlab job run` without vLLM and `swarmlab programbench grade` come in follow-up PRs.
+
+## Faithful participant
+
+`mini_swe_agent` runs mini-swe-agent 2.4.6, the official ProgramBench baseline agent, as a swarmlab participant. The agent loop is mini-swe-agent's own `DefaultAgent`: its step and wall-clock limits, its step counting, its messages and its templates. swarmlab supplies the model (requests go through `tools.infer`, so the budget, the ledger and the cache apply) and the environment (commands go through the executor to the world's `bash` tool). Module: `swarmlab/participants/minisweagent.py` (its docstring is the exact reference).
+
+```
+pip install "swarmlab[programbench]"
+```
+
+The participant does not install mini-swe-agent: its agent loop, exceptions and tool-call helpers are a vendored copy of mini-swe-agent 2.4.6 in `swarmlab/vendor/minisweagent/` (MIT; its README lists the files, their wheel hashes and the changes, which are import paths only).
+
+`participants: [{type: mini_swe_agent, params: {...}}]`
+
+| param | default | meaning |
+|---|---|---|
+| `model` | required | `<provider>:<model id>`, as for `llm` |
+| `steps_per_turn` | null | model calls per turn; null runs until the episode ends (the solo shape) |
+| `step_limit` | 1000 | the baseline's step limit (model calls), checked before each call; keep it equal to the world's `step_limit` |
+| `wall_limit_s` | 21600 | the baseline's wall-clock limit, counted over the agent's own turns |
+| `max_tokens` | 8192 | per response (the baseline sets none; swarmlab's providers need one) |
+| `temperature` | null | null leaves the provider's default, as the baseline does |
+| `extra` | `{}` | provider body fields, as for `llm` |
+| `templates` | `solo` | `solo`, `lead`, `worker`, or `file:<path>` (a YAML mapping with `system_template` and `instance_template`) |
+| `idle_until_assigned` | false | a worker: no model call until something is delivered; its report to `lead_channel` ends the assignment |
+| `wait_tool` | false | a lead: offer `wait_for_workers`, which ends the turn after the step (not with `templates: solo`) |
+| `lead_channel` | `lead` | where workers post reports |
+| `worker_channels` | null | the lead's channels to its workers; null: the agent's `post` channels other than `lead_channel` |
+
+Params are in the spec only when they differ from these defaults.
+
+The official solo run is the solo shape of the world with this participant:
+
+```yaml
+name: programbench-solo
+seeds: [0]
+budget: {soft_usd: 0, hard_usd: 5.0}
+options: {commit: immediate, max_rounds: 1, max_calls_per_turn: 3000}
+roles: {solo: {tools: [bash]}}
+arms:
+  solo:
+    world: {type: programbench, params: {task: abishekvashok__cmatrix.5c082c6, backend: docker}}
+    participants:
+      - {type: mini_swe_agent, count: 1, role: solo, params: {model: "anthropic:claude-haiku-4-5"}}
+```
+
+`max_calls_per_turn` counts tool calls, not steps, and one reply may run several commands, so it is set well above the 1000-step limit; the run-start check only requires at least `step_limit`. The executor's cap is a safety net here: the episode should end by submission or by one of the baseline's limits.
+
+How the transcript matches the baseline:
+
+- The model is offered exactly the baseline's one tool, mini-swe-agent's `BASH_TOOL` (`bash`, "Execute a bash command", one `command` string), and nothing else: not `end_turn`, which swarmlab's executor lists for every agent, nor the board's tools. `swarmlab prompts` shows `tools: bash`.
+- The system message is the baseline's system template and the first user message its instance template, rendered with the same machine details; the world's resource sentence follows it (the one added sentence).
+- Each reply is stored as the model's assistant message with its tool calls. Each `bash` result comes back as a tool message rendered with the baseline's `observation_template`: the return code, the output (head and tail past 10000 characters), and the warnings when fewer than 20 steps or less than 10 minutes are left.
+- A reply without a tool call, with bad `bash` arguments or calling any other tool (`end_turn` included) gets the baseline's `format_error_template` message (the "output token limit" variant when the reply was cut off) and counts as a step; the episode goes on, and three in a row end it (`RepeatedFormatError`).
+- A submission, the step limit and the wall limit end the episode with the baseline's exit messages (`Submitted`, `LimitsExceeded`, `TimeExceeded`). The workspace is graded as it is in every case.
+- The turn ends only when the episode does (submission, step limit, wall limit, repeated format errors) or when swarmlab's own limits stop it (the executor's `max_calls_per_turn`, the budget's hard ceiling).
+- Differences: requests go through swarmlab's providers (see the deviations above). Their adapters send a tool schema exactly as the participant offers it, so the wire schema is the baseline's: `BASH_TOOL` without `additionalProperties`, and on Anthropic without `strict`. The participant's whole conversation, mini-swe-agent's message dicts, is in its snapshot state (`messages`), and the model calls are in the event log as for any participant.
+
+## Swarm shape
+
+The lead/worker scaffold of arXiv 2610.17471 with this participant: a lead with the official task text and delegation instructions, workers that see only their assignments, a shared workspace, and k steps per turn:
+
+```yaml
+name: programbench-team
+seeds: [0]
+budget: {soft_usd: 0, hard_usd: 20.0}
+options: {commit: immediate, max_rounds: 60, max_calls_per_turn: 40, scheduler: {type: fixed}}
+roles:
+  lead: {tools: [bash, post, read_board], channels_write: [worker-1, worker-2, worker-3]}
+  worker: {tools: [bash, post, read_board], channels_read: [worker-1, worker-2, worker-3]}
+arms:
+  team:
+    world: {type: programbench, params: {task: abishekvashok__cmatrix.5c082c6, backend: docker}}
+    medium:
+      delivery: pull
+      topology:
+        type: rooms
+        params:
+          rooms:
+            lead: [a000, a001, a002, a003]
+            worker-1: [a000, a001]
+            worker-2: [a000, a002]
+            worker-3: [a000, a003]
+    participants:
+      - {type: mini_swe_agent, count: 1, role: lead,
+         params: {model: "anthropic:claude-haiku-4-5", templates: lead, steps_per_turn: 10,
+                  wait_tool: true}}
+      - {type: mini_swe_agent, count: 3, role: worker,
+         params: {model: "anthropic:claude-haiku-4-5", templates: worker, steps_per_turn: 10,
+                  idle_until_assigned: true}}
+```
+
+- Channels: one room per worker, shared with the lead (`worker-1`: the lead `a000` and the worker `a001`), carries its assignments; the `lead` room carries the reports. The lead's role writes only the worker rooms; a worker's role reads only worker rooms, so of its rooms it reads its own and never the other workers' reports. The `tree` topology does not fit: its channels are the groups and one `coordinators` channel, so a lead cannot have a channel of its own with each worker.
+- Delegation is a post on the worker's room; the lead's prompt names the rooms (`worker_channels`). A report is a post on `lead`, starting with the worker's room name, since board messages carry no author.
+- Pull delivery: nobody's model sees a message unless it calls `read_board`. Each idle worker (`idle_until_assigned`) still reads its board once per turn itself, with no model call; once something arrives it works for up to 10 steps per turn until it posts its report, then it is idle again. Its next assignment continues the same conversation. Under `delivery: push` the deliveries are inserted as one user message at the start of the turn instead (use `push_consume: true` so each is pushed once).
+- `wait_for_workers` ends the lead's turn after the current step; the reports are on the board at its next turn.
+- The `fixed` scheduler gives the lead the first turn of every round, so with immediate commit an assignment reaches its worker in the same round.
+- Only the lead submits. The worker template tells workers never to run the submission command, which would end the run for the whole team.
+- Each agent has its own step limit and its own clock (its turns only); the world's 6 h clock is shared, and past it every command is refused, which ends each agent's episode (`TimeExceeded`).
+
+Check a spec without spending: `swarmlab validate <spec>` and `swarmlab prompts <spec>` show the exact system and first user message of the lead and of a worker.
 
 ## Snapshots, resume and the viewer
 
