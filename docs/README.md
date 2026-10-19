@@ -12,6 +12,7 @@ The [project README](../README.md) is the overview. These pages are the referenc
 | [Hidden Sites](guide/hidden-sites.md) | run the hidden-site allocation task: parameters, information boundary, matched trial stream, metrics, cost |
 | [Crossed zones](guide/building-experiments.md#crossed-zones) | run the coloring world's relay task: groups, zones, generated boards, the oracle control, relay-status diagnostics |
 | [Minesweeper](guide/minesweeper.md) | run the shared-board Minesweeper world: parameters and difficulty, information boundary, provable cells and allocation accounting, metrics, cost |
+| [ProgramBench](guide/programbench.md) | run one ProgramBench task (rebuild a program from its binary and docs with one bash tool): install, the local and Docker backends, the official semantics kept and the documented deviations, the solo spec shape, snapshots and the free dry run |
 | [Cascade](guide/cascade.md) | run the information-cascade ("grader") scenario: one-shot workers, a noisy private signal, misleading first signals, board variants |
 | [Real models and budgets](guide/real-models.md) | pick a model id, set keys, read prices, tune timeouts, preflight, set reasoning controls, self-host with `job run` (vLLM serve profiles), size `soft_usd` / `hard_usd` / `total_usd`, handle refusals, capture reasoning traces |
 | [Spec reference](guide/spec-reference.md) | look up any YAML key, its shape and default (generated from the pydantic models) |
