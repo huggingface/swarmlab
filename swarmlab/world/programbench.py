@@ -109,7 +109,14 @@ Official semantics replicated
   `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` with return code 0 submits (`submission_of`). The world
   records `submitted`, the rest of the output as `submission`, who and when; `terminal()` is true
   from then on and `validate` refuses every later `bash` (`Ack(ok=False, error="submitted")`).
-  There is no `submit` tool. Submission freezes the workspace (below).
+  There is no `submit` tool. Submission freezes the workspace (below). The first submission is
+  final: under `commit: async` two agents' commands may both print the marker and exit before
+  either completion is handled; the first one handled (on the loop, after its await) is the
+  submission, and a later one is not (no submission field changes, `terminal()` follows the
+  first submitter). It still counts as a step and returns its real `output` and `returncode`,
+  with `exception_info` `This command was not taken as the submission: <agent> already
+  submitted the final output (the episode is over)` (a mini_swe_agent participant still ends
+  its episode on the marker, as on any refused command after a submission).
 - Docker: `docker run -d --name <n> -w <workspace> --rm --network none --cpus 20 --memory 60g
   --memory-swap 60g --user agent --cap-drop SYS_PTRACE <image> sleep 7h`, then per call
   `docker exec -w <workspace> -e K=V ... <id> bash -lc <command>`, as mini-swe-agent's
@@ -356,6 +363,7 @@ DOCKER_START_TIMEOUT_S = 1800                   # a pull of a 1-2 GB image; not 
 HISTORY_KEEP = 10
 RUN_MARKER = "SWARMLAB_PROGRAMBENCH_RUN"         # =<random id> in every local command's environment
 _ERROR_PREFIX = "An error occurred while executing the command: "
+NOT_THE_SUBMISSION = "This command was not taken as the submission: "
 log = logging.getLogger(__name__)
 
 # ---- the official task text (mini-swe-agent, MIT; see the module docstring) -----------------
@@ -1663,7 +1671,12 @@ class ProgramBench(World):
         self.history = [*self.history, {"round": self.round, "agent": a, "command": command[:200],
                                         "returncode": out["returncode"]}][-HISTORY_KEEP:]
         sub = submission_of(out["output"], out["returncode"])
-        if sub is not None:
+        if sub is not None and self.submitted:
+            # another command that submits completed first (both were running when neither had
+            # been handled): the first handled is the submission, frozen; this one only ran
+            out = {**out, "exception_info": f"{NOT_THE_SUBMISSION}{self.submitted_by} already "
+                                            f"submitted the final output (the episode is over)"}
+        elif sub is not None:
             self.submitted, self.submission = True, sub
             self.submitted_by, self.submitted_round = a, self.round
             # the submission freezes the workspace: every other command still running (other

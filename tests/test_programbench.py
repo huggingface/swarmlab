@@ -813,6 +813,36 @@ def test_submission_kills_the_other_agents_running_command(tmp_path):
     assert bash(w, "ls", "a001").accepted is False           # and nothing new starts
 
 
+def test_the_first_submission_handled_stays_when_two_complete_before_either_is_handled(tmp_path):
+    w = make(tmp_path, agents=("a000", "a001"))
+    w.set_commit_mode("async")
+    w.reset(random.Random(0), ["a000", "a001"])
+    w.begin_round(3)
+
+    async def go():
+        first = asyncio.create_task(w.bash("a000", f"echo {SUBMIT_MARKER}; echo first"))
+        second = asyncio.create_task(w.bash("a001", f"sleep 0.1; echo {SUBMIT_MARKER}; "
+                                                    "echo second"))
+        await asyncio.sleep(0)       # both commands start
+        time.sleep(0.5)  # noqa: ASYNC251 - both exit while the loop is blocked: neither handled
+        return await asyncio.gather(first, second)
+
+    first, second = asyncio.run(go())
+    assert first.feedback == {"output": f"{SUBMIT_MARKER}\nfirst\n", "returncode": 0,
+                              "exception_info": ""}
+    assert (w.submitted, w.submission, w.submitted_by, w.submitted_round) == (
+        True, "first\n", "a000", 3)
+    assert second.accepted and second.feedback == {
+        "output": f"{SUBMIT_MARKER}\nsecond\n", "returncode": 0,
+        "exception_info": "This command was not taken as the submission: a000 already submitted "
+                          "the final output (the episode is over)"}
+    assert w.steps == {"a000": 1, "a001": 1} and w.steps_total == 2
+    w.close_turn("a001", 3)
+    assert not w.terminal()                               # the second agent did not submit
+    w.close_turn("a000", 4)
+    assert w.terminal() and w.submitted_by == "a000"
+
+
 def test_submission_kills_timed_out_commands_too(tmp_path):
     w = make(tmp_path, command_timeout_s=0.3)
     fb = sh(w, "echo $$ > o.pid; sleep 30")
