@@ -38,7 +38,10 @@ order a000, a001, ...) is in group `G(i % G)`, so groups differ in size by at mo
 (ids `Z0` .. `Z{M-1}`) has its targets shown to group `z % G` and may be painted only by group
 `(z + 1) % G` (the fixed cycle): with G = M = 3, Z0 G0 -> G1, Z1 G1 -> G2, Z2 G2 -> G0; with G = 2,
 Z0 G0 -> G1 and Z1 G1 -> G0, so each group sees one zone and paints the other; with M > G a group
-sees and paints several zones; with M < G some groups neither see nor paint a zone. Invariants:
+sees and paints several zones; with M < G some groups neither see nor paint a zone.
+`observers: [agent, ...]` (default none) are in no group and left out of that count: they see no
+zone's targets and may paint only open cells, and the group cycle runs over the other agents in
+order (an observer is, for example, the hub of a `star` topology, which only relays). Invariants:
 
 - every zone's painting group is non-empty, which holds when there are at least G agents: the
   world requires them (`requires.n_agents = ("n_groups", None)`, checked at `Experiment`
@@ -68,6 +71,14 @@ One text part:
     Z1 at x=0..4, y=1..2: targets visible to G1, painted by G2
     Z2 at x=5..9, y=6..7: targets visible to G2, painted by G0
     You are a000, in group G0. <your duties: per zone you see and report, per zone you paint>
+
+With `zone_view: true` (default false) a block follows the duties line: a blank line,
+`Your zones (each cell as x:colour)`, then per zone the agent's group sees or paints
+`Z0 (you paint it):` or `Z0 (you see it, G1 paints it):` and per row
+`  row y=4: target 5:r 6:g 7:b 8:y 9:r; now 5:. 6:g 7:. 8:. 9:.`, with `hidden from you, get it
+from the board` for the target of a zone the agent paints but cannot see; for a zone it paints
+and sees, `  cells still to paint: (5,4) (7,4) ...` (or `none, done`). It spares models counting
+columns in long rows, which at 40+ columns made them paint a zone with its neighbour's colours.
 
 With `oracle: true` the zone lines read `targets visible to G0 and G1 (its painters), painted by
 G1` and the painting group's target rows show the zone. `observation.private` is
@@ -172,6 +183,7 @@ HIDDEN = "?"
 TARGET_HEADER = "Target grid"
 CURRENT_HEADER = 'Current grid ("." = unpainted):'
 COLOURS_PREFIX = "Colours:"
+ZONE_VIEW_HEADER = "Your zones"
 RELAY_STATUSES = ("complete", "viewer_never_posted", "viewer_posted_wrong_or_unparsed",
                   "painter_never_read_correct_report", "painter_read_but_painted_wrong")
 
@@ -391,7 +403,9 @@ class ColoringGrid(World):
                  target_changes: list | tuple = (),
                  worker_failures: list | tuple = (),
                  paints_per_round: int = 10,
-                 status_tools: list[str] | tuple[str, ...] = ()) -> None:
+                 status_tools: list[str] | tuple[str, ...] = (),
+                 observers: list[str] | tuple[str, ...] = (),
+                 zone_view: bool = False) -> None:
         if height < 1 or width < 1:
             raise ValueError("height and width must be >= 1")
         if not 2 <= palette <= len(COLOURS):
@@ -424,6 +438,8 @@ class ColoringGrid(World):
         self.worker_failures = [(int(r), [AgentId(a) for a in agents]) for r, agents in worker_failures]
         self.paints_per_round = paints_per_round
         self.status_tools = tuple(status_tools)
+        self.observers = [str(a) for a in observers]
+        self.zone_view = bool(zone_view)
         # state (snapshotted)
         self.agents: list[AgentId] = []
         self.groups: dict[str, int] = {}
@@ -443,15 +459,20 @@ class ColoringGrid(World):
     _skip_in_snapshot: ClassVar[tuple[str, ...]] = (
         "params", "height", "width", "colours", "n_groups", "n_zones", "zone_max", "oracle",
         "zone_w", "zone_h", "target_changes", "worker_failures", "paints_per_round", "status_tools",
+        "observers", "zone_view",
     )
 
     # ---- lifecycle ---------------------------------------------------------------------------
     def reset(self, rng: random.Random, agents: list[AgentId]) -> None:
-        if len(agents) < self.n_groups:
+        unknown = sorted(set(self.observers) - {str(a) for a in agents})
+        if unknown:
+            raise ValueError(f"ColoringGrid observers {unknown} are not agents of this run")
+        members = [a for a in agents if str(a) not in self.observers]
+        if len(members) < self.n_groups:
             raise ValueError(f"ColoringGrid needs at least {self.n_groups} agents (one per group), "
-                             f"got {len(agents)}")
+                             f"got {len(members)}" + (" besides its observers" if self.observers else ""))
         self.agents = list(agents)
-        self.groups = {str(a): i % self.n_groups for i, a in enumerate(self.agents)}
+        self.groups = {str(a): i % self.n_groups for i, a in enumerate(members)}
         self.target = [[rng.choice(self.colours) for _ in range(self.width)]
                        for _ in range(self.height)]
         self.crossed = generate_zones(rng, self.height, self.width, self.n_zones, self.n_groups,
@@ -545,6 +566,9 @@ class ColoringGrid(World):
     def _duties(self, agent: AgentId) -> str:
         g = self.groups.get(str(agent))
         if g is None:
+            if str(agent) in self.observers:
+                return (f"You are {agent}, in no group: you see no zone's targets and may paint "
+                        "only open cells.")
             return ""
         sees = [z for z in self.crossed if z["viewer_group"] == g]
         paints = [z for z in self.crossed if z["painter_group"] == g]
@@ -599,8 +623,34 @@ class ColoringGrid(World):
             duties = self._duties(agent)
             if duties:
                 lines.append(duties)
+            if self.zone_view:
+                lines += self._zone_view(agent)
         g = self.groups.get(str(agent))
         return text_observation("\n".join(lines), **({"group": g} if g is not None else {}))
+
+    def _zone_view(self, agent: AgentId) -> list[str]:
+        """`zone_view: true`: the zones the agent's group sees or paints, cell by cell with
+        coordinates, so nobody has to count columns in the full rows (module docstring)."""
+        g = self.groups.get(str(agent))
+        mine = [z for z in self.crossed if g in (z["viewer_group"], z["painter_group"])]
+        if not mine:
+            return []
+        out = ["", f"{ZONE_VIEW_HEADER} (each cell as x:colour)"]
+        for z in mine:
+            paints, sees = z["painter_group"] == g, self._can_view(agent, z)
+            role = ("you paint it" if paints else f"you see it, G{z['painter_group']} paints it")
+            out.append(f"{z['zone_id']} ({role}):")
+            wrong = []
+            for y in range(z["y"], z["y"] + z["height"]):
+                xs = range(z["x"], z["x"] + z["width"])
+                target = (" ".join(f"{x}:{self.target[y][x]}" for x in xs) if sees
+                          else "hidden from you, get it from the board")
+                now = " ".join(f"{x}:{self.grid[y][x]}" for x in xs)
+                out.append(f"  row y={y}: target {target}; now {now}")
+                wrong += [f"({x},{y})" for x in xs if sees and self.grid[y][x] != self.target[y][x]]
+            if paints and sees:
+                out.append("  cells still to paint: " + (" ".join(wrong) if wrong else "none, done"))
+        return out
 
     def _cell_error(self, x: Any, y: Any, color: Any) -> tuple[str, str] | None:
         """(reason code, message) when the paint is malformed, else None."""

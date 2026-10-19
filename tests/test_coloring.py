@@ -28,6 +28,7 @@ from swarmlab.rng import derive
 from swarmlab.viewer.build import build
 from swarmlab.world.base import Action
 from swarmlab.world.coloring import (
+    ZONE_VIEW_HEADER,
     ColoringGrid,
     board_hash,
     format_report,
@@ -1062,3 +1063,46 @@ def test_cap_note_marks_spinning_turns_and_report_counts_rejected_calls(tmp_path
     text_ = build_report(out, "cap")
     assert "| rejected tool calls |" in text_
     assert "| 8/22 |" in text_  # spinner 4 of 5 refused, busy 0 of 5, idle 0 of 1, per round
+
+
+def test_observers_are_in_no_group():
+    agents = [agent_id(i) for i in range(5)]
+    w = ColoringGrid(height=4, width=10, groups=4, zones=4, observers=["a004"])
+    w.reset(derive(1, "world"), agents)
+    assert "a004" not in w.groups and sorted(w.groups.values()) == [0, 1, 2, 3]
+    text = w.observe(agent_id(4)).parts[0].text
+    assert "in no group" in text and "a004" not in text.split("Groups:")[1].split("\n")[0]
+    assert all(c == "?" for row in text.split("\n")[1:5] for c in row)  # sees no zone targets
+    assert w._zone_refusal(agent_id(4), w.crossed[0]["x"], w.crossed[0]["y"]) is not None
+    with pytest.raises(ValueError, match="besides its observers"):
+        ColoringGrid(height=4, width=10, groups=5, zones=4, observers=["a004"]).reset(
+            derive(1, "world"), agents)
+    with pytest.raises(ValueError, match="not agents"):
+        ColoringGrid(observers=["a099"]).reset(derive(1, "world"), agents)
+
+
+
+def test_zone_view_lists_own_zones_cell_by_cell():
+    agents = [agent_id(i) for i in range(4)]
+
+    def grid(**kw):
+        w = ColoringGrid(height=4, width=10, groups=4, zones=4, **kw)
+        w.reset(derive(1, "world"), agents)
+        return w
+
+    plain, w = grid(), grid(zone_view=True)
+    assert ZONE_VIEW_HEADER not in text(plain, agent_id(0))
+    assert parse_observation(text(w, agent_id(0))) == parse_observation(text(plain, agent_id(0)))
+    sees = next(z for z in w.crossed if z["viewer_group"] == 0)
+    paints = next(z for z in w.crossed if z["painter_group"] == 0)
+    body = text(w, agent_id(0)).split(ZONE_VIEW_HEADER)[1]
+    assert f"{sees['zone_id']} (you see it, G{sees['painter_group']} paints it):" in body
+    assert f"{sees['x']}:{w.target[sees['y']][sees['x']]}" in body  # every visible cell with its x
+    assert f"{paints['zone_id']} (you paint it):" in body and "hidden from you" in body
+    assert "cells still to paint" not in body  # a painter without the targets learns nothing here
+
+    o = grid(zone_view=True, oracle=True)
+    pz = next(z for z in o.crossed if z["painter_group"] == 0)
+    o.grid[pz["y"]][pz["x"]] = o.target[pz["y"]][pz["x"]]
+    left = text(o, agent_id(0)).split("cells still to paint: ")[1].split("\n")[0].split()
+    assert f"({pz['x']},{pz['y']})" not in left and len(left) == pz["width"] * pz["height"] - 1
