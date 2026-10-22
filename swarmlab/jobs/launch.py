@@ -133,6 +133,24 @@ serve job's namespace). Refused: `--endpoint` with `--model` or a `vllm:` arm (A
 chosen arm on a provider with `base_url_env`, a model on such a provider that is not the served
 name, and (without `--endpoint`) a chosen provider with `base_url_env` (nothing would set it).
 
+Staged files (both modes)
+-------------------------
+A participant param string `file:<path>` (at any depth of the chosen arms' participant `params`:
+`templates: file:...`, `guidance: file:...`, an llm `system_prompt: file:...`) names a file on
+this machine that the job does not have. `plan_job` copies none yet but records each one in
+`JobPlan.staged_files` (`name` = its basename, `size`, `sha256`, `source` = the resolved path,
+`ref` = the value as written; a relative path resolves against the current directory, as a local
+run reads it) and rewrites the job spec's value to `file:/opt/swarmlab/stage/files/<name>` (the
+stage dir the job entry syncs into, `STAGE_LOCAL`); `stage` copies the files into
+`<stage>/files/` (refusing one whose content changed since the plan). Two references with one
+basename and different contents are refused (rename one); the same file referenced twice is
+staged once. A missing file is refused at plan time. The records are in plan.json, and
+bootstrap.sh records what it finds in `<stage>/files/` (name, size, sha256) in job.json
+`staged_files`. A job spec with no references is unchanged. The spec hash is unaffected by the
+rewrite: `spec_hash` hashes a readable `file:` param by its content (swarmlab/spec.py), so the
+job's runs hash like a local run on the same files. Each experiment can keep its stage dirs and
+runs in its own bucket with `--bucket` (e.g. `hf://buckets/<ns>/flint-programbench`).
+
 `hf_command` adds `--expose PORT` for each of a plan's `expose` ports (the serve plan's; never
 `--expose-public`), `job_entry` runs the plan's `entry_script` (default `bootstrap.sh`; the serve
 plan's is `serve.sh`), and `submit` merges a plan's `ledger_fields()` into the ledger row (the
@@ -288,9 +306,10 @@ def vllm_provider(model: str, port: int = DEFAULT_PORT, concurrency: int = DEFAU
 
 
 def job_spec_doc(doc: dict, model: str | None, arms: Sequence[str] | None = None,
-                 **provider_kw: Any) -> dict:
+                 staged: list[dict[str, Any]] | None = None, **provider_kw: Any) -> dict:
     """The spec the job runs: the in-job vllm provider (unless `model` is None: API mode), and
-    only the chosen `arms` (when given).
+    only the chosen `arms` (when given); with `staged` (a list, filled in), every participant
+    `file:` reference rewritten to the job's stage dir (module doc, "Staged files").
 
     Arms the job does not run are dropped: they may call other models, which the job does not
     serve or price, and the job validates every arm of its spec before it starts."""
@@ -299,7 +318,43 @@ def job_spec_doc(doc: dict, model: str | None, arms: Sequence[str] | None = None
         out["arms"] = {a: out["arms"][a] for a in out["arms"] if a in set(arms)}
     if model is not None:
         out["providers"] = {**out.get("providers", {}), "vllm": vllm_provider(model, **provider_kw)}
+    if staged is not None:
+        for a in out["arms"].values():
+            for g in a.get("participants") or []:
+                if isinstance(g, dict) and isinstance(g.get("params"), dict):
+                    g["params"] = _stage_refs(g["params"], staged)
     return out
+
+
+STAGED_DIR = "files"   # under the stage dir
+
+
+def _stage_refs(value: Any, staged: list[dict[str, Any]]) -> Any:
+    """`value` with each `file:<path>` string rewritten to the job's staged copy; records the
+    file in `staged` (once per file; SpecError for a missing file or a basename clash)."""
+    if isinstance(value, dict):
+        return {k: _stage_refs(v, staged) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_stage_refs(v, staged) for v in value]
+    if not (isinstance(value, str) and value.startswith("file:")):
+        return value
+    src = Path(value[len("file:"):]).expanduser().resolve()
+    try:
+        data = src.read_bytes()
+    except OSError as e:
+        raise SpecError(f"{value}: cannot read the referenced file ({e}); the job needs a copy "
+                        "of every file: reference") from e
+    digest = hashlib.sha256(data).hexdigest()
+    name = src.name
+    same = next((f for f in staged if f["name"] == name), None)
+    if same is not None and same["sha256"] != digest:
+        raise SpecError(f"two file: references share the name {name!r} with different contents "
+                        f"({same['source']} and {src}); the job stages them flat under "
+                        f"{STAGED_DIR}/, so rename one")
+    if same is None:
+        staged.append({"name": name, "size": len(data), "sha256": digest, "source": str(src),
+                       "ref": value})
+    return f"file:{STAGE_LOCAL}/{STAGED_DIR}/{name}"
 
 
 def dump_yaml(doc: dict) -> str:
@@ -343,6 +398,7 @@ class JobPlan:
     extras: list[str] = field(default_factory=list)   # swarmlab extras installed in the job
     programbench: dict[str, Any] | None = None        # {"task", "image", "wall_limit_s", ...}
     endpoint: dict[str, Any] | None = None            # --endpoint (module doc), else None
+    staged_files: list[dict[str, Any]] = field(default_factory=list)  # module doc, staged files
 
     @property
     def stage_remote(self) -> str:
@@ -494,7 +550,7 @@ def plan_job(
         "commit": commit, "dirty": dirty, "runs": runs, "vllm_version": vllm_version,
         "max_model_len": max_model_len, "gpu_memory_utilization": gpu_memory_utilization,
         "revision": revision, "sync_every_s": sync_every_s, "orig_spec_yaml": spec.read_text(),
-        "port": port}
+        "port": port, "staged_files": []}
     if api:
         plan = _plan_api(doc, chosen, len(seed_list), flavor=flavor, image=image,
                          timeout=timeout, per_round_s=per_round_s, setup_s=setup_s,
@@ -580,7 +636,8 @@ def _plan_vllm(doc: dict, chosen: list[str], n_seeds: int, *, model: str, flavor
                      "will not be parsed and agent turns will be prose")
     if "vllm" in doc.get("providers", {}):
         notes.append("the spec's own providers.vllm is replaced by the in-job server override")
-    job_doc = job_spec_doc(doc, model, arms=chosen, port=common["port"], concurrency=concurrency,
+    job_doc = job_spec_doc(doc, model, arms=chosen, staged=common["staged_files"],
+                           port=common["port"], concurrency=concurrency,
                            timeout_s=request_timeout_s)
     job_yaml = dump_yaml(job_doc)
     pb = [a for a, e in _check_job_spec(job_yaml, chosen).items()
@@ -611,7 +668,7 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
               image: str | None, timeout: str | int | None, per_round_s: float | None,
               setup_s: int, parallel: int, environ: Mapping[str, str],
               common: dict[str, Any], endpoint: Mapping[str, Any] | None = None) -> JobPlan:
-    job_yaml = dump_yaml(job_spec_doc(doc, None, arms=chosen))
+    job_yaml = dump_yaml(job_spec_doc(doc, None, arms=chosen, staged=common["staged_files"]))
     exps = _check_job_spec(job_yaml, chosen)
     notes: list[str] = []
     pb = programbench_arms(exps)
@@ -920,6 +977,9 @@ def describe(plan: JobPlan) -> str:
                          f"job down at its first command (DNS blackholed, sudo removed; pinned: "
                          f"{', '.join(pinned)})" if pb["lockdown"] else
                          f"  programbench task {pb['task']} (backend local, lockdown off)")
+    for f in plan.staged_files:
+        lines.append(f"  staged file: {f['ref']} -> file:{STAGE_LOCAL}/{STAGED_DIR}/{f['name']} "
+                     f"({f['size']} bytes, sha256 {f['sha256'][:12]})")
     for a, d in plan.estimate_detail["arms"].items():
         unit = d.get("unit", "round")
         if "wall_limit_s" in d:
@@ -979,6 +1039,13 @@ def stage(plan: JobPlan, directory: Path | str,
     (d / "spec.orig.yaml").write_text(plan.orig_spec_yaml)
     (d / "bootstrap.sh").write_text(bootstrap_script())
     (d / "plan.json").write_text(json.dumps(plan.as_dict(), indent=1, sort_keys=True))
+    for f in plan.staged_files:
+        data = Path(f["source"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != f["sha256"]:
+            raise SpecError(f"{f['source']} changed since the plan (sha256 {f['sha256'][:12]}); "
+                            "plan again")
+        (d / STAGED_DIR).mkdir(exist_ok=True)
+        (d / STAGED_DIR / f["name"]).write_bytes(data)
     if build is not None:
         build(d)
     return d
