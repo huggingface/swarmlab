@@ -103,7 +103,7 @@ def test_guidance_file_is_read_at_render_time(tmp_path):
     agent = MiniSweAgent(model="anthropic:claude-haiku-5-5", templates="worker",
                          guidance=f"file:{lead}")
     view = type("V", (), {"description": "", "turn": None})()
-    assert agent.template_vars(view, [])["guidance"] == "Delegate early.\n"
+    assert agent.template_vars(view, [])["guidance"] == "Delegate early."  # resolve_guidance (#33) strips the text
 
 
 def test_a_spec_without_references_is_unchanged(tmp_path):
