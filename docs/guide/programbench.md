@@ -281,6 +281,10 @@ Use the solo YAML above with `backend: local` (the default) and an API model, e.
 
 What to expect in the job log: `mode=api tag=... job=...`, `installing uv`, `installing a managed Python 3.12`, `installing swarmlab-...whl [anthropic,programbench]`, `run arm=solo seed=0`, then little until the run ends: the run's estimate and status lines, while the agent's commands go to the run's events, not the log. Finally `finishing: status=completed rc=0; final sync ...` and `JOB_EXIT 0`. Bring the run home with `swarmlab job fetch <run_id> --tag <tag>`. `swarmlab view`, `report` and `export` then work on it, and the score says `graded: false`.
 
+**A self-served model.** To run on an open model that needs a GPU, such as Flint, serve it in a second job and point the run at it: `swarmlab job serve RecursiveSI/flint --launch`, then, once `swarmlab job endpoint <id>` says ready, `swarmlab job run examples/programbench_team_async_flint.yaml --endpoint <id> --launch`. The run job stays a CPU job in the task image; the lockdown also pins the endpoint's host. See [Self-served models in HF Jobs](real-models.md#self-served-models-in-hf-jobs) for the provider block, the cost and how to stop the server.
+
+**Files the spec references.** A participant param `file:<path>` (`templates: file:...`, `guidance: file:...`) is copied into the stage dir under `files/` and the job's spec points at the copy; two different files with the same name are refused. The run's spec hash depends on the file's content, not its path, so the job's runs hash like local ones.
+
 ## Grading
 
 ```

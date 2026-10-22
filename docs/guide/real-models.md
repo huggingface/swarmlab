@@ -1,6 +1,6 @@
 # Real models and budgets
 
-Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, prompt caching, self-hosting with HF Jobs (vLLM serve profiles), API models in HF Jobs, refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
+Model ids, keys, prices, timeouts, preflight, reasoning controls, every budget cap, prompt caching, self-hosting with HF Jobs (vLLM serve profiles), API models in HF Jobs, self-served models in their own HF Job, refusals and reasoning traces. Read this before the first run that spends money. Back to the [docs index](../README.md).
 
 ## Switching to real models
 
@@ -61,6 +61,30 @@ swarmlab job run spec.yaml --model ibm-granite/granite-4.1-3b --flavor a10g-smal
 ### API models in HF Jobs (no vLLM)
 
 `swarmlab job run SPEC` without `--model`, for a spec whose arms call API models (no `vllm:` model), plans a CPU job with no vLLM. It runs on `cpu-upgrade` by default with the uv image, or with the task image for a [ProgramBench](programbench.md#running-in-hf-jobs) world. The model's key variable is passed by name (`--secrets ANTHROPIC_API_KEY`, or `ANTHROPIC_KEY` when only that one is set in your shell) next to `HF_TOKEN`. `--launch` refuses while one is unset. The printout says `mode: api (no vLLM)` and lists the secret names. Model calls are billed by the provider on top of the job's compute, and each run's budget caps them. `--parallel N` works as with vLLM (up to N runs at once, the estimate from the schedule), except that a plan with a ProgramBench run refuses it: that run locks the job down and works in the image's one `/workspace`.
+
+### Self-served models in HF Jobs
+
+A ProgramBench run (or any API-mode job) can call a model that a second HF Job serves on a GPU, for example Flint (`RecursiveSI/flint`, served with its own SGLang kit on one H200). The serving job is only the server; the run job calls it over the jobs proxy.
+
+1. **Serve.** `swarmlab job serve RecursiveSI/flint --engine sglang --profile flint --flavor h200` prints the job: the image (`lmsysorg/sglang:v0.5.16-cu130`, the tag the kit was validated with), the setup (download the kit's `sglang/` folder from the model repo, `bash install.sh`, download the weights), the serve command (`serve_h200.sh`), the readiness check (`/health_generate`, then `/v1/models` listing `flint`), `--expose 30000` and `--secrets HF_TOKEN`. Add `--launch` to submit it. The job is recorded in `runs/jobs.jsonl` with `kind: serve`. Flint needs at least 141 GB per GPU, so its profile refuses any flavor other than `h200`. Setup and start take about 4 minutes; the log then says `SWARMLAB_SERVE_READY url=...`. `--engine vllm` serves a model with vLLM instead (e.g. `swarmlab job serve Qwen/Qwen3.5-9B --engine vllm --flavor a100-large`), with the same flag profiles as in-job vLLM and the HF model id as the served name. `--revision` pins the repo commit.
+2. **Endpoint.** `swarmlab job endpoint <serve job id>` prints the exposed URL (`https://<id>--30000.hf.jobs`, from `hf jobs inspect`), the served model name, `ready true|false` (`GET /v1/models` with your `HF_TOKEN`), and the job's compute cost so far.
+3. **The spec.** It declares a provider with no URL and calls the served name through it:
+
+   ```yaml
+   providers:
+     served:
+       type: openai_compat
+       params: {name: served, base_url_env: SWARMLAB_ENDPOINT_URL, api_key_env: HF_TOKEN,
+                history_reasoning: true, self_hosted: true, timeout_s: 1200,
+                pricing: {flint: [0, 0, 0]}}
+   # participants: model: "served:flint", max_tokens: 32768
+   ```
+
+   `base_url_env` names the variable that holds the URL, so the serve job's id never enters the spec or its hash. `history_reasoning: true` sends each assistant turn's `reasoning_content` back on later turns, which Flint needs (mini_swe_agent keeps it for the whole episode; an `llm` participant keeps it within a turn, and across turns with `carry_thinking: true`). The `[0, 0, 0]` price row makes the ledger show $0: the cost is the serve job's GPU time. Flint wants `max_tokens` of at least 32768; leaving `temperature` unset gives the server's default 1.0. `examples/programbench_team_async_flint.yaml` is the async team on Flint.
+4. **Run.** `swarmlab job run spec.yaml --endpoint <serve job id>` resolves the endpoint and plans the API-mode job. The job gets `SWARMLAB_ENDPOINT_URL=<url>/v1` (and each `base_url_env` the arms use), and a ProgramBench world under lockdown also pins the endpoint's host (`SWARMLAB_PIN_HOSTS_EXTRA`), so the agent's lockdown keeps the model reachable. `--launch` refuses until the endpoint is ready. The plan notes when the serve job times out before the run job would. `--endpoint-url URL` skips the lookup (the served name is then not checked). The run refuses `--endpoint` with `--model` or a `vllm:` arm, a model on the provider that is not the served name, and a `base_url_env` provider without `--endpoint`. To call the same server from your machine, export `SWARMLAB_ENDPOINT_URL=<url>/v1`.
+5. **Cost and stop.** The serve job bills its flavor's rate (h200: $5/h) from start to end, busy or idle. It ends at its `--timeout` (default 6 h; use `--timeout 8h` to cover a 7 h ProgramBench job) or with `swarmlab job stop <id>` (`hf jobs cancel`). `swarmlab job endpoint` and `swarmlab job status` show the cost so far. Runs that call it record $0, and the GPU time is not split between runs.
+
+An experiment can keep its stage dirs and runs in its own bucket: pass `--bucket hf://buckets/<namespace>/<name>` to `job serve` and `job run` (the Flint work uses `hf://buckets/cmpatino/flint-programbench`).
 
 ## Refusals
 
