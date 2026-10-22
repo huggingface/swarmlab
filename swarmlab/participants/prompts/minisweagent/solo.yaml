@@ -1,5 +1,7 @@
 # The official solo prompt: mini-swe-agent 2.4.6's ProgramBench templates (programbench_system,
 # programbench_instance: swarmlab.world.programbench's verbatim copy, rendered with this machine's
-# uname as mini-swe-agent renders it), plus the world's one resource sentence.
+# uname as mini-swe-agent renders it), plus the world's one resource sentence. With `guidance` it
+# is no longer the official run but the paper's "Solo PIV"-style run: the guidance paragraph comes
+# between the instance text and the resource sentence, and nothing else changes.
 system_template: "{{ programbench_system }}"
-instance_template: "{{ programbench_instance }}{% if resource_sentence %}\n\n{{ resource_sentence }}{% endif %}"
+instance_template: "{{ programbench_instance }}{% if guidance %}\n\n{{ guidance }}{% endif %}{% if resource_sentence %}\n\n{{ resource_sentence }}{% endif %}"
