@@ -57,7 +57,9 @@ Mapping (ChatRequest -> `messages.create` kwargs):
   content block in order as a request block (`text`: type, text; `thinking`: type, thinking,
   signature; `redacted_thinking`: type, data; `tool_use`: type, id, name, input; other types:
   their fields minus None), and an assistant message carrying `provider_content` is sent as
-  exactly those blocks instead of text + tool calls. Passing thinking blocks back unchanged is
+  exactly those blocks instead of text + tool calls (unless they are the OpenAI-compatible
+  adapter's `reasoning_text` blocks, from a provider switch within one memory: then the message
+  is sent as text + tool calls). Passing thinking blocks back unchanged is
   what the API asks for in tool loops (preserved thinking on Opus 5.5, Sonnet 5.5 and Fable 5.1:
   the model reads its earlier reasoning; leaving the blocks out is accepted but loses it). The
   blocks are bound to the history before them, so a caller that trims history must drop them
@@ -254,7 +256,9 @@ def tool_definition(schema: ToolSchema) -> dict:
 
 
 def _blocks(m: ChatMessage) -> list[dict]:
-    if m.role == "assistant" and m.provider_content is not None:
+    if (m.role == "assistant" and m.provider_content is not None
+            and not any(isinstance(b, dict) and b.get("type") == "reasoning_text"
+                        for b in m.provider_content)):
         return [dict(b) for b in m.provider_content]  # verbatim: thinking signatures bind order
     if m.role == "tool":
         return [{"type": "tool_result", "tool_use_id": m.tool_call_id or "",
