@@ -30,12 +30,13 @@ from swarmlab.participants.minisweagent import (
     WAIT_RESULT,
     MiniSweAgent,
     command_rules,
+    is_context_length_error,
     load_minisweagent,
     resource_sentence_of,
     rules_block,
 )
 from swarmlab.providers.anthropic import tool_definition
-from swarmlab.providers.base import ChatMessage, ChatRequest
+from swarmlab.providers.base import ChatMessage, ChatRequest, ProviderError
 from swarmlab.providers.fake import FakeProvider, _assistant_calls, _response
 from swarmlab.providers.openai_compat import build_body
 from swarmlab.registry import build, catalog, describe
@@ -126,6 +127,26 @@ def flaky(request, rng):
     if k == 1:
         return _response(request, rng, [("post", {"text": "hi"})])
     return _response(request, rng, [("bash", {"command": "ls" if k == 2 else SUBMIT})])
+
+
+CONTEXT_400 = ('served: HTTP 400: {"object":"error","message":"Requested token count exceeds the '
+               "model's maximum context length of 262144 tokens. You requested a total of 262200 "
+               'tokens","type":"BadRequestError","param":null,"code":400}')
+
+
+def context_overflow(request, rng):
+    """Three commands, then the provider's context-length 400 (vLLM's words)."""
+    if _replies(request) == 3:
+        raise ProviderError(CONTEXT_400, status=400)
+    return forever(request, rng)
+
+
+def bad_request(request, rng):
+    """One command, then an unrelated provider 400."""
+    if _replies(request) == 1:
+        raise ProviderError('served: HTTP 400: {"message":"unknown field chat_template_kwargs"}',
+                            status=400)
+    return forever(request, rng)
 
 
 CLOCK = [1_000_000.0]
@@ -312,6 +333,49 @@ def test_wall_limit_warning_and_exit(tmp_path, monkeypatch):
     obs = [m["content"] for m in tools_of(st)]
     assert all("running low on time" not in o for o in obs[:2])
     assert "You have approximately 5 minutes remaining before timeout." in obs[2]
+
+
+def test_context_length_error_ends_the_episode_as_context_exceeded(tmp_path):
+    run = solo(tmp_path, fake("context_overflow"), role="solo")
+    st = state(run)
+    assert st["messages"][-1] == {"role": "exit", "content": "ContextExceeded",
+                                  "extra": {"exit_status": "ContextExceeded", "submission": ""}}
+    assert roles_of(st) == ["system", "user"] + ["assistant", "tool"] * 3 + ["exit"]
+    assert (st["n_calls"], st["finished"]) == (4, True)
+    assert run.meta["end_reason"] == "max_rounds" and run.score["submitted"] is False
+    assert run.meta["turns_errored"] == 0
+    (ended,) = turns(run)
+    assert ended["yield_kind"] != "error"
+    assert ended["usage"]["notes"] == ["exit:ContextExceeded"]
+    assert Run.load(run.dir).replay()["score"] == run.score
+
+
+def test_an_unrelated_provider_error_still_errors_the_turn(tmp_path):
+    run = solo(tmp_path, fake("bad_request"), role="solo")
+    (ended,) = turns(run)
+    assert ended["yield_kind"] == "error"
+    assert run.meta["turns_errored"] == 1
+    st = state(run)
+    assert roles_of(st)[-1] != "exit" and not st["finished"]
+
+
+@pytest.mark.parametrize("message", [
+    "x: HTTP 400: This model's maximum context length is 8192 tokens",
+    "x: HTTP 400: input exceeds the CONTEXT LENGTH",
+    'x: HTTP 400: {"error": {"code": "context_length_exceeded"}}',
+    "x: HTTP 400: Too many tokens in the request",
+    "x: HTTP 400: prompt is too long: 210000 tokens > 200000 maximum",
+    "x: HTTP 400: Input length 300000 exceeds the limit",
+])
+def test_context_length_matcher_phrases(message):
+    assert is_context_length_error(ProviderError(message, status=400))
+    assert not is_context_length_error(ProviderError(message, status=500))
+    assert not is_context_length_error(ProviderError(message, status=None))
+    assert not is_context_length_error(RuntimeError(message))
+
+
+def test_context_length_matcher_ignores_other_400s():
+    assert not is_context_length_error(ProviderError("x: HTTP 400: bad field", status=400))
 
 
 def test_three_format_errors_end_the_episode(tmp_path):

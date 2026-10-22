@@ -23,8 +23,9 @@ Two shapes
 - Solo (official): `steps_per_turn=None` (the default), one round, one turn (`commit: immediate`,
   `max_rounds: 1`, `options.max_calls_per_turn` above the number of commands the episode can
   run). The turn steps until the episode ends: a submission, the step limit (`LimitsExceeded`),
-  the wall limit (`TimeExceeded`) or `max_consecutive_format_errors` (3) format errors in a row
-  (`RepeatedFormatError`), each recorded as the baseline's `exit` message, or until the runner
+  the wall limit (`TimeExceeded`), `max_consecutive_format_errors` (3) format errors in a row
+  (`RepeatedFormatError`) or a context-length error (`ContextExceeded`, Model adapter), each
+  recorded as the baseline's `exit` message, or until the runner
   ends it (the executor's cap, the hard ceiling, cancellation). The `solo` template offers the
   model exactly the baseline's one tool, mini-swe-agent's `BASH_TOOL`: not the `end_turn` the
   executor always lists, so a model cannot end the episode early by calling it (it is an unknown
@@ -72,7 +73,7 @@ The turn
 6. Steps in a worker thread (the bridge, below): up to `steps_per_turn`, handling
    `InterruptAgentFlow` exactly as `run()`: a `FormatError` adds its cost and messages (and the
    `RepeatedFormatError` exit at the limit), any other (`Submitted`, `LimitsExceeded`,
-   `TimeExceeded`) appends its exit message. With the other templates the turn also ends after
+   `TimeExceeded`, `ContextExceeded`) appends its exit message. With the other templates the turn also ends after
    a step in which the model called `end_turn`, `wait_for_workers`, or a call was refused
    `turn_ended`; with `solo` none of these is offered (under `commit: async`
    `wait_for_workers` does not end the turn).
@@ -96,6 +97,19 @@ the provider's `provider_content` when it carried thinking blocks, sent back unc
 `ChatResponse.cost_usd` and `response` a small summary (model, provider, finish reason, usage,
 cached), since the full response is in the run's blobs. Timestamps are left out of `extra` so the
 stored state is a function of the responses.
+
+A context-length error ends the episode: when `tools.infer` raises a `ProviderError` with status
+400 whose message names the context length (`is_context_length_error`: case-insensitively any of
+`CONTEXT_LENGTH_PHRASES`, e.g. vLLM's "maximum context length", OpenAI's
+`context_length_exceeded`, Anthropic's "prompt is too long"), `query` raises mini-swe-agent's
+`LimitsExceeded` with the exit message `{"role": "exit", "content": "ContextExceeded", "extra":
+{"exit_status": "ContextExceeded", "submission": ""}}`, as the step limit does. The agent is
+finished and the turn ends normally, so the run ends as any finished episode and the workspace
+is graded as it is. The baseline carries the whole transcript too and would crash on that error
+(it does not count as a step's model call any less: `n_calls` was already incremented). Any
+other `ProviderError` propagates as before and errors the turn. Anthropic's adapter raises a 400
+as the SDK's own `BadRequestError`, not a `ProviderError`, so this applies to it only if that
+changes.
 
 Tool calls are parsed with mini-swe-agent's own `parse_toolcall_actions`: `bash` calls are the
 actions; a call to a tool that is not offered, bad `bash` arguments, or no tool call at all is
@@ -232,7 +246,13 @@ from typing import Any, ClassVar
 
 import yaml
 
-from ..providers.base import ChatMessage, ChatRequest, ChatResponse, parse_json_args
+from ..providers.base import (
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ProviderError,
+    parse_json_args,
+)
 from ..tools import AgentTools, ToolCall, ToolSchema
 from ..vendor.minisweagent import __version__ as msa_version
 from ..vendor.minisweagent import exceptions as msa_exceptions
@@ -365,9 +385,24 @@ def load_minisweagent() -> SimpleNamespace:
     return SimpleNamespace(
         DefaultAgent=DefaultAgent, InterruptAgentFlow=msa_exceptions.InterruptAgentFlow,
         FormatError=msa_exceptions.FormatError, Submitted=msa_exceptions.Submitted,
-        TimeExceeded=msa_exceptions.TimeExceeded,
+        TimeExceeded=msa_exceptions.TimeExceeded, LimitsExceeded=msa_exceptions.LimitsExceeded,
         parse_toolcall_actions=parse_toolcall_actions,
         format_observations=format_toolcall_observation_messages)
+
+
+CONTEXT_LENGTH_PHRASES = ("maximum context length", "context length", "context_length_exceeded",
+                          "too many tokens", "prompt is too long", "input length")
+CONTEXT_EXCEEDED = {"role": "exit", "content": "ContextExceeded",
+                    "extra": {"exit_status": "ContextExceeded", "submission": ""}}
+
+
+def is_context_length_error(error: BaseException) -> bool:
+    """A `ProviderError` with status 400 whose message names the context length (module doc,
+    Model adapter)."""
+    if not isinstance(error, ProviderError) or error.status != 400:
+        return False
+    text = str(error).lower()
+    return any(phrase in text for phrase in CONTEXT_LENGTH_PHRASES)
 
 
 # ---- template helpers ---------------------------------------------------------------------------
@@ -555,7 +590,12 @@ class _Model:
 
     # -- the protocol
     def query(self, messages: list[dict], **kwargs: Any) -> dict:
-        resp: ChatResponse = self.turn.run(self.turn.tools.infer(self.request(messages)))
+        try:
+            resp: ChatResponse = self.turn.run(self.turn.tools.infer(self.request(messages)))
+        except ProviderError as e:
+            if is_context_length_error(e):
+                raise self.msa.LimitsExceeded(copy.deepcopy(CONTEXT_EXCEEDED)) from e
+            raise
         u = self.turn.usage
         u.prompt_tokens += resp.usage.prompt_tokens
         u.completion_tokens += resp.usage.completion_tokens
