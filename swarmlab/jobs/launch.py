@@ -146,7 +146,12 @@ stage dir the job entry syncs into, `STAGE_LOCAL`); `stage` copies the files int
 basename and different contents are refused (rename one); the same file referenced twice is
 staged once. A missing file is refused at plan time. The records are in plan.json, and
 bootstrap.sh records what it finds in `<stage>/files/` (name, size, sha256) in job.json
-`staged_files`. A job spec with no references is unchanged. The spec hash is unaffected by the
+`staged_files`. A job spec with no references is unchanged. The plan builds and prices every
+chosen arm from the job spec with the LOCAL paths (`_check_job_spec`; a participant may open its
+`file:` param in its constructor, and the staged copies exist only in the job); the rewritten job
+spec (`job_spec_yaml`) is only written to the stage dir, where `swarmlab validate` and the runs in
+the job read it after the stage sync put the copies at `/opt/swarmlab/stage/files/` (the default
+`SWARMLAB_STAGE_DIR`; overriding it breaks the rewritten paths). The spec hash is unaffected by the
 rewrite: `spec_hash` hashes a readable `file:` param by its content (swarmlab/spec.py), so the
 job's runs hash like a local run on the same files. Each experiment can keep its stage dirs and
 runs in its own bucket with `--bucket` (e.g. `hf://buckets/<ns>/flint-programbench`).
@@ -636,11 +641,13 @@ def _plan_vllm(doc: dict, chosen: list[str], n_seeds: int, *, model: str, flavor
                      "will not be parsed and agent turns will be prose")
     if "vllm" in doc.get("providers", {}):
         notes.append("the spec's own providers.vllm is replaced by the in-job server override")
-    job_doc = job_spec_doc(doc, model, arms=chosen, staged=common["staged_files"],
-                           port=common["port"], concurrency=concurrency,
-                           timeout_s=request_timeout_s)
-    job_yaml = dump_yaml(job_doc)
-    pb = [a for a, e in _check_job_spec(job_yaml, chosen).items()
+    kw = {"port": common["port"], "concurrency": concurrency, "timeout_s": request_timeout_s}
+    job_yaml = dump_yaml(job_spec_doc(doc, model, arms=chosen, staged=common["staged_files"],
+                                      **kw))
+    # checked with the local file: paths (a participant may read them at construction); the
+    # staged copies exist only inside the job
+    local_yaml = dump_yaml(job_spec_doc(doc, model, arms=chosen, **kw))
+    pb = [a for a, e in _check_job_spec(local_yaml, chosen).items()
           if getattr(e.world, "name", None) == "programbench"]
     if pb:
         raise SpecError(f"arm(s) {pb}: a programbench world runs in an API-model job inside its "
@@ -669,7 +676,7 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
               setup_s: int, parallel: int, environ: Mapping[str, str],
               common: dict[str, Any], endpoint: Mapping[str, Any] | None = None) -> JobPlan:
     job_yaml = dump_yaml(job_spec_doc(doc, None, arms=chosen, staged=common["staged_files"]))
-    exps = _check_job_spec(job_yaml, chosen)
+    exps = _check_job_spec(dump_yaml(job_spec_doc(doc, None, arms=chosen)), chosen)  # local paths
     notes: list[str] = []
     pb = programbench_arms(exps)
     ep = endpoint_plan(exps, endpoint)

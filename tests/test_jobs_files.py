@@ -1,6 +1,7 @@
 """`swarmlab job run` stages the files a spec references (`file:<path>` participant params) and
 rewrites the job spec to the copies; `spec_hash` hashes such params by content. Offline."""
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -114,3 +115,63 @@ def test_a_spec_without_references_is_unchanged(tmp_path):
     assert api.staged_files == [] and jl.dump_yaml(jl.job_spec_doc(
         load_experiment_yaml(tmp_path / "api.yaml"), None, arms=["solo"])) == api.job_spec_yaml
     assert not (jl.stage(api, tmp_path / "st", build=None) / "files").exists()
+
+
+# ---- a participant that opens its file: param at construction (as mini_swe_agent's guidance on
+# the piv-prompts branch does): planning must not build it from the in-job paths ----------------
+from swarmlab.participants.scripted import EvidenceAggregator
+
+OPENED: list[str] = []
+
+
+class OpensFile(EvidenceAggregator):
+    """Test participant: reads its `notes: file:<path>` param in __init__."""
+
+    entry_point = None
+
+    def __init__(self, notes: str) -> None:
+        OPENED.append(notes)
+        self.notes_text = Path(notes[len("file:"):]).read_text()
+
+
+def opens_doc(notes):
+    return {"name": "opens", "seeds": [0], "options": {"max_rounds": 1},
+            "arms": {"a": {"world": "flaggame", "participants": [
+                {"type": "tests.test_jobs_files:OpensFile", "count": 3,
+                 "params": {"notes": f"file:{notes}"}}]}}}
+
+
+@pytest.mark.parametrize("mode", ["api", "vllm"])
+def test_constructor_reads_local_paths_and_the_stage_carries_the_rewrite(tmp_path, mode,
+                                                                         monkeypatch):
+    from typer.testing import CliRunner
+
+    from swarmlab.cli import app
+
+    notes = tmp_path / "piv-solo.txt"
+    notes.write_text("Work alone.\n")
+    doc = opens_doc(notes)
+    if mode == "vllm":   # one llm agent so the job has a model to serve
+        doc["arms"]["a"]["participants"].append(
+            {"type": "llm", "count": 1, "params": {"model": "vllm:Qwen/Qwen3.5-9B"}})
+    OPENED.clear()
+    model = "Qwen/Qwen3.5-9B" if mode == "vllm" else None
+    spec = write(tmp_path, doc)
+    p = plan(spec, **({"model": model} if model else {}))
+    assert OPENED and all(o == f"file:{notes}" for o in OPENED)   # never the in-job path
+    st = jl.stage(p, tmp_path / "st", build=None)
+    staged = yaml.safe_load((st / "spec.yaml").read_text())
+    assert staged["arms"]["a"]["participants"][0]["params"]["notes"] == \
+        "file:/opt/swarmlab/stage/files/piv-solo.txt"
+    assert (st / "files" / "piv-solo.txt").read_text() == "Work alone.\n"
+    # inside the job the stage dir is /opt/swarmlab/stage: there `validate` reads the copy
+    in_job = tmp_path / "in_job.yaml"
+    in_job.write_text((st / "spec.yaml").read_text().replace(jl.STAGE_LOCAL, str(st)))
+    OPENED.clear()
+    res = CliRunner().invoke(app, ["validate", str(in_job)])
+    assert res.exit_code == 0, res.output
+    assert OPENED and all(o == f"file:{st}/files/piv-solo.txt" for o in OPENED)
+    local_spec = tmp_path / "local.yaml"   # the job spec with the local paths
+    local_spec.write_text(jl.dump_yaml(jl.job_spec_doc(load_experiment_yaml(spec), model, arms=["a"])))
+    local, job = Experiment.from_yaml(local_spec, "a"), Experiment.from_yaml(in_job, "a")
+    assert local.spec_hash(0, 1) == job.spec_hash(0, 1)
