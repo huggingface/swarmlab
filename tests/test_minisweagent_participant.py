@@ -1176,18 +1176,54 @@ def test_guide_async_team_spec_runs_end_to_end_with_fake_models(tmp_path):
     assert Run.load(run.dir).replay()["score"] == run.score
 
 
-def test_guidance_is_appended_to_the_team_templates_and_refused_for_solo(tmp_path):
-    """`guidance` is a paragraph after the team text (lead and worker), before the resource
-    sentence; the solo template is the official text and takes none."""
-    for templates in ("lead", "worker"):
+def test_guidance_is_appended_to_every_template(tmp_path):
+    """`guidance` is a paragraph after the instance text (solo, lead and worker), before the
+    resource sentence."""
+    for templates in ("solo", "lead", "worker"):
         p = MiniSweAgent(model="fake:x", templates=templates, guidance="Delegate the implementation.")
         view = _view(tools=[_post_tool(["lead", "worker-1"])])
         text = p.turn_message(view).content
-        assert "Delegate the implementation." in text
+        assert text.endswith("\n\nDelegate the implementation.\n\n"
+                             "This machine has 8 CPUs and 32 GB of memory.")
         assert text.index("Delegate the implementation.") > text.index("## Working with a team") \
             if templates == "lead" else True
     assert MiniSweAgent(model="fake:x", templates="lead").guidance is None
-    with pytest.raises(ValueError, match="guidance needs the lead"):
-        MiniSweAgent(model="fake:x", templates="solo", guidance="x")
     with pytest.raises(ValueError, match="non-empty string"):
         MiniSweAgent(model="fake:x", templates="lead", guidance="  ")
+
+
+def test_guidance_file_is_read_without_its_header_and_a_literal_stays_literal(tmp_path):
+    from swarmlab.participants.minisweagent import resolve_guidance
+
+    note = tmp_path / "g.txt"
+    note.write_text("# a header comment\n# another\n## Plan first\n\nThen build.\n")
+    assert resolve_guidance(f"file:{note}") == "## Plan first\n\nThen build."
+    for literal in ("Delegate the implementation.", "note: plan first"):
+        assert resolve_guidance(literal) == literal
+    p = MiniSweAgent(model="fake:x", templates="worker", guidance=f"file:{note}")
+    assert p.params["guidance"] == f"file:{note}"   # the reference, not the text
+    assert p.turn_message(_view(tools=[_post_tool(["lead", "worker-1"])])).content.endswith(
+        "\n\n## Plan first\n\nThen build.\n\nThis machine has 8 CPUs and 32 GB of memory.")
+    with pytest.raises(FileNotFoundError):
+        MiniSweAgent(model="fake:x", templates="lead", guidance=f"file:{tmp_path / 'missing'}")
+    only_header = tmp_path / "h.txt"
+    only_header.write_text("# nothing else\n")
+    with pytest.raises(ValueError, match="empty text"):
+        MiniSweAgent(model="fake:x", guidance=f"file:{only_header}")
+
+
+def test_solo_with_guidance_is_the_official_prompt_plus_one_paragraph(tmp_path):
+    """Solo PIV: the official system text and tool, and the official instance text with the
+    guidance paragraph before the resource sentence; without guidance, the official text."""
+    system, instance = prompt_parts()
+    view = _view()
+    official = MiniSweAgent(model="fake:x")
+    piv = MiniSweAgent(model="fake:x", guidance="Plan, implement, verify.")
+    for p in (official, piv):
+        p.bind("a000", random.Random(0))
+        assert p._render_system(view) == system
+        assert [t.name for t in p.offered_tools(view)] == ["bash"]
+    resource = "This machine has 8 CPUs and 32 GB of memory."
+    assert official.turn_message(view).content == f"{instance}\n\n{resource}"
+    assert piv.turn_message(view).content == \
+        f"{instance}\n\nPlan, implement, verify.\n\n{resource}"

@@ -167,14 +167,32 @@ uname), `programbench_rules` (the `<RULES>` block of the system text),
 submission bullet), `resource_sentence` (the last paragraph of `view.description` when it starts
 with `This machine has`, else empty), `lead_channel`, `worker_channels` (the `worker_channels`
 param, or the channels of this agent's `post` tool other than `lead_channel`: for a lead one per
-worker, for a worker its own), `wait_tool`, `guidance` (the param, or empty; `file:<path>` is the file's text, read at render time like `templates: file:`; both templates append it as a paragraph before the resource sentence), `turn_based` (`commit: async`: the lead's
-`wait_for_workers` bullet says the tool returns the reports, the worker's text says it waits
+worker, for a worker its own), `wait_tool`, `guidance` (the param's text, or empty: all three
+templates append it as a paragraph before the resource sentence; see Guidance), `turn_based`
+(`commit: async`: the lead's `wait_for_workers` bullet says the tool returns the reports, the worker's text says it waits
 between assignments; the round-based text is unchanged), `agent`, `role` and `tools` (names
 offered). `solo`
-is the official text plus the resource sentence, byte for byte what the baseline renders plus
-that sentence; `lead` adds delegation instructions; `worker` has the environment rules and its
+without `guidance` is the official text plus the resource sentence, byte for byte what the
+baseline renders plus that sentence (with `guidance` it is not the official run: see Guidance);
+`lead` adds delegation instructions; `worker` has the environment rules and its
 role, not the task statement. A role's `prompt_append` is added to the system message, its
 `model` and `budget.max_tokens` replace the participant's.
+
+Guidance
+--------
+`guidance` is a paragraph appended to the instance text of any template (arXiv 2610.17471's
+"guidance" regimes): the literal text, or `file:<path>`, a text file (relative to the working
+directory) read when the participant is built (so `swarmlab validate` catches a missing file) and
+again when the prompt is rendered, i.e. at run time on the machine that runs the spec. Leading
+lines of the file that start with `# ` (hash, space) are a header comment and are not sent;
+the rest is the paragraph, stripped. `params` (and the spec hash) hold the param as written (the
+path), not the text.
+
+`templates: solo` with `guidance` is NOT the official ProgramBench solo run: it is the paper's
+"Solo PIV"-style run (one agent given the three-phase workflow, no delegation). Its prompts differ
+from the official solo prompts by exactly that paragraph, placed between the official instance
+text and the resource sentence; the system message and the one `bash` tool are unchanged. Without
+`guidance` the solo prompts stay byte for byte the official ones.
 
 State and snapshots
 -------------------
@@ -370,6 +388,17 @@ def load_templates(templates: str) -> dict[str, str]:
                          "system_template and instance_template")
     return {"system_template": data["system_template"],
             "instance_template": data["instance_template"]}
+
+
+def resolve_guidance(guidance: str) -> str:
+    """The text of a `guidance` param (module doc, Guidance): `file:<path>` read from the file
+    without its leading `# ` header lines, anything else the literal text."""
+    if not guidance.startswith("file:"):
+        return guidance
+    lines = Path(guidance[len("file:"):]).read_text().splitlines()
+    while lines and lines[0].startswith("# "):
+        lines.pop(0)
+    return "\n".join(lines).strip()
 
 
 def resource_sentence_of(description: str) -> str:
@@ -698,9 +727,10 @@ class MiniSweAgent(Participant):
                              "offers only bash")
         if guidance is not None and (not isinstance(guidance, str) or not guidance.strip()):
             raise ValueError(f"guidance must be a non-empty string or null, got {guidance!r}")
-        if guidance is not None and templates == "solo":
-            raise ValueError("guidance needs the lead, worker or a file: templates: the solo "
-                             "template is the official text and takes no additions")
+        if guidance is not None:
+            text = resolve_guidance(guidance)
+            if not text.strip():
+                raise ValueError(f"guidance {guidance!r} resolves to an empty text")
         if not isinstance(lead_channel, str) or not lead_channel:
             raise ValueError(f"lead_channel must be a channel name, got {lead_channel!r}")
         if worker_channels is not None and (isinstance(worker_channels, str) or not all(
@@ -790,8 +820,7 @@ class MiniSweAgent(Participant):
                 "resource_sentence": resource_sentence_of(view.description),
                 "lead_channel": self.lead_channel, "worker_channels": channels,
                 "wait_tool": self.wait_tool, "turn_based": view.turn is not None,
-                "guidance": (Path(self.guidance[len("file:"):]).read_text()
-                             if (self.guidance or "").startswith("file:") else self.guidance or ""),
+                "guidance": resolve_guidance(self.guidance) if self.guidance else "",
                 "agent": str(getattr(self, "agent", "")),
                 "role": getattr(self, "_role_name", None) or "",
                 "tools": [t.name for t in offered]}

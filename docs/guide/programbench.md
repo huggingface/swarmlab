@@ -114,7 +114,7 @@ The participant does not install mini-swe-agent: its agent loop, exceptions and 
 | `wait_tool` | false | a lead: offer `wait_for_workers`, which ends the turn after the step; under `commit: async` it waits for the reports and returns them instead (its role must list `wait`). Not with `templates: solo` |
 | `lead_channel` | `lead` | where workers post reports |
 | `worker_channels` | null | the lead's channels to its workers; null: the agent's `post` channels other than `lead_channel` |
-| `guidance` | null | a paragraph appended to the lead or worker instance text (the paper's "guidance" to the team, e.g. "Delegate the implementation to your workers"); not with `solo` |
+| `guidance` | null | a paragraph appended to the instance text (the paper's "guidance", e.g. "Delegate the implementation to your workers"): the literal text, or `file:<path>`, a text file read at run time on the machine that runs the spec (leading `# ` lines are a header comment and are not sent). With `templates: solo` the run is no longer the official one: it is the paper's "Solo PIV"-style run, whose prompts are the official ones plus exactly that paragraph (before the resource sentence) |
 
 Params are in the spec only when they differ from these defaults.
 
