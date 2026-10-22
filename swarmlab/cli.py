@@ -107,6 +107,10 @@ Decisions where the contract is silent:
 - `job run|status|logs|fetch` (WP8, HF Jobs with a co-located vLLM server, or API models
   without vLLM when `--model` is omitted and no arm calls a `vllm:` model) are documented in
   `swarmlab/jobs/` and docs/handoff/WP8.md. `job run` only prints unless `--launch`.
+- `job serve MODEL` plans (with `--launch` submits) a job that only serves a model (SGLang kit
+  profile such as flint, or vLLM) on an exposed port; `job endpoint ID` resolves its URL and
+  readiness; `job stop ID` cancels it; `job run SPEC --endpoint ID` (or `--endpoint-url URL`)
+  runs the spec's `base_url_env` providers against it (swarmlab/jobs/serve.py, launch.py).
 - Working directory: `run` without `--out` refuses (exit 2) when the current directory is the
   swarmlab checkout itself (`is_swarmlab_checkout`: a pyproject.toml with `name = "swarmlab"`),
   so runs never land in the repo by accident; `init` says to work from a project directory
@@ -1189,15 +1193,38 @@ def job_run(
         "--allow-dirty", help="Launch from a checkout with uncommitted changes.")] = False,
     ledger: Annotated[Path, typer.Option("--ledger", help="Local launch ledger (JSONL).")] = Path(
         "runs/jobs.jsonl"),
+    endpoint: Annotated[str | None, typer.Option(
+        "--endpoint", help="Serve job id (`swarmlab job serve`): its exposed URL becomes the base "
+        "URL of the spec's base_url_env providers in this job (API mode).")] = None,
+    endpoint_url: Annotated[str | None, typer.Option(
+        "--endpoint-url", help="The exposed URL itself (e.g. https://<id>--30000.hf.jobs), "
+        "instead of looking up --endpoint; the served name is then not checked.")] = None,
     as_json: JsonOpt = False,
 ) -> None:
     """Print (and with --launch submit) an HF Job: `swarmlab run` per arm x seed, next to vLLM
-    serving MODEL, or against API models (no --model, no vllm: model in the arms)."""
+    serving MODEL, or against API models (no --model, no vllm: model in the arms), or against a
+    model another job serves (--endpoint)."""
     from .jobs import launch as jl
     from .jobs import profiles as jp
 
     def go() -> dict[str, Any]:
         kw: dict[str, Any] = {}
+        ep_text = ""
+        if endpoint is not None or endpoint_url is not None:
+            if endpoint_url is not None:
+                kw["endpoint"] = {"url": endpoint_url, "job_id": endpoint,
+                                  "served_model_name": None}
+            else:
+                from .jobs import serve as js
+
+                ep = js.resolve_endpoint(endpoint, hf=jl.which_hf(), ledger=ledger)
+                if launch and not ep["ready"]:
+                    raise SpecError(f"serve job {endpoint} is not ready ({ep['detail']}); wait "
+                                    f"for `swarmlab job endpoint {endpoint}` to say ready")
+                kw["endpoint"] = {"url": ep["url"], "job_id": endpoint,
+                                  "served_model_name": ep["served_model_name"],
+                                  "remaining_s": ep.get("remaining_s")}
+                ep_text = js.describe_endpoint(ep) + "\n\n"
         if probe_extra is not None:
             kw["probe_extra"] = jp.parse_probe_extra(probe_extra)
         for key, val in (("image", image), ("vllm_version", vllm_version),
@@ -1210,7 +1237,7 @@ def job_run(
                            vllm_flags_append=vllm_flags_append, profile=profile,
                            parallel=parallel, **kw)
         data: dict[str, Any] = {"ok": True, "plan": plan.as_dict(), "launched": False}
-        text = jl.describe(plan)
+        text = ep_text + jl.describe(plan)
         if stage_dir is not None:
             jl.stage(plan, stage_dir)
             data["stage_dir"] = str(stage_dir)
@@ -1282,6 +1309,112 @@ def job_fetch(
     def go() -> dict[str, Any]:
         d = remote.fetch(run_id, out, bucket, tag)
         return {**summary(Run(d)), "fetched": str(d)}
+
+    _execute(go, as_json)
+
+
+@job_app.command("serve")
+def job_serve(
+    model: Annotated[str, typer.Argument(help="HF model id to serve, e.g. RecursiveSI/flint.")],
+    engine: Annotated[str, typer.Option(
+        "--engine", help="sglang (a model with a kit profile, e.g. flint) or vllm.")] = "sglang",
+    flavor: Annotated[str, typer.Option("--flavor", help="HF Jobs GPU flavor.")] = "h200",
+    timeout: Annotated[str, typer.Option(
+        "--timeout", help="Job timeout: the server runs (and bills) until then or `job stop`.")] = "6h",
+    profile: Annotated[str, typer.Option(
+        "--profile", help="sglang: a kit profile (auto: by model id); vllm: the serve-flag "
+        "profile as in `job run` (auto, none, or a model id).")] = "auto",
+    image: Annotated[str | None, typer.Option(
+        "--image", help="Docker image (default: the profile's validated tag; vllm: uv python3.12).")] = None,
+    revision: Annotated[str | None, typer.Option("--revision", help="Model repo revision to pin.")] = None,
+    port: Annotated[int | None, typer.Option(
+        "--port", help="Server port, exposed through the jobs proxy (default: the profile's; vllm 8000).")] = None,
+    vllm_version: Annotated[str | None, typer.Option("--vllm-version", help="vllm: pip version.")] = None,
+    vllm_flags: Annotated[str | None, typer.Option(
+        "--vllm-flags", help="vllm: serve flags replacing the profile/default ones.")] = None,
+    max_model_len: Annotated[int | None, typer.Option("--max-model-len", help="vllm: --max-model-len.")] = None,
+    bucket: Annotated[str, typer.Option("--bucket", help="Bucket for the stage dir.")] = (
+        "hf://buckets/cmpatino/swarmlab-runs"),
+    stage_dir: Annotated[Path | None, typer.Option(
+        "--stage-dir", help="Also write the stage files (serve.sh, plan.json) here.")] = None,
+    launch: Annotated[bool, typer.Option(
+        "--launch", help="Upload the stage dir and submit the serving job (otherwise only print).")] = False,
+    allow_dirty: Annotated[bool, typer.Option(
+        "--allow-dirty", help="Launch from a checkout with uncommitted changes.")] = False,
+    ledger: Annotated[Path, typer.Option("--ledger", help="Local launch ledger (JSONL).")] = Path(
+        "runs/jobs.jsonl"),
+    as_json: JsonOpt = False,
+) -> None:
+    """Print (and with --launch submit) an HF Job that only serves MODEL on an exposed port."""
+    from .jobs import launch as jl
+    from .jobs import serve as js
+
+    def go() -> dict[str, Any]:
+        kw: dict[str, Any] = {}
+        for key, val in (("image", image), ("revision", revision), ("port", port),
+                         ("vllm_version", vllm_version), ("vllm_flags", vllm_flags),
+                         ("max_model_len", max_model_len)):
+            if val is not None:
+                kw[key] = val
+        plan = js.plan_serve(model, engine=engine, flavor=flavor, timeout=timeout,
+                             profile=profile, bucket=bucket, **kw)
+        data: dict[str, Any] = {"ok": True, "plan": plan.as_dict(), "launched": False}
+        text = js.describe_serve(plan)
+        if stage_dir is not None:
+            js.stage_serve(plan, stage_dir)
+            data["stage_dir"] = str(stage_dir)
+            text += f"\nstaged locally: {stage_dir}"
+        if not launch:
+            text += "\nnot launched (pass --launch to upload the stage dir and submit)"
+        else:
+            if plan.dirty and not allow_dirty:
+                raise SpecError("the checkout has uncommitted changes; commit first or pass "
+                                "--allow-dirty")
+            row = js.submit_serve(plan, hf=jl.which_hf(), ledger=ledger)
+            data.update(launched=True, job=row)
+            text += (f"\nlaunched serve job {row['job_id']}  {row['url']}\n"
+                     f"follow:   swarmlab job logs {row['job_id']} --follow  (SWARMLAB_SERVE_READY)\n"
+                     f"endpoint: swarmlab job endpoint {row['job_id']}\n"
+                     f"run:      swarmlab job run SPEC --endpoint {row['job_id']}\n"
+                     f"stop:     swarmlab job stop {row['job_id']}")
+        data["text"] = text
+        return data if as_json else {"text": text}
+
+    _execute(go, as_json)
+
+
+@job_app.command("endpoint")
+def job_endpoint(
+    job_id: Annotated[str, typer.Argument(help="Serve job id (`swarmlab job serve --launch`).")],
+    ledger: Annotated[Path, typer.Option("--ledger", help="Local launch ledger (JSONL).")] = Path(
+        "runs/jobs.jsonl"),
+    as_json: JsonOpt = False,
+) -> None:
+    """A serve job's exposed URL, served model name and readiness (GET /v1/models with HF_TOKEN),
+    and its compute cost so far."""
+    from .jobs import launch as jl
+    from .jobs import serve as js
+
+    def go() -> dict[str, Any]:
+        ep = js.resolve_endpoint(job_id, hf=jl.which_hf(), ledger=ledger)
+        return {"ok": True, **ep} if as_json else {"text": js.describe_endpoint(ep)}
+
+    _execute(go, as_json)
+
+
+@job_app.command("stop")
+def job_stop(
+    job_id: Annotated[str, typer.Argument(help="HF Job id (e.g. a serve job).")],
+    as_json: JsonOpt = False,
+) -> None:
+    """Cancel a job (`hf jobs cancel`): how a serve job ends before its timeout."""
+    from .jobs import launch as jl
+    from .jobs import serve as js
+
+    def go() -> dict[str, Any]:
+        out = js.stop(job_id, hf=jl.which_hf())
+        text = f"cancelled job {job_id}" + (f"\n{out}" if out else "")
+        return {"ok": True, "job_id": job_id, "text": text} if as_json else {"text": text}
 
     _execute(go, as_json)
 

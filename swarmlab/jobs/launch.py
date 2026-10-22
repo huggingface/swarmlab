@@ -111,6 +111,32 @@ spec as given (its own `providers:` kept).
   skips everything vLLM; `SWARMLAB_MODE=api` selects that branch.
 - The job runs as root; the programbench world's lockdown happens at the first `bash` command
   (world code, not the bootstrap), and keeps the Hub hosts the bucket sync needs.
+
+Self-served endpoint (`--endpoint`)
+-----------------------------------
+`plan_job(spec, endpoint={"url", "served_model_name", "job_id"})` (`swarmlab job run --endpoint
+<serve job id>`, resolved by `serve.resolve_endpoint`, or `--endpoint-url URL`; `remaining_s`,
+the serve job's time left, adds a note when it is shorter than this job's timeout) runs API mode
+against a model served by another HF Job (`swarmlab job serve`, swarmlab/jobs/serve.py). The spec
+declares the provider without a URL, e.g. `providers: {served: {type: openai_compat, params:
+{name: served, base_url_env: SWARMLAB_ENDPOINT_URL, api_key_env: HF_TOKEN, history_reasoning:
+true, self_hosted: true, pricing: {flint: [0, 0, 0]}}}}`, and the arms call `served:flint`; the
+job spec is the spec as given, so the endpoint URL (which embeds the serve job's id) is in no
+`spec_hash` or `request_hash`. The plan records the endpoint (`JobPlan.endpoint`: job id, URL,
+base URL, host, served name, the env it sets) in plan.json, and the job gets it as environment:
+each chosen provider's `base_url_env` = `<url>/v1`, `SWARMLAB_ENDPOINT_URL` (the same base URL)
+and `SWARMLAB_ENDPOINT_JOB` (bootstrap.sh records both in job.json `endpoint`), and, with a
+programbench world under lockdown, `SWARMLAB_PIN_HOSTS_EXTRA=<host>` (the world adds it to its
+pinned hosts at the lockdown; `pin_hosts` itself is a world param in `spec_hash`). `HF_TOKEN`,
+already a job secret, is the provider's key (the jobs proxy wants a token with read access to the
+serve job's namespace). Refused: `--endpoint` with `--model` or a `vllm:` arm (API mode only), no
+chosen arm on a provider with `base_url_env`, a model on such a provider that is not the served
+name, and (without `--endpoint`) a chosen provider with `base_url_env` (nothing would set it).
+
+`hf_command` adds `--expose PORT` for each of a plan's `expose` ports (the serve plan's; never
+`--expose-public`), `job_entry` runs the plan's `entry_script` (default `bootstrap.sh`; the serve
+plan's is `serve.sh`), and `submit` merges a plan's `ledger_fields()` into the ledger row (the
+serve plan's sets `kind: serve`).
 """
 from __future__ import annotations
 
@@ -316,6 +342,7 @@ class JobPlan:
     missing_secrets: list[str] = field(default_factory=list)          # unset where planned
     extras: list[str] = field(default_factory=list)   # swarmlab extras installed in the job
     programbench: dict[str, Any] | None = None        # {"task", "image", "wall_limit_s", ...}
+    endpoint: dict[str, Any] | None = None            # --endpoint (module doc), else None
 
     @property
     def stage_remote(self) -> str:
@@ -345,7 +372,8 @@ class JobPlan:
         if self.mode == "api":
             return {**self._common_env(), "SWARMLAB_MODE": "api",
                     "SWARMLAB_SECRET_NAMES": " ".join(self.secrets),
-                    "SWARMLAB_EXTRAS": ",".join(self.extras)}   # HF_HOME: root-only default
+                    "SWARMLAB_EXTRAS": ",".join(self.extras),   # HF_HOME: root-only default
+                    **(self.endpoint or {}).get("env", {})}
         env = {
             **self._common_env(),
             "VLLM_MODEL": self.model or "",
@@ -424,10 +452,13 @@ def plan_job(
     now: float | None = None,
     git: Callable[[], tuple[str, bool]] | None = None,
     environ: Mapping[str, str] | None = None,
+    endpoint: Mapping[str, Any] | None = None,
 ) -> JobPlan:
     """The job for `spec`: vLLM mode when `model` is given or an arm calls a `vllm:` model, else
     API mode (module docstring). `environ` (default `os.environ`) is where API mode looks for
-    the secrets' values (only whether they are set)."""
+    the secrets' values (only whether they are set). `endpoint` (`{"url", "served_model_name",
+    "job_id", "remaining_s"}`; the last three may be None) points the chosen arms'
+    `base_url_env` providers at a self-served model (module doc, "Self-served endpoint")."""
     spec = Path(spec)
     doc = load_experiment_yaml(spec)
     chosen = list(arms) if arms else list(doc["arms"])
@@ -442,6 +473,14 @@ def plan_job(
         raise SpecError(f"--parallel must be >= 1, got {parallel}")
     api = model is None and not any(m.startswith("vllm:") for a in chosen
                                     for m in arm_models(doc, a))
+    if endpoint is not None and not api:
+        vl = [f"{a}: {m}" for a in chosen for m in arm_models(doc, a) if m.startswith("vllm:")]
+        raise SpecError("--endpoint runs the arms against a model served by another job (API "
+                        "mode, no in-job vLLM), but "
+                        + (f"--model {model} was given" if model is not None else
+                           f"the chosen arms call vllm: models ({'; '.join(vl)})")
+                        + "; call the served model through a provider with base_url_env, e.g. "
+                        "served:<served model name>")
     if not api and model is None:
         raise SpecError("the chosen arms call vllm: models; pass --model <the HF model id vLLM "
                         "serves>")
@@ -460,7 +499,7 @@ def plan_job(
         plan = _plan_api(doc, chosen, len(seed_list), flavor=flavor, image=image,
                          timeout=timeout, per_round_s=per_round_s, setup_s=setup_s,
                          parallel=parallel, environ=os.environ if environ is None else environ,
-                         common=common)
+                         common=common, endpoint=endpoint)
     else:
         assert model is not None
         plan = _plan_vllm(doc, chosen, len(seed_list), model=model, flavor=flavor or VLLM_FLAVOR,
@@ -571,11 +610,12 @@ def _plan_vllm(doc: dict, chosen: list[str], n_seeds: int, *, model: str, flavor
 def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
               image: str | None, timeout: str | int | None, per_round_s: float | None,
               setup_s: int, parallel: int, environ: Mapping[str, str],
-              common: dict[str, Any]) -> JobPlan:
+              common: dict[str, Any], endpoint: Mapping[str, Any] | None = None) -> JobPlan:
     job_yaml = dump_yaml(job_spec_doc(doc, None, arms=chosen))
     exps = _check_job_spec(job_yaml, chosen)
     notes: list[str] = []
     pb = programbench_arms(exps)
+    ep = endpoint_plan(exps, endpoint)
     facts = None
     if pb:
         tasks = sorted({w.task for w in pb.values()})
@@ -597,6 +637,12 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
         facts = {"task": tasks[0], "image": first.image, "wall_limit_s": first.wall_limit_s,
                  "lockdown": first.lockdown, "pin_hosts": list(first.pin_hosts),
                  "user": first.user}
+        if ep is not None and first.lockdown:
+            from ..world.programbench import PIN_HOSTS_EXTRA_VAR
+
+            ep["env"][PIN_HOSTS_EXTRA_VAR] = ep["host"]
+            ep["pin_hosts_extra"] = [ep["host"]]
+            facts["pin_hosts_extra"] = [ep["host"]]
         if not first.lockdown:
             notes.append("the programbench world has lockdown: false: the agent keeps the job's "
                          "network and sudo")
@@ -625,6 +671,11 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
     if timeout_s < total:
         notes.append(f"timeout {fmt_duration(timeout_s)} is below the {total // 60} min estimate; "
                      "the job may be cut (runs synced so far stay in the bucket, resumable)")
+    left = (endpoint or {}).get("remaining_s")
+    if ep is not None and left is not None and left < timeout_s:
+        notes.append(f"the serve job {ep['job_id']} times out in {left // 60} min, before this "
+                     f"job's {fmt_duration(timeout_s)} timeout: calls after that fail (launch "
+                     "the serve job with a longer --timeout)")
     secrets, missing = job_secrets(exps, environ)
     if missing:
         notes.append(f"{', '.join(missing)} not set in this environment: the job reads each "
@@ -637,7 +688,64 @@ def _plan_api(doc: dict, chosen: list[str], n_seeds: int, *, flavor: str | None,
         vllm_flags="",
         job_spec_yaml=job_yaml, notes=notes, vllm_flags_source="none", vllm_profile=None,
         probe_extra={}, probe_extra_source="none", mode="api", secrets=secrets,
-        missing_secrets=missing, extras=extras, programbench=facts, parallel=parallel)
+        missing_secrets=missing, extras=extras, programbench=facts, parallel=parallel,
+        endpoint=ep)
+
+
+ENDPOINT_URL_VAR = "SWARMLAB_ENDPOINT_URL"   # the endpoint's base URL in the job (job.json)
+ENDPOINT_JOB_VAR = "SWARMLAB_ENDPOINT_JOB"   # the serve job's id in the job (job.json)
+
+
+def endpoint_providers(exps: Mapping[str, Any]) -> dict[str, list[tuple[str, Any]]]:
+    """{arm: [(model, provider)]} of the chosen arms' models whose provider reads its base URL
+    from the environment (`base_url_env`)."""
+    out: dict[str, list[tuple[str, Any]]] = {}
+    for a, e in exps.items():
+        for m in _models(e):
+            p = e.provider_for(m)[0]
+            if getattr(p, "base_url_env", None):
+                out.setdefault(a, []).append((m, p))
+    return out
+
+
+def endpoint_plan(exps: Mapping[str, Any], endpoint: Mapping[str, Any] | None) -> dict | None:
+    """`JobPlan.endpoint` for `--endpoint` (module doc, "Self-served endpoint"), or None; the
+    refusals listed there."""
+    from urllib.parse import urlsplit
+
+    served = endpoint_providers(exps)
+    if endpoint is None:
+        if served:
+            names = sorted({f"{p.name} (${p.base_url_env})" for xs in served.values()
+                            for _, p in xs})
+            raise SpecError(f"provider(s) {', '.join(names)} read their base URL from the "
+                            "environment, which the job sets only from --endpoint <serve job id> "
+                            "(or --endpoint-url URL); pass one")
+        return None
+    url = str(endpoint.get("url") or "").rstrip("/").removesuffix("/v1")
+    host = urlsplit(url).hostname
+    if not url or not host or urlsplit(url).scheme not in ("http", "https"):
+        raise SpecError(f"--endpoint: no usable URL ({endpoint.get('url')!r}); is the serve job "
+                        "running with an exposed port? (swarmlab job endpoint <id>)")
+    if not served:
+        raise SpecError("--endpoint given, but no chosen arm calls a provider with base_url_env "
+                        "(declare e.g. providers: {served: {type: openai_compat, params: {name: "
+                        f"served, base_url_env: {ENDPOINT_URL_VAR}, api_key_env: HF_TOKEN, "
+                        "pricing: {<served name>: [0, 0, 0]}}}} and call served:<served name>)")
+    name = endpoint.get("served_model_name")
+    bad = [f"arm {a!r} calls {m!r}" for a, xs in served.items() for m, _ in xs
+           if name and m.partition(":")[2] != name]
+    if bad:
+        raise SpecError(f"--endpoint serves {name!r}, but {'; '.join(bad)}: the model id after "
+                        f"the provider prefix must be the served model name ({name})")
+    base = f"{url}/v1"
+    env = {ENDPOINT_URL_VAR: base, **({ENDPOINT_JOB_VAR: str(endpoint["job_id"])}
+                                      if endpoint.get("job_id") else {})}
+    for xs in served.values():
+        for _, p in xs:
+            env[p.base_url_env] = base
+    return {"job_id": endpoint.get("job_id"), "url": url, "base_url": base, "host": host,
+            "served_model_name": name, "env": env, "pin_hosts_extra": []}
 
 
 def programbench_arms(exps: Mapping[str, Any]) -> dict[str, Any]:
@@ -725,20 +833,22 @@ def job_entry(plan: Any) -> str:
     """The shell line the job runs: fetch the stage dir, then the bootstrap script. In vllm mode
     the uv image's uv fetches it; otherwise (API mode, grade jobs) uv is installed first when the
     image has none (into UV_LOCAL, PATH and shell profiles untouched) and handed to bootstrap.sh
-    as SWARMLAB_UV."""
+    as SWARMLAB_UV. The script is the plan's `entry_script` (default bootstrap.sh)."""
+    script = getattr(plan, "entry_script", "bootstrap.sh")
     if plan.mode == "vllm":
         return (f"mkdir -p {STAGE_LOCAL} && uv tool run --from 'huggingface_hub>=1.32' "
                 f"hf buckets sync \"$SWARMLAB_STAGE\" {STAGE_LOCAL} && "
-                f"exec bash {STAGE_LOCAL}/bootstrap.sh")
+                f"exec bash {STAGE_LOCAL}/{script}")
     return (f"mkdir -p {STAGE_LOCAL} && UV=$(command -v uv) || {{ curl -LsSf {UV_INSTALLER} | "
             f"env UV_INSTALL_DIR={UV_LOCAL} UV_NO_MODIFY_PATH=1 sh && UV={UV_LOCAL}/uv; }} && "
             f"\"$UV\" tool run --from 'huggingface_hub>=1.32' hf buckets sync \"$SWARMLAB_STAGE\" "
-            f"{STAGE_LOCAL} && SWARMLAB_UV=\"$UV\" exec bash {STAGE_LOCAL}/bootstrap.sh")
+            f"{STAGE_LOCAL} && SWARMLAB_UV=\"$UV\" exec bash {STAGE_LOCAL}/{script}")
 
 
 def launcher_flags(plan: JobPlan) -> list[str]:
     """The flags the launcher always passes to `vllm serve` (never part of `vllm_flags`)."""
-    out = ["--served-model-name", plan.model, "--host", "127.0.0.1", "--port", str(plan.port),
+    host = getattr(plan, "host", "127.0.0.1")   # a serve job listens on 0.0.0.0 (--expose)
+    out = ["--served-model-name", plan.model, "--host", host, "--port", str(plan.port),
            "--max-model-len", str(plan.max_model_len),
            "--gpu-memory-utilization", f"{plan.gpu_memory_utilization:g}"]
     if plan.revision:
@@ -761,7 +871,8 @@ def serve_command(plan: JobPlan) -> str:
 def hf_command(plan: Any, hf: str = "hf") -> list[str]:
     """The exact `hf jobs run` argv of a plan (a `JobPlan`, or a grade plan with the same
     attributes): secrets by name only (`--secrets NAME`: the hf CLI reads the value from the
-    launching environment), then volumes (`-v`, none for an agent job), then the env."""
+    launching environment), then volumes (`-v`, none for an agent job), exposed ports
+    (`--expose`, a serve job's), then the env."""
     cmd = [hf, "jobs", "run", "--detach", "--flavor", plan.flavor,
            "--timeout", fmt_duration(plan.timeout_s)]
     for name in plan.secrets:
@@ -770,6 +881,8 @@ def hf_command(plan: Any, hf: str = "hf") -> list[str]:
             "--label", "experiment=swarmlab", "--label", f"swarmlab_tag={plan.tag}"]
     for vol in getattr(plan, "volumes", ()):
         cmd += ["-v", vol]
+    for port in getattr(plan, "expose", ()):   # token-gated proxy; never --expose-public
+        cmd += ["--expose", str(port)]
     for k, v in plan.env().items():
         cmd += ["-e", f"{k}={v}"]
     return [*cmd, plan.image, "bash", "-c", job_entry(plan)]
@@ -795,11 +908,17 @@ def describe(plan: JobPlan) -> str:
                    f"wheel extras [{','.join(plan.extras)}]"),
                   ("  secrets (names; the hf CLI reads each value from this environment): "
                    f"{' '.join(plan.secrets)}")]
+        if plan.endpoint:
+            ep = plan.endpoint
+            lines.append(f"  endpoint: {ep['base_url']} (serve job {ep['job_id'] or '?'}, model "
+                         f"{ep['served_model_name'] or '?'}); env "
+                         + " ".join(f"{k}={v}" for k, v in sorted(ep["env"].items())))
         pb = plan.programbench
         if pb:
+            pinned = [*pb["pin_hosts"], *pb.get("pin_hosts_extra", [])]
             lines.append(f"  programbench task {pb['task']} (backend local): the world locks the "
                          f"job down at its first command (DNS blackholed, sudo removed; pinned: "
-                         f"{', '.join(pb['pin_hosts'])})" if pb["lockdown"] else
+                         f"{', '.join(pinned)})" if pb["lockdown"] else
                          f"  programbench task {pb['task']} (backend local, lockdown off)")
     for a, d in plan.estimate_detail["arms"].items():
         unit = d.get("unit", "round")
@@ -820,6 +939,9 @@ def describe(plan: JobPlan) -> str:
                  f"{fmt_duration(plan.timeout_s)}; flavor {plan.flavor}: {cost}")
     lines.append("model calls are self-hosted: the ledger shows $0, the cost is the job's compute"
                  if plan.mode == "vllm" else
+                 "model calls go to the serve job (its own compute, billed while it runs; see "
+                 "`swarmlab job endpoint`); the cost above is this job's compute"
+                 if plan.endpoint else
                  "model calls are billed by their providers on top (each run's budget caps them); "
                  "the cost above is the job's compute")
     lines += [f"note: {n}" for n in plan.notes]
@@ -903,6 +1025,8 @@ def submit(plan: Any, *, hf: str = "hf", runner: Runner = run_cli,
            "commit": plan.commit, "runs": [f"{a}:{s}" for a, s in getattr(plan, "runs", [])],
            "stage_remote": plan.stage_remote, "runs_remote": getattr(plan, "runs_remote", None),
            "mode": plan.mode, "secrets": list(plan.secrets)}
+    if callable(getattr(plan, "ledger_fields", None)):
+        row.update(plan.ledger_fields())
     with tempfile.TemporaryDirectory() as tmp:
         f = Path(tmp) / "launch.json"
         f.write_text(json.dumps(row, indent=1))

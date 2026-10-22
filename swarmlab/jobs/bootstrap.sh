@@ -16,6 +16,11 @@
 #   so the agent user of a ProgramBench task image cannot read run dirs or job logs.
 #   SWARMLAB_EXTRAS (comma-separated, e.g. anthropic,programbench) installs the wheel with those
 #   extras; SWARMLAB_SECRET_NAMES (names only) is recorded in job.json.
+#   SWARMLAB_ENDPOINT_URL / SWARMLAB_ENDPOINT_JOB (api, `swarmlab job run --endpoint`): the base URL
+#   and job id of a model served by another job, recorded in job.json `endpoint` (the providers
+#   read their own `base_url_env`; the programbench world reads SWARMLAB_PIN_HOSTS_EXTRA).
+# A serving job (`swarmlab job serve`) does not run this script: it runs serve.sh (same stage-dir
+# fetch, same exit-code table below, plus 15: the server exited after it was ready).
 #
 # Every setting comes from the environment (set by swarmlab/jobs/launch.py with `-e`):
 #   SWARMLAB_TAG          job tag, e.g. m2-vllm-qwen9b-1a2b3c4-20261006-120000
@@ -146,6 +151,8 @@ doc = {
              "ready_s": e("READY_S") or None},
     "probe": probe,
     "grade": grade,
+    "endpoint": {"job_id": e("SWARMLAB_ENDPOINT_JOB") or None,
+                 "base_url": e("SWARMLAB_ENDPOINT_URL")} if e("SWARMLAB_ENDPOINT_URL") else None,
 }
 print(json.dumps(doc, indent=1))
 PY
