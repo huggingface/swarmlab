@@ -51,6 +51,12 @@ cpus=None, memory_gb=None, snapshot_exclude=(), check_task=True)`
   bootstrap runs after the lockdown, uploads file contents to the `casUrl` the Hub's
   `xet-write-token` endpoint returns; both names were seen there). Download hosts
   (`transfer.xethub.hf.co`, `cas-bridge.xethub.hf.co`) are not pinned.
+  `SWARMLAB_PIN_HOSTS_EXTRA` (`PIN_HOSTS_EXTRA_VAR`; host names separated by spaces or commas,
+  read when the lockdown runs) adds hosts to `pin_hosts` for this process only: `swarmlab job run
+  --endpoint` sets it to the host of a self-served model's exposed URL (another HF Job,
+  `<job id>--<port>.hf.jobs`), which is known only at launch. It is an environment variable and
+  not a world param because `pin_hosts` is part of `spec_hash` and the URL embeds the serve job's
+  id; what was pinned is recorded in the backend info (`lockdown.pinned`) either way.
 - `max_output_bytes`: a safety cap on one command's output (below).
 - `cpus`, `memory_gb`: the resources the task text states and the docker flags use. `None`:
   docker uses the official 20 CPUs / 60 GB; the local backend detects them from the cgroup when
@@ -361,6 +367,7 @@ DOCKER_CPUS, DOCKER_MEMORY_GB = 20, 60          # programbench.yaml run_args
 DOCKER_CONTAINER_TIMEOUT = "7h"                 # programbench.yaml container_timeout
 DOCKER_START_TIMEOUT_S = 1800                   # a pull of a 1-2 GB image; not task semantics
 HISTORY_KEEP = 10
+PIN_HOSTS_EXTRA_VAR = "SWARMLAB_PIN_HOSTS_EXTRA"  # hosts the job launcher adds (module doc)
 RUN_MARKER = "SWARMLAB_PROGRAMBENCH_RUN"         # =<random id> in every local command's environment
 _ERROR_PREFIX = "An error occurred while executing the command: "
 NOT_THE_SUBMISSION = "This command was not taken as the submission: "
@@ -805,6 +812,12 @@ def remove_sudo(user: str, sudoers: str = LockdownPaths.sudoers,
         os.chmod(sudo_bin, 0)
         done["sudo_disabled"] = True
     return done
+
+
+def pin_hosts_extra(environ: Mapping[str, str] | None = None) -> list[str]:
+    """The host names `SWARMLAB_PIN_HOSTS_EXTRA` lists (spaces or commas), in order."""
+    raw = (os.environ if environ is None else environ).get(PIN_HOSTS_EXTRA_VAR) or ""
+    return [h for h in raw.replace(",", " ").split() if h]
 
 
 def apply_lockdown(user: str | None, hosts: Sequence[str], paths: LockdownPaths | None = None,
@@ -1523,6 +1536,7 @@ class ProgramBench(World):
         lockdown = None
         if self._lockdown_applies():
             user, hosts = self.user, list(self.pin_hosts)
+            hosts += [h for h in pin_hosts_extra() if h not in hosts]
 
             def lockdown() -> dict:
                 return apply_lockdown(user, hosts)

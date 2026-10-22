@@ -520,6 +520,21 @@ def test_lockdown_and_detection_are_skipped_when_not_root(tmp_path, monkeypatch)
     assert calls == [] and w.resources["cpus"] is None and w.backend_info["applied"] is False
 
 
+def test_pin_hosts_extra_from_the_environment_joins_the_lockdown(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(pb, "apply_lockdown", lambda user, hosts: calls.append(hosts)
+                        or {"applied": True, "pinned": {}})
+    monkeypatch.setattr(pb, "detect_resources", lambda *a: (4.0, 16.0))
+    monkeypatch.setattr(pb.os, "geteuid", lambda: 0)
+    monkeypatch.setenv(pb.PIN_HOSTS_EXTRA_VAR, "abc--30000.hf.jobs, hf.co")
+    w = make(tmp_path, lockdown=True, pin_hosts=["hf.co"])
+    spec_before = w.spec()
+    sh(w, "true")
+    assert calls == [["hf.co", "abc--30000.hf.jobs"]]   # added once, after the world's own
+    assert w.spec() == spec_before and "abc--30000" not in json.dumps(w.spec())
+    assert pb.pin_hosts_extra({}) == [] and pb.pin_hosts_extra({pb.PIN_HOSTS_EXTRA_VAR: "a b,c"}) == ["a", "b", "c"]
+
+
 def test_lockdown_runs_at_the_first_command_when_root(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(pb, "apply_lockdown", lambda user, hosts: calls.append((user, hosts))
