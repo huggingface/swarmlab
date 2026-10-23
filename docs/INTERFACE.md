@@ -106,7 +106,7 @@ class RunSpec(BaseModel):
     medium: MediumSpec; metrics: list[PluginSpec]; budget: Budget; options: RunOptions
 ```
 
-`Plugin.type_name()` uses `entry_point` only when it is defined on the class itself (`cls.__dict__`), so a subclass of a registered plugin serialises as `module:Class`, never as its parent. `spec_hash(run_spec)` is SHA-256 of canonical JSON (sorted keys, no whitespace). Run identity is `(git_commit, dirty, spec_hash)`; the runner records all three on `run_started` and archives the serialised spec to `artifacts/spec.yaml`. YAML files hold `name`, `arms: {arm: {world, participants: [{type, count, params}], medium, metrics}}`, `budget`, and `options`; `participants[].count` expands to repeated entries.
+`Plugin.type_name()` uses `entry_point` only when it is defined on the class itself (`cls.__dict__`), so a subclass of a registered plugin serialises as `module:Class`, never as its parent. `spec_hash(run_spec)` is SHA-256 of canonical JSON (sorted keys, no whitespace). (Amendment, file references) A participant param string `file:<path>` (at any depth of its `params`) is hashed as `file:sha256:<hex of the file's bytes>` when the file is readable, else as written; the serialised spec keeps the path. So a job that stages the file under another path hashes like a local run on the same contents. Run identity is `(git_commit, dirty, spec_hash)`; the runner records all three on `run_started` and archives the serialised spec to `artifacts/spec.yaml`. YAML files hold `name`, `arms: {arm: {world, participants: [{type, count, params}], medium, metrics}}`, `budget`, and `options`; `participants[].count` expands to repeated entries.
 
 ## 4. Events
 

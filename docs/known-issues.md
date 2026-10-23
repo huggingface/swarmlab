@@ -46,6 +46,15 @@ Last checked against main on 2026-10-08. Items fixed since the first version (pe
 - The grade job's timeout is capped at 12 h, below the evaluator's worst case for tasks with many branches (cmatrix: 14.8 h). A real grade of a small task should take minutes.
 - Haiku 5.5's long-prompt tier (over 100,000 prompt tokens) is billed by `AnthropicProvider.cost`, but `estimate` and `swarmlab models` show only the base row.
 
+## Self-served models (`swarmlab job serve`)
+
+- No per-run GPU attribution: runs that call a served model record $0; the serve job's cost (`swarmlab job endpoint`, `job status`) is not split between the runs that used it.
+- The serve job bills its rate (h200: $5/h) until its timeout or `swarmlab job stop`, idle or not. Nothing stops it when the run jobs end.
+- The jobs proxy admits any HF token with read access to the serve job's namespace, so anyone with such a token can call the server while it runs. `--expose-public` (no auth) is never used. The agent in a ProgramBench job can reach the pinned endpoint host but has no token (secrets are stripped from its commands).
+- The endpoint host is pinned to the address it resolved to at the lockdown; if the jobs proxy moves during a 6 h run, calls fail.
+- Not yet run for real: `serve.sh` is tested against a stub server, and the Flint setup steps are the 2026-10-22 probe's commands. The image is the tag, not the digest the kit's Dockerfile pins (a digest reference is untested on HF Jobs; `--image lmsysorg/sglang@sha256:...` pins it).
+- `spec_hash` now hashes `file:` participant params by content: runs from before that change that used `file:` params hash differently, so `run` treats them as another configuration (`--rerun`, or a new out dir).
+
 ## Roles, paired runs, registry, viewer
 
 - Roles: a role's `model` override is ignored by `Experiment.estimate`; a fork keeps the parent's participant settings (role overrides in an edited spec do not re-bind them); `reconfigure` interventions do not change roles. `Role` and `Tree` are not re-exported at top level (import from `swarmlab.roles` and `swarmlab.medium.topology`).

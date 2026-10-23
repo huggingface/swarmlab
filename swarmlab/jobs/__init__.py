@@ -7,7 +7,9 @@ default); `bootstrap.sh` runs inside the job (vLLM or not + `swarmlab run` per a
 sync + manifest, or the grade); `remote.py` reads jobs and fetches run dirs back (`swarmlab job
 status|logs|fetch`); `programbench.py` plans and launches the grade job of a ProgramBench run and
 writes its score back (`swarmlab programbench grade|fetch-grade`); `grade.py` runs inside that
-job (the official evaluator on a local container class).
+job (the official evaluator on a local container class); `serve.py` plans and launches a job that
+only serves a model on an exposed port and resolves its endpoint (`swarmlab job
+serve|endpoint|stop`, `job run --endpoint`), and `serve.sh` runs inside it.
 """
 from .launch import JobPlan, describe, hf_command, plan_job, stage, submit
 from .remote import fetch, find_run, logs, status

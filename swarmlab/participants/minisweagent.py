@@ -167,7 +167,7 @@ uname), `programbench_rules` (the `<RULES>` block of the system text),
 submission bullet), `resource_sentence` (the last paragraph of `view.description` when it starts
 with `This machine has`, else empty), `lead_channel`, `worker_channels` (the `worker_channels`
 param, or the channels of this agent's `post` tool other than `lead_channel`: for a lead one per
-worker, for a worker its own), `wait_tool`, `guidance` (the param, or empty; both templates append it as a paragraph before the resource sentence), `turn_based` (`commit: async`: the lead's
+worker, for a worker its own), `wait_tool`, `guidance` (the param, or empty; `file:<path>` is the file's text, read at render time like `templates: file:`; both templates append it as a paragraph before the resource sentence), `turn_based` (`commit: async`: the lead's
 `wait_for_workers` bullet says the tool returns the reports, the worker's text says it waits
 between assignments; the round-based text is unchanged), `agent`, `role` and `tools` (names
 offered). `solo`
@@ -790,7 +790,8 @@ class MiniSweAgent(Participant):
                 "resource_sentence": resource_sentence_of(view.description),
                 "lead_channel": self.lead_channel, "worker_channels": channels,
                 "wait_tool": self.wait_tool, "turn_based": view.turn is not None,
-                "guidance": self.guidance or "",
+                "guidance": (Path(self.guidance[len("file:"):]).read_text()
+                             if (self.guidance or "").startswith("file:") else self.guidance or ""),
                 "agent": str(getattr(self, "agent", "")),
                 "role": getattr(self, "_role_name", None) or "",
                 "tools": [t.name for t in offered]}

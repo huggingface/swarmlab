@@ -1,0 +1,45 @@
+# examples/programbench_team_async.yaml on a self-served Flint (RecursiveSI/flint) instead of Haiku:
+# the model runs in its own HF Job (`swarmlab job serve RecursiveSI/flint --launch`) and this
+# spec's job calls it over the jobs proxy (`swarmlab job run <this file> --endpoint <serve job
+# id>`; docs/guide/real-models.md, "Self-served models in HF Jobs").
+#
+# The `served` provider names no URL: `base_url_env` says which variable holds it, and
+# `--endpoint` sets that variable in the job, so the serve job's id never enters the spec hash.
+# `api_key_env: HF_TOKEN`: the jobs proxy wants an HF token with read access to the serve job's
+# namespace (already a job secret). `history_reasoning: true`: Flint wants its
+# `reasoning_content` back on earlier assistant turns. Pricing is [0, 0, 0] (`self_hosted`): the
+# cost is the serve job's GPU time, shown by `swarmlab job endpoint`.
+name: programbench-team-async-flint
+seeds: [0]
+budget: {hard_usd: 1.0}
+options: {commit: async, rounds_per_agent: 30, max_calls_per_turn: 40}
+providers:
+  served:
+    type: openai_compat
+    params: {name: served, base_url_env: SWARMLAB_ENDPOINT_URL, api_key_env: HF_TOKEN,
+             history_reasoning: true, self_hosted: true, timeout_s: 1200, concurrency: 8,
+             pricing: {flint: [0, 0, 0]}}
+roles:
+  lead: {tools: [bash, post, read_board, wait], channels_write: [worker-1, worker-2]}
+  worker: {tools: [bash, post, read_board, wait], channels_read: [worker-1, worker-2]}
+arms:
+  team:
+    world: {type: programbench, params: {task: abishekvashok__cmatrix.5c082c6}}
+    medium:
+      delivery: pull
+      topology:
+        type: rooms
+        params:
+          rooms:
+            lead: [a000, a001, a002]
+            worker-1: [a000, a001]
+            worker-2: [a000, a002]
+    participants:
+      # Flint reasons at length: max_tokens >= 32768 (the kit's advice); temperature unset =
+      # the server's default 1.0
+      - {type: mini_swe_agent, count: 1, role: lead,
+         params: {model: "served:flint", max_tokens: 32768, templates: lead, steps_per_turn: 10,
+                  step_limit: 100, wait_tool: true}}
+      - {type: mini_swe_agent, count: 2, role: worker,
+         params: {model: "served:flint", max_tokens: 32768, templates: worker, steps_per_turn: 10,
+                  step_limit: 100, idle_until_assigned: true}}

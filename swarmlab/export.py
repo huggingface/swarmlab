@@ -100,8 +100,9 @@ Decisions where the contract is silent:
     thinking) has its blocks in the provider's order, `thinking` as pi `{"type": "thinking",
     "thinking", "thinkingSignature"}` (text `""` when the display was omitted) and
     `redacted_thinking` as `{"type": "thinking", "thinking": "", "thinkingSignature": <data>,
-    "redacted": true}`; a response with only `reasoning` text (OpenAI-compatible) gets one
-    `thinking` block before its text.
+    "redacted": true}`; a response with only `reasoning` text (OpenAI-compatible, also with
+    `history_reasoning`'s `reasoning_text` block in `provider_content`) gets one `thinking` block
+    before its text.
   - An image part of a message becomes a text block `[image: PNG <w>×<h>]` (M5 §4,
     `render.image_label`); the pixels stay in the request blobs.
   - pi `usage.cost` holds the logged `cost_usd` in `total` only (the run does not split cost
@@ -664,8 +665,9 @@ class _Session:
                   reasoning: str | None = None, provider_content: list | None = None) -> None:
         for c in calls:
             self.tool_names[str(c.get("call_id"))] = str(c.get("name"))
-        if provider_content:
-            blocks = _pi_blocks(provider_content, calls)
+        if provider_content and not any(isinstance(b, dict) and b.get("type") == "reasoning_text"
+                                        for b in provider_content):
+            blocks = _pi_blocks(provider_content, calls)  # Anthropic blocks
         else:
             blocks = [{"type": "thinking", "thinking": reasoning}] if reasoning else []
             if text:

@@ -5,6 +5,15 @@ Decisions where the contract is silent:
 - `spec_hash` is SHA-256 over `json.dumps(spec.model_dump(mode="json"), sort_keys=True,
   separators=(",", ":"), ensure_ascii=True)`. Key order in params never changes the hash; list
   order (agents, metrics, policies) does, because it is semantic.
+- File references: a participant param string `file:<path>` (anywhere in its `params`, e.g.
+  `templates: file:...` or `guidance: file:...` of mini_swe_agent, `system_prompt: file:...` of
+  llm) enters the hash as `file:sha256:<hex of the file's bytes>` when the file is readable
+  (`file_refs_by_content`), else as written. So the hash follows what the participant reads, not
+  where it lives: `swarmlab job run` stages such files and rewrites the path to the job's stage
+  dir, and the job's runs hash like a local run on the same contents (and an edited file is a new
+  configuration). The run spec itself (run.json, artifacts/spec.yaml) keeps the path as given.
+  Runs from before this rule that used `file:` params hash differently now (`existing` treats
+  them as another configuration).
 - Experiment YAML shape (validated by `load_experiment_yaml`; unknown keys are errors)::
 
       name: flag-gossip
@@ -255,6 +264,25 @@ def canonical_json(data: Any) -> str:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+FILE_REF = "file:"
+
+
+def file_refs_by_content(value: Any) -> Any:
+    """`value` with every `file:<path>` string (in nested dicts and lists too) whose file is
+    readable replaced by `file:sha256:<hex>` of its bytes (module doc, "File references")."""
+    if isinstance(value, str) and value.startswith(FILE_REF):
+        try:
+            data = Path(value[len(FILE_REF):]).read_bytes()
+        except (OSError, ValueError):
+            return value
+        return f"{FILE_REF}sha256:{hashlib.sha256(data).hexdigest()}"
+    if isinstance(value, dict):
+        return {k: file_refs_by_content(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [file_refs_by_content(v) for v in value]
+    return value
+
+
 def spec_hash(run_spec: RunSpec) -> str:
     """SHA-256 hex of the canonical JSON of the resolved spec."""
     data = run_spec.model_dump(mode="json")
@@ -263,6 +291,9 @@ def spec_hash(run_spec: RunSpec) -> str:
     if not data.get("interventions"):  # M3a, likewise
         data.pop("interventions", None)
     (data.get("budget") or {}).pop("total_usd", None)  # experiment-wide, not part of a run
+    for part in data.get("participants") or []:
+        if isinstance(part, dict) and isinstance(part.get("params"), dict):
+            part["params"] = file_refs_by_content(part["params"])
     return hashlib.sha256(canonical_json(data).encode()).hexdigest()
 
 

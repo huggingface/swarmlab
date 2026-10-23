@@ -37,6 +37,22 @@ A profile's `min_gpu_gb` is the GPU memory one card needs to serve the model at 
 a note when the chosen flavor's card is smaller (`launch.FLAVOR_GPU_GB`). It is only set where a
 smaller card is known to fail: granite-4.2-8b needs 48 GB (on a10g-large, 24 GB, vLLM ran out of KV
 cache at 32k: 2.66 GiB free, 5 GiB needed), so it runs on l40sx1 or a100-large.
+
+Kit profiles (`KIT_PROFILES`, `swarmlab job serve --engine sglang --profile <name>`,
+swarmlab/jobs/serve.py): a model that ships its own serving kit in its repo (an install script,
+patches, a wheel, a serve script per GPU) is served by running that kit in its base image, not by
+flags. `KitProfile` holds the engine, the image (the tag the kit was validated with, and the
+digest its Dockerfile pins), the kit's directory in the model repo, its install script, the
+serve script per HF Jobs flavor (a flavor not listed is refused: the kit's scripts are per GPU
+type), the port, the served model name (what the server calls the model in `/v1/models` and
+requests), the readiness paths (polled in order, every one must answer 2xx), the probe request
+extra and the environment the setup needs. `flint` (RecursiveSI/flint) was validated on HF Jobs
+on 2026-10-22: h200 (141 GB; the kit needs >= 141 GB per replica), driver 580 / CUDA 13.0, image
+lmsysorg/sglang:v0.5.16-cu130; `install.sh` ~52 s (needs PIP_BREAK_SYSTEM_PACKAGES=1; the image's
+huggingface_hub must stay < 2.0 for its transformers, so nothing upgrades it), weights ~40 s,
+server ready ~106 s later on `/health_generate`; tool calls and `reasoning_content` are parsed by
+the kit's `flint` parsers, and the model wants `reasoning_content` back on earlier assistant turns
+(the spec's provider sets `history_reasoning: true`).
 """
 from __future__ import annotations
 
@@ -218,3 +234,60 @@ def resolve_flags(model: str, *, vllm_flags: str | None = None, profile: str | N
         probe_extra=extra, probe_extra_source=extra_source,
         validated_vllm=prof.validated_vllm if prof else None,
         min_gpu_gb=prof.min_gpu_gb if prof else None)
+
+
+# ---- kit profiles (swarmlab job serve --engine sglang) ----------------------------------------
+@dataclass(frozen=True)
+class KitProfile:
+    """How to serve a model whose repo ships a serving kit (module doc, "Kit profiles")."""
+
+    name: str
+    model: str                       # the HF repo holding the weights and the kit
+    engine: str                      # "sglang"
+    image: str                       # the validated tag
+    image_digest: str | None         # the digest the kit's Dockerfile pins (recorded)
+    kit_dir: str                     # the kit's directory in the repo
+    install: str                     # install script in kit_dir, run as `bash <it> <kit dir>`
+    serve_scripts: dict[str, str]    # HF Jobs flavor -> serve script in kit_dir
+    port: int
+    served_model_name: str
+    ready_paths: tuple[str, ...] = ("/health", "/v1/models")
+    probe_extra: dict[str, Any] = field(default_factory=dict)
+    setup_env: dict[str, str] = field(default_factory=dict)
+    min_gpu_gb: int | None = None
+    validated: str = ""
+    note: str = ""
+
+
+KIT_PROFILES: dict[str, KitProfile] = {k.name: k for k in (
+    KitProfile(
+        name="flint", model="RecursiveSI/flint", engine="sglang",
+        image="lmsysorg/sglang:v0.5.16-cu130",
+        image_digest="sha256:7b6a35df9839fd593a94a1eaee82d7777f472225d9f3ad1f8a2e0cb2bd1785d0",
+        kit_dir="sglang", install="install.sh", serve_scripts={"h200": "serve_h200.sh"},
+        port=30000, served_model_name="flint", ready_paths=("/health_generate", "/v1/models"),
+        probe_extra={}, setup_env={"PIP_BREAK_SYSTEM_PACKAGES": "1",
+                                   "PIP_ROOT_USER_ACTION": "ignore"},
+        min_gpu_gb=141, validated="SGLang v0.5.16 (cu130), h200, driver 580.178.04, 2026-10-22",
+        note="one replica per 141 GB GPU; recommended max_tokens >= 32768, temperature 1.0 (the "
+             "server default); send reasoning_content back (history_reasoning: true)"),
+)}
+
+
+def select_kit_profile(model: str, profile: str | None = "auto") -> KitProfile:
+    """`auto` (or None): the kit profile whose `model` is `model`; else the named one, which
+    must exist and serve `model`. SpecError otherwise."""
+    name = (profile or "auto").strip()
+    if name.lower() == "auto":
+        found = [k for k in KIT_PROFILES.values() if k.model.lower() == model.lower()]
+        if not found:
+            raise SpecError(f"--engine sglang serves models with a kit profile only, and none is "
+                            f"for {model!r}; known: "
+                            + ", ".join(f"{k.name} ({k.model})" for k in KIT_PROFILES.values()))
+        return found[0]
+    kit = KIT_PROFILES.get(name)
+    if kit is None:
+        raise SpecError(f"--profile {name!r}: no such kit profile; known: {', '.join(KIT_PROFILES)}")
+    if kit.model.lower() != model.lower():
+        raise SpecError(f"--profile {name} serves {kit.model}, not {model!r}")
+    return kit

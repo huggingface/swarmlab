@@ -16,6 +16,13 @@
 #   so the agent user of a ProgramBench task image cannot read run dirs or job logs.
 #   SWARMLAB_EXTRAS (comma-separated, e.g. anthropic,programbench) installs the wheel with those
 #   extras; SWARMLAB_SECRET_NAMES (names only) is recorded in job.json.
+#   $STAGE_DIR/files/: files the spec references (`file:<path>` params, rewritten by the launcher
+#   to these copies); job.json `staged_files` lists what is there (name, size, sha256).
+#   SWARMLAB_ENDPOINT_URL / SWARMLAB_ENDPOINT_JOB (api, `swarmlab job run --endpoint`): the base URL
+#   and job id of a model served by another job, recorded in job.json `endpoint` (the providers
+#   read their own `base_url_env`; the programbench world reads SWARMLAB_PIN_HOSTS_EXTRA).
+# A serving job (`swarmlab job serve`) does not run this script: it runs serve.sh (same stage-dir
+# fetch, same exit-code table below, plus 15: the server exited after it was ready).
 #
 # Every setting comes from the environment (set by swarmlab/jobs/launch.py with `-e`):
 #   SWARMLAB_TAG          job tag, e.g. m2-vllm-qwen9b-1a2b3c4-20261006-120000
@@ -105,8 +112,8 @@ hf_q() { "$HF" "$@" >>"$JT/joblogs/hf.log" 2>&1; }
 write_manifest() {
   ENDED_AT="${1:-}" STARTED_AT="$STARTED_AT" STATUS="$STATUS" RC="$RC" READY_S="$READY_S" \
     DONE_RUNS="$DONE_RUNS" FAILED_RUNS="$FAILED_RUNS" VLLM_CMDLINE="$VLLM_CMDLINE" MODE="$MODE" \
-    PROBE_FILE="$JT/probe.json" GRADE_FILE="$JT/grade.json" python3 - <<'PY' >"$JT/job.json"
-import json, os
+    PROBE_FILE="$JT/probe.json" GRADE_FILE="$JT/grade.json" STAGE_DIR="$STAGE_DIR" python3 - <<'PY' >"$JT/job.json"
+import hashlib, json, os
 e = os.environ.get
 try:
     probe = json.load(open(e("PROBE_FILE")))
@@ -116,6 +123,12 @@ try:
     probe_extra = json.loads(e("VLLM_PROBE_EXTRA") or "")
 except ValueError:
     probe_extra = e("VLLM_PROBE_EXTRA")   # unparsable: recorded as given (the probe fails on it)
+staged = []   # what the job has in <stage>/files (plan.json `staged_files` says what was planned)
+files_dir = os.path.join(e("STAGE_DIR") or "", "files")
+for name in sorted(os.listdir(files_dir)) if os.path.isdir(files_dir) else []:
+    with open(os.path.join(files_dir, name), "rb") as fh:
+        blob = fh.read()
+    staged.append({"name": name, "size": len(blob), "sha256": hashlib.sha256(blob).hexdigest()})
 grade = None
 if e("MODE") == "grade":
     try:
@@ -146,6 +159,9 @@ doc = {
              "ready_s": e("READY_S") or None},
     "probe": probe,
     "grade": grade,
+    "staged_files": staged,
+    "endpoint": {"job_id": e("SWARMLAB_ENDPOINT_JOB") or None,
+                 "base_url": e("SWARMLAB_ENDPOINT_URL")} if e("SWARMLAB_ENDPOINT_URL") else None,
 }
 print(json.dumps(doc, indent=1))
 PY

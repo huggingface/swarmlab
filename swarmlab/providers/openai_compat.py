@@ -1,7 +1,7 @@
 """OpenAICompatProvider: chat-completions over `httpx.AsyncClient` (docs/INTERFACE-M1b.md §1).
 
 `OpenAICompatProvider(name, base_url=None, api_key_env=None, pricing=None, concurrency=8,
-timeout_s=90.0, max_retries=2, self_hosted=None)`. Presets (`preset(name, **overrides)`): `hf`
+timeout_s=90.0, max_retries=2, self_hosted=None, base_url_env=None, history_reasoning=False)`. Presets (`preset(name, **overrides)`): `hf`
 (`https://router.huggingface.co/v1`, `HF_TOKEN`), `openai` (`https://api.openai.com/v1`, `OPENAI_API_KEY`), `vllm` (`base_url`
 required, no key). A preset's `base_url`/`api_key_env` fill in when not given explicitly, so
 `OpenAICompatProvider("hf", pricing={...})` is the HF router with prices. Presets ship with an
@@ -16,6 +16,15 @@ while still counting calls and tokens; reports label that $0 as compute-time
 spec (`providers.<prefix>.params.self_hosted`; left out when None, so older spec hashes hold). `served_by` falls back to the provider name
 (`"vllm"`) when the server sends no `x-inference-provider` header and the provider is
 self-hosted.
+
+`base_url_env` (a self-served model in another HF Job, `swarmlab job serve`; docs/guide/real-models.md):
+the name of an environment variable holding the base URL, read at each call, so the spec names
+the variable and never the URL (an exposed job URL embeds the serve job's id, which must not enter
+`spec_hash`). It excludes `base_url` (both given: ValueError) and replaces a preset's URL. The
+provider builds without the variable set (`validate`, the job planner), and a call with it unset
+or empty raises `ProviderError` (status None, not retried). `swarmlab job run --endpoint` sets the
+variable in the job. Like `self_hosted`, `base_url_env` and `history_reasoning` are left out of
+`params` at their defaults, so earlier specs keep their `spec_hash`.
 
 Mapping:
 
@@ -55,8 +64,17 @@ Mapping:
 - Reasoning: `message.reasoning_content` (vLLM, SGLang, DeepInfra, DeepSeek), else
   `message.reasoning` (OpenRouter, some routers), when a non-empty string, becomes
   `ChatResponse.reasoning` with `reasoning_kind = "text"` (what the server returned; for open
-  models usually the full chain of thought). It is recorded only: it is never sent back
+  models usually the full chain of thought). By default it is recorded only, never sent back
   (chat templates drop earlier turns' reasoning, and some servers reject it in a request).
+  `history_reasoning=True` (for models whose template needs earlier turns' reasoning, e.g. Flint
+  on SGLang) also sets `ChatResponse.provider_content = [{"type": "reasoning_text", "field":
+  <the key the server used>, "text": <reasoning>}]`; the participants keep `provider_content` on
+  the stored assistant message (LLMAgent within a turn, or across turns with `carry_thinking`;
+  mini_swe_agent always), and this adapter sends such a message back with `<field>: <text>` next
+  to its content and tool calls (`reasoning_content` for SGLang/vLLM, `reasoning` for routers
+  that use that key). Only `reasoning_text` blocks are read; Anthropic blocks in
+  `provider_content` (a provider switch within one memory) are ignored here, and the Anthropic
+  adapter ignores `reasoning_text` blocks likewise.
 - Timeouts and retries (see `base.py`): each attempt is bounded by `timeout_s` (httpx timeout and
   an `asyncio.timeout` around the attempt). `httpx.TimeoutException`, the attempt deadline,
   other `httpx.TransportError`s, HTTP 429 and 5xx are retried up to `max_retries` times with
@@ -99,7 +117,17 @@ PRESETS: dict[str, dict[str, str | None]] = {
 }
 
 
-def _message(m: ChatMessage) -> dict:
+REASONING_BLOCK = "reasoning_text"   # the `provider_content` block type of `history_reasoning`
+REASONING_FIELDS = ("reasoning_content", "reasoning")
+
+
+def reasoning_blocks(provider_content: list[dict] | None) -> list[dict]:
+    """The `reasoning_text` blocks of an assistant message's `provider_content`."""
+    return [b for b in provider_content or []
+            if isinstance(b, dict) and b.get("type") == REASONING_BLOCK]
+
+
+def _message(m: ChatMessage, history_reasoning: bool = False) -> dict:
     if m.role == "tool":
         return {"role": "tool", "tool_call_id": m.tool_call_id or "", "content": text_of(m.content)}
     if isinstance(m.content, str):
@@ -121,14 +149,18 @@ def _message(m: ChatMessage) -> dict:
         ]
         if not content:
             out["content"] = None
+    if m.role == "assistant" and history_reasoning:
+        for b in reasoning_blocks(m.provider_content):
+            field = b.get("field") if b.get("field") in REASONING_FIELDS else REASONING_FIELDS[0]
+            out[field] = str(b.get("text") or "")
     return out
 
 
-def build_body(request: ChatRequest) -> dict:
+def build_body(request: ChatRequest, history_reasoning: bool = False) -> dict:
     forced = check_tool_choice(request)
     body: dict[str, Any] = {
         "model": model_id(request),
-        "messages": [_message(m) for m in request.messages],
+        "messages": [_message(m, history_reasoning) for m in request.messages],
         "max_tokens": request.max_tokens,
     }
     if request.tools and request.tool_protocol == "native":
@@ -173,13 +205,17 @@ def parse_completion(data: dict) -> tuple[str, list[ToolCall], Usage, str]:
     return msg.get("content") or "", calls, usage, finish
 
 
-def parse_reasoning(data: dict) -> dict:
-    """`ChatResponse` reasoning fields from a chat-completions body (module doc); {} without."""
+def parse_reasoning(data: dict, history_reasoning: bool = False) -> dict:
+    """`ChatResponse` reasoning fields from a chat-completions body (module doc); {} without.
+    With `history_reasoning`, also the `provider_content` block that sends it back."""
     msg = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
-    for key in ("reasoning_content", "reasoning"):
+    for key in REASONING_FIELDS:
         value = msg.get(key)
         if isinstance(value, str) and value:
-            return {"reasoning": value, "reasoning_kind": "text"}
+            out: dict[str, Any] = {"reasoning": value, "reasoning_kind": "text"}
+            if history_reasoning:
+                out["provider_content"] = [{"type": REASONING_BLOCK, "field": key, "text": value}]
+            return out
     return {}
 
 
@@ -189,18 +225,35 @@ class OpenAICompatProvider(Provider):
     def __init__(self, name: str, base_url: str | None = None, api_key_env: str | None = None,
                  pricing: dict | None = None, concurrency: int = 8,
                  timeout_s: float = DEFAULT_TIMEOUT_S, max_retries: int = DEFAULT_MAX_RETRIES,
-                 self_hosted: bool | None = None) -> None:
+                 self_hosted: bool | None = None, base_url_env: str | None = None,
+                 history_reasoning: bool = False) -> None:
         preset = PRESETS.get(name, {})
         self.self_hosted = (name == "vllm") if self_hosted is None else bool(self_hosted)
+        params = getattr(self, "params", {})
         if self_hosted is None:  # keep pre-WP8 specs (and their spec_hash) unchanged
-            getattr(self, "params", {}).pop("self_hosted", None)
+            params.pop("self_hosted", None)
+        if base_url_env is None:  # likewise for the later options at their defaults
+            params.pop("base_url_env", None)
+        if not history_reasoning:
+            params.pop("history_reasoning", None)
         self.name = name
-        self.base_url = (base_url or preset.get("base_url") or "").rstrip("/")
-        if not self.base_url:
-            raise ValueError(f"provider {name!r} needs a base_url")
+        if base_url and base_url_env:
+            raise ValueError(f"provider {name!r}: give base_url or base_url_env, not both")
+        self.base_url_env = base_url_env or None
+        self.history_reasoning = bool(history_reasoning)
+        self._base_url = (base_url or preset.get("base_url") or "").rstrip("/")
+        if not self._base_url and not self.base_url_env:
+            raise ValueError(f"provider {name!r} needs a base_url (or base_url_env)")
         self.api_key_env = api_key_env if api_key_env is not None else preset.get("api_key_env")
         self._setup(pricing, concurrency, timeout_s, max_retries)
         self._transport: httpx.AsyncBaseTransport | None = None
+
+    @property
+    def base_url(self) -> str:
+        """The URL calls go to: `base_url_env`'s value when set (read now), else the fixed one."""
+        if self.base_url_env:
+            return os.environ.get(self.base_url_env, "").strip().rstrip("/")
+        return self._base_url
 
     def _headers(self) -> dict[str, str]:
         headers = {"content-type": "application/json"}
@@ -211,7 +264,12 @@ class OpenAICompatProvider(Provider):
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         self.calls += 1
-        body = build_body(request)
+        body = build_body(request, self.history_reasoning)
+        base_url = self.base_url
+        if not base_url:
+            raise ProviderError(f"{self.name}: base_url_env {self.base_url_env} is not set (it "
+                                "holds the server's base URL; `swarmlab job run --endpoint` sets "
+                                "it in the job)", status=None, attempts=0)
         start = time.monotonic()
         timed_out = False
         attempt = 0  # failed attempts so far
@@ -220,7 +278,7 @@ class OpenAICompatProvider(Provider):
                 retry_after: str | None = None
                 try:
                     async with asyncio.timeout(self.timeout_s):
-                        resp = await client.post(f"{self.base_url}/chat/completions", json=body,
+                        resp = await client.post(f"{base_url}/chat/completions", json=body,
                                                  headers=self._headers())
                 except (httpx.TimeoutException, TimeoutError) as e:
                     timed_out = True
@@ -256,7 +314,7 @@ class OpenAICompatProvider(Provider):
             or (self.name if self.self_hosted else None),
             latency_s=time.monotonic() - start, finish_reason=finish,
             attempts=attempt + 1, retried_after_timeout=timed_out,
-            refusal=Refusal() if finish == "refusal" else None, **parse_reasoning(data),
+            refusal=Refusal() if finish == "refusal" else None, **parse_reasoning(data, self.history_reasoning),
         )
 
 

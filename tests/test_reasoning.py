@@ -407,3 +407,103 @@ def test_opt_in_kept_thinking_still_counts_when_it_is_sent(tmp_path):
     turns = [e for e in run.events if e["type"] == "turn_ended"]
     assert [t["yield_kind"] for t in turns] == ["end_turn", "error"]
     assert "context_limit" in turns[1]["error"]
+
+
+# ---- history_reasoning (OpenAI-compatible; self-served Flint on SGLang) -----------------------------
+def served(handler, **kw):
+    from swarmlab.providers.openai_compat import OpenAICompatProvider
+
+    p = OpenAICompatProvider("served", base_url="http://flint:30000/v1",
+                             pricing={"flint": (0, 0, 0)}, **kw)
+    p._transport = httpx.MockTransport(handler)
+    return p
+
+
+@pytest.mark.parametrize("key", ["reasoning_content", "reasoning"])
+async def test_history_reasoning_keeps_the_servers_field_and_sends_it_back(key):
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json=completion(
+            {"content": "", key: "Plan: list files.", "tool_calls": [
+                {"id": "c1", "type": "function",
+                 "function": {"name": "bash", "arguments": '{"command": "ls"}'}}]},
+            finish="tool_calls"))
+
+    p = served(handler, history_reasoning=True)
+    resp = await p.complete(req(model="served:flint"))
+    assert resp.reasoning == "Plan: list files."
+    assert resp.provider_content == [{"type": "reasoning_text", "field": key,
+                                      "text": "Plan: list files."}]
+    history = [ChatMessage(role="user", content="go"),
+               ChatMessage(role="assistant", content="", tool_calls=resp.tool_calls,
+                           provider_content=resp.provider_content),
+               ChatMessage(role="tool", content="a b", tool_call_id="c1")]
+    await p.complete(req(model="served:flint", messages=history))
+    sent = seen[1]["messages"][1]
+    assert sent[key] == "Plan: list files." and sent["content"] is None
+    assert sent["tool_calls"][0]["function"]["name"] == "bash"
+    other = ({"reasoning_content", "reasoning"} - {key}).pop()
+    assert other not in sent and "provider_content" not in sent
+    # the default never captures nor sends it, even when a message carries the block
+    body = build_body(req(model="served:flint", messages=history))
+    assert key not in body["messages"][1]
+    assert (await served(handler).complete(req(model="served:flint"))).provider_content is None
+
+
+def test_history_reasoning_and_base_url_env_stay_out_of_default_params(monkeypatch):
+    from swarmlab.providers.base import ProviderError
+    from swarmlab.providers.openai_compat import OpenAICompatProvider
+
+    plain = OpenAICompatProvider("served", base_url="http://x/v1", pricing={"m": (0, 0, 0)})
+    assert "history_reasoning" not in plain.params and "base_url_env" not in plain.params
+    p = OpenAICompatProvider("served", base_url_env="SWARMLAB_ENDPOINT_URL",
+                             history_reasoning=True, pricing={"m": (0, 0, 0)})
+    assert p.params["base_url_env"] == "SWARMLAB_ENDPOINT_URL" and p.params["history_reasoning"]
+    assert p.params["base_url"] is None  # the URL is never part of the spec
+    monkeypatch.delenv("SWARMLAB_ENDPOINT_URL", raising=False)
+    assert p.base_url == ""
+    with pytest.raises(ProviderError, match="SWARMLAB_ENDPOINT_URL is not set"):
+        import asyncio
+        asyncio.run(p.complete(req(model="served:m")))
+    monkeypatch.setenv("SWARMLAB_ENDPOINT_URL", "https://abc--30000.hf.jobs/v1/")
+    assert p.base_url == "https://abc--30000.hf.jobs/v1"
+    with pytest.raises(ValueError, match="not both"):
+        OpenAICompatProvider("served", base_url="http://x", base_url_env="E")
+    with pytest.raises(ValueError, match="base_url_env"):
+        OpenAICompatProvider("served")
+
+
+async def test_base_url_env_is_read_at_call_time(monkeypatch):
+    from swarmlab.providers.openai_compat import OpenAICompatProvider
+
+    urls = []
+
+    def handler(request):
+        urls.append(str(request.url))
+        assert request.headers["authorization"] == "Bearer hf_x"
+        return httpx.Response(200, json=completion({"content": "ok"}))
+
+    monkeypatch.setenv("HF_TOKEN", "hf_x")
+    monkeypatch.setenv("SWARMLAB_ENDPOINT_URL", "https://abc--30000.hf.jobs/v1")
+    p = OpenAICompatProvider("served", base_url_env="SWARMLAB_ENDPOINT_URL", api_key_env="HF_TOKEN",
+                             pricing={"flint": (0, 0, 0)})
+    p._transport = httpx.MockTransport(handler)
+    await p.complete(req(model="served:flint"))
+    assert urls == ["https://abc--30000.hf.jobs/v1/chat/completions"]
+
+
+def test_reasoning_text_blocks_cross_providers_safely():
+    from swarmlab.participants.minisweagent import _Model
+    from swarmlab.providers.anthropic import _blocks
+
+    block = [{"type": "reasoning_text", "field": "reasoning_content", "text": "why"}]
+    stored = {"role": "assistant", "content": "", "provider_content": block, "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "ls"}'}}]}
+    msg = _Model._chat_message(stored)  # mini_swe_agent resends what it stored
+    assert msg.provider_content == block
+    assert build_body(req(model="served:flint", messages=[msg]),
+                      history_reasoning=True)["messages"][0]["reasoning_content"] == "why"
+    sent = _blocks(msg)  # the Anthropic adapter sends text + tool calls, not the foreign block
+    assert [b["type"] for b in sent] == ["tool_use"]
