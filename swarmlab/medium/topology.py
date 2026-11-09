@@ -64,6 +64,7 @@ Decisions where the contract is silent:
 from __future__ import annotations
 
 import random
+import re
 from typing import TYPE_CHECKING, ClassVar
 
 from ..ids import AgentId
@@ -153,6 +154,163 @@ class Star(Topology):
         if post.agent == self.center:
             return [a for a in agents if a != self.center]
         return [self.center] if self.center in agents else []
+
+
+AGENT_ID_PATTERN = r"^a[0-9]{3,4}$"
+
+
+class Direct(Topology):
+    """Direct messages: every post names one addressee (`post(to=..., text)`) and reaches only it.
+
+    The `to` argument is a plain string checked against the run's agents, not an enum of agent
+    ids: at hundreds of agents an enum would add thousands of tokens to every request and swamp
+    the communication cost being measured. A post without `to`, to an unknown agent or to the
+    author is refused with a tool error, so nothing is delivered silently to nobody.
+    """
+
+    entry_point: ClassVar[str | None] = "direct"
+    description: ClassVar[str] = "Direct messages: each post names one addressee (`to`) and reaches only it"
+    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "agents")
+
+    def __init__(self) -> None:
+        self.agents: list[AgentId] = []
+
+    def reset_agents(self, agents: list[AgentId]) -> None:
+        self.agents = list(agents)
+
+    def post_properties(self, agent: AgentId) -> dict[str, dict]:
+        return {"to": {"type": "string", "pattern": AGENT_ID_PATTERN,
+                       "description": "the id of the one agent who receives this message, e.g. a003"}}
+
+    def post_required(self) -> list[str]:
+        return ["to"]
+
+    def check_post(self, agent: AgentId, channel: str, extra: dict) -> str | None:
+        to = extra.get("to")
+        if not isinstance(to, str) or not to:
+            return "post needs `to`: the id of the agent who receives the message"
+        if to == agent:
+            return "`to` must be another agent, not yourself"
+        if self.agents and to not in self.agents:
+            return f"unknown agent {to!r}; agents are a000..{self.agents[-1]}"
+        return None
+
+    def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
+        to = post.fields.get("to")
+        return [AgentId(to)] if to in agents and to != post.agent else []
+
+
+CHANNEL_NAME_PATTERN = r"^[A-Za-z0-9_-]{1,40}$"
+
+
+class SelfOrganized(Topology):
+    """Agent-managed channels: agents create, join and leave named channels while the run goes on.
+
+    - A post to a channel name the board does not have yet creates that channel (up to
+      `max_channels`); posting to a channel makes the author a member. A post reaches the
+      channel's members at commit time, minus the author.
+    - `join_channel(channel)` and `leave_channel(channel)` change membership at once (within the
+      round, before the commit), so a member who joins in round r receives the posts committed at
+      the end of round r. Joining a channel that does not exist yet creates it.
+    - `list_channels()` returns every channel with its member count and whether the caller is a
+      member; `list_channels(channel=X)` returns X's members.
+    - `main` is an ordinary channel with no members at the start: a team that moves everyone into
+      it has chosen all-to-all for itself.
+
+    Membership is plain state, snapshotted with the topology, so resume and replay rebuild it.
+    The tool calls are logged like every tool call (`tool_calls` export table), which is the
+    record of how the rooms formed.
+    """
+
+    entry_point: ClassVar[str | None] = "self_organized"
+    description: ClassVar[str] = "Agent-managed channels: agents create, join and leave named channels"
+    dynamic_channels: ClassVar[bool] = True
+
+    def __init__(self, max_channels: int = 1024, list_limit: int = 100) -> None:
+        if max_channels < 1:
+            raise ValueError(f"max_channels must be >= 1, got {max_channels}")
+        if list_limit < 1:
+            raise ValueError(f"list_limit must be >= 1, got {list_limit}")
+        self.max_channels = max_channels
+        self.list_limit = list_limit
+        self.members: dict[str, list[AgentId]] = {}
+
+    def reset_agents(self, agents: list[AgentId]) -> None:
+        self.members = {}
+
+    def channels(self) -> list[str]:
+        return sorted(self.members)
+
+    def channel_members(self, channel: str) -> list[AgentId]:
+        return list(self.members.get(channel, []))
+
+    def default_channel(self, agent: AgentId) -> str | None:
+        return None  # every post names its channel
+
+    def _ensure(self, channel: str) -> str | None:
+        if not isinstance(channel, str) or not re.fullmatch(CHANNEL_NAME_PATTERN, channel):
+            return "channel names are 1-40 letters, digits, '_' or '-'"
+        if channel not in self.members:
+            if channel != "main" and len([c for c in self.members if c != "main"]) >= self.max_channels:
+                return f"too many channels (at most {self.max_channels})"
+            self.members[channel] = []
+        return None
+
+    def _join(self, agent: AgentId, channel: str) -> str | None:
+        err = self._ensure(channel)
+        if err is None and agent not in self.members[channel]:
+            self.members[channel].append(agent)
+        return err
+
+    def check_post(self, agent: AgentId, channel: str, extra: dict) -> str | None:
+        return self._join(agent, channel)  # posting creates the channel and joins its author
+
+    def tool_schemas(self, agent: AgentId) -> list:
+        from ..tools import ToolSchema
+
+        chan = {"type": "string", "pattern": CHANNEL_NAME_PATTERN}
+        return [
+            ToolSchema(name="join_channel",
+                       description="Join a channel (creating it if it does not exist) to receive its posts.",
+                       parameters={"type": "object", "properties": {"channel": chan},
+                                   "required": ["channel"], "additionalProperties": False}),
+            ToolSchema(name="leave_channel", description="Leave a channel; you stop receiving its posts.",
+                       parameters={"type": "object", "properties": {"channel": chan},
+                                   "required": ["channel"], "additionalProperties": False}),
+            ToolSchema(name="list_channels",
+                       description=("List the channels with their member counts, or, given a channel, "
+                                    "its members."),
+                       parameters={"type": "object", "properties": {"channel": chan},
+                                   "required": [], "additionalProperties": False}),
+        ]
+
+    def call_tool(self, agent: AgentId, name: str, args: dict, round: int) -> tuple[bool, dict | str]:
+        channel = args.get("channel")
+        if set(args) - {"channel"}:
+            return False, f"bad args: {name}(channel)"
+        if name == "join_channel":
+            err = self._join(agent, channel)
+            return (False, err) if err else (True, {"channel": channel,
+                                                    "members": len(self.members[channel])})
+        if name == "leave_channel":
+            if channel not in self.members or agent not in self.members[channel]:
+                return False, f"you are not a member of {channel!r}"
+            self.members[channel].remove(agent)
+            return True, {"channel": channel, "members": len(self.members[channel])}
+        if name == "list_channels":
+            if channel is not None:
+                if channel not in self.members:
+                    return False, f"unknown channel {channel!r}"
+                return True, {"channel": channel, "members": list(self.members[channel])}
+            rows = sorted(self.members.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+            return True, {"channels": [{"channel": c, "members": len(m), "joined": agent in m}
+                                       for c, m in rows[: self.list_limit]],
+                          "total": len(rows)}
+        return False, f"unknown topology tool {name!r}"
+
+    def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
+        members = set(self.members.get(post.channel, []))
+        return [a for a in agents if a != post.agent and a in members]
 
 
 class Tree(Topology):

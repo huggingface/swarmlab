@@ -42,6 +42,8 @@ groups = "swarmlab.medium.topology:Groups"
 star = "swarmlab.medium.topology:Star"
 tree = "swarmlab.medium.topology:Tree"
 rooms = "swarmlab.medium.topology:Rooms"
+direct = "swarmlab.medium.topology:Direct"
+self_organized = "swarmlab.medium.topology:SelfOrganized"
 
 [project.entry-points."swarmlab.policies"]
 delay = "swarmlab.medium.board:DelayPolicy"
