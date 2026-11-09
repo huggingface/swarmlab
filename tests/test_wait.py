@@ -84,7 +84,7 @@ def test_wait_returns_the_lead_post_and_read_board_then_has_nothing_new(tmp_path
     (kind, ok, res, _), (kind2, ok2, res2, _) = RESULTS["a001"][:2]
     assert kind == "wait" and ok and res["timed_out"] is False and res["waited_s"] >= 0
     assert [p["content"] for p in res["posts"]] == ["go"]
-    assert set(res["posts"][0]) == {"delivery_id", "post_id", "eligible_round", "content"}
+    assert set(res["posts"][0]) == {"delivery_id", "post_id", "sender", "eligible_round", "content"}
     assert kind2 == "read_board" and ok2 and res2["items"] == []  # the wait was a read
     events = _events(run.dir)
     reads = [e for e in events if e["type"] == "read" and e["agent"] == "a001"]

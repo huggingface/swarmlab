@@ -184,6 +184,7 @@ class Board(Persistable, Plugin):
         self._buffer: list[Post] = []
         self._inboxes: dict[AgentId, list[Delivery]] = {}
         self._post_channel: dict[PostId, str] = {}
+        self._post_author: dict[PostId, AgentId] = {}  # who wrote each committed post (`sender`)
         self._post_seq: tuple[int, int] = (0, 0)       # (round, next n)
         self._delivery_seq: tuple[int, int] = (0, 0)
         # intervention overlays (M3a)
@@ -271,6 +272,7 @@ class Board(Persistable, Plugin):
         deliveries: list[Delivery] = []
         for post in posts:
             self._post_channel[post.post_id] = post.channel
+            self._post_author[post.post_id] = post.agent
             if self._mutes.get(post.agent, -1) >= round:
                 continue  # muted author: the post is logged, nobody receives it
             readers = (list(recipients) if recipients is not None
@@ -369,6 +371,10 @@ class Board(Persistable, Plugin):
     def content(self, delivery: Delivery, blobs: BlobStoreLike) -> str:
         return blobs.get(delivery.content_hash).decode()
 
+    def sender_of(self, delivery: Delivery) -> AgentId | None:
+        """The author of the delivered post (None for a post committed before this was kept)."""
+        return self._post_author.get(delivery.post_id)
+
     def channel_of(self, delivery: Delivery) -> str | None:
         return self._post_channel.get(delivery.post_id)
 
@@ -387,6 +393,7 @@ class Board(Persistable, Plugin):
             "buffer": [p.model_dump(mode="json") for p in self._buffer],
             "inboxes": {a: [d.model_dump(mode="json") for d in ds] for a, ds in self._inboxes.items()},
             "post_channel": dict(self._post_channel),
+            "post_author": dict(self._post_author),
             "post_seq": self._post_seq,
             "delivery_seq": self._delivery_seq,
             "topology": (self.topology.spec(), self.topology.snapshot()),
@@ -405,6 +412,7 @@ class Board(Persistable, Plugin):
             AgentId(a): [Delivery.model_validate(d) for d in ds] for a, ds in state["inboxes"].items()
         }
         self._post_channel = dict(state["post_channel"])
+        self._post_author = {k: AgentId(v) for k, v in state.get("post_author", {}).items()}
         self._post_seq = tuple(state["post_seq"])
         self._delivery_seq = tuple(state["delivery_seq"])
         self._delays = {AgentId(a): (int(v[0]), v[1]) for a, v in state.get("delays", {}).items()}

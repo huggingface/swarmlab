@@ -170,15 +170,20 @@ class Direct(Topology):
 
     entry_point: ClassVar[str | None] = "direct"
     description: ClassVar[str] = "Direct messages: each post names one addressee (`to`) and reaches only it"
-    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "agents")
+    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "agents", "allow_all")
 
-    def __init__(self) -> None:
+    def __init__(self, allow_all: bool = False) -> None:
+        self.allow_all = bool(allow_all)  # `to: "all"` reaches every other agent (a broadcast)
         self.agents: list[AgentId] = []
 
     def reset_agents(self, agents: list[AgentId]) -> None:
         self.agents = list(agents)
 
     def post_properties(self, agent: AgentId) -> dict[str, dict]:
+        if self.allow_all:
+            return {"to": {"type": "string", "pattern": r"^(a[0-9]{3,4}|all)$",
+                           "description": "the id of the one agent who receives this message, "
+                                          "e.g. a003, or all for every other agent"}}
         return {"to": {"type": "string", "pattern": AGENT_ID_PATTERN,
                        "description": "the id of the one agent who receives this message, e.g. a003"}}
 
@@ -189,6 +194,8 @@ class Direct(Topology):
         to = extra.get("to")
         if not isinstance(to, str) or not to:
             return "post needs `to`: the id of the agent who receives the message"
+        if to == "all" and self.allow_all:
+            return None
         if to == agent:
             return "`to` must be another agent, not yourself"
         if self.agents and to not in self.agents:
@@ -197,6 +204,8 @@ class Direct(Topology):
 
     def recipients(self, post: Post, agents: list[AgentId], round: int, rng: random.Random) -> list[AgentId]:
         to = post.fields.get("to")
+        if to == "all" and self.allow_all:
+            return [a for a in agents if a != post.agent]
         return [AgentId(to)] if to in agents and to != post.agent else []
 
 
