@@ -49,3 +49,13 @@ def test_prompt_parts_and_answer_parsing():
     assert parse_answer("x #### [3, 1] y #### [1, 2, 3]") == [1, 2, 3]
     assert parse_answer("#### [1, 'a']") is None
     assert after_thinking("<think>#### [9]</think>#### [1]") == "#### [1]"
+
+
+def test_problem_fixes_the_numbers_not_the_names():
+    def w(seed, problem):
+        x = Aggregation(problem=problem)
+        x.reset(derive(seed, "world"), [agent_id(i) for i in range(4)])
+        return x
+    a, b = w(1, 7), w(2, 7)
+    assert a.numbers == b.numbers and a.names != b.names
+    assert w(1, 8).numbers != a.numbers

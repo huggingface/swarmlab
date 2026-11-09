@@ -6,11 +6,14 @@ from different agents as separate entries. It succeeds if any agent submits the 
 list. No agent can succeed alone at N >= 2, so the task tests whether agents share and collect
 private information.
 
-Per run (from the world rng): 16 numbers drawn uniformly from 1..99, of which the first N are
-used (the paper's evaluation problems hold sixteen, so one problem serves every team size), and
-the agents' public names, N distinct names sampled from `agent_1` .. `agent_64`, each agent seeing
+Per run: 16 numbers drawn uniformly from 1..99, of which the first N are used (the paper's
+evaluation problems hold sixteen, so one problem serves every team size), and the agents' public
+names, N distinct names sampled from `agent_1` .. `agent_64`, each agent seeing
 its teammates in its own shuffled order (the paper samples fresh names and orders per episode so
-no convention can attach to a name).
+no convention can attach to a name). With `problem: <int>` the numbers come from that problem id
+alone (`random.Random(f"aggregation-problem-{problem}")`), so several runs (the paper's G team
+attempts per problem) share the numbers while names and order still come from the run seed;
+without it (default) the numbers come from the world rng.
 
 The observation has two text parts: the paper's first user turn (`FIRST_USER_TURN`, Appendix G),
 then a roster line, `ROSTER_PREFIX` followed by JSON `{"name", "teammates", "ids", "n"}`: the
@@ -74,9 +77,12 @@ class Aggregation(World):
     entry_point: ClassVar[str | None] = "aggregation"
     requires: ClassVar[Requirements] = Requirements(commit="async")
     name = "aggregation"
-    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params",)
+    _skip_in_snapshot: ClassVar[tuple[str, ...]] = ("params", "problem")
 
-    def __init__(self) -> None:
+    def __init__(self, problem: int | None = None) -> None:
+        if problem is not None and (isinstance(problem, bool) or not isinstance(problem, int)):
+            raise ValueError(f"problem must be an integer, got {problem!r}")
+        self.problem = problem
         self.agents: list[AgentId] = []
         self.numbers: dict[str, int] = {}
         self.names: dict[str, str] = {}             # agent id -> public name
@@ -87,7 +93,8 @@ class Aggregation(World):
         self.agents = list(agents)
         if len(self.agents) > N_NUMBERS:
             raise ValueError(f"at most {N_NUMBERS} agents, got {len(self.agents)}")
-        drawn = [rng.randint(1, 99) for _ in range(N_NUMBERS)]
+        src = rng if self.problem is None else random.Random(f"aggregation-problem-{self.problem}")
+        drawn = [src.randint(1, 99) for _ in range(N_NUMBERS)]
         self.numbers = {str(a): drawn[i] for i, a in enumerate(self.agents)}
         names = rng.sample([f"agent_{i}" for i in range(1, NAME_POOL + 1)], len(self.agents))
         self.names = {str(a): names[i] for i, a in enumerate(self.agents)}
