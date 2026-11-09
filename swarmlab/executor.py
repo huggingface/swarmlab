@@ -213,7 +213,9 @@ WAIT_SCHEMA = ToolSchema(
     parameters=_obj({"timeout_s": {"type": "number", "description": "Seconds to wait at most; "
                                    "omit to wait until a message arrives."},
                      "peek": {"type": "boolean", "description": "Return the unread items' ids and "
-                              "senders without reading them (nothing is marked read)."}}, []),
+                              "senders without reading them (nothing is marked read)."},
+                     "known": {"type": "array", "items": {"type": "string"}, "description": "With "
+                               "peek: wait for an unread item whose delivery id is not listed."}}, []),
 )
 WAIT_LIMIT = 50  # posts a `wait` returns at most (read_board's default limit)
 
@@ -754,19 +756,24 @@ class RoundExecutor:
             self.waits.notify()
         return ToolResult(call_id=call_id, ok=True, result={"id": post_id}, pending=False)
 
-    def _unread(self, agent: AgentId) -> bool:
-        """`agent` has an item a `read_board()` would return now (eligible, unread, readable)."""
+    def _unread(self, agent: AgentId, known: frozenset[str] = frozenset()) -> bool:
+        """`agent` has an item a `read_board()` would return now (eligible, unread, readable)
+        whose delivery id is not in `known`."""
         readable = set(self._channels(agent, "read"))
-        return any(self.board.channel_of(d) in readable
+        return any(self.board.channel_of(d) in readable and d.delivery_id not in known
                    for d in self.board.pushable(agent, self.round, 1 << 30))
 
     async def _wait(self, agent: AgentId, call_id: CallId, args: dict) -> ToolResult:
-        extra = set(args) - {"timeout_s", "peek"}
+        extra = set(args) - {"timeout_s", "peek", "known"}
         timeout = args.get("timeout_s")
         peek = args.get("peek", False)
-        if extra or not isinstance(peek, bool) or (timeout is not None and (
+        known = args.get("known", [])
+        if extra or not isinstance(peek, bool) or not isinstance(known, list) or (
+                known and not peek) or (timeout is not None and (
                 not isinstance(timeout, int | float) or isinstance(timeout, bool) or timeout < 0)):
-            return self._err(call_id, "bad args: wait(timeout_s?: number >= 0, peek?: boolean)")
+            return self._err(call_id, "bad args: wait(timeout_s?: number >= 0, peek?: boolean, "
+                                      "known?: [delivery id], only with peek)")
+        known = frozenset(str(k) for k in known)
         hub = self.waits
         assert hub is not None  # `_allowed` refuses `wait` without a hub
         loop = asyncio.get_running_loop()
@@ -774,7 +781,7 @@ class RoundExecutor:
         deadline = None if timeout is None else start + float(timeout)
         timed_out = False
         released = False  # the turn's permit, given up while parked (WaitHub, Permits)
-        while not self._unread(agent):
+        while not self._unread(agent, known):
             remaining = None if deadline is None else deadline - loop.time()
             if hub.stalled(agent) or (remaining is not None and remaining <= 0):
                 timed_out = True

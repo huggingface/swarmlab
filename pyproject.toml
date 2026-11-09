@@ -28,6 +28,7 @@ flaggame = "swarmlab.world.flaggame:FlagGame"
 coloring = "swarmlab.world.coloring:ColoringGrid"
 hidden_sites = "swarmlab.world.hidden_sites:HiddenSites"
 cascade = "swarmlab.world.cascade:CascadeWorld"
+aggregation = "swarmlab.world.aggregation:Aggregation"
 minesweeper = "swarmlab.world.minesweeper:Minesweeper"
 programbench = "swarmlab.world.programbench:ProgramBench"
 
@@ -59,6 +60,7 @@ relay_painter = "swarmlab.participants.scripted:RelayPainter"
 llm = "swarmlab.participants.llm:LLMAgent"
 mini_swe_agent = "swarmlab.participants.minisweagent:MiniSweAgent"
 cascade_worker = "swarmlab.participants.cascade:CascadeWorker"
+s3_agent = "swarmlab.participants.s3:S3Agent"
 
 [project.entry-points."swarmlab.metrics"]
 "belief.accuracy" = "swarmlab.metrics.belief:Accuracy"
